@@ -381,10 +381,31 @@ fn split_list_value(value: &str) -> Vec<String> {
         .replace('、', ",")
         .replace('/', ",");
 
-    normalized
-        .split(',')
+    let mut results = Vec::new();
+    for part in normalized.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Handle bare hashtag patterns like "#旅行 #音楽 #プログラミング"
+        if trimmed.starts_with('#') || trimmed.contains(" #") {
+            for tag in split_hashtag_tokens(trimmed) {
+                results.push(tag);
+            }
+        } else {
+            results.push(trimmed.to_string());
+        }
+    }
+    results
+}
+
+/// Split "#tag1 #tag2 #tag3" into ["tag1", "tag2", "tag3"].
+/// Strips leading '#' from each token.
+fn split_hashtag_tokens(value: &str) -> Vec<String> {
+    value
+        .split('#')
         .map(str::trim)
-        .filter(|part| !part.is_empty())
+        .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect()
 }
@@ -469,5 +490,48 @@ mod tests {
         assert_eq!(profile.properties.hashtags, vec!["rust", "ai"]);
         assert_eq!(profile.properties.mbti.as_deref(), Some("ENFP"));
         assert_eq!(profile.attributes, vec!["AI", "ML"]);
+    }
+
+    #[test]
+    fn normalize_handles_bare_hashtag_entries() {
+        let mut profile = StudentProfile {
+            email: None,
+            generated_email: None,
+            name: "Test".into(),
+            bio_text: None,
+            profile_pic: None,
+            gallery_images: vec![],
+            properties: StudentProperties {
+                hashtags: vec![
+                    "#旅行 #音楽 #プログラミング".into(),
+                    "#読書".into(),
+                    "already clean".into(),
+                ],
+                hobbies: vec!["#basketball #soccer".into()],
+                ..Default::default()
+            },
+            attributes: vec!["#AI #ML".into()],
+            source_slide_object_id: None,
+            source_document_id: None,
+            source_canonical_uri: None,
+            thumbnail_blob_ref: None,
+            thumbnail_url: None,
+            companion_to_slide_object_id: None,
+        };
+
+        profile.normalize_in_place();
+
+        assert_eq!(
+            profile.properties.hashtags,
+            vec!["旅行", "音楽", "プログラミング", "読書", "already clean"]
+        );
+        assert_eq!(profile.properties.hobbies, vec!["basketball", "soccer"]);
+        assert_eq!(profile.attributes, vec!["AI", "ML"]);
+    }
+
+    #[test]
+    fn split_list_handles_mixed_hashtag_and_comma() {
+        let result = split_list_value("#tag1, #tag2 #tag3");
+        assert_eq!(result, vec!["tag1", "tag2", "tag3"]);
     }
 }
