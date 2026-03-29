@@ -18,6 +18,10 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 rusqlite = { version = "0.34", features = ["bundled"] }
 dotenvy = "0.15"
 base64 = "0.22"
+image = "0.25"
+roxmltree = "0.20"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+regex = "1"
 
 [dev-dependencies]
 pretty_assertions = "1"

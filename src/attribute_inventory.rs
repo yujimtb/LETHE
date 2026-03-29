@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::self_host::app::ProjectionSnapshot;
@@ -18,6 +19,10 @@ pub struct AttributeInventoryDocument {
     pub candidates: Vec<AttributeCandidate>,
 }
 
+/// A candidate label found across student profiles.
+///
+/// In label-inventory mode each candidate represents a unique **attribute
+/// label** (e.g. "出身地", "呼ばれたい名前") rather than a property value.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AttributeCandidate {
     pub candidate_key: String,
@@ -26,6 +31,18 @@ pub struct AttributeCandidate {
     pub label: String,
     pub value: String,
     pub value_kind: CandidateValueKind,
+    /// How many students use this label.
+    #[serde(default)]
+    pub student_count: usize,
+    /// Names of students who use this label (for display).
+    #[serde(default)]
+    pub student_names: Vec<String>,
+    /// Sample property values for context (e.g. "東京", "佐野ちゃん").
+    #[serde(default)]
+    pub example_values: Vec<String>,
+    /// The AI-normalized property key, if known (e.g. "Nickname", "Birthplace").
+    #[serde(default)]
+    pub ai_property_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -34,6 +51,13 @@ pub enum CandidateValueKind {
     ShortText,
     LongText,
     Url,
+}
+
+/// A raw label–value pair extracted from bio_text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BioLabel {
+    pub label: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +136,12 @@ pub struct DiscoveredAttributeGroup {
     pub document_count: usize,
     pub source_paths: Vec<String>,
     pub example_values: Vec<String>,
+    /// Which students have this label.
+    #[serde(default)]
+    pub student_names: Vec<String>,
+    /// AI-normalized property key, if mapped.
+    #[serde(default)]
+    pub ai_property_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,170 +155,215 @@ pub enum InventoryCommand {
 }
 
 pub fn build_inventory_documents(snapshot: &ProjectionSnapshot) -> Vec<AttributeInventoryDocument> {
-    let mut documents = snapshot
-        .person_page
-        .profiles
-        .iter()
-        .filter_map(|person| {
-            let frontend = person.frontend_profile.as_ref()?;
-            let source_document_id = Some(frontend.source_document_id.clone());
-            let source_canonical_uri = frontend.source_canonical_uri.clone();
-            let document_key = source_document_id
-                .clone()
-                .unwrap_or_else(|| person.person_id.as_str().to_string());
-            let payload = serde_json::json!({
-                "person": {
-                    "display_name": person.display_name,
-                    "self_intro_text": person.self_intro_text,
-                },
-                "profile": frontend.profile,
+    // Collect per-student label data, then aggregate into deduplicated candidates.
+    struct StudentLabels {
+        display_name: String,
+        labels: Vec<BioLabel>,
+        ai_keys: Vec<(String, String)>, // (ai_key, example_value)
+    }
+
+    let mut all_students: Vec<StudentLabels> = Vec::new();
+
+    for person in &snapshot.person_page.profiles {
+        let Some(frontend) = person.frontend_profile.as_ref() else {
+            continue;
+        };
+        let bio_text = frontend.profile.bio_text.as_deref().unwrap_or("");
+        let labels = extract_bio_labels(bio_text);
+
+        // Collect AI property keys with their values for cross-reference.
+        let ai_keys = extract_ai_property_keys(&frontend.profile.properties);
+
+        all_students.push(StudentLabels {
+            display_name: person.display_name.clone(),
+            labels,
+            ai_keys,
+        });
+    }
+
+    // Aggregate: group by normalized label text.
+    // Key = normalized label, Value = aggregated candidate info
+    struct LabelAgg {
+        raw_label: String,         // first-seen raw form
+        student_names: Vec<String>,
+        example_values: BTreeSet<String>,
+        ai_property_key: Option<String>,
+    }
+
+    let mut label_map: BTreeMap<String, LabelAgg> = BTreeMap::new();
+
+    for student in &all_students {
+        // Track which normalized labels this student contributed (dedup per student).
+        let mut seen_in_student: BTreeSet<String> = BTreeSet::new();
+
+        for bio_label in &student.labels {
+            let norm = normalize_label_text(&bio_label.label);
+            if norm.is_empty() || seen_in_student.contains(&norm) {
+                continue;
+            }
+            seen_in_student.insert(norm.clone());
+
+            let agg = label_map.entry(norm).or_insert_with(|| LabelAgg {
+                raw_label: bio_label.label.clone(),
+                student_names: Vec::new(),
+                example_values: BTreeSet::new(),
+                ai_property_key: None,
             });
-            let mut candidates = Vec::new();
-            collect_string_candidates(&payload, None, None, &mut candidates);
-            candidates.sort_by(|left, right| {
-                left.source_path
-                    .cmp(&right.source_path)
-                    .then(left.value.cmp(&right.value))
-            });
-            Some(AttributeInventoryDocument {
-                document_key,
-                person_id: person.person_id.as_str().to_string(),
-                display_name: person.display_name.clone(),
-                source_document_id,
-                source_canonical_uri,
-                last_activity: person.last_activity,
-                candidates,
-            })
+            agg.student_names.push(student.display_name.clone());
+            if !bio_label.value.is_empty() && agg.example_values.len() < 5 {
+                agg.example_values.insert(bio_label.value.clone());
+            }
+        }
+
+        // Also register AI property keys — these serve as "label" evidence.
+        for (ai_key, example_val) in &student.ai_keys {
+            let norm = normalize_label_text(ai_key);
+            if norm.is_empty() {
+                continue;
+            }
+            if let Some(agg) = label_map.get_mut(&norm) {
+                // Attach AI key to an existing bio label group.
+                if agg.ai_property_key.is_none() {
+                    agg.ai_property_key = Some(ai_key.clone());
+                }
+                if !example_val.is_empty() && agg.example_values.len() < 5 {
+                    agg.example_values.insert(example_val.clone());
+                }
+            }
+            // For AI keys without a matching bio label we also inject a
+            // candidate if no student wrote a matching raw label.  This
+            // ensures properties that only appear via the AI extraction
+            // are still surfaced (e.g. if some students don't write an
+            // explicit label).
+            if !label_map.contains_key(&norm) && !seen_in_student.contains(&norm) {
+                seen_in_student.insert(norm.clone());
+                let agg = label_map.entry(norm).or_insert_with(|| LabelAgg {
+                    raw_label: ai_key.clone(),
+                    student_names: Vec::new(),
+                    example_values: BTreeSet::new(),
+                    ai_property_key: Some(ai_key.clone()),
+                });
+                agg.student_names.push(student.display_name.clone());
+                if !example_val.is_empty() && agg.example_values.len() < 5 {
+                    agg.example_values.insert(example_val.clone());
+                }
+            }
+        }
+    }
+
+    // Build candidates sorted by student count (most common first).
+    let mut candidates: Vec<AttributeCandidate> = label_map
+        .into_iter()
+        .map(|(norm, agg)| {
+            let student_count = agg.student_names.len();
+            AttributeCandidate {
+                candidate_key: format!("label:{norm}"),
+                attribute_path: norm.clone(),
+                source_path: format!("{} student(s)", student_count),
+                label: agg.raw_label.clone(),
+                value: agg.raw_label,
+                value_kind: CandidateValueKind::ShortText,
+                student_count,
+                student_names: agg.student_names,
+                example_values: agg.example_values.into_iter().collect(),
+                ai_property_key: agg.ai_property_key,
+            }
         })
-        .collect::<Vec<_>>();
+        .collect();
 
-    documents.sort_by(|left, right| {
-        right
-            .last_activity
-            .cmp(&left.last_activity)
-            .then(left.display_name.cmp(&right.display_name))
-            .then(left.person_id.cmp(&right.person_id))
+    candidates.sort_by(|a, b| {
+        b.student_count
+            .cmp(&a.student_count)
+            .then(a.label.cmp(&b.label))
     });
-    documents
+
+    // Return a single aggregate document (all students combined).
+    vec![AttributeInventoryDocument {
+        document_key: "all-labels".into(),
+        person_id: "aggregate".into(),
+        display_name: format!("All Students ({} profiles)", all_students.len()),
+        source_document_id: None,
+        source_canonical_uri: None,
+        last_activity: None,
+        candidates,
+    }]
 }
 
-fn collect_string_candidates(
-    value: &serde_json::Value,
-    source_path: Option<&str>,
-    attribute_path: Option<&str>,
-    out: &mut Vec<AttributeCandidate>,
-) {
-    match value {
-        serde_json::Value::Null => {}
-        serde_json::Value::String(raw) => {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                return;
-            }
-            let source_path = source_path.unwrap_or("").to_string();
-            let attribute_path = attribute_path.unwrap_or("").to_string();
-            if is_metadata_path(&attribute_path) {
-                return;
-            }
-            out.push(AttributeCandidate {
-                candidate_key: format!("{source_path}={trimmed}"),
-                label: label_for_attribute_path(&attribute_path),
-                value: trimmed.to_string(),
-                value_kind: classify_value_kind(trimmed),
-                source_path,
-                attribute_path,
-            });
+/// Extract `label：value` pairs from bio_text.
+///
+/// Handles full-width `：` and half-width `:` separators.  Skips labels that
+/// look like time stamps (e.g. `12:34`) or URLs.
+pub fn extract_bio_labels(bio_text: &str) -> Vec<BioLabel> {
+    let re = Regex::new(r"(?m)^\s*([^\n:：]{1,30}?)\s*[：:]\s*(.*)").unwrap();
+    let mut results = Vec::new();
+    for caps in re.captures_iter(bio_text) {
+        let raw_label = caps[1].trim().to_string();
+        let raw_value = caps[2].trim().to_string();
+
+        // Skip labels that look like numeric timestamps or single chars.
+        if raw_label.is_empty() || raw_label.chars().count() < 2 {
+            continue;
         }
-        serde_json::Value::Array(items) => {
-            for (index, item) in items.iter().enumerate() {
-                let next_source = match source_path {
-                    Some(base) if !base.is_empty() => format!("{base}[{index}]"),
-                    _ => format!("[{index}]"),
-                };
-                let next_attribute = match attribute_path {
-                    Some(base) if !base.is_empty() => format!("{base}[]"),
-                    _ => "[]".to_string(),
-                };
-                collect_string_candidates(item, Some(&next_source), Some(&next_attribute), out);
-            }
+        if raw_label.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            continue;
         }
-        serde_json::Value::Object(object) => {
-            for (key, item) in object {
-                let next_source = append_object_segment(source_path, key);
-                let next_attribute = append_object_segment(attribute_path, &canonicalize_segment(key));
-                collect_string_candidates(item, Some(&next_source), Some(&next_attribute), out);
-            }
+        // Skip if it looks like a URL fragment (e.g. "https")
+        if raw_label.eq_ignore_ascii_case("http") || raw_label.eq_ignore_ascii_case("https") {
+            continue;
         }
-        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+        results.push(BioLabel {
+            label: raw_label,
+            value: raw_value,
+        });
     }
+    results
 }
 
-/// Paths that represent system metadata rather than student attributes.
-const METADATA_PATHS: &[&str] = &[
-    "profile.source_slide_object_id",
-    "profile.source_document_id",
-    "profile.source_canonical_uri",
-    "profile.thumbnail_blob_ref",
-    "profile.thumbnail_url",
-    "profile.companion_to_slide_object_id",
-    "profile.profile_pic.url",
-    "profile.gallery_images[].url",
-];
-
-fn is_metadata_path(attribute_path: &str) -> bool {
-    METADATA_PATHS.iter().any(|&pattern| attribute_path == pattern)
-}
-
-fn append_object_segment(base: Option<&str>, key: &str) -> String {
-    match base {
-        Some(prefix) if !prefix.is_empty() => format!("{prefix}.{key}"),
-        _ => key.to_string(),
-    }
-}
-
-fn canonicalize_segment(key: &str) -> String {
-    let mut normalized = String::new();
-    let mut last_was_separator = false;
-    let mut previous_was_lowercase = false;
-    for ch in key.chars() {
-        if ch.is_ascii_alphanumeric() {
-            if ch.is_ascii_uppercase() && previous_was_lowercase && !normalized.ends_with('_') {
-                normalized.push('_');
-            }
-            normalized.push(ch.to_ascii_lowercase());
-            last_was_separator = false;
-            previous_was_lowercase = ch.is_ascii_lowercase();
-        } else if !last_was_separator && !normalized.is_empty() {
-            normalized.push('_');
-            last_was_separator = true;
-            previous_was_lowercase = false;
+/// Extract AI property keys and their (first) values from a `StudentProperties`
+/// object serialized as JSON.
+fn extract_ai_property_keys(
+    properties: &crate::slide_analysis::types::StudentProperties,
+) -> Vec<(String, String)> {
+    let json = serde_json::to_value(properties).unwrap_or_default();
+    let Some(obj) = json.as_object() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (key, val) in obj {
+        let example = match val {
+            serde_json::Value::String(s) if !s.is_empty() => s.clone(),
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .next()
+                .unwrap_or("")
+                .to_string(),
+            _ => String::new(),
+        };
+        // Only include keys that have non-null/non-empty values.
+        if !example.is_empty() {
+            out.push((key.clone(), example));
         }
     }
-    normalized.trim_matches('_').to_string()
+    out
 }
 
-fn classify_value_kind(value: &str) -> CandidateValueKind {
-    if value.starts_with("http://") || value.starts_with("https://") {
-        CandidateValueKind::Url
-    } else if value.len() > 120 || value.contains('\n') {
-        CandidateValueKind::LongText
-    } else {
-        CandidateValueKind::ShortText
-    }
-}
-
-fn label_for_attribute_path(attribute_path: &str) -> String {
-    let leaf = attribute_path
-        .rsplit('.')
-        .next()
-        .unwrap_or(attribute_path)
-        .replace("[]", "")
-        .replace('_', " ");
-    let mut chars = leaf.chars();
-    match chars.next() {
-        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.collect::<String>()),
-        None => "Value".to_string(),
-    }
+/// Normalize a label text for grouping (lowercase ASCII, collapse whitespace).
+fn normalize_label_text(label: &str) -> String {
+    label
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_uppercase() {
+                c.to_ascii_lowercase()
+            } else {
+                c
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 impl AttributeInventoryState {
@@ -399,31 +474,41 @@ impl AttributeInventoryState {
     }
 
     pub fn suggestions_for(&self, candidate: &AttributeCandidate) -> Vec<AttributeSuggestion> {
-        let candidate_leaf = normalized_leaf(&candidate.attribute_path);
+        let candidate_norm = normalize_label_text(&candidate.value);
         let mut suggestions = self
             .known_attributes
             .iter()
             .filter_map(|attribute| {
                 let mut score = 0usize;
+                // Exact label match in source_paths (aliases).
                 if attribute
                     .source_paths
                     .iter()
-                    .any(|path| path == &candidate.attribute_path)
+                    .any(|alias| normalize_label_text(alias) == candidate_norm)
                 {
                     score += 100;
                 }
-                if normalized_leaf(&attribute.id) == candidate_leaf {
-                    score += 80;
+                // Display name similarity.
+                if normalize_label_text(&attribute.display_name) == candidate_norm {
+                    score += 90;
                 }
-                if normalized_leaf(&attribute.display_name) == candidate_leaf {
-                    score += 75;
+                // Partial overlap in label text (shared characters).
+                if score == 0 {
+                    let attr_norm = normalize_label_text(&attribute.display_name);
+                    if !candidate_norm.is_empty()
+                        && !attr_norm.is_empty()
+                        && (candidate_norm.contains(&attr_norm)
+                            || attr_norm.contains(&candidate_norm))
+                    {
+                        score += 50;
+                    }
                 }
-                if attribute
-                    .source_paths
-                    .iter()
-                    .any(|path| normalized_leaf(path) == candidate_leaf)
-                {
-                    score += 60;
+                // Check if AI key matches any alias.
+                if let Some(ai_key) = &candidate.ai_property_key {
+                    let ai_norm = normalize_label_text(ai_key);
+                    if attribute.source_paths.iter().any(|p| normalize_label_text(p) == ai_norm) {
+                        score += 70;
+                    }
                 }
                 if score == 0 {
                     return None;
@@ -497,7 +582,6 @@ impl AttributeInventoryState {
 
 pub fn summarize_documents(documents: &[AttributeInventoryDocument]) -> Vec<DiscoveredAttributeGroup> {
     let mut groups = BTreeMap::<String, DiscoveredAttributeGroup>::new();
-    let mut document_sets = BTreeMap::<String, BTreeSet<String>>::new();
     for document in documents {
         for candidate in &document.candidates {
             let group = groups
@@ -507,29 +591,26 @@ pub fn summarize_documents(documents: &[AttributeInventoryDocument]) -> Vec<Disc
                     label: candidate.label.clone(),
                     value_kind: candidate.value_kind,
                     occurrence_count: 0,
-                    document_count: 0,
+                    document_count: candidate.student_count,
                     source_paths: Vec::new(),
                     example_values: Vec::new(),
+                    student_names: candidate.student_names.clone(),
+                    ai_property_key: candidate.ai_property_key.clone(),
                 });
             group.occurrence_count += 1;
-            if !group.source_paths.contains(&candidate.source_path) {
-                group.source_paths.push(candidate.source_path.clone());
+            if !group.source_paths.contains(&candidate.label) {
+                group.source_paths.push(candidate.label.clone());
             }
-            if !group.example_values.contains(&candidate.value) && group.example_values.len() < 8 {
-                group.example_values.push(candidate.value.clone());
+            for ev in &candidate.example_values {
+                if !group.example_values.contains(ev) && group.example_values.len() < 5 {
+                    group.example_values.push(ev.clone());
+                }
             }
-            document_sets
-                .entry(candidate.attribute_path.clone())
-                .or_default()
-                .insert(document.document_key.clone());
         }
     }
-    for (path, document_ids) in document_sets {
-        if let Some(group) = groups.get_mut(&path) {
-            group.document_count = document_ids.len();
-        }
-    }
-    groups.into_values().collect()
+    let mut result: Vec<_> = groups.into_values().collect();
+    result.sort_by(|a, b| b.document_count.cmp(&a.document_count).then(a.label.cmp(&b.label)));
+    result
 }
 
 pub fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), Box<dyn std::error::Error>> {
@@ -547,12 +628,16 @@ pub fn read_alias_catalog(path: &Path) -> Result<AttributeAliasCatalog, Box<dyn 
 }
 
 fn absorb_candidate(attribute: &mut KnownAttribute, candidate: &AttributeCandidate) {
+    // Store the label text itself as a source alias.
     let mut source_paths = attribute.source_paths.iter().cloned().collect::<BTreeSet<_>>();
-    source_paths.insert(candidate.attribute_path.clone());
+    source_paths.insert(candidate.value.clone());
     attribute.source_paths = source_paths.into_iter().collect();
 
+    // Store sample property values (from the candidate's example_values) as examples.
     let mut examples = attribute.examples.iter().cloned().collect::<BTreeSet<_>>();
-    examples.insert(candidate.value.clone());
+    for ev in &candidate.example_values {
+        examples.insert(ev.clone());
+    }
     attribute.examples = examples.into_iter().take(5).collect();
     attribute.review_count += 1;
 }
@@ -570,18 +655,6 @@ fn normalize_attribute_id(value: &str) -> String {
         }
     }
     id.trim_matches('-').to_string()
-}
-
-fn normalized_leaf(value: &str) -> String {
-    value
-        .rsplit('.')
-        .next()
-        .unwrap_or(value)
-        .replace("[]", "")
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .map(|ch| ch.to_ascii_lowercase())
-        .collect()
 }
 
 pub fn parse_inventory_command(input: &str) -> Result<InventoryCommand, String> {
@@ -623,124 +696,120 @@ mod tests {
     use super::*;
     use crate::domain::EntityRef;
     use crate::person_page::types::{FrontendProfile, PersonPageOutput, PersonProfile};
-    use crate::slide_analysis::types::{GalleryImage, ProfilePic, StudentProfile, StudentProperties};
+    use crate::slide_analysis::types::{StudentProfile, StudentProperties};
 
     #[test]
-    fn build_inventory_documents_flattens_dynamic_strings() {
+    fn extract_bio_labels_parses_colon_separated_pairs() {
+        let bio = "呼ばれたい名前：佐野ちゃん\n出身地：東京\n生年月日：2007/02/16\n趣味・特技：旅行、写真";
+        let labels = extract_bio_labels(bio);
+        assert_eq!(labels.len(), 4);
+        assert_eq!(labels[0].label, "呼ばれたい名前");
+        assert_eq!(labels[0].value, "佐野ちゃん");
+        assert_eq!(labels[1].label, "出身地");
+        assert_eq!(labels[1].value, "東京");
+        assert_eq!(labels[2].label, "生年月日");
+        assert_eq!(labels[3].label, "趣味・特技");
+        assert_eq!(labels[3].value, "旅行、写真");
+    }
+
+    #[test]
+    fn extract_bio_labels_handles_half_width_colon() {
+        let bio = "Nickname: メンディー\nMBTI: INTJ";
+        let labels = extract_bio_labels(bio);
+        assert!(labels.iter().any(|l| l.label == "Nickname" && l.value == "メンディー"));
+        assert!(labels.iter().any(|l| l.label == "MBTI" && l.value == "INTJ"));
+    }
+
+    #[test]
+    fn extract_bio_labels_skips_timestamps_and_urls() {
+        let bio = "12:34\nhttps://example.com\n出身地：東京";
+        let labels = extract_bio_labels(bio);
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].label, "出身地");
+    }
+
+    #[test]
+    fn build_inventory_documents_extracts_labels_not_values() {
         let snapshot = ProjectionSnapshot {
             identity: Default::default(),
             person_page: PersonPageOutput {
-                profiles: vec![PersonProfile {
-                    person_id: EntityRef::new("person:test"),
-                    display_name: "Test User".into(),
-                    self_intro_text: Some("Hello world".into()),
-                    self_intro_slide_id: None,
-                    self_intro_thumbnail: None,
-                    identities: Vec::new(),
-                    source_count: 1,
-                    last_activity: None,
-                    profile_updated_at: Utc::now(),
-                    frontend_profile: Some(FrontendProfile {
-                        source_document_id: "document:gslides:test#slide:1".into(),
-                        source_canonical_uri: Some("https://example.com/slide".into()),
-                        thumbnail_ref: None,
-                        thumbnail_url: None,
-                        profile: StudentProfile {
-                            email: Some("test@example.com".into()),
-                            generated_email: None,
-                            name: "Test User".into(),
-                            bio_text: Some("Longer biography".into()),
-                            profile_pic: Some(ProfilePic {
-                                coordinates: None,
-                                description: Some("Portrait".into()),
-                                url: Some("https://example.com/p.png".into()),
-                            }),
-                            gallery_images: vec![GalleryImage {
-                                coordinates: None,
-                                description: Some("Club activity".into()),
-                                url: None,
-                            }],
-                            properties: StudentProperties {
-                                hobbies: vec!["Basketball".into()],
-                                ..StudentProperties::default()
-                            },
-                            attributes: vec!["friendly".into()],
-                            source_slide_object_id: None,
-                            source_document_id: Some("document:gslides:test#slide:1".into()),
-                            source_canonical_uri: Some("https://example.com/slide".into()),
-                            thumbnail_blob_ref: None,
-                            thumbnail_url: None,
-                            companion_to_slide_object_id: None,
-                        },
+                profiles: vec![
+                    make_person("Student A", "呼ばれたい名前：なっしー\n出身地：東京", StudentProperties {
+                        nickname: Some("なっしー".into()),
+                        birthplace: Some("東京".into()),
+                        ..StudentProperties::default()
                     }),
-                }],
+                    make_person("Student B", "あだ名：メンディー\n出身地：大阪", StudentProperties {
+                        nickname: Some("メンディー".into()),
+                        birthplace: Some("大阪".into()),
+                        ..StudentProperties::default()
+                    }),
+                ],
                 ..PersonPageOutput::default()
             },
             built_at: Utc::now(),
         };
 
         let docs = build_inventory_documents(&snapshot);
+        assert_eq!(docs.len(), 1, "should produce a single aggregate document");
         let doc = &docs[0];
-        assert!(doc
-            .candidates
-            .iter()
-            .any(|candidate| candidate.attribute_path == "profile.properties.hobbies[]" && candidate.value == "Basketball"));
-        assert!(doc
-            .candidates
-            .iter()
-            .any(|candidate| candidate.attribute_path == "profile.gallery_images[].description" && candidate.value == "Club activity"));
-        assert!(doc
-            .candidates
-            .iter()
-            .any(|candidate| candidate.attribute_path == "person.self_intro_text" && candidate.value == "Hello world"));
-        // Metadata paths must be excluded (M)
-        assert!(!doc
-            .candidates
-            .iter()
-            .any(|candidate| candidate.attribute_path == "profile.source_document_id"));
-        assert!(!doc
-            .candidates
-            .iter()
-            .any(|candidate| candidate.attribute_path == "profile.source_canonical_uri"));
-        assert!(!doc
-            .candidates
-            .iter()
-            .any(|candidate| candidate.attribute_path == "profile.profile_pic.url"));
+
+        // Should have label candidates, not value candidates.
+        // "出身地" appears in both students → student_count = 2
+        let birthplace = doc.candidates.iter().find(|c| c.value == "出身地");
+        assert!(birthplace.is_some(), "should have 出身地 label");
+        assert_eq!(birthplace.unwrap().student_count, 2);
+
+        // "呼ばれたい名前" appears in 1 student only
+        let nickname_a = doc.candidates.iter().find(|c| c.value == "呼ばれたい名前");
+        assert!(nickname_a.is_some(), "should have 呼ばれたい名前 label");
+        assert_eq!(nickname_a.unwrap().student_count, 1);
+
+        // "あだ名" appears in 1 student
+        let nickname_b = doc.candidates.iter().find(|c| c.value == "あだ名");
+        assert!(nickname_b.is_some(), "should have あだ名 label");
+        assert_eq!(nickname_b.unwrap().student_count, 1);
+
+        // Raw values like "東京" or "なっしー" should NOT appear as candidate labels.
+        assert!(
+            !doc.candidates.iter().any(|c| c.value == "東京"),
+            "property values should not be candidates"
+        );
+        assert!(
+            !doc.candidates.iter().any(|c| c.value == "なっしー"),
+            "property values should not be candidates"
+        );
     }
 
     #[test]
-    fn state_suggests_exact_path_matches_first() {
+    fn suggestions_match_labels_by_alias() {
         let candidate = AttributeCandidate {
-            candidate_key: "k".into(),
-            attribute_path: "profile.properties.hobbies[]".into(),
-            source_path: "profile.properties.hobbies[0]".into(),
-            label: "Hobbies".into(),
-            value: "Basketball".into(),
+            candidate_key: "label:あだ名".into(),
+            attribute_path: "あだ名".into(),
+            source_path: "1 student(s)".into(),
+            label: "あだ名".into(),
+            value: "あだ名".into(),
             value_kind: CandidateValueKind::ShortText,
+            student_count: 1,
+            student_names: vec!["Test".into()],
+            example_values: vec!["メンディー".into()],
+            ai_property_key: Some("Nickname".into()),
         };
         let state = AttributeInventoryState {
             version: 1,
-            known_attributes: vec![
-                KnownAttribute {
-                    id: "hobbies".into(),
-                    display_name: "Hobbies".into(),
-                    source_paths: vec!["profile.properties.hobbies[]".into()],
-                    examples: vec![],
-                    review_count: 1,
-                },
-                KnownAttribute {
-                    id: "likes".into(),
-                    display_name: "Likes".into(),
-                    source_paths: vec!["profile.properties.likes[]".into()],
-                    examples: vec![],
-                    review_count: 1,
-                },
-            ],
+            known_attributes: vec![KnownAttribute {
+                id: "nickname".into(),
+                display_name: "ニックネーム".into(),
+                source_paths: vec!["呼ばれたい名前".into(), "Nickname".into()],
+                examples: vec!["なっしー".into()],
+                review_count: 1,
+            }],
             reviewed_candidates: BTreeMap::new(),
         };
 
         let suggestions = state.suggestions_for(&candidate);
-        assert_eq!(suggestions[0].id, "hobbies");
+        assert!(!suggestions.is_empty(), "should suggest ニックネーム via AI key match");
+        assert_eq!(suggestions[0].id, "nickname");
     }
 
     #[test]
@@ -759,37 +828,83 @@ mod tests {
     }
 
     #[test]
-    fn summarize_documents_groups_candidates_by_attribute_path() {
+    fn summarize_groups_labels_by_normalized_text() {
         let documents = vec![AttributeInventoryDocument {
-            document_key: "doc-1".into(),
-            person_id: "person:test".into(),
-            display_name: "Test".into(),
+            document_key: "all-labels".into(),
+            person_id: "aggregate".into(),
+            display_name: "All Students".into(),
             source_document_id: None,
             source_canonical_uri: None,
             last_activity: None,
             candidates: vec![
                 AttributeCandidate {
-                    candidate_key: "a".into(),
-                    attribute_path: "profile.properties.hobbies[]".into(),
-                    source_path: "profile.properties.Hobbies[0]".into(),
-                    label: "Hobbies".into(),
-                    value: "Basketball".into(),
+                    candidate_key: "label:出身地".into(),
+                    attribute_path: "出身地".into(),
+                    source_path: "3 student(s)".into(),
+                    label: "出身地".into(),
+                    value: "出身地".into(),
                     value_kind: CandidateValueKind::ShortText,
+                    student_count: 3,
+                    student_names: vec!["A".into(), "B".into(), "C".into()],
+                    example_values: vec!["東京".into(), "大阪".into()],
+                    ai_property_key: Some("Birthplace".into()),
                 },
                 AttributeCandidate {
-                    candidate_key: "b".into(),
-                    attribute_path: "profile.properties.hobbies[]".into(),
-                    source_path: "profile.properties.Hobbies[1]".into(),
-                    label: "Hobbies".into(),
-                    value: "Piano".into(),
+                    candidate_key: "label:趣味".into(),
+                    attribute_path: "趣味".into(),
+                    source_path: "2 student(s)".into(),
+                    label: "趣味".into(),
+                    value: "趣味".into(),
                     value_kind: CandidateValueKind::ShortText,
+                    student_count: 2,
+                    student_names: vec!["A".into(), "B".into()],
+                    example_values: vec!["旅行".into()],
+                    ai_property_key: Some("Hobbies".into()),
                 },
             ],
         }];
 
         let groups = summarize_documents(&documents);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].attribute_path, "profile.properties.hobbies[]");
-        assert_eq!(groups[0].occurrence_count, 2);
+        assert_eq!(groups.len(), 2);
+        // Sorted by document_count (student_count) desc.
+        assert_eq!(groups[0].label, "出身地");
+        assert_eq!(groups[0].document_count, 3);
+        assert_eq!(groups[1].label, "趣味");
+    }
+
+    fn make_person(name: &str, bio: &str, props: StudentProperties) -> PersonProfile {
+        PersonProfile {
+            person_id: EntityRef::new(&format!("person:{name}")),
+            display_name: name.into(),
+            self_intro_text: None,
+            self_intro_slide_id: None,
+            self_intro_thumbnail: None,
+            identities: Vec::new(),
+            source_count: 1,
+            last_activity: None,
+            profile_updated_at: Utc::now(),
+            frontend_profile: Some(FrontendProfile {
+                source_document_id: format!("doc:{name}"),
+                source_canonical_uri: None,
+                thumbnail_ref: None,
+                thumbnail_url: None,
+                profile: StudentProfile {
+                    email: None,
+                    generated_email: None,
+                    name: name.into(),
+                    bio_text: Some(bio.into()),
+                    profile_pic: None,
+                    gallery_images: Vec::new(),
+                    properties: props,
+                    attributes: Vec::new(),
+                    source_slide_object_id: None,
+                    source_document_id: None,
+                    source_canonical_uri: None,
+                    thumbnail_blob_ref: None,
+                    thumbnail_url: None,
+                    companion_to_slide_object_id: None,
+                },
+            }),
+        }
     }
 }
