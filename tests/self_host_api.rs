@@ -110,7 +110,7 @@ fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
         poll_interval: std::time::Duration::from_secs(300),
         api_tokens: vec![ApiTokenConfig {
             token: SecretString::new("test-api-token").unwrap(),
-            scopes: vec!["projection:read".into(), "blob:read".into()],
+            scopes: vec!["read:persons".into(), "read:timeline".into()],
         }],
         resource_limits: ResourceLimits {
             max_blob_bytes: 10 * 1024 * 1024,
@@ -211,7 +211,6 @@ fn public_blob_endpoint_serves_persisted_blob_bytes() {
             app.oneshot(
                 Request::builder()
                     .uri(format!("/public/blobs/{blob_hash}"))
-                    .header("authorization", "Bearer test-api-token")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -328,5 +327,33 @@ fn api_rejects_unauthenticated_projection_access() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn timeline_endpoint_rejects_missing_timeline_scope() {
+    let (root, db, blobs) = temp_paths();
+    let mut config = test_config(db, blobs);
+    config.api_tokens = vec![ApiTokenConfig {
+        token: SecretString::new("person-only-token").unwrap(),
+        scopes: vec!["read:persons".into()],
+    }];
+    let app = build_router(AppService::bootstrap(config).unwrap());
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let response = runtime
+        .block_on(async {
+            app.oneshot(
+                Request::builder()
+                    .uri("/api/projections/proj:person-page/records/person:test/timeline")
+                    .header("authorization", "Bearer person-only-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        })
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let _ = std::fs::remove_dir_all(root);
 }

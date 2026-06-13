@@ -91,7 +91,7 @@
 - `LETHE_SLACK_CHANNEL_IDS`
 - `LETHE_GOOGLE_PRESENTATION_IDS`
 - `LETHE_GOOGLE_ACCESS_TOKEN`
-- `LETHE_API_TOKENS` (`token:scope+scope` の comma 区切り。例: `local-dev:projection:read+blob:read+admin:sync`)
+- `LETHE_API_TOKENS` (`token:scope+scope` の comma 区切り。例: `qa-read-token:read:persons+read:timeline,sync-token:admin:sync`)
 
 access token を毎回手で入れたくない場合は、代わりに以下を設定します。
 
@@ -139,19 +139,19 @@ cargo run --bin lethe-selfhost
 
 - `GET /health`
 - `POST /admin/sync` (`admin:sync` scope)
-- `GET /public/blobs/{sha256}` (`blob:read` scope)
-- `GET /api/projections/{projection_id}/records` (`projection:read` scope)
-- `GET /api/projections/{projection_id}/records/{record_id}` (`projection:read` scope)
-- `GET /api/projections/{projection_id}/records/{record_id}/slides` (`projection:read` scope)
-- `GET /api/projections/{projection_id}/records/{record_id}/messages` (`projection:read` scope)
-- `GET /api/projections/{projection_id}/records/{record_id}/timeline` (`projection:read` scope)
+- `GET /public/blobs/{sha256}` (Phase 0 では無認証公開。公開blobに個人情報や非公開資料を置かない)
+- `GET /api/projections/{projection_id}/records` (`read:persons` scope)
+- `GET /api/projections/{projection_id}/records/{record_id}` (`read:persons` + `read:timeline` scope)
+- `GET /api/projections/{projection_id}/records/{record_id}/slides` (`read:timeline` scope)
+- `GET /api/projections/{projection_id}/records/{record_id}/messages` (`read:timeline` scope)
+- `GET /api/projections/{projection_id}/records/{record_id}/timeline` (`read:timeline` scope)
 - `GET /api/persons/*` は `Deprecation: true` 付きの person projection alias
 
 ### Notes
 
 - 永続化は SQLite + ローカル blob directory を使います
-- API は `/health` を除いて `Authorization: Bearer <token>` を必須とします
-- `LETHE_API_TOKENS` の scope は `projection:read`, `blob:read`, `admin:sync`, `*` を使います
+- API は `/health` と `/public/blobs/{sha256}` を除いて `Authorization: Bearer <token>` を必須とします
+- `LETHE_API_TOKENS` の scope は `read:persons`, `read:timeline`, `admin:sync`, `*` を使います
 - Slack channel / Google presentation は内部で構造化 source instance (`sources`) に正規化され、secret は `credential_ref` で参照されます
 - 既定の runtime state は `./data/lethe.sqlite3` と `./data/blobs/` です。このディレクトリは Git では無視されます
 - 旧 `dokp.sqlite3` は deprecated です。ローカル検証や運用フローでは `LETHE_DATABASE_PATH=./data/lethe.sqlite3` を使ってください
@@ -161,12 +161,30 @@ cargo run --bin lethe-selfhost
 - slide-analysis の supplemental cache も SQLite に保存され、bootstrap 後も person detail に復元されます
 - Google Slides export URL を Notion が取得できるかは、元 presentation の共有設定に依存します。private なままだと external image fallback は失敗する可能性があります
 - `LETHE_PUBLIC_BASE_URL` を fallback に使う場合は **Notion から到達可能な公開 URL** を指定してください。`http://127.0.0.1:8080` のような loopback URL はローカル検証には使えますが、Notion 自体は取得できません
-- person detail では `Filtering-before-Exposure` により `identities` を非表示にしています
+- person detail では `Filtering-before-Exposure` により `Visibility=false` のレコードと、`identities` / `DoB` / `Birthplace` / 連絡先系フィールドをレスポンス前に構造的に除外します
 - identity / person-page の時刻は壁時計ではなく入力観測・補助レコードから導出し、replay の決定性を保ちます
 - slide-analysis と Notion write-back の失敗は同期中に握り潰さず、その場で返します
 - Google Slides で未取得 revision が複数ある場合、self-host は取得可能な **最新 revision の正しい snapshot** だけを materialize し、古い revision に最新内容を誤って付与しません
 - Slack sync は thread parent を見つけたとき `conversations.replies` も辿り、thread reply を個別 observation として取り込みます
 - 秘密鍵・アクセストークンを一度でもローカルで使った場合は、公開前に新しい値へローテーションしてください
+
+### Phase 0 Q&A service
+
+`src/qa` は 6/24 チャットボット納品向けの薄い Q&A サービス境界です。
+
+- 保持 token は `read:persons` / `read:timeline` のみを許可し、`admin:sync` を含む token は拒否します
+- 質問文は `RetrievalQuery` として型付きで retriever へ渡し、URL・コマンド・SQLへ直接展開しません
+- 対象外カテゴリ、本人特定、低確信、日次コストキャップ超過は運営者誘導の定型文を返します
+- 回答末尾に人間可読の由来と observation ID を表示し、SQLiteログには provenance を observation ID で保存します
+- `tests/fixtures/phase0_golden_questions.json` は検収・回帰用のゴールデン質問セットです
+
+### Token rotation
+
+1. 新しい token を発行する。
+2. `.env` の `LETHE_API_TOKENS` を新 token に更新する。sync token を変える場合は cron や運用側の `Authorization` 設定も同時に更新する。
+3. `cargo run --bin lethe-selfhost` のプロセスを再起動する。
+4. 新 token で対象 endpoint が通ること、旧 token が 401 になることを確認する。
+5. 公開前、または秘密値を一度でもローカルで使った後は必ずローテーションする。
 
 ### Publication Safety Check
 

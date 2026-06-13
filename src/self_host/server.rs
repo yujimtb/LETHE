@@ -78,10 +78,8 @@ async fn sync_now(
 
 async fn public_blob(
     State(service): State<AppService>,
-    headers: HeaderMap,
     Path(blob_hash): Path<String>,
 ) -> Result<Response, ApiError> {
-    service.authorize_headers(&headers, "blob:read")?;
     let Some(blob_ref) = blob_ref_from_hash(&blob_hash) else {
         return Err(ApiError::not_found());
     };
@@ -105,7 +103,7 @@ async fn list_persons(
     headers: HeaderMap,
     Query(query): Query<PersonsQuery>,
 ) -> Result<Response, ApiError> {
-    service.authorize_headers(&headers, "projection:read")?;
+    service.authorize_headers(&headers, "read:persons")?;
     Ok(deprecated_alias_response(service.persons_response(
         query.mode.as_deref(),
         query.pin.as_deref(),
@@ -119,7 +117,7 @@ async fn person_detail(
     Path(person_id): Path<String>,
     Query(query): Query<ReadQuery>,
 ) -> Result<Response, ApiError> {
-    service.authorize_headers(&headers, "projection:read")?;
+    service.authorize_headers_all(&headers, &["read:persons", "read:timeline"])?;
     Ok(deprecated_alias_response(service.person_detail_response(
         &person_id,
         query.mode.as_deref(),
@@ -133,7 +131,7 @@ async fn person_slides(
     Path(person_id): Path<String>,
     Query(query): Query<ReadQuery>,
 ) -> Result<Response, ApiError> {
-    service.authorize_headers(&headers, "projection:read")?;
+    service.authorize_headers(&headers, "read:timeline")?;
     Ok(deprecated_alias_response(service.person_slides_response(
         &person_id,
         query.mode.as_deref(),
@@ -147,7 +145,7 @@ async fn person_messages(
     Path(person_id): Path<String>,
     Query(query): Query<ReadQuery>,
 ) -> Result<Response, ApiError> {
-    service.authorize_headers(&headers, "projection:read")?;
+    service.authorize_headers(&headers, "read:timeline")?;
     Ok(deprecated_alias_response(
         service.person_messages_response(
             &person_id,
@@ -163,7 +161,7 @@ async fn person_timeline(
     Path(person_id): Path<String>,
     Query(query): Query<ReadQuery>,
 ) -> Result<Response, ApiError> {
-    service.authorize_headers(&headers, "projection:read")?;
+    service.authorize_headers(&headers, "read:timeline")?;
     Ok(deprecated_alias_response(
         service.person_timeline_response(
             &person_id,
@@ -179,7 +177,7 @@ async fn projection_records(
     Path(projection_id): Path<String>,
     Query(query): Query<PersonsQuery>,
 ) -> Result<Json<crate::api::envelope::ResponseEnvelope<serde_json::Value>>, ApiError> {
-    service.authorize_headers(&headers, "projection:read")?;
+    service.authorize_headers(&headers, "read:persons")?;
     ensure_projection_person_page(&projection_id)?;
     Ok(Json(service.persons_response(
         query.mode.as_deref(),
@@ -194,7 +192,7 @@ async fn projection_record_detail(
     Path((projection_id, record_id)): Path<(String, String)>,
     Query(query): Query<ReadQuery>,
 ) -> Result<Json<crate::api::envelope::ResponseEnvelope<serde_json::Value>>, ApiError> {
-    service.authorize_headers(&headers, "projection:read")?;
+    service.authorize_headers_all(&headers, &["read:persons", "read:timeline"])?;
     ensure_projection_person_page(&projection_id)?;
     Ok(Json(service.person_detail_response(
         &record_id,
@@ -209,7 +207,7 @@ async fn projection_record_slides(
     Path((projection_id, record_id)): Path<(String, String)>,
     Query(query): Query<ReadQuery>,
 ) -> Result<Json<crate::api::envelope::ResponseEnvelope<serde_json::Value>>, ApiError> {
-    service.authorize_headers(&headers, "projection:read")?;
+    service.authorize_headers(&headers, "read:timeline")?;
     ensure_projection_person_page(&projection_id)?;
     Ok(Json(service.person_slides_response(
         &record_id,
@@ -224,7 +222,7 @@ async fn projection_record_messages(
     Path((projection_id, record_id)): Path<(String, String)>,
     Query(query): Query<ReadQuery>,
 ) -> Result<Json<crate::api::envelope::ResponseEnvelope<serde_json::Value>>, ApiError> {
-    service.authorize_headers(&headers, "projection:read")?;
+    service.authorize_headers(&headers, "read:timeline")?;
     ensure_projection_person_page(&projection_id)?;
     Ok(Json(service.person_messages_response(
         &record_id,
@@ -239,7 +237,7 @@ async fn projection_record_timeline(
     Path((projection_id, record_id)): Path<(String, String)>,
     Query(query): Query<ReadQuery>,
 ) -> Result<Json<crate::api::envelope::ResponseEnvelope<serde_json::Value>>, ApiError> {
-    service.authorize_headers(&headers, "projection:read")?;
+    service.authorize_headers(&headers, "read:timeline")?;
     ensure_projection_person_page(&projection_id)?;
     Ok(Json(service.person_timeline_response(
         &record_id,

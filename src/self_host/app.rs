@@ -382,11 +382,24 @@ impl AppService {
         headers: &HeaderMap,
         required_scope: &str,
     ) -> Result<(), SelfHostError> {
+        self.authorize_headers_all(headers, &[required_scope])
+    }
+
+    pub fn authorize_headers_all(
+        &self,
+        headers: &HeaderMap,
+        required_scopes: &[&str],
+    ) -> Result<(), SelfHostError> {
+        if required_scopes.is_empty() {
+            return Err(SelfHostError::Policy(
+                "at least one required scope must be specified".to_string(),
+            ));
+        }
         let Some(header) = headers.get(axum::http::header::AUTHORIZATION) else {
             self.emit_audit(
                 "actor:anonymous",
                 AuditEventKind::PolicyDenial,
-                serde_json::json!({ "required_scope": required_scope, "reason": "missing bearer token" }),
+                serde_json::json!({ "required_scopes": required_scopes, "reason": "missing bearer token" }),
             );
             return Err(SelfHostError::Auth("missing bearer token".to_string()));
         };
@@ -402,25 +415,28 @@ impl AppService {
             .iter()
             .find(|candidate| candidate.token.expose() == token)
             .ok_or_else(|| SelfHostError::Auth("token rejected".to_string()))?;
-        if matched
-            .scopes
-            .iter()
-            .any(|scope| scope == "*" || scope == required_scope)
+        if required_scopes.iter().all(|required_scope| {
+            matched
+                .scopes
+                .iter()
+                .any(|scope| scope == "*" || scope == required_scope)
+        })
         {
             self.emit_audit(
                 "actor:api-token",
-                audit_kind_for_scope(required_scope),
-                serde_json::json!({ "required_scope": required_scope }),
+                audit_kind_for_scope(required_scopes[0]),
+                serde_json::json!({ "required_scopes": required_scopes }),
             );
             Ok(())
         } else {
             self.emit_audit(
                 "actor:api-token",
                 AuditEventKind::PolicyDenial,
-                serde_json::json!({ "required_scope": required_scope, "reason": "scope denied" }),
+                serde_json::json!({ "required_scopes": required_scopes, "reason": "scope denied" }),
             );
             Err(SelfHostError::Policy(format!(
-                "token lacks required scope {required_scope}"
+                "token lacks required scopes {}",
+                required_scopes.join(",")
             )))
         }
     }
@@ -1723,11 +1739,14 @@ fn non_empty_state(value: Option<String>) -> Option<String> {
 }
 
 fn restricted_fields() -> Vec<RestrictedFieldSpec> {
-    vec![RestrictedFieldSpec {
-        field_path: "identities".into(),
-        level: AccessScope::Restricted,
-        mask_strategy: MaskStrategy::Exclude,
-    }]
+    ["identities", "DoB", "Birthplace", "dob", "birthplace", "email", "generated_email", "SNS"]
+        .into_iter()
+        .map(|field_path| RestrictedFieldSpec {
+            field_path: field_path.into(),
+            level: AccessScope::Restricted,
+            mask_strategy: MaskStrategy::Exclude,
+        })
+        .collect()
 }
 
 fn slack_ts_value(value: &str) -> f64 {
@@ -2927,8 +2946,7 @@ fn blob_ref_sha256(blob_ref: &str) -> Option<&str> {
 fn audit_kind_for_scope(scope: &str) -> AuditEventKind {
     match scope {
         "admin:sync" => AuditEventKind::WriteExecution,
-        "blob:read" => AuditEventKind::Export,
-        "projection:read" => AuditEventKind::ReadRestricted,
+        "read:persons" | "read:timeline" => AuditEventKind::ReadRestricted,
         _ => AuditEventKind::ReadRestricted,
     }
 }

@@ -34,6 +34,11 @@ impl FilteringGate {
         let mut out = payload.clone();
         let mut masked = Vec::new();
 
+        if !Self::retain_visible(&mut out) {
+            out = serde_json::Value::Null;
+            masked.push("visibility".to_string());
+        }
+
         for spec in field_specs {
             if Self::should_mask(spec.level, viewer_scope) {
                 if Self::apply_mask(&mut out, &spec.field_path, spec.mask_strategy) {
@@ -45,6 +50,39 @@ impl FilteringGate {
         FilterResult {
             payload: out,
             masked_fields: masked,
+        }
+    }
+
+    fn retain_visible(value: &mut serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(obj) => {
+                if obj
+                    .get("visibility")
+                    .or_else(|| obj.get("Visibility"))
+                    .and_then(|raw| raw.as_bool())
+                    == Some(false)
+                {
+                    return false;
+                }
+                for child in obj.values_mut() {
+                    if !Self::retain_visible(child) {
+                        *child = serde_json::Value::Null;
+                    }
+                }
+                true
+            }
+            serde_json::Value::Array(items) => {
+                let mut index = 0;
+                while index < items.len() {
+                    if Self::retain_visible(&mut items[index]) {
+                        index += 1;
+                    } else {
+                        items.remove(index);
+                    }
+                }
+                true
+            }
+            _ => true,
         }
     }
 
@@ -289,5 +327,22 @@ mod tests {
         let result = FilteringGate::filter(&payload, AccessScope::Internal, &specs);
         assert!(result.payload["data"][0].get("identities").is_none());
         assert!(result.payload["data"][1].get("identities").is_none());
+    }
+
+    #[test]
+    fn visibility_false_objects_are_removed_before_exposure() {
+        let payload = json!({
+            "data": [
+                {"person_id": "visible", "Visibility": true, "display_name": "Visible"},
+                {"person_id": "hidden", "Visibility": false, "display_name": "Hidden"}
+            ],
+            "total": 2
+        });
+
+        let result = FilteringGate::filter(&payload, AccessScope::Internal, &[]);
+
+        assert_eq!(result.payload["data"].as_array().unwrap().len(), 1);
+        assert_eq!(result.payload["data"][0]["person_id"], "visible");
+        assert!(!result.payload.to_string().contains("hidden"));
     }
 }
