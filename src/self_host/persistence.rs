@@ -21,6 +21,8 @@ pub struct SqlitePersistence {
     blob_dir: PathBuf,
 }
 
+const CURRENT_SCHEMA_VERSION: i64 = 1;
+
 impl SqlitePersistence {
     pub fn open(database_path: &Path, blob_dir: &Path) -> Result<Self, PersistenceError> {
         if let Some(parent) = database_path.parent() {
@@ -138,6 +140,31 @@ impl SqlitePersistence {
         Ok(blobs)
     }
 
+    pub fn garbage_collect_orphan_blobs(&self) -> Result<usize, PersistenceError> {
+        let mut stmt = self.conn.prepare("SELECT blob_ref FROM blobs")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut referenced = std::collections::HashSet::new();
+        for row in rows {
+            if let Some(hash) = row?.strip_prefix("blob:sha256:").map(ToOwned::to_owned) {
+                referenced.insert(hash);
+            }
+        }
+
+        let mut removed = 0usize;
+        for entry in fs::read_dir(&self.blob_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !referenced.contains(&name) {
+                fs::remove_file(entry.path())?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     fn init_schema(&self) -> Result<(), PersistenceError> {
         self.conn.execute_batch(
             "
@@ -163,7 +190,21 @@ impl SqlitePersistence {
                 created_at TEXT NOT NULL,
                 supplemental_json TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            );
             ",
+        )?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+            params![
+                CURRENT_SCHEMA_VERSION,
+                "initial_observation_blob_supplemental_state",
+                chrono::Utc::now().to_rfc3339(),
+            ],
         )?;
         Ok(())
     }
@@ -269,6 +310,41 @@ mod tests {
         assert_eq!(supplementals.len(), 1);
         assert_eq!(supplementals[0].id, supplemental.id);
         assert_eq!(supplementals[0].kind, "slide-analysis");
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn migration_ledger_records_current_schema_version() {
+        let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+        let db = tmp.join("test.sqlite3");
+        let blob_dir = tmp.join("blobs");
+        let store = SqlitePersistence::open(&db, &blob_dir).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row(
+                "SELECT version FROM schema_migrations WHERE version = ?1",
+                [CURRENT_SCHEMA_VERSION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn garbage_collect_orphan_blobs_removes_unreferenced_files() {
+        let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+        let db = tmp.join("test.sqlite3");
+        let blob_dir = tmp.join("blobs");
+        let store = SqlitePersistence::open(&db, &blob_dir).unwrap();
+        let orphan = blob_dir.join("f".repeat(64));
+        fs::write(&orphan, b"orphan").unwrap();
+
+        let removed = store.garbage_collect_orphan_blobs().unwrap();
+        assert_eq!(removed, 1);
+        assert!(!orphan.exists());
 
         let _ = fs::remove_dir_all(tmp);
     }

@@ -9,11 +9,63 @@ pub struct SelfHostConfig {
     pub database_path: PathBuf,
     pub blob_dir: PathBuf,
     pub poll_interval: Duration,
+    pub api_tokens: Vec<ApiTokenConfig>,
+    pub resource_limits: ResourceLimits,
+    pub sources: Vec<SourceInstanceConfig>,
     pub slack: SlackConfig,
     pub google: GoogleConfig,
     pub slide_analysis_limit: usize,
     pub slide_ai: Option<SlideAiConfig>,
     pub notion: Option<NotionWritebackConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApiTokenConfig {
+    pub token: SecretString,
+    pub scopes: Vec<String>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: impl Into<String>) -> Result<Self, ConfigError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(ConfigError::InvalidEnv {
+                name: "secret",
+                message: "must not be blank".to_string(),
+            });
+        }
+        Ok(Self(value))
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SecretString([redacted])")
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResourceLimits {
+    pub max_blob_bytes: usize,
+    pub max_payload_bytes: usize,
+    pub max_sync_items: usize,
+    pub max_page_size: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceInstanceConfig {
+    pub id: String,
+    pub adapter: String,
+    pub credential_ref: String,
+    pub cursor_key: String,
+    pub settings: serde_json::Value,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +124,13 @@ impl SelfHostConfig {
         let blob_dir =
             PathBuf::from(env::var("LETHE_BLOB_DIR").unwrap_or_else(|_| "./data/blobs".to_string()));
         let poll_interval = Duration::from_secs(parse_u64_env("LETHE_POLL_SECONDS", 300)?);
+        let api_tokens = parse_api_tokens_env("LETHE_API_TOKENS")?;
+        let resource_limits = ResourceLimits {
+            max_blob_bytes: parse_usize_env("LETHE_MAX_BLOB_BYTES", 10 * 1024 * 1024)?,
+            max_payload_bytes: parse_usize_env("LETHE_MAX_PAYLOAD_BYTES", 1024 * 1024)?,
+            max_sync_items: parse_usize_env("LETHE_MAX_SYNC_ITEMS", 10_000)?,
+            max_page_size: parse_usize_env("LETHE_MAX_PAGE_SIZE", 100)?,
+        };
 
         let slack = SlackConfig {
             bot_token: required_env("LETHE_SLACK_BOT_TOKEN")?,
@@ -89,6 +148,7 @@ impl SelfHostConfig {
             presentation_ids: parse_csv_env("LETHE_GOOGLE_PRESENTATION_IDS", true)?,
         };
         let slide_analysis_limit = parse_usize_env("LETHE_GOOGLE_SLIDE_ANALYSIS_LIMIT", 10)?;
+        let sources = source_instances_from_legacy_config(&slack, &google);
 
         if google.access_token.is_none()
             && (google.client_id.is_none()
@@ -114,7 +174,7 @@ impl SelfHostConfig {
                 model: env::var("LETHE_GEMINI_MODEL")
                     .ok()
                     .filter(|v| !v.trim().is_empty())
-                    .unwrap_or_else(|| "gemini-2.5-flash".to_string()),
+                    .unwrap_or_else(|| "gemini-3-flash-preview".to_string()),
             });
 
         Ok(Self {
@@ -123,6 +183,9 @@ impl SelfHostConfig {
             database_path,
             blob_dir,
             poll_interval,
+            api_tokens,
+            resource_limits,
+            sources,
             slack,
             google,
             slide_analysis_limit,
@@ -130,6 +193,66 @@ impl SelfHostConfig {
             notion,
         })
     }
+}
+
+fn parse_api_tokens_env(name: &'static str) -> Result<Vec<ApiTokenConfig>, ConfigError> {
+    let raw = required_env(name)?;
+    let mut tokens = Vec::new();
+    for entry in raw.split(',').map(str::trim).filter(|entry| !entry.is_empty()) {
+        let (token, scopes) = entry.split_once(':').ok_or_else(|| ConfigError::InvalidEnv {
+            name,
+            message: "entries must use token:scope+scope format".to_string(),
+        })?;
+        let scopes = scopes
+            .split('+')
+            .map(str::trim)
+            .filter(|scope| !scope.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        if scopes.is_empty() {
+            return Err(ConfigError::InvalidEnv {
+                name,
+                message: "token entry must include at least one scope".to_string(),
+            });
+        }
+        tokens.push(ApiTokenConfig {
+            token: SecretString::new(token.to_string())?,
+            scopes,
+        });
+    }
+    if tokens.is_empty() {
+        return Err(ConfigError::InvalidEnv {
+            name,
+            message: "must include at least one token".to_string(),
+        });
+    }
+    Ok(tokens)
+}
+
+fn source_instances_from_legacy_config(
+    slack: &SlackConfig,
+    google: &GoogleConfig,
+) -> Vec<SourceInstanceConfig> {
+    let mut sources = Vec::new();
+    for channel_id in &slack.channel_ids {
+        sources.push(SourceInstanceConfig {
+            id: format!("slack:{channel_id}"),
+            adapter: "slack".to_string(),
+            credential_ref: "env:LETHE_SLACK_BOT_TOKEN".to_string(),
+            cursor_key: format!("slack:{channel_id}:oldest_ts"),
+            settings: serde_json::json!({ "channel_id": channel_id }),
+        });
+    }
+    for presentation_id in &google.presentation_ids {
+        sources.push(SourceInstanceConfig {
+            id: format!("gslides:{presentation_id}"),
+            adapter: "gslides".to_string(),
+            credential_ref: "env:LETHE_GOOGLE_ACCESS_TOKEN".to_string(),
+            cursor_key: format!("gslides:{presentation_id}:revision"),
+            settings: serde_json::json!({ "presentation_id": presentation_id }),
+        });
+    }
+    sources
 }
 
 fn required_env(name: &'static str) -> Result<String, ConfigError> {
@@ -206,6 +329,14 @@ mod tests {
         let err = normalize_public_base_url("LETHE_PUBLIC_BASE_URL", "ftp://example.com".into())
             .unwrap_err();
         assert!(matches!(err, ConfigError::InvalidEnv { .. }));
+    }
+
+    #[test]
+    fn secret_string_debug_redacts_value() {
+        let secret = SecretString::new("super-secret-token").unwrap();
+        let debug = format!("{secret:?}");
+        assert!(!debug.contains("super-secret-token"));
+        assert!(debug.contains("redacted"));
     }
 }
 

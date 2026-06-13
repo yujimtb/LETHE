@@ -646,8 +646,10 @@ fn normalize_attribute_id(value: &str) -> String {
     let mut id = String::new();
     let mut last_was_dash = false;
     for ch in value.trim().chars() {
-        if ch.is_ascii_alphanumeric() {
-            id.push(ch.to_ascii_lowercase());
+        if ch.is_alphanumeric() {
+            for lowered in ch.to_lowercase() {
+                id.push(lowered);
+            }
             last_was_dash = false;
         } else if !last_was_dash && !id.is_empty() {
             id.push('-');

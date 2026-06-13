@@ -1,7 +1,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::{Cursor, Read};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
+use axum::http::HeaderMap;
 
 use crate::adapter::config::{AdapterConfig, BackoffStrategy, RateLimitConfig, RetryConfig, SchemaBinding};
 use crate::adapter::gslides::client::GoogleSlidesClient;
@@ -15,15 +17,17 @@ use crate::api::envelope::{ProjectionMetadata, ResponseEnvelope};
 use crate::api::health::HealthResponse;
 use crate::api::pagination::{paginate, PaginatedResponse, PaginationParams};
 use crate::api::read_mode::{ReadModeError, ReadModeResolver};
+use crate::attribute_inventory::{AttributeInventoryDocument, build_inventory_documents};
 use crate::domain::{
     ActorRef, AuthorityModel, BlobRef, CaptureModel, EntityRef, IngestResult, Observation,
     ObserverRef, ProjectionRef, ProjectionStatus, ReadMode, SchemaRef, SemVer,
     SourceSystemRef,
 };
 use crate::governance::engine::PolicyEngine;
+use crate::governance::audit::{AuditLog, InMemoryAuditLog};
 use crate::governance::filter::FilteringGate;
 use crate::governance::types::{
-    AccessScope, ConsentStatus, Environment, MaskStrategy, Operation, PolicyOutcome,
+    AccessScope, AuditEvent, AuditEventKind, ConsentStatus, Environment, MaskStrategy, Operation, PolicyOutcome,
     PolicyRequest, RestrictedFieldSpec, Role,
 };
 use crate::identity::projector::IdentityProjector;
@@ -58,6 +62,8 @@ pub enum SelfHostError {
     NotFound(String),
     #[error("policy denied: {0}")]
     Policy(String),
+    #[error("authentication failed: {0}")]
+    Auth(String),
     #[error("internal state lock poisoned")]
     LockPoisoned,
     #[error("ingestion rejected: {0}")]
@@ -73,7 +79,15 @@ pub struct SyncReport {
     pub slide_analyses: usize,
     pub notion_synced: usize,
     pub duplicates: usize,
+    pub quarantined: usize,
+    pub dead_letters: Vec<DeadLetter>,
     pub last_sync_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeadLetter {
+    pub source: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -112,6 +126,34 @@ pub struct NotionReviewSyncReport {
 struct RankedNotionWriteCandidate {
     preview: NotionReviewCandidate,
     write_record: WriteRecord,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct NotionSourceImageCandidate {
+    object_id: String,
+    source_url: String,
+    blob_ref: String,
+    center_x_pct: f64,
+    center_y_pct: f64,
+}
+
+type NotionSourceImageIndex = HashMap<String, Vec<NotionSourceImageCandidate>>;
+
+#[derive(Debug, Clone)]
+struct SlideImageCandidate {
+    object_id: String,
+    content_url: String,
+    center_x: f64,
+    center_y: f64,
+    z_index: usize,
+    rotation_degrees: i32,
+}
+
+#[derive(Debug, Clone)]
+struct PptxSlideImageCandidate {
+    bytes: Vec<u8>,
+    center_x_pct: f64,
+    center_y_pct: f64,
 }
 
 const PERSON_PAGE_NOTION_PROJECTION_VERSION: &str =
@@ -259,6 +301,7 @@ pub struct AppService {
     google_client: HttpGoogleSlidesClient,
     slide_analyzer: Option<GeminiSlideAnalyzer>,
     notion_client: Option<NotionClient>,
+    audit_log: Arc<InMemoryAuditLog>,
 }
 
 impl AppService {
@@ -288,7 +331,8 @@ impl AppService {
             .map(|nc| {
                 NotionClient::new(
                     NotionConfig::new(&nc.token, &nc.database_id)
-                        .with_blob_dir(config.blob_dir.clone()),
+                        .with_blob_dir(config.blob_dir.clone())
+                        .with_public_base_url(config.public_base_url.clone()),
                 )
             })
             .transpose()?;
@@ -306,6 +350,7 @@ impl AppService {
             google_client,
             slide_analyzer,
             notion_client,
+            audit_log: Arc::new(InMemoryAuditLog::new()),
         })
     }
 
@@ -326,6 +371,64 @@ impl AppService {
         });
     }
 
+    pub fn authorize_headers(
+        &self,
+        headers: &HeaderMap,
+        required_scope: &str,
+    ) -> Result<(), SelfHostError> {
+        let Some(header) = headers.get(axum::http::header::AUTHORIZATION) else {
+            self.emit_audit(
+                "actor:anonymous",
+                AuditEventKind::PolicyDenial,
+                serde_json::json!({ "required_scope": required_scope, "reason": "missing bearer token" }),
+            );
+            return Err(SelfHostError::Auth("missing bearer token".to_string()));
+        };
+        let raw = header
+            .to_str()
+            .map_err(|_| SelfHostError::Auth("invalid authorization header".to_string()))?;
+        let token = raw
+            .strip_prefix("Bearer ")
+            .ok_or_else(|| SelfHostError::Auth("authorization must use Bearer token".to_string()))?;
+        let matched = self
+            .config
+            .api_tokens
+            .iter()
+            .find(|candidate| candidate.token.expose() == token)
+            .ok_or_else(|| SelfHostError::Auth("token rejected".to_string()))?;
+        if matched
+            .scopes
+            .iter()
+            .any(|scope| scope == "*" || scope == required_scope)
+        {
+            self.emit_audit(
+                "actor:api-token",
+                audit_kind_for_scope(required_scope),
+                serde_json::json!({ "required_scope": required_scope }),
+            );
+            Ok(())
+        } else {
+            self.emit_audit(
+                "actor:api-token",
+                AuditEventKind::PolicyDenial,
+                serde_json::json!({ "required_scope": required_scope, "reason": "scope denied" }),
+            );
+            Err(SelfHostError::Policy(format!(
+                "token lacks required scope {required_scope}"
+            )))
+        }
+    }
+
+    fn emit_audit(&self, actor: &str, kind: AuditEventKind, detail: serde_json::Value) {
+        self.audit_log.emit(AuditEvent {
+            id: format!("audit:{}", uuid::Uuid::now_v7()),
+            timestamp: Utc::now(),
+            actor: ActorRef::new(actor),
+            kind,
+            detail,
+        });
+    }
+
     pub fn sync_without_notion_writeback(&self) -> Result<SyncReport, SelfHostError> {
         let mut cloned = self.clone();
         cloned.notion_client = None;
@@ -336,11 +439,20 @@ impl AppService {
         &self,
         limit: usize,
     ) -> Result<Vec<NotionReviewCandidate>, SelfHostError> {
-        let core = self.core_lock()?;
+        let mut core = self.core_lock()?;
+        let persistence = self.persistence_lock()?;
+        let observations = core.lake.list().to_vec();
+        let source_image_index = build_notion_source_image_index(
+            &observations,
+            &mut core.blobs,
+            &self.google_client,
+            &persistence,
+        );
         Ok(ranked_notion_write_candidates_from_snapshot(
             &core.snapshot,
             limit,
             self.config.public_base_url.as_deref(),
+            &source_image_index,
         )
             .into_iter()
             .map(|candidate| candidate.preview)
@@ -361,16 +473,56 @@ impl AppService {
                 slide_analyses: 0,
                 notion_synced: 0,
                 duplicates: 0,
+                quarantined: 0,
+                dead_letters: Vec::new(),
                 last_sync_at: Utc::now(),
             }
         };
         let candidates = {
-            let core = self.core_lock()?;
-            ranked_notion_write_candidates_from_snapshot(
+            let mut core = self.core_lock()?;
+            let persistence = self.persistence_lock()?;
+            let observations = core.lake.list().to_vec();
+            let seed_candidates = ranked_notion_write_candidates_from_snapshot(
                 &core.snapshot,
                 limit,
                 self.config.public_base_url.as_deref(),
-            )
+                &HashMap::new(),
+            );
+            let target_source_document_ids = seed_candidates
+                .iter()
+                .map(|candidate| candidate.preview.source_document_id.clone())
+                .collect::<Vec<_>>();
+            let source_image_index = build_targeted_notion_source_image_index(
+                &observations,
+                &target_source_document_ids,
+                &mut core.blobs,
+                &self.google_client,
+                &persistence,
+            );
+            let seed_previews = seed_candidates
+                .into_iter()
+                .map(|candidate| (candidate.preview.person_id.clone(), candidate.preview))
+                .collect::<HashMap<_, _>>();
+            let mut ranked = core
+                .snapshot
+                .person_page
+                .profiles
+                .iter()
+                .filter_map(|person| {
+                    let preview = seed_previews.get(person.person_id.as_str())?.clone();
+                    let frontend = person.frontend_profile.as_ref()?;
+                    let write_record = notion_write_record_for_person(
+                        person,
+                        frontend,
+                        core.snapshot.built_at,
+                        self.config.public_base_url.as_deref(),
+                        source_image_index.get(frontend.source_document_id.as_str()),
+                    )?;
+                    Some(RankedNotionWriteCandidate { preview, write_record })
+                })
+                .collect::<Vec<_>>();
+            ranked.sort_by_key(|candidate| candidate.preview.rank);
+            ranked
         };
 
         let notion = self.notion_client.as_ref().ok_or_else(|| {
@@ -411,6 +563,11 @@ impl AppService {
             writes,
             cleaned_up,
         })
+    }
+
+    pub fn attribute_inventory_documents(&self) -> Result<Vec<AttributeInventoryDocument>, SelfHostError> {
+        let core = self.core_lock()?;
+        Ok(build_inventory_documents(&core.snapshot))
     }
 
     pub fn sync_all(&self) -> Result<SyncReport, SelfHostError> {
@@ -582,8 +739,8 @@ impl AppService {
         let analysis_model = self
             .slide_analyzer
             .as_ref()
-            .map(|analyzer| format!("{}+continuation-v1", analyzer.model_name()))
-            .unwrap_or_else(|| "heuristic-fallback+continuation-v1".to_string());
+            .map(|analyzer| format!("{}+continuation-v2-image-url", analyzer.model_name()))
+            .unwrap_or_else(|| "heuristic-fallback+continuation-v2-image-url".to_string());
         let mut needs_analysis = false;
         for presentation_id in &self.config.google.presentation_ids {
             let Some(_observation) = slide_obs_by_presentation.get(presentation_id) else {
@@ -665,6 +822,7 @@ impl AppService {
                     profile.thumbnail_blob_ref = Some(thumbnail_blob_ref.as_str().to_string());
                     profile.thumbnail_url = rendered.content_url.clone();
                     profile.companion_to_slide_object_id = None;
+                    resolve_slide_image_urls(&presentation, slide, &mut profile);
 
                     let mut consumed_companion = false;
                     let mut companion_result = None;
@@ -690,6 +848,7 @@ impl AppService {
                         companion_profile.source_canonical_uri = Some(canonical_uri.clone());
                         companion_profile.thumbnail_url = companion_rendered.content_url.clone();
                         companion_profile.companion_to_slide_object_id = Some(slide.object_id.clone());
+                        resolve_slide_image_urls(&presentation, next_slide, &mut companion_profile);
 
                         if should_merge_companion_slide(&profile, &companion_profile, observation) {
                             let companion_blob_ref = core.blobs.put(&companion_rendered.data);
@@ -810,6 +969,14 @@ impl AppService {
             core.rebuild_snapshot();
         }
 
+        let observations = core.lake.list().to_vec();
+        let persistence = self.persistence_lock()?;
+        let source_image_index = build_notion_source_image_index(
+            &observations,
+            &mut core.blobs,
+            &self.google_client,
+            &persistence,
+        );
         let notion_write_records = core
             .snapshot
             .person_page
@@ -817,11 +984,18 @@ impl AppService {
             .iter()
             .filter_map(|person| {
                 let frontend = person.frontend_profile.as_ref()?;
+                Some((person, frontend))
+            })
+            .collect::<Vec<_>>();
+        let notion_write_records = notion_write_records
+            .iter()
+            .filter_map(|(person, frontend)| {
                 let write_record = notion_write_record_for_person(
                     person,
                     frontend,
                     core.snapshot.built_at,
                     self.config.public_base_url.as_deref(),
+                    source_image_index.get(frontend.source_document_id.as_str()),
                 )?;
                 Some((write_record.entity_id.clone(), write_record))
             })
@@ -845,6 +1019,8 @@ impl AppService {
             slide_analyses,
             notion_synced,
             duplicates,
+            quarantined: 0,
+            dead_letters: Vec::new(),
             last_sync_at,
         })
     }
@@ -1563,6 +1739,202 @@ fn merge_companion_profile(
     append_distinct_strings(&mut primary.attributes, &companion.attributes);
 }
 
+fn resolve_slide_image_urls(
+    presentation: &crate::adapter::gslides::client::PresentationNative,
+    slide: &crate::adapter::gslides::client::SlideNative,
+    profile: &mut crate::slide_analysis::types::StudentProfile,
+) {
+    let Some(page_size) = presentation.page_size.as_ref() else {
+        return;
+    };
+    if page_size.width_emu <= 0 || page_size.height_emu <= 0 {
+        return;
+    }
+
+    let mut available_images = slide_image_candidates(slide);
+    if available_images.is_empty() {
+        return;
+    }
+
+    if let Some(profile_pic) = profile.profile_pic.as_mut() {
+        if let Some(coordinates) = profile_pic.coordinates.as_ref() {
+            let target = normalize_coordinate_target(coordinates, page_size);
+            if let Some(matched) = find_nearest_slide_image(target, &available_images) {
+                let matched_object_id = matched.object_id.clone();
+                let matched_url =
+                    apply_rotation_to_google_image_url(&matched.content_url, matched.rotation_degrees);
+                profile_pic.url = Some(matched_url);
+                available_images.retain(|image| image.object_id != matched_object_id);
+            }
+        } else if profile_pic.url.is_none() {
+            let first_image = available_images.remove(0);
+            profile_pic.url = Some(apply_rotation_to_google_image_url(
+                &first_image.content_url,
+                first_image.rotation_degrees,
+            ));
+        }
+    }
+
+    for gallery_image in &mut profile.gallery_images {
+        if gallery_image.url.as_deref().is_some_and(|url| url.starts_with("http")) {
+            continue;
+        }
+        let Some(coordinates) = gallery_image.coordinates.as_ref() else {
+            continue;
+        };
+        let target = normalize_coordinate_target(coordinates, page_size);
+        let Some(matched) = find_nearest_slide_image(target, &available_images) else {
+            continue;
+        };
+        let matched_object_id = matched.object_id.clone();
+        let matched_url =
+            apply_rotation_to_google_image_url(&matched.content_url, matched.rotation_degrees);
+        gallery_image.url = Some(matched_url);
+        available_images.retain(|image| image.object_id != matched_object_id);
+    }
+
+    if profile.profile_pic.is_none() && !available_images.is_empty() {
+        let first_image = available_images.remove(0);
+        profile.profile_pic = Some(crate::slide_analysis::types::ProfilePic {
+            coordinates: None,
+            description: None,
+            url: Some(apply_rotation_to_google_image_url(
+                &first_image.content_url,
+                first_image.rotation_degrees,
+            )),
+        });
+    }
+}
+
+fn slide_image_candidates(
+    slide: &crate::adapter::gslides::client::SlideNative,
+) -> Vec<SlideImageCandidate> {
+    slide
+        .page_elements
+        .iter()
+        .enumerate()
+        .filter_map(|(z_index, element)| slide_image_candidate_from_element(element, z_index))
+        .collect()
+}
+
+fn slide_image_candidate_from_element(
+    element: &serde_json::Value,
+    z_index: usize,
+) -> Option<SlideImageCandidate> {
+    let image = element.get("image")?;
+    let content_url = image.get("contentUrl")?.as_str()?.to_string();
+    let object_id = element.get("objectId")?.as_str()?.to_string();
+    let size = element.get("size")?;
+    let width = size
+        .get("width")
+        .and_then(|value| value.get("magnitude"))
+        .and_then(serde_json::Value::as_f64)?;
+    let height = size
+        .get("height")
+        .and_then(|value| value.get("magnitude"))
+        .and_then(serde_json::Value::as_f64)?;
+    let transform = element.get("transform")?;
+    let translate_x = transform
+        .get("translateX")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or_default();
+    let translate_y = transform
+        .get("translateY")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or_default();
+    let scale_x = transform
+        .get("scaleX")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(1.0);
+    let scale_y = transform
+        .get("scaleY")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(1.0);
+    let rotation_degrees = image
+        .get("imageProperties")
+        .and_then(|value| value.get("cropProperties"))
+        .and_then(|_| Some(0))
+        .unwrap_or(0);
+
+    Some(SlideImageCandidate {
+        object_id,
+        content_url,
+        center_x: translate_x + (width * scale_x.abs() / 2.0),
+        center_y: translate_y + (height * scale_y.abs() / 2.0),
+        z_index,
+        rotation_degrees,
+    })
+}
+
+fn normalize_coordinate_target(
+    coordinates: &crate::slide_analysis::types::ImageCoordinates,
+    page_size: &crate::adapter::gslides::client::PageSize,
+) -> (f64, f64) {
+    let x_pct = normalize_selection_percent(coordinates.x);
+    let y_pct = normalize_selection_percent(coordinates.y);
+    (
+        (x_pct / 100.0) * page_size.width_emu as f64,
+        (y_pct / 100.0) * page_size.height_emu as f64,
+    )
+}
+
+fn normalize_selection_percent(value: f64) -> f64 {
+    if value <= 100.0 {
+        value.max(0.0)
+    } else if value <= 1000.0 {
+        (value / 10.0).max(0.0)
+    } else {
+        100.0
+    }
+}
+
+fn find_nearest_slide_image(
+    target: (f64, f64),
+    candidates: &[SlideImageCandidate],
+) -> Option<&SlideImageCandidate> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut with_distance = candidates
+        .iter()
+        .map(|candidate| {
+            let dx = candidate.center_x - target.0;
+            let dy = candidate.center_y - target.1;
+            let distance = (dx * dx + dy * dy).sqrt();
+            (candidate, distance)
+        })
+        .collect::<Vec<_>>();
+    let min_distance = with_distance
+        .iter()
+        .map(|(_, distance)| *distance)
+        .fold(f64::INFINITY, f64::min);
+    let tolerance = 50.0;
+    with_distance.retain(|(_, distance)| *distance <= min_distance + tolerance);
+    with_distance.sort_by(|left, right| {
+        right
+            .0
+            .z_index
+            .cmp(&left.0.z_index)
+            .then_with(|| left.1.total_cmp(&right.1))
+    });
+    with_distance.into_iter().map(|(candidate, _)| candidate).next()
+}
+
+fn apply_rotation_to_google_image_url(url: &str, rotation_degrees: i32) -> String {
+    if rotation_degrees == 0 || !url.contains("googleusercontent.com") {
+        return url.to_string();
+    }
+    let mut parts = url.splitn(2, '?');
+    let mut base = parts.next().unwrap_or_default().to_string();
+    let query = parts.next().map(|value| format!("?{value}")).unwrap_or_default();
+    if base.contains('=') {
+        base.push_str(&format!("-r{rotation_degrees}"));
+    } else {
+        base.push_str(&format!("=r{rotation_degrees}"));
+    }
+    format!("{base}{query}")
+}
+
 fn merge_optional_field(target: &mut Option<String>, source: &Option<String>) {
     if target.as_ref().is_some_and(|value| !value.trim().is_empty()) {
         return;
@@ -1631,6 +2003,7 @@ fn ranked_notion_write_candidates_from_snapshot(
     snapshot: &ProjectionSnapshot,
     limit: usize,
     public_base_url: Option<&str>,
+    source_image_index: &NotionSourceImageIndex,
 ) -> Vec<RankedNotionWriteCandidate> {
     let mut ranked = snapshot
         .person_page
@@ -1648,6 +2021,7 @@ fn ranked_notion_write_candidates_from_snapshot(
                 frontend,
                 snapshot.built_at,
                 public_base_url,
+                source_image_index.get(frontend.source_document_id.as_str()),
             )?;
 
             Some(RankedNotionWriteCandidate {
@@ -1696,6 +2070,7 @@ fn notion_write_record_for_person(
     frontend: &FrontendProfile,
     synced_at: DateTime<Utc>,
     public_base_url: Option<&str>,
+    source_images: Option<&Vec<NotionSourceImageCandidate>>,
 ) -> Option<WriteRecord> {
     let profile = frontend.profile.clone();
     let entity_id = profile
@@ -1725,6 +2100,12 @@ fn notion_write_record_for_person(
             "visibility": true,
         }),
     );
+    if let Some(source_images) = source_images {
+        payload_object.insert(
+            "_lethe_source_images".to_string(),
+            serde_json::to_value(source_images).ok()?,
+        );
+    }
     Some(WriteRecord {
         entity_id,
         title,
@@ -1770,12 +2151,528 @@ fn parse_google_slide_document_id(value: &str) -> Option<(&str, &str)> {
     }
 }
 
+fn build_notion_source_image_index(
+    observations: &[Observation],
+    blobs: &mut BlobStore,
+    google_client: &impl GoogleSlidesClient,
+    persistence: &SqlitePersistence,
+) -> NotionSourceImageIndex {
+    let mut index = HashMap::new();
+
+    for observation in observations {
+        if !observation.subject.as_str().starts_with("document:gslides:") {
+            continue;
+        }
+        let Some(blob_ref) = observation
+            .payload
+            .get("native")
+            .and_then(|value| value.get("blobRef"))
+            .and_then(serde_json::Value::as_str)
+            .map(BlobRef::new)
+        else {
+            continue;
+        };
+        let Some(blob_bytes) = blobs.get(&blob_ref) else {
+            continue;
+        };
+        let Ok(presentation) =
+            serde_json::from_slice::<crate::adapter::gslides::client::PresentationNative>(
+                blob_bytes,
+            )
+        else {
+            continue;
+        };
+
+        let page_size = page_size_for_presentation(&presentation);
+        let pptx_slide_images = page_size.and_then(|page_size| {
+            pptx_slide_images_for_presentation(&presentation.presentation_id, page_size, google_client)
+        });
+
+        for (slide_index, slide) in presentation.slides.iter().enumerate() {
+            let candidates = if let (Some(slides), Some(page_size)) =
+                (pptx_slide_images.as_ref(), page_size)
+            {
+                slides
+                    .get(slide_index)
+                    .map(|pptx_images| {
+                        notion_source_image_candidates_from_pptx_slide(
+                            slide,
+                            pptx_images,
+                            page_size,
+                            blobs,
+                            persistence,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        notion_source_image_candidates_from_slide(
+                            &presentation,
+                            slide,
+                            blobs,
+                            google_client,
+                            persistence,
+                        )
+                    })
+            } else {
+                notion_source_image_candidates_from_slide(
+                    &presentation,
+                    slide,
+                    blobs,
+                    google_client,
+                    persistence,
+                )
+            };
+            if candidates.is_empty() {
+                continue;
+            }
+            index.insert(
+                format!(
+                    "document:gslides:{}#slide:{}",
+                    presentation.presentation_id, slide.object_id
+                ),
+                candidates,
+            );
+        }
+    }
+
+    index
+}
+
+fn build_targeted_notion_source_image_index(
+    observations: &[Observation],
+    source_document_ids: &[String],
+    blobs: &mut BlobStore,
+    google_client: &impl GoogleSlidesClient,
+    persistence: &SqlitePersistence,
+) -> NotionSourceImageIndex {
+    let mut observation_by_presentation = HashMap::new();
+    for observation in observations {
+        if observation.subject.as_str().starts_with("document:gslides:") {
+            observation_by_presentation.insert(observation.subject.as_str().to_string(), observation);
+        }
+    }
+
+    let mut index = HashMap::new();
+    let mut pptx_slide_images_by_presentation =
+        HashMap::<String, Option<Vec<Vec<PptxSlideImageCandidate>>>>::new();
+    for source_document_id in source_document_ids {
+        let Some((presentation_id, slide_object_id)) =
+            parse_google_slide_document_id(source_document_id)
+        else {
+            continue;
+        };
+        let Some(observation) = observation_by_presentation.get(&format!("document:gslides:{presentation_id}")) else {
+            continue;
+        };
+        let Some(blob_ref) = observation
+            .payload
+            .get("native")
+            .and_then(|value| value.get("blobRef"))
+            .and_then(serde_json::Value::as_str)
+            .map(BlobRef::new)
+        else {
+            continue;
+        };
+        let Some(blob_bytes) = blobs.get(&blob_ref) else {
+            continue;
+        };
+        let Ok(presentation) =
+            serde_json::from_slice::<crate::adapter::gslides::client::PresentationNative>(blob_bytes)
+        else {
+            continue;
+        };
+        let Some(page_size) = page_size_for_presentation(&presentation) else {
+            continue;
+        };
+        let Some((slide_index, slide)) = presentation
+            .slides
+            .iter()
+            .enumerate()
+            .find(|(_, slide)| slide.object_id == slide_object_id)
+        else {
+            continue;
+        };
+
+        if !pptx_slide_images_by_presentation.contains_key(presentation_id) {
+            pptx_slide_images_by_presentation.insert(
+                presentation_id.to_string(),
+                pptx_slide_images_for_presentation(presentation_id, page_size, google_client),
+            );
+        }
+        let pptx_candidates = pptx_slide_images_by_presentation
+            .get(presentation_id)
+            .and_then(|slides| slides.as_ref())
+            .and_then(|slides| {
+                slides.get(slide_index).map(|pptx_images| {
+                    notion_source_image_candidates_from_pptx_slide(
+                        slide,
+                        pptx_images,
+                        page_size,
+                        blobs,
+                        persistence,
+                    )
+                })
+            });
+
+        let candidates = pptx_candidates.unwrap_or_else(|| {
+            eprintln!(
+                "falling back to direct source image download for {}#slide:{}",
+                presentation_id, slide_object_id
+            );
+            notion_source_image_candidates_from_slide(
+                &presentation,
+                slide,
+                blobs,
+                google_client,
+                persistence,
+            )
+        });
+        if !candidates.is_empty() {
+            index.insert(
+                format!("document:gslides:{presentation_id}#slide:{slide_object_id}"),
+                candidates,
+            );
+        } else {
+            let _ = slide_index;
+        }
+    }
+    index
+}
+
+fn page_size_for_presentation(
+    presentation: &crate::adapter::gslides::client::PresentationNative,
+) -> Option<&crate::adapter::gslides::client::PageSize> {
+    let page_size = presentation.page_size.as_ref()?;
+    if page_size.width_emu <= 0 || page_size.height_emu <= 0 {
+        None
+    } else {
+        Some(page_size)
+    }
+}
+
+fn notion_source_image_candidates_from_slide(
+    presentation: &crate::adapter::gslides::client::PresentationNative,
+    slide: &crate::adapter::gslides::client::SlideNative,
+    blobs: &mut BlobStore,
+    google_client: &impl GoogleSlidesClient,
+    persistence: &SqlitePersistence,
+) -> Vec<NotionSourceImageCandidate> {
+    let Some(page_size) = presentation.page_size.as_ref() else {
+        return Vec::new();
+    };
+    if page_size.width_emu <= 0 || page_size.height_emu <= 0 {
+        return Vec::new();
+    }
+
+    slide
+        .page_elements
+        .iter()
+        .filter_map(|element| {
+            notion_source_image_candidate_from_element(
+                element,
+                page_size,
+                blobs,
+                google_client,
+                persistence,
+            )
+        })
+        .collect()
+}
+
+fn notion_source_image_candidates_from_pptx_slide(
+    slide: &crate::adapter::gslides::client::SlideNative,
+    pptx_images: &[PptxSlideImageCandidate],
+    page_size: &crate::adapter::gslides::client::PageSize,
+    blobs: &mut BlobStore,
+    persistence: &SqlitePersistence,
+) -> Vec<NotionSourceImageCandidate> {
+    let native_images = slide_image_candidates(slide);
+    pptx_images
+        .iter()
+        .enumerate()
+        .filter_map(|(index, pptx_image)| {
+            let matched_native =
+                match_native_slide_image_candidate(&native_images, pptx_image.center_x_pct, pptx_image.center_y_pct, page_size);
+            let blob_ref = persistence.persist_blob(&pptx_image.bytes).ok()?;
+            blobs.put(&pptx_image.bytes);
+            Some(NotionSourceImageCandidate {
+                object_id: matched_native
+                    .map(|candidate| candidate.object_id.clone())
+                    .unwrap_or_else(|| format!("pptx-image-{index}")),
+                source_url: matched_native
+                    .map(|candidate| apply_rotation_to_google_image_url(&candidate.content_url, candidate.rotation_degrees))
+                    .unwrap_or_default(),
+                blob_ref: blob_ref.as_str().to_string(),
+                center_x_pct: pptx_image.center_x_pct,
+                center_y_pct: pptx_image.center_y_pct,
+            })
+        })
+        .collect()
+}
+
+fn notion_source_image_candidate_from_element(
+    element: &serde_json::Value,
+    page_size: &crate::adapter::gslides::client::PageSize,
+    blobs: &mut BlobStore,
+    google_client: &impl GoogleSlidesClient,
+    persistence: &SqlitePersistence,
+) -> Option<NotionSourceImageCandidate> {
+    let object_id = element.get("objectId")?.as_str()?.to_string();
+    let content_url = element
+        .get("image")
+        .and_then(|value| value.get("contentUrl"))
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
+    let bytes = match google_client.download_bytes(&content_url) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!(
+                "source image download failed for {}: {}",
+                object_id, err
+            );
+            return None;
+        }
+    };
+    let blob_ref = persistence.persist_blob(&bytes).ok()?;
+    blobs.put(&bytes);
+    let size = element.get("size")?;
+    let width = size
+        .get("width")
+        .and_then(|value| value.get("magnitude"))
+        .and_then(serde_json::Value::as_f64)?;
+    let height = size
+        .get("height")
+        .and_then(|value| value.get("magnitude"))
+        .and_then(serde_json::Value::as_f64)?;
+    let transform = element.get("transform")?;
+    let translate_x = transform
+        .get("translateX")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or_default();
+    let translate_y = transform
+        .get("translateY")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or_default();
+    let scale_x = transform
+        .get("scaleX")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(1.0);
+    let scale_y = transform
+        .get("scaleY")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(1.0);
+
+    let center_x = translate_x + (width * scale_x.abs() / 2.0);
+    let center_y = translate_y + (height * scale_y.abs() / 2.0);
+
+    Some(NotionSourceImageCandidate {
+        object_id,
+        source_url: content_url,
+        blob_ref: blob_ref.as_str().to_string(),
+        center_x_pct: (center_x / page_size.width_emu as f64) * 100.0,
+        center_y_pct: (center_y / page_size.height_emu as f64) * 100.0,
+    })
+}
+
+fn match_native_slide_image_candidate<'a>(
+    candidates: &'a [SlideImageCandidate],
+    center_x_pct: f64,
+    center_y_pct: f64,
+    page_size: &crate::adapter::gslides::client::PageSize,
+) -> Option<&'a SlideImageCandidate> {
+    candidates.iter().min_by(|left, right| {
+        let left_x = (left.center_x / page_size.width_emu as f64) * 100.0;
+        let left_y = (left.center_y / page_size.height_emu as f64) * 100.0;
+        let right_x = (right.center_x / page_size.width_emu as f64) * 100.0;
+        let right_y = (right.center_y / page_size.height_emu as f64) * 100.0;
+        squared_distance(left_x, left_y, center_x_pct, center_y_pct)
+            .total_cmp(&squared_distance(right_x, right_y, center_x_pct, center_y_pct))
+            .then_with(|| right.z_index.cmp(&left.z_index))
+    })
+}
+
+fn squared_distance(left_x: f64, left_y: f64, right_x: f64, right_y: f64) -> f64 {
+    let dx = left_x - right_x;
+    let dy = left_y - right_y;
+    (dx * dx) + (dy * dy)
+}
+
+fn parse_pptx_slide_images(
+    pptx_bytes: &[u8],
+    page_size: &crate::adapter::gslides::client::PageSize,
+) -> Result<Vec<Vec<PptxSlideImageCandidate>>, String> {
+    const REL_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    let mut archive = zip::ZipArchive::new(Cursor::new(pptx_bytes))
+        .map_err(|err| format!("failed to open pptx zip: {err}"))?;
+
+    let mut slides = Vec::new();
+    let mut slide_number = 1usize;
+    loop {
+        let slide_path = format!("ppt/slides/slide{slide_number}.xml");
+        let rels_path = format!("ppt/slides/_rels/slide{slide_number}.xml.rels");
+        if archive.by_name(&slide_path).is_err() {
+            break;
+        }
+        let slide_xml = read_zip_entry(&mut archive, &slide_path)?;
+        let rels_xml = read_zip_entry(&mut archive, &rels_path)?;
+        let rels_doc = roxmltree::Document::parse(&rels_xml)
+            .map_err(|err| format!("failed to parse {rels_path}: {err}"))?;
+        let rel_targets = rels_doc
+            .descendants()
+            .filter(|node| node.tag_name().name() == "Relationship")
+            .filter_map(|node| {
+                Some((
+                    node.attribute("Id")?.to_string(),
+                    resolve_zip_relative_path("ppt/slides", node.attribute("Target")?),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        let slide_doc = roxmltree::Document::parse(&slide_xml)
+            .map_err(|err| format!("failed to parse {slide_path}: {err}"))?;
+        let mut images = Vec::new();
+        for pic in slide_doc
+            .descendants()
+            .filter(|node| node.tag_name().name() == "pic")
+        {
+            let Some(embed_id) = pic
+                .descendants()
+                .find(|node| node.tag_name().name() == "blip")
+                .and_then(|node| node.attribute((REL_NS, "embed")))
+            else {
+                continue;
+            };
+            let Some(target) = rel_targets.get(embed_id) else {
+                continue;
+            };
+            let Some(xfrm) = pic.descendants().find(|node| node.tag_name().name() == "xfrm") else {
+                continue;
+            };
+            let Some(off) = xfrm.children().find(|node| node.tag_name().name() == "off") else {
+                continue;
+            };
+            let Some(ext) = xfrm.children().find(|node| node.tag_name().name() == "ext") else {
+                continue;
+            };
+            let x = off.attribute("x").and_then(|value| value.parse::<f64>().ok()).unwrap_or_default();
+            let y = off.attribute("y").and_then(|value| value.parse::<f64>().ok()).unwrap_or_default();
+            let cx = ext.attribute("cx").and_then(|value| value.parse::<f64>().ok()).unwrap_or_default();
+            let cy = ext.attribute("cy").and_then(|value| value.parse::<f64>().ok()).unwrap_or_default();
+            let bytes = read_zip_entry_bytes(&mut archive, target)?;
+            images.push(PptxSlideImageCandidate {
+                bytes,
+                center_x_pct: ((x + cx / 2.0) / page_size.width_emu as f64) * 100.0,
+                center_y_pct: ((y + cy / 2.0) / page_size.height_emu as f64) * 100.0,
+            });
+        }
+        slides.push(images);
+        slide_number += 1;
+    }
+    Ok(slides)
+}
+
+fn pptx_slide_images_for_presentation(
+    presentation_id: &str,
+    page_size: &crate::adapter::gslides::client::PageSize,
+    google_client: &impl GoogleSlidesClient,
+) -> Option<Vec<Vec<PptxSlideImageCandidate>>> {
+    let pptx_bytes = match google_client.export_presentation_pptx(presentation_id) {
+        Ok(bytes) => Some(bytes),
+        Err(err) => {
+            eprintln!(
+                "failed to export presentation pptx for {}: {}; trying local manual fallback",
+                presentation_id, err
+            );
+            let manual_path = manual_pptx_path_for_presentation(presentation_id);
+            match std::fs::read(&manual_path) {
+                Ok(bytes) => Some(bytes),
+                Err(read_err) => {
+                    eprintln!(
+                        "failed to read manual pptx fallback {}: {}",
+                        manual_path.display(),
+                        read_err
+                    );
+                    None
+                }
+            }
+        }
+    }?;
+
+    match parse_pptx_slide_images(&pptx_bytes, page_size) {
+        Ok(slides) => Some(slides),
+        Err(err) => {
+            eprintln!(
+                "failed to parse pptx slide images for {}: {}",
+                presentation_id, err
+            );
+            None
+        }
+    }
+}
+
+fn manual_pptx_path_for_presentation(presentation_id: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from("data")
+        .join("manual_pptx")
+        .join(format!("{presentation_id}.pptx"))
+}
+
+fn read_zip_entry(
+    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    path: &str,
+) -> Result<String, String> {
+    let mut file = archive
+        .by_name(path)
+        .map_err(|err| format!("missing zip entry {path}: {err}"))?;
+    let mut xml = String::new();
+    file.read_to_string(&mut xml)
+        .map_err(|err| format!("failed to read {path}: {err}"))?;
+    Ok(xml)
+}
+
+fn read_zip_entry_bytes(
+    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    path: &str,
+) -> Result<Vec<u8>, String> {
+    let mut file = archive
+        .by_name(path)
+        .map_err(|err| format!("missing zip entry {path}: {err}"))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|err| format!("failed to read {path}: {err}"))?;
+    Ok(bytes)
+}
+
+fn resolve_zip_relative_path(base_dir: &str, target: &str) -> String {
+    let mut segments = base_dir
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    for part in target.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            value => segments.push(value.to_string()),
+        }
+    }
+    segments.join("/")
+}
+
 fn blob_ref_sha256(blob_ref: &str) -> Option<&str> {
     let hash = blob_ref.strip_prefix("blob:sha256:")?;
     if hash.len() == 64 && hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
         Some(hash)
     } else {
         None
+    }
+}
+
+fn audit_kind_for_scope(scope: &str) -> AuditEventKind {
+    match scope {
+        "admin:sync" => AuditEventKind::WriteExecution,
+        "blob:read" => AuditEventKind::Export,
+        "projection:read" => AuditEventKind::ReadRestricted,
+        _ => AuditEventKind::ReadRestricted,
     }
 }
 
@@ -1818,14 +2715,9 @@ fn ranked_self_intro_slide_indices(
             .then(left.0.cmp(&right.0))
     });
 
-    let positive = ranked.iter().filter(|(_, score)| *score > 0).count();
     ranked
         .into_iter()
-        .take(if positive == 0 {
-            limit.min(presentation.slides.len())
-        } else {
-            limit.min(positive)
-        })
+        .take(limit.min(presentation.slides.len()))
         .map(|(index, _)| index)
         .collect()
 }
@@ -2046,7 +2938,10 @@ mod tests {
         ActorRef, AuthorityModel, CaptureModel, EntityRef, IdempotencyKey, Mutability,
         Observation, ObserverRef, SchemaRef, SemVer, SupplementalId, SupplementalRecord,
     };
-    use crate::self_host::config::{GoogleConfig, SelfHostConfig, SlackConfig};
+    use crate::self_host::config::{
+        ApiTokenConfig, GoogleConfig, ResourceLimits, SecretString, SelfHostConfig, SlackConfig,
+    };
+    use crate::governance::audit::InMemoryAuditLog;
     use crate::self_host::google::HttpGoogleSlidesClient;
     use crate::self_host::persistence::SqlitePersistence;
     use crate::self_host::slack::HttpSlackClient;
@@ -2130,6 +3025,17 @@ mod tests {
             database_path: db,
             blob_dir: blobs,
             poll_interval: std::time::Duration::from_secs(300),
+            api_tokens: vec![ApiTokenConfig {
+                token: SecretString::new("test-api-token").unwrap(),
+                scopes: vec!["*".into()],
+            }],
+            resource_limits: ResourceLimits {
+                max_blob_bytes: 10 * 1024 * 1024,
+                max_payload_bytes: 1024 * 1024,
+                max_sync_items: 10_000,
+                max_page_size: 100,
+            },
+            sources: vec![],
             slack: SlackConfig {
                 bot_token: "xoxb-test-token".into(),
                 thread_token: None,
@@ -2281,6 +3187,44 @@ mod tests {
     }
 
     #[test]
+    fn ranked_self_intro_slide_indices_include_lower_scoring_slides_within_limit() {
+        let presentation = crate::adapter::gslides::client::PresentationNative {
+            presentation_id: "deck-2".into(),
+            title: "2026 Slides".into(),
+            locale: None,
+            slides: vec![
+                crate::adapter::gslides::client::SlideNative {
+                    object_id: "profile".into(),
+                    page_elements: vec![serde_json::json!({
+                        "shape": {
+                            "text": {
+                                "textElements": [
+                                    { "textRun": { "content": "自己紹介\n" } },
+                                    { "textRun": { "content": "田中太郎\n" } }
+                                ]
+                            }
+                        }
+                    })],
+                },
+                crate::adapter::gslides::client::SlideNative {
+                    object_id: "neutral".into(),
+                    page_elements: vec![serde_json::json!({
+                        "shape": {
+                            "text": {
+                                "textElements": [{ "textRun": { "content": "写真\n" } }]
+                            }
+                        }
+                    })],
+                },
+            ],
+            page_size: None,
+        };
+
+        let ranked = ranked_self_intro_slide_indices(&presentation, 2);
+        assert_eq!(ranked, vec![0, 1]);
+    }
+
+    #[test]
     fn extract_slide_text_fragments_and_name_inference_use_text_runs() {
         let slide = crate::adapter::gslides::client::SlideNative {
             object_id: "profile".into(),
@@ -2417,7 +3361,12 @@ mod tests {
             built_at: Utc::now(),
         };
 
-        let ranked = ranked_notion_write_candidates_from_snapshot(&snapshot, 2, None);
+        let ranked = ranked_notion_write_candidates_from_snapshot(
+            &snapshot,
+            2,
+            None,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(ranked.len(), 2);
         assert_eq!(ranked[0].preview.entity_id, "a@example.com");
         assert_eq!(ranked[1].preview.entity_id, "b@example.com");
@@ -2503,6 +3452,7 @@ mod tests {
             &snapshot,
             1,
             Some("https://public.example.com/root"),
+            &std::collections::HashMap::new(),
         );
         let expected_url = format!(
             "https://docs.google.com/presentation/d/{}/export/png?id={}&pageid=1",
@@ -2574,6 +3524,7 @@ mod tests {
             &snapshot,
             1,
             Some("https://public.example.com/root"),
+            &std::collections::HashMap::new(),
         );
         let expected_url = format!(
             "https://public.example.com/root/public/blobs/{}",
@@ -2626,6 +3577,7 @@ mod tests {
             google_client: HttpGoogleSlidesClient::new(&config.google).unwrap(),
             slide_analyzer: None,
             notion_client: None,
+            audit_log: Arc::new(InMemoryAuditLog::new()),
         };
 
         let draft = ObservationDraft {

@@ -1,0 +1,13 @@
+[package]
+name = "lethe-selfhost"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lethe-core = { path = "../lethe-core" }
+lethe-policy = { path = "../lethe-policy" }
+lethe-storage-api = { path = "../lethe-storage-api" }
+lethe-storage-sqlite = { path = "../lethe-storage-sqlite" }
+lethe-runtime = { path = "../lethe-runtime" }
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

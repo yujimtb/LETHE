@@ -82,6 +82,147 @@ impl HttpGoogleSlidesClient {
             message: "google oauth token rejected".to_string(),
         })
     }
+
+    fn get_bytes(&self, url: &str) -> Result<Vec<u8>, AdapterError> {
+        let mut token = self.bearer_token()?;
+
+        for attempt in 0..2 {
+            let response = self
+                .http
+                .get(url)
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .send()
+                .map_err(|err| AdapterError::Network {
+                    message: err.to_string(),
+                })?;
+
+            let status = response.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                if attempt == 0 {
+                    if let Some(refreshed) = self.auth.refresh_access_token(&self.http)? {
+                        token = refreshed;
+                        continue;
+                    }
+                }
+
+                return Err(AdapterError::AuthFailure {
+                    message: "google oauth token rejected".to_string(),
+                });
+            }
+
+            if !status.is_success() {
+                let body = response.text().map_err(|err| AdapterError::Network {
+                    message: err.to_string(),
+                })?;
+                return Err(AdapterError::MalformedResponse {
+                    message: format!("google byte download {url} returned {status}: {body}"),
+                });
+            }
+
+            return response
+                .bytes()
+                .map(|bytes| bytes.to_vec())
+                .map_err(|err| AdapterError::Network {
+                    message: err.to_string(),
+                });
+        }
+
+        Err(AdapterError::AuthFailure {
+            message: "google oauth token rejected".to_string(),
+        })
+    }
+
+    fn post_json_value(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, AdapterError> {
+        let mut token = self.bearer_token()?;
+
+        for attempt in 0..2 {
+            let response = self
+                .http
+                .post(url)
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .header(CONTENT_TYPE, "application/json")
+                .json(body)
+                .send()
+                .map_err(|err| AdapterError::Network {
+                    message: err.to_string(),
+                })?;
+
+            let status = response.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                if attempt == 0 {
+                    if let Some(refreshed) = self.auth.refresh_access_token(&self.http)? {
+                        token = refreshed;
+                        continue;
+                    }
+                }
+                return Err(AdapterError::AuthFailure {
+                    message: "google oauth token rejected".to_string(),
+                });
+            }
+
+            let body_text = response.text().map_err(|err| AdapterError::Network {
+                message: err.to_string(),
+            })?;
+            if !status.is_success() {
+                return Err(AdapterError::MalformedResponse {
+                    message: format!("google api {url} returned {status}: {body_text}"),
+                });
+            }
+            return serde_json::from_str(&body_text).map_err(|err| AdapterError::MalformedResponse {
+                message: format!("google api {url} decode error: {err}; body: {body_text}"),
+            });
+        }
+
+        Err(AdapterError::AuthFailure {
+            message: "google oauth token rejected".to_string(),
+        })
+    }
+
+    fn delete_resource(&self, url: &str) -> Result<(), AdapterError> {
+        let mut token = self.bearer_token()?;
+
+        for attempt in 0..2 {
+            let response = self
+                .http
+                .delete(url)
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .send()
+                .map_err(|err| AdapterError::Network {
+                    message: err.to_string(),
+                })?;
+
+            let status = response.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                if attempt == 0 {
+                    if let Some(refreshed) = self.auth.refresh_access_token(&self.http)? {
+                        token = refreshed;
+                        continue;
+                    }
+                }
+                return Err(AdapterError::AuthFailure {
+                    message: "google oauth token rejected".to_string(),
+                });
+            }
+
+            if status.is_success() || status == reqwest::StatusCode::NO_CONTENT {
+                return Ok(());
+            }
+            let body_text = response.text().map_err(|err| AdapterError::Network {
+                message: err.to_string(),
+            })?;
+            return Err(AdapterError::MalformedResponse {
+                message: format!("google api {url} returned {status}: {body_text}"),
+            });
+        }
+
+        Err(AdapterError::AuthFailure {
+            message: "google oauth token rejected".to_string(),
+        })
+    }
 }
 
 impl GoogleSlidesClient for HttpGoogleSlidesClient {
@@ -207,18 +348,7 @@ impl GoogleSlidesClient for HttpGoogleSlidesClient {
         let content_url = thumbnail.content_url.ok_or_else(|| AdapterError::MalformedResponse {
             message: "missing thumbnail contentUrl".to_string(),
         })?;
-        let data = self
-            .http
-            .get(&content_url)
-            .send()
-            .map_err(|err| AdapterError::Network {
-                message: err.to_string(),
-            })?
-            .bytes()
-            .map_err(|err| AdapterError::Network {
-                message: err.to_string(),
-            })?
-            .to_vec();
+        let data = self.get_bytes(&content_url)?;
 
         Ok(RenderedSlide {
             slide_object_id: slide_object_id.to_string(),
@@ -226,6 +356,83 @@ impl GoogleSlidesClient for HttpGoogleSlidesClient {
             data,
             content_url: Some(content_url),
         })
+    }
+
+    fn download_bytes(&self, url: &str) -> Result<Vec<u8>, AdapterError> {
+        self.get_bytes(url)
+    }
+
+    fn export_presentation_pptx(&self, presentation_id: &str) -> Result<Vec<u8>, AdapterError> {
+        self.get_bytes(&format!(
+            "https://www.googleapis.com/drive/v3/files/{presentation_id}/export?mimeType=application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        ))
+    }
+
+    fn export_single_slide_pptx(
+        &self,
+        presentation_id: &str,
+        slide_object_id: &str,
+    ) -> Result<Vec<u8>, AdapterError> {
+        #[derive(Deserialize)]
+        struct DriveCopyResponse {
+            id: String,
+        }
+
+        let source = self.get_presentation(presentation_id)?;
+        let slide_index = source
+            .slides
+            .iter()
+            .position(|slide| slide.object_id == slide_object_id)
+            .ok_or_else(|| {
+                AdapterError::Other(format!(
+                    "slide {slide_object_id} not found in presentation {presentation_id}"
+                ))
+            })?;
+
+        let copied_value = self.post_json_value(
+            &format!("https://www.googleapis.com/drive/v3/files/{presentation_id}/copy"),
+            &serde_json::json!({
+                "name": format!("lethe-temp-{presentation_id}-{slide_object_id}")
+            }),
+        )?;
+        let copied: DriveCopyResponse =
+            serde_json::from_value(copied_value).map_err(|err| AdapterError::MalformedResponse {
+                message: format!("failed to decode drive copy response: {err}"),
+            })?;
+
+        let export_result = (|| -> Result<Vec<u8>, AdapterError> {
+            let copied_presentation = self.get_presentation(&copied.id)?;
+            let delete_requests = copied_presentation
+                .slides
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != slide_index)
+                .map(|(_, slide)| {
+                    serde_json::json!({
+                        "deleteObject": { "objectId": slide.object_id }
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !delete_requests.is_empty() {
+                self.post_json_value(
+                    &format!(
+                        "https://slides.googleapis.com/v1/presentations/{}/:batchUpdate",
+                        copied.id
+                    ),
+                    &serde_json::json!({ "requests": delete_requests }),
+                )?;
+            }
+            self.export_presentation_pptx(&copied.id)
+        })();
+
+        if let Err(err) = self.delete_resource(&format!(
+            "https://www.googleapis.com/drive/v3/files/{}",
+            copied.id
+        )) {
+            eprintln!("failed to delete temporary presentation {}: {}", copied.id, err);
+        }
+
+        export_result
     }
 }
 

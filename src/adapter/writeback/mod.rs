@@ -5,6 +5,7 @@
 //! destination (Notion, Airtable, etc.) can implement to receive
 //! projection results.
 
+pub mod image_crop;
 pub mod notion;
 pub mod traits;
 

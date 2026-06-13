@@ -8,6 +8,7 @@
 //! - Heartbeat Observation generator
 
 pub mod config;
+pub mod conformance;
 pub mod error;
 pub mod heartbeat;
 pub mod idempotency;
@@ -19,6 +20,7 @@ pub mod gslides;
 pub mod writeback;
 
 pub use config::*;
+pub use conformance::*;
 pub use error::*;
 pub use heartbeat::*;
 pub use idempotency::*;

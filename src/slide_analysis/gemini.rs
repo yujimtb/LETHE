@@ -13,6 +13,7 @@ use crate::domain::Observation;
 use crate::lake::BlobStore;
 
 use super::types::StudentProfile;
+use super::provider::{DerivationLineage, DerivationProvider, DerivedStudentProfile};
 
 #[derive(Debug, Clone)]
 pub struct GeminiSlideAnalyzer {
@@ -214,6 +215,40 @@ impl GeminiSlideAnalyzer {
             message: format!("gemini profile decode error: {err}; text: {text}"),
         })?;
         Ok(Some(profile))
+    }
+}
+
+impl DerivationProvider for GeminiSlideAnalyzer {
+    fn provider_name(&self) -> &str {
+        "gemini"
+    }
+
+    fn model_name(&self) -> &str {
+        &self.model
+    }
+
+    fn provider_version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
+    }
+
+    fn derive_student_profile(
+        &self,
+        observation: &Observation,
+        blobs: &BlobStore,
+    ) -> Result<Option<DerivedStudentProfile>, AdapterError> {
+        let Some(profile) = self.extract_profile(observation, blobs)? else {
+            return Ok(None);
+        };
+        Ok(Some(DerivedStudentProfile {
+            profile,
+            lineage: DerivationLineage {
+                source_observation: observation.id.clone(),
+                provider: self.provider_name().to_string(),
+                model: self.model_name().to_string(),
+                version: self.provider_version().to_string(),
+                confidence: 1.0,
+            },
+        }))
     }
 }
 

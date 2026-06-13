@@ -2,7 +2,9 @@ pub mod domain;
 pub mod registry;
 pub mod lake;
 pub mod supplemental;
+pub mod storage_api;
 pub mod adapter;
+pub mod attribute_inventory;
 pub mod governance;
 pub mod runtime;
 

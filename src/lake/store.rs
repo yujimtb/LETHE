@@ -7,6 +7,14 @@ use std::collections::HashMap;
 use crate::domain::{
     EntityRef, Observation, ObservationId, ObserverRef, SchemaRef,
 };
+use crate::storage_api::ObservationStore;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppendOutcome {
+    Appended(ObservationId),
+    Duplicate(ObservationId),
+    Conflict(ObservationId),
+}
 
 /// Watermark representing the latest position in the Lake.
 #[derive(Debug, Clone)]
@@ -30,12 +38,27 @@ impl LakeStore {
         Self::default()
     }
 
-    /// Append an observation.  Returns `Err(existing_id)` if the
-    /// idempotency key was already seen.
+    /// Append an observation. Returns `Err(existing_id)` if the idempotency key
+    /// was already seen. Use `append_idempotent` when duplicate vs conflict
+    /// must be distinguished.
     pub fn append(&mut self, obs: Observation) -> Result<ObservationId, ObservationId> {
+        match self.append_idempotent(obs) {
+            AppendOutcome::Appended(id) => Ok(id),
+            AppendOutcome::Duplicate(existing_id) | AppendOutcome::Conflict(existing_id) => {
+                Err(existing_id)
+            }
+        }
+    }
+
+    pub fn append_idempotent(&mut self, obs: Observation) -> AppendOutcome {
         if let Some(key) = &obs.idempotency_key {
             if let Some(&idx) = self.dedup_index.get(&key.0) {
-                return Err(self.observations[idx].id.clone());
+                let existing = &self.observations[idx];
+                return if same_idempotent_observation(existing, &obs) {
+                    AppendOutcome::Duplicate(existing.id.clone())
+                } else {
+                    AppendOutcome::Conflict(existing.id.clone())
+                };
             }
         }
         let id = obs.id.clone();
@@ -44,7 +67,7 @@ impl LakeStore {
             self.dedup_index.insert(key.0.clone(), idx);
         }
         self.observations.push(obs);
-        Ok(id)
+        AppendOutcome::Appended(id)
     }
 
     /// Roll back the most recent append if it matches the provided id.
@@ -119,6 +142,27 @@ impl LakeStore {
     }
 }
 
+impl ObservationStore for LakeStore {
+    fn observations(&self) -> &[Observation] {
+        self.list()
+    }
+}
+
+fn same_idempotent_observation(left: &Observation, right: &Observation) -> bool {
+    left.schema == right.schema
+        && left.schema_version == right.schema_version
+        && left.observer == right.observer
+        && left.source_system == right.source_system
+        && left.authority_model == right.authority_model
+        && left.capture_model == right.capture_model
+        && left.subject == right.subject
+        && left.target == right.target
+        && left.payload == right.payload
+        && left.attachments == right.attachments
+        && left.consent == right.consent
+        && left.meta == right.meta
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,6 +209,18 @@ mod tests {
         let id1 = lake.append(o1).unwrap();
         let result = lake.append(o2);
         assert_eq!(result, Err(id1));
+        assert_eq!(lake.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_idempotency_key_with_different_payload_is_conflict() {
+        let mut lake = LakeStore::new();
+        let o1 = sample_obs("dup-different");
+        let mut o2 = sample_obs("dup-different");
+        o2.payload = serde_json::json!({"changed": true});
+        let id1 = lake.append(o1).unwrap();
+        let result = lake.append_idempotent(o2);
+        assert_eq!(result, AppendOutcome::Conflict(id1));
         assert_eq!(lake.len(), 1);
     }
 

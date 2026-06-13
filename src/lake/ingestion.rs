@@ -9,13 +9,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{
     AuthorityModel, BlobRef, CaptureModel, EntityRef, IdempotencyKey,
-    IngestResult, Observation, ObserverRef, QuarantineTicket, SchemaRef,
+    ActorRef, IngestResult, Observation, ObserverRef, QuarantineTicket, SchemaRef,
     SemVer, SourceSystemRef, MAX_CLOCK_SKEW,
+};
+use crate::governance::engine::PolicyEngine;
+use crate::governance::types::{
+    AccessScope, ConsentStatus, Environment, Operation, PolicyOutcome, PolicyRequest, Role,
 };
 use crate::registry::RegistryStore;
 
 use super::blob::BlobStore;
-use super::store::LakeStore;
+use super::store::{AppendOutcome, LakeStore};
 
 /// Client-facing request to ingest an observation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,16 +151,33 @@ impl IngestionGate<'_> {
         }
 
         // Step 3: Validate payload (JSON Schema).
-        // For MVP we only check that payload is a JSON object.
-        if !req.payload.is_object() {
+        if let Err(message) = validate_payload(&schema.payload_schema, &req.payload) {
             return IngestResult::Rejected {
                 class: crate::domain::FailureClass::ValidationFailure,
-                message: "Payload must be a JSON object".into(),
+                message,
             };
         }
 
-        // Step 4: Governance policy — placeholder (M08 Governance).
-        // MVP: always Allow.
+        // Step 4: Governance policy before append.
+        let policy = PolicyEngine::evaluate(&PolicyRequest {
+            actor: ActorRef::new(req.observer.as_str().replace("obs:", "actor:")),
+            role: Role::SystemAdmin,
+            operation: Operation::Write {
+                mode: crate::domain::WriteMode::Canonical,
+                authority: req.authority_model,
+            },
+            data_scope: AccessScope::Internal,
+            consent_status: ConsentStatus::Unrestricted,
+            environment: Environment::Production,
+        });
+        if let PolicyOutcome::Deny { reason } = policy {
+            return IngestResult::Quarantined {
+                ticket: QuarantineTicket {
+                    id: uuid::Uuid::now_v7().to_string(),
+                    reason: format!("policy denied: {}: {}", reason.code, reason.message),
+                },
+            };
+        }
 
         // Step 5: Idempotency check is handled by LakeStore.append().
 
@@ -204,11 +225,27 @@ impl IngestionGate<'_> {
             meta: req.meta,
         };
 
-        match self.lake.append(obs) {
-            Ok(id) => IngestResult::Ingested { id, recorded_at },
-            Err(existing_id) => IngestResult::Duplicate { existing_id },
+        match self.lake.append_idempotent(obs) {
+            AppendOutcome::Appended(id) => IngestResult::Ingested { id, recorded_at },
+            AppendOutcome::Duplicate(existing_id) => IngestResult::Duplicate { existing_id },
+            AppendOutcome::Conflict(existing_id) => IngestResult::Quarantined {
+                ticket: QuarantineTicket {
+                    id: uuid::Uuid::now_v7().to_string(),
+                    reason: format!(
+                        "idempotency conflict: existing observation {existing_id} has different payload"
+                    ),
+                },
+            },
         }
     }
+}
+
+fn validate_payload(schema: &serde_json::Value, payload: &serde_json::Value) -> Result<(), String> {
+    let validator = jsonschema::validator_for(schema)
+        .map_err(|err| format!("Invalid payload schema: {err}"))?;
+    validator
+        .validate(payload)
+        .map_err(|err| format!("Payload does not match schema: {err}"))
 }
 
 // ===========================================================================

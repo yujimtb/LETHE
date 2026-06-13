@@ -3,6 +3,20 @@ name = "lethe"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = [
+    ".",
+    "crates/lethe-core",
+    "crates/lethe-policy",
+    "crates/lethe-storage-api",
+    "crates/lethe-storage-sqlite",
+    "crates/lethe-adapter-slack",
+    "crates/lethe-adapter-gslides",
+    "crates/lethe-runtime",
+    "crates/lethe-selfhost",
+    "crates/lethe-projection-person",
+]
+
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }

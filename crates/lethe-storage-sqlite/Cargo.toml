@@ -1,0 +1,8 @@
+[package]
+name = "lethe-storage-sqlite"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lethe-storage-api = { path = "../lethe-storage-api" }
+rusqlite = { version = "0.34", features = ["bundled"] }

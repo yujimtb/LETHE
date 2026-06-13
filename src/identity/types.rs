@@ -19,8 +19,18 @@ pub struct SourceIdentifier {
 #[serde(rename_all = "snake_case")]
 pub enum IdentifierType {
     Email,
+    SlackId,
+    ExternalId,
+    ArbitraryKey,
     UserId,
     DisplayName,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityResolutionStrategy {
+    pub name: String,
+    pub ordered_claims: Vec<IdentifierType>,
+    pub minimum_confidence: ConfidenceLevel,
 }
 
 /// A candidate person from a single source (Phase 1 output).
@@ -114,6 +124,22 @@ mod tests {
             let json = serde_json::to_string(&status).unwrap();
             let back: CandidateStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(status, back);
+        }
+    }
+
+    #[test]
+    fn generalized_identifier_types_round_trip() {
+        for identifier_type in [
+            IdentifierType::Email,
+            IdentifierType::SlackId,
+            IdentifierType::ExternalId,
+            IdentifierType::ArbitraryKey,
+            IdentifierType::UserId,
+            IdentifierType::DisplayName,
+        ] {
+            let json = serde_json::to_string(&identifier_type).unwrap();
+            let back: IdentifierType = serde_json::from_str(&json).unwrap();
+            assert_eq!(identifier_type, back);
         }
     }
 }

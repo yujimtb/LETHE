@@ -1,0 +1,32 @@
+[
+  {
+    "id": "et:person",
+    "name": "Person",
+    "description": "People represented by observations"
+  },
+  {
+    "id": "et:space",
+    "name": "Space",
+    "description": "Physical or logical spaces"
+  },
+  {
+    "id": "et:artifact",
+    "name": "Artifact",
+    "description": "Physical or digital artifacts"
+  },
+  {
+    "id": "et:document",
+    "name": "Document",
+    "description": "Digital documents"
+  },
+  {
+    "id": "et:message",
+    "name": "Message",
+    "description": "Messages"
+  },
+  {
+    "id": "et:observer",
+    "name": "Observer",
+    "description": "Observers themselves"
+  }
+]

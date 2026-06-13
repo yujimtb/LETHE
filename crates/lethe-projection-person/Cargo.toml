@@ -1,0 +1,8 @@
+[package]
+name = "lethe-projection-person"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lethe-core = { path = "../lethe-core" }
+lethe = { path = "../.." }

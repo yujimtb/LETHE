@@ -453,8 +453,11 @@ impl IdentityProjector {
     fn identifier_type_rank(identifier_type: IdentifierType) -> u8 {
         match identifier_type {
             IdentifierType::Email => 0,
-            IdentifierType::UserId => 1,
-            IdentifierType::DisplayName => 2,
+            IdentifierType::SlackId => 1,
+            IdentifierType::ExternalId => 2,
+            IdentifierType::ArbitraryKey => 3,
+            IdentifierType::UserId => 4,
+            IdentifierType::DisplayName => 5,
         }
     }
 }

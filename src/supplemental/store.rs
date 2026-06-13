@@ -11,6 +11,7 @@ use crate::domain::{
 };
 use crate::domain::supplemental::ConsentMetadata;
 use crate::lake::LakeStore;
+use crate::storage_api::SupplementalStorePort;
 
 /// Versioned snapshot of a supplemental record (for ManagedCache history).
 #[derive(Debug, Clone)]
@@ -235,6 +236,12 @@ impl SupplementalStore {
 
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
+    }
+}
+
+impl SupplementalStorePort for SupplementalStore {
+    fn supplemental_records(&self) -> Vec<&SupplementalRecord> {
+        self.records.values().map(|versioned| &versioned.record).collect()
     }
 }
 

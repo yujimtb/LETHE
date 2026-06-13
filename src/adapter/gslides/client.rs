@@ -95,6 +95,19 @@ pub trait GoogleSlidesClient {
         slide_object_id: &str,
         format: &str,
     ) -> Result<RenderedSlide, AdapterError>;
+
+    /// Download arbitrary presentation-adjacent bytes (e.g. image contentUrl).
+    fn download_bytes(&self, url: &str) -> Result<Vec<u8>, AdapterError>;
+
+    /// Export an entire presentation as PPTX bytes.
+    fn export_presentation_pptx(&self, presentation_id: &str) -> Result<Vec<u8>, AdapterError>;
+
+    /// Export a single slide as a temporary one-slide PPTX.
+    fn export_single_slide_pptx(
+        &self,
+        presentation_id: &str,
+        slide_object_id: &str,
+    ) -> Result<Vec<u8>, AdapterError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +120,8 @@ pub struct FixtureGoogleSlidesClient {
     pub presentations: std::collections::HashMap<String, PresentationNative>,
     pub metas: std::collections::HashMap<String, PresentationMeta>,
     pub rendered: std::collections::HashMap<(String, String), RenderedSlide>,
+    pub exports: std::collections::HashMap<String, Vec<u8>>,
+    pub single_slide_exports: std::collections::HashMap<(String, String), Vec<u8>>,
 }
 
 impl FixtureGoogleSlidesClient {
@@ -134,6 +149,22 @@ impl FixtureGoogleSlidesClient {
     pub fn with_rendered(mut self, pres_id: &str, slide_id: &str, rendered: RenderedSlide) -> Self {
         self.rendered
             .insert((pres_id.to_string(), slide_id.to_string()), rendered);
+        self
+    }
+
+    pub fn with_exported_pptx(mut self, presentation_id: &str, bytes: Vec<u8>) -> Self {
+        self.exports.insert(presentation_id.to_string(), bytes);
+        self
+    }
+
+    pub fn with_exported_single_slide_pptx(
+        mut self,
+        presentation_id: &str,
+        slide_object_id: &str,
+        bytes: Vec<u8>,
+    ) -> Self {
+        self.single_slide_exports
+            .insert((presentation_id.to_string(), slide_object_id.to_string()), bytes);
         self
     }
 }
@@ -183,5 +214,35 @@ impl GoogleSlidesClient for FixtureGoogleSlidesClient {
                 "rendered slide {presentation_id}/{slide_object_id} not found"
             ))
         })
+    }
+
+    fn download_bytes(&self, url: &str) -> Result<Vec<u8>, AdapterError> {
+        self.rendered
+            .values()
+            .find(|rendered| rendered.content_url.as_deref() == Some(url))
+            .map(|rendered| rendered.data.clone())
+            .ok_or_else(|| AdapterError::Other(format!("download url {url} not found")))
+    }
+
+    fn export_presentation_pptx(&self, presentation_id: &str) -> Result<Vec<u8>, AdapterError> {
+        self.exports
+            .get(presentation_id)
+            .cloned()
+            .ok_or_else(|| AdapterError::Other(format!("pptx export for {presentation_id} not found")))
+    }
+
+    fn export_single_slide_pptx(
+        &self,
+        presentation_id: &str,
+        slide_object_id: &str,
+    ) -> Result<Vec<u8>, AdapterError> {
+        self.single_slide_exports
+            .get(&(presentation_id.to_string(), slide_object_id.to_string()))
+            .cloned()
+            .ok_or_else(|| {
+                AdapterError::Other(format!(
+                    "single-slide pptx export for {presentation_id}/{slide_object_id} not found"
+                ))
+            })
     }
 }

@@ -1210,6 +1210,87 @@ dependencies = [
 ]
 
 [[package]]
+name = "lethe-adapter-gslides"
+version = "0.1.0"
+dependencies = [
+ "lethe-core",
+]
+
+[[package]]
+name = "lethe-adapter-slack"
+version = "0.1.0"
+dependencies = [
+ "lethe-core",
+]
+
+[[package]]
+name = "lethe-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "lethe-policy"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "lethe-core",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "lethe-projection-person"
+version = "0.1.0"
+dependencies = [
+ "lethe",
+ "lethe-core",
+]
+
+[[package]]
+name = "lethe-runtime"
+version = "0.1.0"
+dependencies = [
+ "lethe-core",
+ "tokio",
+]
+
+[[package]]
+name = "lethe-selfhost"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "lethe-core",
+ "lethe-policy",
+ "lethe-runtime",
+ "lethe-storage-api",
+ "lethe-storage-sqlite",
+ "tokio",
+]
+
+[[package]]
+name = "lethe-storage-api"
+version = "0.1.0"
+dependencies = [
+ "lethe-core",
+ "serde_json",
+]
+
+[[package]]
+name = "lethe-storage-sqlite"
+version = "0.1.0"
+dependencies = [
+ "lethe-storage-api",
+ "rusqlite",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.183"
 source = "registry+https://github.com/rust-lang/crates.io-index"

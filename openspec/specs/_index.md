@@ -30,6 +30,8 @@
 | M13 | Person Page | [person-page.md](person-page.md) | 個人ページ Projection & API (MVP) | ✓ |
 | M14 | API Serving | [api-serving.md](api-serving.md) | API layer / read modes / serving | ✓ |
 | M15 | Runtime | [runtime.md](runtime.md) | Topology / sandbox / reference stack | ✓(min) |
+| M16 | Platform Generalization | [platform-generalization.md](platform-generalization.md) | ドメイン分離 / plugin / storage port | — |
+| M17 | Platform Robustness | [platform-robustness.md](platform-robustness.md) | authn / 冪等 / 失敗隔離 / 運用品質 | — |
 
 ---
 
@@ -59,7 +61,11 @@ M01 Domain Kernel ────────────────────�
   │                                                                 
   ├──► M08 Governance (cross-cutting)                              
   │                                                                 
-  └──► M15 Runtime (cross-cutting)                                 
+  ├──► M15 Runtime (cross-cutting)                                 
+  │                                                                 
+  ├──► M16 Platform Generalization (cross-cutting; depends on M01/M02/M09)
+  │                                                                 
+  └──► M17 Platform Robustness (cross-cutting; depends on M03/M08/M14/M15)
 ```
 
 ### 依存関係の読み方
@@ -167,6 +173,8 @@ M15 Runtime
 13. M08 Governance (engine)  ← internal-only + audit
 14. M15 Runtime (min)        ← local sandbox
 15. M07 Write-Back           ← post-MVP / contract freeze 後
+16. M16 Platform Generalization ← domain vocabulary / storage port / adapter contract
+17. M17 Platform Robustness     ← authn / resumable sync / audit / resource limits
 ```
 
 ---

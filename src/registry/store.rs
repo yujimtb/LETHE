@@ -99,6 +99,11 @@ impl RegistryStore {
         version: SemVer,
         payload_schema: serde_json::Value,
     ) -> Result<(), DomainError> {
+        let current = self
+            .schemas
+            .get(&id.0)
+            .ok_or_else(|| DomainError::NotFound(format!("Schema {} not found", id)))?;
+        validate_schema_compatibility(&current.version, &current.payload_schema, &version, &payload_schema)?;
         if !self.schemas.contains_key(&id.0) {
             return Err(DomainError::NotFound(format!("Schema {} not found", id)));
         }
@@ -224,6 +229,65 @@ impl RegistryStore {
     }
 }
 
+fn validate_schema_compatibility(
+    current_version: &SemVer,
+    current_schema: &serde_json::Value,
+    next_version: &SemVer,
+    next_schema: &serde_json::Value,
+) -> Result<(), DomainError> {
+    let Some((current_major, _, _)) = parse_semver(current_version.as_str()) else {
+        return Err(DomainError::Validation(format!(
+            "Current schema version {} is not SemVer",
+            current_version
+        )));
+    };
+    let Some((next_major, _, _)) = parse_semver(next_version.as_str()) else {
+        return Err(DomainError::Validation(format!(
+            "Next schema version {} is not SemVer",
+            next_version
+        )));
+    };
+    if next_major > current_major {
+        return Ok(());
+    }
+
+    let current_required = required_fields(current_schema);
+    let next_required = required_fields(next_schema);
+    let added = next_required
+        .difference(&current_required)
+        .cloned()
+        .collect::<Vec<_>>();
+    if added.is_empty() {
+        Ok(())
+    } else {
+        Err(DomainError::Validation(format!(
+            "Schema {} adds required fields {:?} without a major version bump",
+            next_version, added
+        )))
+    }
+}
+
+fn parse_semver(raw: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = raw.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+fn required_fields(schema: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    schema
+        .get("required")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+        .collect()
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -332,6 +396,39 @@ mod tests {
 
         let versions = store.get_schema_versions(&SchemaRef::new("schema:slack-message"));
         assert_eq!(versions.len(), 2);
+    }
+
+    #[test]
+    fn schema_minor_version_rejects_new_required_field() {
+        let mut store = RegistryStore::new();
+        let schema = ObservationSchema {
+            id: SchemaRef::new("schema:room-entry"),
+            name: "Room Entry".into(),
+            version: SemVer::new("1.0.0"),
+            subject_type: EntityTypeRef::new("et:message"),
+            target_type: None,
+            payload_schema: serde_json::json!({
+                "type": "object",
+                "required": ["id"]
+            }),
+            source_contracts: vec![],
+            attachment_config: None,
+            registered_by: None,
+            registered_at: None,
+        };
+        store.register_schema(schema).unwrap();
+
+        let err = store
+            .add_schema_version(
+                &SchemaRef::new("schema:room-entry"),
+                SemVer::new("1.1.0"),
+                serde_json::json!({
+                    "type": "object",
+                    "required": ["id", "room"]
+                }),
+            )
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
     }
 
     // -- Observer -----------------------------------------------------------

@@ -7,9 +7,11 @@
 //! Ported from skcollege_dictionary pipeline (Main.js + AIService.js).
 
 pub mod gemini;
+pub mod provider;
 pub mod projector;
 pub mod types;
 
 pub use gemini::GeminiSlideAnalyzer;
+pub use provider::{DerivationLineage, DerivationProvider, DerivedStudentProfile};
 pub use projector::SlideAnalysisProjector;
 pub use types::*;

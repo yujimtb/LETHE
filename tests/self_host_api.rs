@@ -7,7 +7,9 @@ use lethe::domain::{
     SemVer, SourceSystemRef,
 };
 use lethe::self_host::app::AppService;
-use lethe::self_host::config::{GoogleConfig, SelfHostConfig, SlackConfig};
+use lethe::self_host::config::{
+    ApiTokenConfig, GoogleConfig, ResourceLimits, SecretString, SelfHostConfig, SlackConfig,
+};
 use lethe::self_host::persistence::SqlitePersistence;
 use lethe::self_host::server::build_router;
 use tower::util::ServiceExt;
@@ -87,6 +89,17 @@ fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
         database_path: db,
         blob_dir: blobs,
         poll_interval: std::time::Duration::from_secs(300),
+        api_tokens: vec![ApiTokenConfig {
+            token: SecretString::new("test-api-token").unwrap(),
+            scopes: vec!["projection:read".into(), "blob:read".into()],
+        }],
+        resource_limits: ResourceLimits {
+            max_blob_bytes: 10 * 1024 * 1024,
+            max_payload_bytes: 1024 * 1024,
+            max_sync_items: 10_000,
+            max_page_size: 100,
+        },
+        sources: vec![],
         slack: SlackConfig {
             bot_token: "xoxb-test-token".into(),
             thread_token: None,
@@ -136,6 +149,7 @@ fn self_host_persons_endpoint_returns_projection_data() {
             app.oneshot(
                 Request::builder()
                     .uri("/api/persons")
+                    .header("authorization", "Bearer test-api-token")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -175,6 +189,7 @@ fn public_blob_endpoint_serves_persisted_blob_bytes() {
             app.oneshot(
                 Request::builder()
                     .uri(format!("/public/blobs/{blob_hash}"))
+                    .header("authorization", "Bearer test-api-token")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -227,6 +242,7 @@ fn self_host_person_detail_hides_restricted_identities() {
                 .oneshot(
                     Request::builder()
                         .uri("/api/persons")
+                        .header("authorization", "Bearer test-api-token")
                         .body(Body::empty())
                         .unwrap(),
                 )
@@ -244,6 +260,7 @@ fn self_host_person_detail_hides_restricted_identities() {
             app.oneshot(
                 Request::builder()
                     .uri(format!("/api/persons/{person_id}"))
+                    .header("authorization", "Bearer test-api-token")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -261,5 +278,27 @@ fn self_host_person_detail_hides_restricted_identities() {
     assert!(detail_json["data"].get("identities").is_none());
     assert_eq!(detail_json["data"]["related_slides"][0]["title"], "田中の自己紹介");
 
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn api_rejects_unauthenticated_projection_access() {
+    let (root, db, blobs) = temp_paths();
+    let app = build_router(AppService::bootstrap(test_config(db, blobs)).unwrap());
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let response = runtime
+        .block_on(async {
+            app.oneshot(
+                Request::builder()
+                    .uri("/api/projections/proj:person-page/records")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        })
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     let _ = std::fs::remove_dir_all(root);
 }
