@@ -42,7 +42,7 @@ use crate::projection::catalog::ProjectionCatalog;
 use crate::projection::runner::Projector;
 use crate::self_host::config::SelfHostConfig;
 use crate::self_host::google::HttpGoogleSlidesClient;
-use crate::self_host::persistence::{PersistenceError, SqlitePersistence};
+use crate::self_host::persistence::{DurableAppendOutcome, PersistenceError, SqlitePersistence};
 use crate::self_host::registry::{seed_projection_catalog, seed_registry};
 use crate::self_host::slack::HttpSlackClient;
 use crate::slide_analysis::GeminiSlideAnalyzer;
@@ -250,7 +250,7 @@ impl AppCore {
             .set_status(&ProjectionRef::new("proj:person-page"), ProjectionStatus::Active);
     }
 
-    fn ingest(&mut self, draft: ObservationDraft) -> IngestResult {
+    fn prepare_observation(&mut self, draft: ObservationDraft) -> Result<Observation, IngestResult> {
         let request = IngestRequest {
             schema: draft.schema,
             schema_version: draft.schema_version,
@@ -267,12 +267,12 @@ impl AppCore {
             meta: draft.meta,
         };
 
-        let mut gate = IngestionGate {
+        let gate = IngestionGate {
             registry: &self.registry,
             lake: &mut self.lake,
             blobs: &self.blobs,
         };
-        gate.ingest(request)
+        gate.prepare_observation(request)
     }
 
     /// Upsert a supplemental record using this core's lake for validation.
@@ -945,22 +945,28 @@ impl AppService {
 
             for result in &analysis_results {
                 let draft = crate::slide_analysis::SlideAnalysisProjector::create_analysis_observation(result);
-                match core.ingest(draft) {
-                    IngestResult::Ingested { id, .. } => {
-                        let observation = core.lake.get(&id).cloned().ok_or_else(|| {
-                            SelfHostError::Ingestion(format!(
-                                "observation {id} missing after append"
-                            ))
-                        })?;
-                        self.persistence_lock()?.persist_observation(&observation)?;
-                    }
-                    IngestResult::Rejected { message, .. } => {
+                let observation = match core.prepare_observation(draft) {
+                    Ok(observation) => observation,
+                    Err(IngestResult::Rejected { message, .. }) => {
                         return Err(SelfHostError::Ingestion(message));
                     }
-                    IngestResult::Quarantined { ticket } => {
+                    Err(IngestResult::Quarantined { ticket }) => {
                         return Err(SelfHostError::Ingestion(ticket.reason));
                     }
-                    IngestResult::Duplicate { .. } => {}
+                    Err(result) => {
+                        if let IngestResult::Duplicate { .. } = result {
+                            continue;
+                        }
+                        return Err(SelfHostError::Ingestion(
+                            "unexpected non-terminal ingestion result during slide analysis"
+                                .to_owned(),
+                        ));
+                    }
+                };
+                if let IngestResult::Ingested { .. } =
+                    self.append_prepared_observation(&mut core, observation)?
+                {
+                    // Count is derived from analysis_results; no per-row action needed here.
                 }
             }
         }
@@ -1276,25 +1282,64 @@ impl AppService {
 
     fn ingest_draft(&self, draft: ObservationDraft) -> Result<IngestResult, SelfHostError> {
         let mut core = self.core_lock()?;
-        let result = core.ingest(draft);
-
-        if let IngestResult::Ingested { id, .. } = &result {
-            let observation = core
-                .lake
-                .get(id)
-                .cloned()
-                .ok_or_else(|| SelfHostError::Ingestion(format!("observation {id} missing after append")))?;
-            if let Err(err) = self.persistence_lock()?.persist_observation(&observation) {
-                core.lake.rollback_last_append(id);
-                return Err(SelfHostError::Persistence(err));
+        let observation = match core.prepare_observation(draft) {
+            Ok(observation) => observation,
+            Err(IngestResult::Rejected { message, .. }) => {
+                return Err(SelfHostError::Ingestion(message));
             }
-        }
+            Err(IngestResult::Quarantined { ticket }) => {
+                return Err(SelfHostError::Ingestion(ticket.reason));
+            }
+            Err(result) => return Ok(result),
+        };
+
+        let result = self.append_prepared_observation(&mut core, observation)?;
 
         match &result {
             IngestResult::Rejected { message, .. } => Err(SelfHostError::Ingestion(message.clone())),
             IngestResult::Quarantined { ticket } => Err(SelfHostError::Ingestion(ticket.reason.clone())),
             _ => Ok(result),
         }
+    }
+
+    fn append_prepared_observation(
+        &self,
+        core: &mut AppCore,
+        observation: Observation,
+    ) -> Result<IngestResult, SelfHostError> {
+        let recorded_at = observation.recorded_at;
+
+        let durable_outcome = self
+            .persistence_lock()?
+            .append_observation_idempotent(&observation)?;
+
+        let result = match durable_outcome {
+            DurableAppendOutcome::Appended(id) => {
+                match core.lake.append_idempotent(observation) {
+                    crate::lake::store::AppendOutcome::Appended(_) => {
+                        IngestResult::Ingested { id, recorded_at }
+                    }
+                    crate::lake::store::AppendOutcome::Duplicate(existing_id)
+                    | crate::lake::store::AppendOutcome::Conflict(existing_id) => {
+                        return Err(SelfHostError::Ingestion(format!(
+                            "SQLite accepted observation {id}, but cache already contains {existing_id}"
+                        )));
+                    }
+                }
+            }
+            DurableAppendOutcome::Duplicate(existing_id) => IngestResult::Duplicate { existing_id },
+            DurableAppendOutcome::CanonicalCollision(existing_id) => {
+                IngestResult::Quarantined {
+                    ticket: crate::domain::QuarantineTicket {
+                        id: uuid::Uuid::now_v7().to_string(),
+                        reason: format!(
+                            "sha256-collision: existing observation {existing_id} has different canonical_json"
+                        ),
+                    },
+                }
+            }
+        };
+        Ok(result)
     }
 
     fn store_blob(&self, data: &[u8]) -> Result<BlobRef, SelfHostError> {
@@ -3541,7 +3586,7 @@ mod tests {
     }
 
     #[test]
-    fn ingest_draft_rolls_back_lake_when_persistence_fails() {
+    fn ingest_draft_duplicate_is_decided_by_persistence_without_cache_append() {
         let root = std::env::temp_dir().join(format!("lethe-self-host-test-{}", uuid::Uuid::now_v7()));
         let db = root.join("lethe.sqlite3");
         let blobs = root.join("blobs");
@@ -3563,7 +3608,13 @@ mod tests {
             recorded_at: Utc::now(),
             consent: None,
             idempotency_key: Some(IdempotencyKey::new("slack:C01ABC:dup-ts")),
-            meta: serde_json::json!({}),
+            meta: serde_json::json!({
+                "canonical_json": serde_json::json!({
+                    "source": "slack",
+                    "object_id": "channel:C01ABC:ts:dup-ts",
+                    "body": "persisted"
+                }).to_string(),
+            }),
         };
         persistence.persist_observation(&persisted_observation).unwrap();
 
@@ -3600,11 +3651,17 @@ mod tests {
             attachments: vec![],
             published: Utc::now(),
             idempotency_key: IdempotencyKey::new("slack:C01ABC:dup-ts"),
-            meta: serde_json::json!({}),
+            meta: serde_json::json!({
+                "canonical_json": serde_json::json!({
+                    "source": "slack",
+                    "object_id": "channel:C01ABC:ts:dup-ts",
+                    "body": "persisted"
+                }).to_string(),
+            }),
         };
 
-        let err = service.ingest_draft(draft).unwrap_err();
-        assert!(matches!(err, SelfHostError::Persistence(_)));
+        let result = service.ingest_draft(draft).unwrap();
+        assert!(matches!(result, crate::domain::IngestResult::Duplicate { .. }));
         assert_eq!(service.core_lock().unwrap().lake.len(), 0);
         assert_eq!(service.persistence_lock().unwrap().load_observations().unwrap().len(), 1);
 

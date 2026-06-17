@@ -1704,6 +1704,7 @@ source-native write-back の必須条件:
 | [governance_capability_model.md](governance_capability_model.md) | consent, filtering, capability, review, retention, secrets |
 | [runtime_reference_architecture.md](runtime_reference_architecture.md) | runtime topology, sandbox, queues, build isolation, reference stack |
 | [adr_backlog.md](adr_backlog.md) | unresolved decisions, decision status, next examples to prepare |
+| [sharding_refactor.md](sharding_refactor.md) | Lake physical sharding の確定設計（identity/routing keyspec, exact index, Patricia split, failover, watermark propagation, logical→physical resolver, migration）。§11 の「keyspec をセットアップ時に確定し tree は leaf 1個で動かす」を sharding 全体へ展開した正典 |
 
 本文から見て未確定な論点は、原則として `adr_backlog.md` に昇格させる。  
 `design_questions.md` は raw な検討履歴として保持し、ADR 候補を育てるためのワークシートとして扱う。

@@ -54,42 +54,63 @@ pub struct IngestionGate<'a> {
 impl IngestionGate<'_> {
     /// Run the full ingestion pipeline (steps 1–9 from the spec).
     pub fn ingest(&mut self, req: IngestRequest) -> IngestResult {
+        let obs = match self.prepare_observation(req) {
+            Ok(obs) => obs,
+            Err(result) => return result,
+        };
+        let recorded_at = obs.recorded_at;
+
+        match self.lake.append_idempotent(obs) {
+            AppendOutcome::Appended(id) => IngestResult::Ingested { id, recorded_at },
+            AppendOutcome::Duplicate(existing_id) => IngestResult::Duplicate { existing_id },
+            AppendOutcome::Conflict(existing_id) => IngestResult::Quarantined {
+                ticket: QuarantineTicket {
+                    id: uuid::Uuid::now_v7().to_string(),
+                    reason: format!(
+                        "idempotency conflict: existing observation {existing_id} has different payload"
+                    ),
+                },
+            },
+        }
+    }
+
+    pub fn prepare_observation(&self, req: IngestRequest) -> Result<Observation, IngestResult> {
         let recorded_at = Utc::now();
 
         // Step 1: Authenticate observer (must be registered).
         let Some(observer) = self.registry.get_observer(&req.observer) else {
-            return IngestResult::Rejected {
+            return Err(IngestResult::Rejected {
                 class: crate::domain::FailureClass::ValidationFailure,
                 message: format!("Observer {} not registered", req.observer),
-            };
+            });
         };
 
         // Step 2: Resolve source contract — verify schema exists.
         let Some(schema) = self.registry.get_schema(&req.schema) else {
-            return IngestResult::Rejected {
+            return Err(IngestResult::Rejected {
                 class: crate::domain::FailureClass::ValidationFailure,
                 message: format!("Schema {} not registered", req.schema),
-            };
+            });
         };
 
         let Some(source_system) = req.source_system.as_ref() else {
-            return IngestResult::Rejected {
+            return Err(IngestResult::Rejected {
                 class: crate::domain::FailureClass::ValidationFailure,
                 message: format!(
                     "Observer {} requires source system {}",
                     observer.id, observer.source_system
                 ),
-            };
+            });
         };
 
         if *source_system != observer.source_system {
-            return IngestResult::Rejected {
+            return Err(IngestResult::Rejected {
                 class: crate::domain::FailureClass::ValidationFailure,
                 message: format!(
                     "Observer {} is bound to source system {}, not {}",
                     observer.id, observer.source_system, source_system
                 ),
-            };
+            });
         }
 
         let observer_allows_schema = observer.schemas.is_empty()
@@ -98,10 +119,10 @@ impl IngestionGate<'_> {
                 .iter()
                 .any(|schema_ref| schema_ref.as_str() == "*" || *schema_ref == req.schema);
         if !observer_allows_schema {
-            return IngestResult::Rejected {
+            return Err(IngestResult::Rejected {
                 class: crate::domain::FailureClass::ValidationFailure,
                 message: format!("Observer {} cannot emit schema {}", observer.id, req.schema),
-            };
+            });
         }
 
         let is_heartbeat = req.schema.as_str() == "schema:observer-heartbeat";
@@ -111,13 +132,13 @@ impl IngestionGate<'_> {
             observer.authority_model
         };
         if req.authority_model != expected_authority {
-            return IngestResult::Rejected {
+            return Err(IngestResult::Rejected {
                 class: crate::domain::FailureClass::ValidationFailure,
                 message: format!(
                     "Observer {} must use authority model {:?}, not {:?}",
                     observer.id, expected_authority, req.authority_model
                 ),
-            };
+            });
         }
 
         let expected_capture = if is_heartbeat {
@@ -126,13 +147,13 @@ impl IngestionGate<'_> {
             observer.capture_model
         };
         if req.capture_model != expected_capture {
-            return IngestResult::Rejected {
+            return Err(IngestResult::Rejected {
                 class: crate::domain::FailureClass::ValidationFailure,
                 message: format!(
                     "Observer {} must use capture model {:?}, not {:?}",
                     observer.id, expected_capture, req.capture_model
                 ),
-            };
+            });
         }
 
         if !schema.source_contracts.is_empty()
@@ -141,21 +162,21 @@ impl IngestionGate<'_> {
                 .iter()
                 .any(|contract| contract.observer_id == observer.id)
         {
-            return IngestResult::Rejected {
+            return Err(IngestResult::Rejected {
                 class: crate::domain::FailureClass::ValidationFailure,
                 message: format!(
                     "Schema {} does not allow observer {}",
                     req.schema, observer.id
                 ),
-            };
+            });
         }
 
         // Step 3: Validate payload (JSON Schema).
         if let Err(message) = validate_payload(&schema.payload_schema, &req.payload) {
-            return IngestResult::Rejected {
+            return Err(IngestResult::Rejected {
                 class: crate::domain::FailureClass::ValidationFailure,
                 message,
-            };
+            });
         }
 
         // Step 4: Governance policy before append.
@@ -171,12 +192,12 @@ impl IngestionGate<'_> {
             environment: Environment::Production,
         });
         if let PolicyOutcome::Deny { reason } = policy {
-            return IngestResult::Quarantined {
+            return Err(IngestResult::Quarantined {
                 ticket: QuarantineTicket {
                     id: uuid::Uuid::now_v7().to_string(),
                     reason: format!("policy denied: {}: {}", reason.code, reason.message),
                 },
-            };
+            });
         }
 
         // Step 5: Idempotency check is handled by LakeStore.append().
@@ -184,16 +205,16 @@ impl IngestionGate<'_> {
         // Step 6: Verify blob refs exist (if any).
         for br in &req.attachments {
             if !self.blobs.contains(br) {
-                return IngestResult::Rejected {
+                return Err(IngestResult::Rejected {
                     class: crate::domain::FailureClass::ValidationFailure,
                     message: format!("Blob {} not found in blob store", br),
-                };
+                });
             }
         }
 
         // Step 7 & 8: Temporal validation (L11).
         if req.published > recorded_at + MAX_CLOCK_SKEW {
-            return IngestResult::Quarantined {
+            return Err(IngestResult::Quarantined {
                 ticket: QuarantineTicket {
                     id: uuid::Uuid::now_v7().to_string(),
                     reason: format!(
@@ -201,7 +222,7 @@ impl IngestionGate<'_> {
                         req.published, recorded_at
                     ),
                 },
-            };
+            });
         }
 
         // Step 9: Build Observation and append.
@@ -225,18 +246,7 @@ impl IngestionGate<'_> {
             meta: req.meta,
         };
 
-        match self.lake.append_idempotent(obs) {
-            AppendOutcome::Appended(id) => IngestResult::Ingested { id, recorded_at },
-            AppendOutcome::Duplicate(existing_id) => IngestResult::Duplicate { existing_id },
-            AppendOutcome::Conflict(existing_id) => IngestResult::Quarantined {
-                ticket: QuarantineTicket {
-                    id: uuid::Uuid::now_v7().to_string(),
-                    reason: format!(
-                        "idempotency conflict: existing observation {existing_id} has different payload"
-                    ),
-                },
-            },
-        }
+        Ok(obs)
     }
 }
 

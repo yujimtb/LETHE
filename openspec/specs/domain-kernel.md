@@ -138,7 +138,7 @@ Observation =
   , published       : Timestamp           -- event time (offset 付き ISO 8601)
   , recordedAt      : Timestamp           -- system ingestion time (UTC)
   , consent         : ConsentRef?
-  , idempotencyKey  : IdempotencyKey?
+  , idempotencyKey  : IdempotencyKey
   , meta            : Json
   }
 ```
@@ -261,7 +261,7 @@ PolicyResult
 | L5 | **No Direct Mutation Law** | Projection materialization を正史として更新しない | append-only 違反 |
 | L6 | **Filtering-before-Exposure Law** | restricted data は表示・配布前に filtering projection を通す | PolicyFailure |
 | L7 | **Provenance Completeness Law** | 出力・書き込み・承認・削除理由は辿れる | 監査不能 |
-| L8 | **Idempotency Law** | 同一 idempotency key の再送は二重化しない | data duplication |
+| L8 | **Idempotency Law** | 同一 identity key の再送は per-leaf exact index で完全(決定的)に二重化しない。silent drop と確率的判定は禁止 | data duplication / silent loss |
 | L9 | **Put-Then-Get Law** | 受理された write は再投影後の view に反映される | consistency 違反 |
 | L10 | **Deterministic Interpretation Law** | academic-pinned の解釈は spec と入力で決まる | DeterminismFailure |
 | L11 | **Temporal Ordering Law** | `published` は `recordedAt + MAX_CLOCK_SKEW` を超えて未来に出ない | ValidationFailure / QuarantineFailure |
@@ -279,7 +279,7 @@ Reviewer が各モジュール実装を検証する際の観点:
 | L5 | Projection table への直接 INSERT/UPDATE がないこと |
 | L6 | restricted data の exposure 前に filter 呼び出しがあること |
 | L7 | audit event が write / approve / export で発行されること |
-| L8 | idempotencyKey での duplicate check があること |
+| L8 | `identity_key` NOT NULL UNIQUE を正規判定とし、衝突時は stored `canonical_json` のみを比較すること |
 | L9 | write → rebuild → read の integration test があること |
 | L10 | academic-pinned build がシード固定・外部非依存であること |
 | L11 | `published <= recordedAt + MAX_CLOCK_SKEW` を gate で検証すること |

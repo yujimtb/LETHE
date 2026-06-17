@@ -146,7 +146,7 @@ Observation =
   , published: Timestamp
   , recordedAt: Timestamp
   , consent: ConsentRef?
-  , idempotencyKey: IdempotencyKey?
+  , idempotencyKey: IdempotencyKey
   , meta: Json
   }
 ```
@@ -556,7 +556,8 @@ deriveDualReferencePlan(command, context) =
    出力、書き込み、承認、削除理由は辿れる。
 
 6. **Idempotency Law**  
-   同一 idempotency key の再送は結果を二重化しない。
+   同一 idempotency key の再送は結果を二重化しない。  
+   sharding 下では per-leaf exact index による**完全（決定的）冪等**に強化する（確率版は撤回）。idempotencyKey は per-message の `source:object_id:H(canonical_content)` で必須・解決可能。詳細は [sharding_refactor.md](sharding_refactor.md)。
 
 7. **No Direct Mutation Law**  
    Projection materialization を正史として更新しない。

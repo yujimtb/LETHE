@@ -5,6 +5,8 @@
 この文書は、LETHE をどのような runtime topology で動かすと実装しやすいかを示す **reference implementation** です。  
 ここでいう runtime は交換可能であり、守るべき本質は `plan.md` と `domain_algebra.md` の意味論と law です。
 
+Lake を物理分割（sharding）する場合の routing layer・partition rule log・exact index / failover spool の運用・logical→physical resolver・per-leaf watermark propagation の確定設計は [sharding_refactor.md](sharding_refactor.md) を参照してください。
+
 ---
 
 ## 1. Design Principles
@@ -105,6 +107,10 @@
 - cold storage export
 - schema/version aware partitioning
 - replay 可能な ordering metadata
+
+現行 Rust self-host 実装では、SQLite が durable store です。起動時に `partition_log.initialize` を 1 件だけ記録し、`routing_keyspec` / `identity_keyspec` の完全形を pin します。`partition_log` は append-only で、UPDATE / DELETE は DB trigger で拒否します。
+
+`observations` table は `append_seq INTEGER PRIMARY KEY AUTOINCREMENT` を leaf-local cursor とし、`identity_key TEXT NOT NULL UNIQUE` と `canonical_json TEXT NOT NULL` を持ちます。self-host の通常 ingest は SQLite INSERT を先に行い、成功した行だけを in-memory Lake cache に反映します。`identity_key` UNIQUE 違反時は stored `canonical_json` と incoming `canonical_json` の exact compare で `Duplicate(existing_id)` / collision quarantine を分けます。
 
 Lake は user-facing query 面ではなく、**capture and replay substrate** として設計します。
 

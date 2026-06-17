@@ -47,7 +47,13 @@ fn slack_observation(user_id: &str, email: &str, name: &str, text: &str, channel
         recorded_at: chrono::Utc::now(),
         consent: None,
         idempotency_key: Some(IdempotencyKey::new(key)),
-        meta: serde_json::json!({}),
+        meta: serde_json::json!({
+            "canonical_json": serde_json::json!({
+                "source": "slack",
+                "object_id": key,
+                "body": text,
+            }).to_string(),
+        }),
     }
 }
 
@@ -78,7 +84,13 @@ fn gslides_observation(editors: &[&str], owner: &str, title: &str, key: &str) ->
         recorded_at: chrono::Utc::now(),
         consent: None,
         idempotency_key: Some(IdempotencyKey::new(format!("gslides-{key}"))),
-        meta: serde_json::json!({}),
+        meta: serde_json::json!({
+            "canonical_json": serde_json::json!({
+                "source": "google-slides",
+                "object_id": key,
+                "title": title,
+            }).to_string(),
+        }),
     }
 }
 

@@ -209,6 +209,14 @@
 - **User signal:** filtering projection での除外がクリーン。
 - **Next decision:** governance_capability_model.md §7.4 と supplemental-store.md に反映済み。merge 後は filtering query 実装へ進む。
 
+## ADR-023 Lake Physical Sharding
+
+- **Status:** Locked（[sharding_refactor.md](sharding_refactor.md) に D0–D12 を確定済み）
+- **Why it matters:** 単一インスタンスの容量・負荷限界を超えて Lake を物理分割するにあたり、dedup・routing・replay・冪等性を壊さない機構を決める中核論点。
+- **Current direction:** identity/routing keyspec の initialize-time pin、per-leaf exact index（SQLite UNIQUE）による完全冪等、Patricia trie + lazy split、AP + failover spool/reconcile、per-(projection×leaf) watermark propagation、logical→physical resolver、idempotent re-ingest を唯一の migration primitive とする blue/green keyspec 変更。詳細と根拠・コード接地点は [sharding_refactor.md](sharding_refactor.md)。
+- **Supersedes（draft 上書き）:** SimHash routing 不採用、確率的冪等性（Bloom ε）撤回→exact、固定ビット trie→Patricia+split bit、idempotencyKey 粒度を per-message に修正。
+- **Next decision:** §3 の実装フェーズ順に従って着手。
+
 ---
 
 ## Relationship to Other Documents

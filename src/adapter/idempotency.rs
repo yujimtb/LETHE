@@ -3,6 +3,24 @@
 //! Same source data → same key. Keys are isolated per adapter.
 
 use crate::domain::IdempotencyKey;
+use sha2::Digest;
+use unicode_normalization::UnicodeNormalization;
+
+pub const CANONICAL_JSON_META_KEY: &str = "canonical_json";
+pub const OBJECT_ID_META_KEY: &str = "object_id";
+
+pub fn identity_key(source: &str, object_id: &str, canonical_json: &str) -> IdempotencyKey {
+    let hash = hex::encode(sha2::Sha256::digest(canonical_json.as_bytes()));
+    IdempotencyKey::new(format!("{source}:{object_id}:{hash}"))
+}
+
+pub fn canonical_json(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).expect("canonical tuple must serialize")
+}
+
+pub fn normalize_canonical_body(body: &str) -> String {
+    body.replace("\r\n", "\n").nfc().collect()
+}
 
 /// Slack idempotency key patterns (M10).
 pub fn slack_message_key(channel_id: &str, ts: &str) -> IdempotencyKey {
@@ -101,5 +119,23 @@ mod tests {
         let slack = slack_message_key("C01", "123");
         let gslides = gslides_revision_key("C01", "123");
         assert_ne!(slack, gslides);
+    }
+
+    #[test]
+    fn identity_key_hashes_canonical_json() {
+        let canonical = canonical_json(&serde_json::json!({
+            "body": "hello",
+            "event_time": "2026-05-01T00:00:00Z",
+        }));
+        let key = identity_key("slack", "channel:C01:ts:1", &canonical);
+
+        assert!(key.as_str().starts_with("slack:channel:C01:ts:1:"));
+        assert_eq!(key.as_str().rsplit(':').next().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn canonical_body_normalizes_transport_noise_only() {
+        assert_eq!(normalize_canonical_body("a\r\nb"), "a\nb");
+        assert_eq!(normalize_canonical_body("a  b"), "a  b");
     }
 }
