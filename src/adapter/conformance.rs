@@ -1,4 +1,5 @@
-use crate::adapter::traits::{Cursor, RawData, SourceAdapter};
+use crate::adapter::idempotency::CANONICAL_JSON_META_KEY;
+use crate::adapter::traits::{Cursor, ObservationDraft, RawData, SourceAdapter};
 
 pub fn source_adapter_contract<A: SourceAdapter>(
     adapter: &A,
@@ -23,4 +24,26 @@ pub fn source_adapter_contract<A: SourceAdapter>(
         }
         crate::adapter::traits::FetchResult::Error(_) => {}
     }
+}
+
+pub fn canonical_identity_stable_under_side_state_change(
+    before: &ObservationDraft,
+    after: &ObservationDraft,
+) {
+    assert_eq!(before.idempotency_key, after.idempotency_key);
+    assert_eq!(
+        before.meta.get(CANONICAL_JSON_META_KEY),
+        after.meta.get(CANONICAL_JSON_META_KEY)
+    );
+}
+
+pub fn canonical_identity_changes_on_content_change(
+    before: &ObservationDraft,
+    after: &ObservationDraft,
+) {
+    assert_ne!(before.idempotency_key, after.idempotency_key);
+    assert_ne!(
+        before.meta.get(CANONICAL_JSON_META_KEY),
+        after.meta.get(CANONICAL_JSON_META_KEY)
+    );
 }

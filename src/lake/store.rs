@@ -1,6 +1,6 @@
 //! M03 Observation Lake — Append-only observation store
 //!
-//! MVP: in-memory Vec with hash-based dedup index.
+//! Non-authoritative in-memory cache for appended observations.
 
 use std::collections::HashMap;
 
@@ -8,6 +8,8 @@ use crate::domain::{
     EntityRef, Observation, ObservationId, ObserverRef, SchemaRef,
 };
 use crate::storage_api::ObservationStore;
+
+const CANONICAL_JSON_META_KEY: &str = "canonical_json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppendOutcome {
@@ -25,11 +27,11 @@ pub struct Watermark {
     pub position: usize,
 }
 
-/// In-memory append-only observation store.
+/// In-memory append-only observation cache.
 #[derive(Debug, Default)]
 pub struct LakeStore {
     observations: Vec<Observation>,
-    /// idempotencyKey → index in `observations`
+    /// identity_key → index in `observations`
     dedup_index: HashMap<String, usize>,
 }
 
@@ -38,9 +40,8 @@ impl LakeStore {
         Self::default()
     }
 
-    /// Append an observation. Returns `Err(existing_id)` if the idempotency key
-    /// was already seen. Use `append_idempotent` when duplicate vs conflict
-    /// must be distinguished.
+    /// Append an observation. Returns `Err(existing_id)` if the identity key
+    /// was already seen.
     pub fn append(&mut self, obs: Observation) -> Result<ObservationId, ObservationId> {
         match self.append_idempotent(obs) {
             AppendOutcome::Appended(id) => Ok(id),
@@ -51,40 +52,20 @@ impl LakeStore {
     }
 
     pub fn append_idempotent(&mut self, obs: Observation) -> AppendOutcome {
-        if let Some(key) = &obs.idempotency_key {
-            if let Some(&idx) = self.dedup_index.get(&key.0) {
-                let existing = &self.observations[idx];
-                return if same_idempotent_observation(existing, &obs) {
-                    AppendOutcome::Duplicate(existing.id.clone())
-                } else {
-                    AppendOutcome::Conflict(existing.id.clone())
-                };
-            }
+        let key = &obs.idempotency_key;
+        if let Some(&idx) = self.dedup_index.get(&key.0) {
+            let existing = &self.observations[idx];
+            return if same_canonical_json(existing, &obs) {
+                AppendOutcome::Duplicate(existing.id.clone())
+            } else {
+                AppendOutcome::Conflict(existing.id.clone())
+            };
         }
         let id = obs.id.clone();
         let idx = self.observations.len();
-        if let Some(key) = &obs.idempotency_key {
-            self.dedup_index.insert(key.0.clone(), idx);
-        }
+        self.dedup_index.insert(key.0.clone(), idx);
         self.observations.push(obs);
         AppendOutcome::Appended(id)
-    }
-
-    /// Roll back the most recent append if it matches the provided id.
-    ///
-    /// This is only intended for failure paths where an append has not yet been
-    /// durably committed outside the process.
-    pub fn rollback_last_append(&mut self, id: &ObservationId) -> Option<Observation> {
-        let last = self.observations.last()?;
-        if last.id != *id {
-            return None;
-        }
-
-        let observation = self.observations.pop()?;
-        if let Some(key) = &observation.idempotency_key {
-            self.dedup_index.remove(key.as_str());
-        }
-        Some(observation)
     }
 
     /// Get a single observation by id.
@@ -148,19 +129,16 @@ impl ObservationStore for LakeStore {
     }
 }
 
-fn same_idempotent_observation(left: &Observation, right: &Observation) -> bool {
-    left.schema == right.schema
-        && left.schema_version == right.schema_version
-        && left.observer == right.observer
-        && left.source_system == right.source_system
-        && left.authority_model == right.authority_model
-        && left.capture_model == right.capture_model
-        && left.subject == right.subject
-        && left.target == right.target
-        && left.payload == right.payload
-        && left.attachments == right.attachments
-        && left.consent == right.consent
-        && left.meta == right.meta
+fn same_canonical_json(left: &Observation, right: &Observation) -> bool {
+    canonical_json(left) == canonical_json(right)
+}
+
+fn canonical_json(observation: &Observation) -> &str {
+    observation
+        .meta
+        .get(CANONICAL_JSON_META_KEY)
+        .and_then(serde_json::Value::as_str)
+        .expect("observation.meta.canonical_json is required")
 }
 
 #[cfg(test)]
@@ -170,6 +148,12 @@ mod tests {
     use chrono::Utc;
 
     fn sample_obs(key: &str) -> Observation {
+        let canonical_json = serde_json::json!({
+            "source": "test",
+            "object_id": key,
+            "body": "hello"
+        })
+        .to_string();
         Observation {
             id: Observation::new_id(),
             schema: SchemaRef::new("schema:test"),
@@ -186,8 +170,10 @@ mod tests {
             published: Utc::now(),
             recorded_at: Utc::now(),
             consent: None,
-            idempotency_key: Some(IdempotencyKey::new(key)),
-            meta: serde_json::json!({}),
+            idempotency_key: IdempotencyKey::new(key),
+            meta: serde_json::json!({
+                CANONICAL_JSON_META_KEY: canonical_json,
+            }),
         }
     }
 
@@ -213,13 +199,33 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_idempotency_key_with_different_payload_is_conflict() {
+    fn duplicate_identity_key_with_different_payload_is_duplicate_when_canonical_matches() {
         let mut lake = LakeStore::new();
         let o1 = sample_obs("dup-different");
         let mut o2 = sample_obs("dup-different");
         o2.payload = serde_json::json!({"changed": true});
         let id1 = lake.append(o1).unwrap();
         let result = lake.append_idempotent(o2);
+        assert_eq!(result, AppendOutcome::Duplicate(id1));
+        assert_eq!(lake.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_identity_key_with_different_canonical_json_is_conflict() {
+        let mut lake = LakeStore::new();
+        let o1 = sample_obs("canonical-collision");
+        let mut o2 = sample_obs("canonical-collision");
+        o2.meta = serde_json::json!({
+            CANONICAL_JSON_META_KEY: serde_json::json!({
+                "source": "test",
+                "object_id": "canonical-collision",
+                "body": "changed"
+            }).to_string(),
+        });
+
+        let id1 = lake.append(o1).unwrap();
+        let result = lake.append_idempotent(o2);
+
         assert_eq!(result, AppendOutcome::Conflict(id1));
         assert_eq!(lake.len(), 1);
     }
@@ -249,14 +255,18 @@ mod tests {
     }
 
     #[test]
-    fn rollback_last_append_removes_latest_observation() {
+    fn missing_canonical_json_panics() {
         let mut lake = LakeStore::new();
-        let obs = sample_obs("rollback");
-        let id = obs.id.clone();
+        let mut obs = sample_obs("missing-canonical");
+        obs.meta = serde_json::json!({});
         lake.append(obs).unwrap();
 
-        let rolled_back = lake.rollback_last_append(&id);
-        assert!(rolled_back.is_some());
-        assert!(lake.is_empty());
+        let mut dup = sample_obs("missing-canonical");
+        dup.meta = serde_json::json!({});
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            lake.append_idempotent(dup);
+        }));
+
+        assert!(result.is_err());
     }
 }

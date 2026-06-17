@@ -51,7 +51,7 @@ fn slack_observation(user_id: &str, email: &str, name: &str, text: &str, channel
         published: Utc::now(),
         recorded_at: Utc::now(),
         consent: None,
-        idempotency_key: Some(IdempotencyKey::new(key)),
+        idempotency_key: IdempotencyKey::new(key),
         meta: json!({}),
     }
 }
@@ -79,7 +79,7 @@ fn gslides_observation(editors: &[&str], owner: &str, title: &str, key: &str) ->
         published: Utc::now(),
         recorded_at: Utc::now(),
         consent: None,
-        idempotency_key: Some(IdempotencyKey::new(key)),
+        idempotency_key: IdempotencyKey::new(key),
         meta: json!({}),
     }
 }

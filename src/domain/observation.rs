@@ -38,8 +38,7 @@ pub struct Observation {
     pub recorded_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consent: Option<ConsentRef>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub idempotency_key: Option<IdempotencyKey>,
+    pub idempotency_key: IdempotencyKey,
     #[serde(default)]
     pub meta: serde_json::Value,
 }
@@ -73,7 +72,7 @@ mod tests {
             published: Utc::now(),
             recorded_at: Utc::now(),
             consent: None,
-            idempotency_key: Some(IdempotencyKey::new("slack:C01:123")),
+            idempotency_key: IdempotencyKey::new("slack:C01:123"),
             meta: serde_json::json!({}),
         }
     }

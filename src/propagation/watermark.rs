@@ -30,10 +30,35 @@ impl WatermarkState {
     }
 }
 
+/// Per-(projection, leaf) cursor using leaf-local append_seq.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeafWatermarkState {
+    pub projection_id: ProjectionRef,
+    pub leaf_id: String,
+    pub last_processed_append_seq: usize,
+    pub last_build_at: DateTime<Utc>,
+    pub last_build_status: BuildStatus,
+    pub pending_count: Option<usize>,
+}
+
+impl LeafWatermarkState {
+    pub fn new(projection_id: ProjectionRef, leaf_id: String) -> Self {
+        Self {
+            projection_id,
+            leaf_id,
+            last_processed_append_seq: 0,
+            last_build_at: Utc::now(),
+            last_build_status: BuildStatus::Success,
+            pending_count: None,
+        }
+    }
+}
+
 /// In-memory watermark store (M06 §3.3).
 #[derive(Debug, Default)]
 pub struct WatermarkStore {
     states: HashMap<String, WatermarkState>,
+    leaf_states: HashMap<(String, String), LeafWatermarkState>,
 }
 
 impl WatermarkStore {
@@ -95,6 +120,99 @@ impl WatermarkStore {
     pub fn all(&self) -> impl Iterator<Item = &WatermarkState> {
         self.states.values()
     }
+
+    pub fn get_leaf(
+        &self,
+        projection_id: &ProjectionRef,
+        leaf_id: &str,
+    ) -> Option<&LeafWatermarkState> {
+        self.leaf_states
+            .get(&(projection_id.as_str().to_owned(), leaf_id.to_owned()))
+    }
+
+    pub fn get_or_init_leaf(
+        &mut self,
+        projection_id: &ProjectionRef,
+        leaf_id: &str,
+    ) -> &LeafWatermarkState {
+        self.leaf_states
+            .entry((projection_id.as_str().to_owned(), leaf_id.to_owned()))
+            .or_insert_with(|| {
+                LeafWatermarkState::new(projection_id.clone(), leaf_id.to_owned())
+            })
+    }
+
+    pub fn update_leaf(
+        &mut self,
+        projection_id: &ProjectionRef,
+        leaf_id: &str,
+        append_seq: usize,
+        status: BuildStatus,
+    ) {
+        let state = self
+            .leaf_states
+            .entry((projection_id.as_str().to_owned(), leaf_id.to_owned()))
+            .or_insert_with(|| {
+                LeafWatermarkState::new(projection_id.clone(), leaf_id.to_owned())
+            });
+
+        assert!(
+            append_seq >= state.last_processed_append_seq,
+            "Leaf watermark must not decrease: {} -> {}",
+            state.last_processed_append_seq,
+            append_seq,
+        );
+
+        state.last_processed_append_seq = append_seq;
+        state.last_build_at = Utc::now();
+        state.last_build_status = status;
+        state.pending_count = None;
+    }
+
+    pub fn record_leaf_failure(&mut self, projection_id: &ProjectionRef, leaf_id: &str) {
+        if let Some(state) = self
+            .leaf_states
+            .get_mut(&(projection_id.as_str().to_owned(), leaf_id.to_owned()))
+        {
+            state.last_build_status = BuildStatus::Failed;
+            state.last_build_at = Utc::now();
+        }
+    }
+
+    pub fn update_leaf_pending(
+        &mut self,
+        projection_id: &ProjectionRef,
+        leaf_id: &str,
+        leaf_append_seq: usize,
+    ) {
+        if let Some(state) = self
+            .leaf_states
+            .get_mut(&(projection_id.as_str().to_owned(), leaf_id.to_owned()))
+        {
+            state.pending_count = Some(
+                leaf_append_seq.saturating_sub(state.last_processed_append_seq),
+            );
+        }
+    }
+
+    pub fn leaf_states_for_projection(
+        &self,
+        projection_id: &ProjectionRef,
+    ) -> Vec<&LeafWatermarkState> {
+        let mut states = self
+            .leaf_states
+            .iter()
+            .filter_map(|((projection, _), state)| {
+                if projection == projection_id.as_str() {
+                    Some(state)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        states.sort_by(|left, right| left.leaf_id.cmp(&right.leaf_id));
+        states
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -148,5 +266,53 @@ mod tests {
         store.update(&id, 5, BuildStatus::Success);
         store.update_pending(&id, 12);
         assert_eq!(store.get(&id).unwrap().pending_count, Some(7));
+    }
+
+    #[test]
+    fn leaf_watermark_tracks_append_seq_per_projection_leaf() {
+        let mut store = WatermarkStore::new();
+        let id = ProjectionRef::new("proj:test");
+
+        store.get_or_init_leaf(&id, "lake:one");
+        store.update_leaf(&id, "lake:one", 7, BuildStatus::Success);
+        store.update_leaf_pending(&id, "lake:one", 10);
+
+        let state = store.get_leaf(&id, "lake:one").unwrap();
+        assert_eq!(state.last_processed_append_seq, 7);
+        assert_eq!(state.pending_count, Some(3));
+    }
+
+    #[test]
+    #[should_panic(expected = "Leaf watermark must not decrease")]
+    fn leaf_watermark_cannot_decrease() {
+        let mut store = WatermarkStore::new();
+        let id = ProjectionRef::new("proj:test");
+        store.update_leaf(&id, "lake:one", 10, BuildStatus::Success);
+        store.update_leaf(&id, "lake:one", 9, BuildStatus::Success);
+    }
+
+    #[test]
+    fn split_baseline_replay_starts_new_child_leaf_at_zero() {
+        let mut store = WatermarkStore::new();
+        let id = ProjectionRef::new("proj:test");
+        store.update_leaf(&id, "lake:parent", 100, BuildStatus::Success);
+
+        store.get_or_init_leaf(&id, "lake:child-left");
+        store.get_or_init_leaf(&id, "lake:child-right");
+
+        assert_eq!(
+            store
+                .get_leaf(&id, "lake:child-left")
+                .unwrap()
+                .last_processed_append_seq,
+            0
+        );
+        assert_eq!(
+            store
+                .get_leaf(&id, "lake:child-right")
+                .unwrap()
+                .last_processed_append_seq,
+            0
+        );
     }
 }

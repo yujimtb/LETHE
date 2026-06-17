@@ -275,7 +275,7 @@ mod tests {
             published: Utc::now(),
             recorded_at: Utc::now(),
             consent: None,
-            idempotency_key: Some(IdempotencyKey::new("test:1")),
+            idempotency_key: IdempotencyKey::new("test:1"),
             meta: serde_json::json!({}),
         };
         let id = obs.id.clone();

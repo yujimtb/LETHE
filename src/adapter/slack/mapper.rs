@@ -56,28 +56,8 @@ impl<C: SlackClient> SlackAdapter<C> {
 
     /// Map a single Slack message to an ObservationDraft.
     pub fn map_message(&self, msg: &SlackMessage) -> ObservationDraft {
-        let object_id = format!("channel:{}:ts:{}", msg.channel_id, msg.ts);
         let published = parse_slack_ts(&msg.ts).unwrap_or_else(Utc::now);
-        let attachment_sha256 = msg
-            .files
-            .iter()
-            .filter_map(|file| file.blob_ref.as_ref())
-            .filter_map(|blob_ref| blob_ref.strip_prefix("blob:sha256:"))
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
-        let canonical_body = if msg.message_type == SlackMessageType::Delete {
-            "[deleted]"
-        } else {
-            msg.text.as_str()
-        };
-        let canonical_tuple = serde_json::json!({
-            "sender": msg.user_id,
-            "body": normalize_canonical_body(canonical_body),
-            "event_time": published.to_rfc3339_opts(SecondsFormat::Micros, true),
-            "attachment_sha256": attachment_sha256,
-        });
-        let canonical_json = canonical_json(&canonical_tuple);
-        let idem_key = identity_key("slack", &object_id, &canonical_json);
+        let identity = declare_canonical_identity("slack", self, self, msg);
 
         let subject = EntityRef::new(format!(
             "message:slack:{}-{}",
@@ -86,8 +66,8 @@ impl<C: SlackClient> SlackAdapter<C> {
 
         let mut meta = serde_json::json!({
             "sourceAdapterVersion": self.config.adapter_version.as_str(),
-            OBJECT_ID_META_KEY: object_id,
-            CANONICAL_JSON_META_KEY: canonical_json,
+            OBJECT_ID_META_KEY: identity.object_id,
+            CANONICAL_JSON_META_KEY: identity.canonical_json,
         });
 
         if msg.message_type == SlackMessageType::Delete {
@@ -149,7 +129,7 @@ impl<C: SlackClient> SlackAdapter<C> {
             payload,
             attachments,
             published,
-            idempotency_key: idem_key,
+            idempotency_key: identity.idempotency_key,
             meta,
         }
     }
@@ -201,6 +181,37 @@ impl<C: SlackClient> SlackAdapter<C> {
     /// Get the current cursor for a channel.
     pub fn get_cursor(&self, channel_id: &str) -> Option<&str> {
         self.cursors.get(channel_id).map(String::as_str)
+    }
+}
+
+impl<C: SlackClient> ObjectIdExtractor<SlackMessage> for SlackAdapter<C> {
+    fn object_id(&self, msg: &SlackMessage) -> String {
+        format!("channel:{}:ts:{}", msg.channel_id, msg.ts)
+    }
+}
+
+impl<C: SlackClient> CanonicalTupleBuilder<SlackMessage> for SlackAdapter<C> {
+    fn canonical_tuple(&self, msg: &SlackMessage) -> serde_json::Value {
+        let published = parse_slack_ts(&msg.ts).unwrap_or_else(Utc::now);
+        let attachment_sha256 = msg
+            .files
+            .iter()
+            .filter_map(|file| file.blob_ref.as_ref())
+            .filter_map(|blob_ref| blob_ref.strip_prefix("blob:sha256:"))
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let canonical_body = if msg.message_type == SlackMessageType::Delete {
+            "[deleted]"
+        } else {
+            msg.text.as_str()
+        };
+
+        serde_json::json!({
+            "sender": msg.user_id,
+            "body": normalize_canonical_body(canonical_body),
+            "event_time": published.to_rfc3339_opts(SecondsFormat::Micros, true),
+            "attachment_sha256": attachment_sha256,
+        })
     }
 }
 
@@ -455,8 +466,24 @@ mod tests {
         let d1 = adapter.map_message(&msg);
         let d2 = adapter.map_message(&with_reaction);
 
-        assert_eq!(d1.idempotency_key, d2.idempotency_key);
-        assert_eq!(d1.meta[CANONICAL_JSON_META_KEY], d2.meta[CANONICAL_JSON_META_KEY]);
+        crate::adapter::conformance::canonical_identity_stable_under_side_state_change(&d1, &d2);
+    }
+
+    #[test]
+    fn edit_wrapper_without_body_change_does_not_change_message_identity_key() {
+        let adapter = SlackAdapter::new(FixtureSlackClient::new(), test_config());
+        let msg = sample_message();
+        let mut wrapper_changed = msg.clone();
+        wrapper_changed.message_type = SlackMessageType::Edit;
+        wrapper_changed.edited = Some(SlackEdited {
+            user: "U01XYZ".into(),
+            ts: "1234567891.000000".into(),
+        });
+
+        let d1 = adapter.map_message(&msg);
+        let d2 = adapter.map_message(&wrapper_changed);
+
+        crate::adapter::conformance::canonical_identity_stable_under_side_state_change(&d1, &d2);
     }
 
     #[test]
@@ -474,8 +501,7 @@ mod tests {
         let d1 = adapter.map_message(&msg);
         let d2 = adapter.map_message(&edited);
 
-        assert_ne!(d1.idempotency_key, d2.idempotency_key);
-        assert_ne!(d1.meta[CANONICAL_JSON_META_KEY], d2.meta[CANONICAL_JSON_META_KEY]);
+        crate::adapter::conformance::canonical_identity_changes_on_content_change(&d1, &d2);
     }
 
     #[test]

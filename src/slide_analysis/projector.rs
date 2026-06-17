@@ -301,9 +301,9 @@ mod tests {
             published: Utc::now(),
             recorded_at: Utc::now(),
             consent: None,
-            idempotency_key: Some(IdempotencyKey::new(format!(
+            idempotency_key: IdempotencyKey::new(format!(
                 "gslides:{presentation_id}:rev:rev001"
-            ))),
+            )),
             meta: serde_json::json!({}),
         }
     }

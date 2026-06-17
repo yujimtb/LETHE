@@ -112,6 +112,15 @@ Lake を物理分割（sharding）する場合の routing layer・partition rule
 
 `observations` table は `append_seq INTEGER PRIMARY KEY AUTOINCREMENT` を leaf-local cursor とし、`identity_key TEXT NOT NULL UNIQUE` と `canonical_json TEXT NOT NULL` を持ちます。self-host の通常 ingest は SQLite INSERT を先に行い、成功した行だけを in-memory Lake cache に反映します。`identity_key` UNIQUE 違反時は stored `canonical_json` と incoming `canonical_json` の exact compare で `Duplicate(existing_id)` / collision quarantine を分けます。
 
+sharding runtime の実装対応:
+
+- `src/runtime/partition.rs`: routing keyspec / identity keyspec、Patricia trie replay、capacity split plan、split cutover protocol、failover / recover event payload。
+- `src/runtime/resolver.rs`: `candidate_leaves(filter, tree)` と `(published, recorded_at, id)` streaming k-way merge。resolver は imperative shell 側に置き、Domain Kernel は物理 leaf を見ません。
+- `src/propagation/watermark.rs` / `src/propagation/scheduler.rs`: per-(projection, leaf) append_seq cursor と per-leaf tail detection。split 後の baseline は child leaf cursor を 0 から開始して全 Observation 再配送を許容します。
+- `src/self_host/failover_spool.rs`: dedicated spool SQLite。spool は append-only で dedup せず、drain は `spool_seq` 順に `rehome_observation(..., StoredIdentity)` だけを使います。
+- `src/runtime/index_policy.rs`: secondary index は明示 read mode 必須です。暗黙 full-scan fallback は禁止し、placement axis に `person` / `subject` / `project` を含めません。
+- `src/runtime/keyspec_migration.rs`: blue/green keyspec migration の状態機械。bulk rehome mode (b)、iterative catch-up、freeze、cutover、retire の順序と旧 keyspec metadata 保持を固定します。
+
 Lake は user-facing query 面ではなく、**capture and replay substrate** として設計します。
 
 ### 3.3 Supplemental Derivation Store

@@ -263,7 +263,7 @@ impl AppCore {
             payload: draft.payload,
             attachments: draft.attachments,
             published: draft.published,
-            idempotency_key: Some(draft.idempotency_key),
+            idempotency_key: draft.idempotency_key,
             meta: draft.meta,
         };
 
@@ -3021,8 +3021,14 @@ mod tests {
                 published: Utc::now(),
                 recorded_at: Utc::now(),
                 consent: None,
-                idempotency_key: Some(IdempotencyKey::new(key)),
-                meta: serde_json::json!({}),
+                idempotency_key: IdempotencyKey::new(key),
+                meta: serde_json::json!({
+                    "canonical_json": serde_json::json!({
+                        "source": "test",
+                        "object_id": key,
+                        "body": "duplicate"
+                    }).to_string(),
+                }),
             }
         }
 
@@ -3165,9 +3171,9 @@ mod tests {
                 published: Utc::now(),
                 recorded_at: Utc::now(),
                 consent: None,
-                idempotency_key: Some(IdempotencyKey::new(format!(
+                idempotency_key: IdempotencyKey::new(format!(
                     "slack:{channel_id}:{ts}"
-                ))),
+                )),
                 meta: serde_json::json!({}),
             }
         }
@@ -3607,7 +3613,7 @@ mod tests {
             published: Utc::now(),
             recorded_at: Utc::now(),
             consent: None,
-            idempotency_key: Some(IdempotencyKey::new("slack:C01ABC:dup-ts")),
+            idempotency_key: IdempotencyKey::new("slack:C01ABC:dup-ts"),
             meta: serde_json::json!({
                 "canonical_json": serde_json::json!({
                     "source": "slack",
@@ -3693,7 +3699,7 @@ mod tests {
             published: Utc::now(),
             recorded_at: Utc::now(),
             consent: None,
-            idempotency_key: Some(IdempotencyKey::new("gslides:pres123:rev:r1")),
+            idempotency_key: IdempotencyKey::new("gslides:pres123:rev:r1"),
             meta: serde_json::json!({}),
         };
         let supplemental = SupplementalRecord {

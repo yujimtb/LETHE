@@ -38,8 +38,7 @@ pub struct IngestRequest {
     #[serde(default)]
     pub attachments: Vec<BlobRef>,
     pub published: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub idempotency_key: Option<IdempotencyKey>,
+    pub idempotency_key: IdempotencyKey,
     #[serde(default)]
     pub meta: serde_json::Value,
 }
@@ -66,9 +65,7 @@ impl IngestionGate<'_> {
             AppendOutcome::Conflict(existing_id) => IngestResult::Quarantined {
                 ticket: QuarantineTicket {
                     id: uuid::Uuid::now_v7().to_string(),
-                    reason: format!(
-                        "idempotency conflict: existing observation {existing_id} has different payload"
-                    ),
+                    reason: format!("sha256-collision: existing observation {existing_id} has different canonical_json"),
                 },
             },
         }
@@ -309,6 +306,12 @@ mod tests {
     }
 
     fn valid_request() -> IngestRequest {
+        let canonical_json = serde_json::json!({
+            "source": "slack",
+            "object_id": "channel:C01:ts:999",
+            "body": "hello"
+        })
+        .to_string();
         IngestRequest {
             schema: SchemaRef::new("schema:slack-message"),
             schema_version: SemVer::new("1.0.0"),
@@ -321,8 +324,10 @@ mod tests {
             payload: serde_json::json!({"text": "hello"}),
             attachments: vec![],
             published: Utc::now(),
-            idempotency_key: Some(IdempotencyKey::new("slack:C01:999")),
-            meta: serde_json::json!({}),
+            idempotency_key: IdempotencyKey::new("slack:C01:999"),
+            meta: serde_json::json!({
+                "canonical_json": canonical_json,
+            }),
         }
     }
 
@@ -622,7 +627,7 @@ mod tests {
 
         // Ingest second with different key.
         let mut req2 = valid_request();
-        req2.idempotency_key = Some(IdempotencyKey::new("slack:C01:1000"));
+        req2.idempotency_key = IdempotencyKey::new("slack:C01:1000");
         let mut gate = IngestionGate {
             registry: &reg,
             lake: &mut lake,

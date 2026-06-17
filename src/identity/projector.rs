@@ -508,7 +508,7 @@ mod tests {
             published: Utc::now(),
             recorded_at: Utc::now(),
             consent: None,
-            idempotency_key: Some(IdempotencyKey::new(key)),
+            idempotency_key: IdempotencyKey::new(key),
             meta: serde_json::json!({}),
         }
     }
@@ -535,7 +535,7 @@ mod tests {
             published: Utc::now(),
             recorded_at: Utc::now(),
             consent: None,
-            idempotency_key: Some(IdempotencyKey::new(key)),
+            idempotency_key: IdempotencyKey::new(key),
             meta: serde_json::json!({}),
         }
     }
@@ -699,7 +699,7 @@ mod tests {
             published: Utc::now(),
             recorded_at: Utc::now(),
             consent: None,
-            idempotency_key: Some(IdempotencyKey::new("slide-analysis:1")),
+            idempotency_key: IdempotencyKey::new("slide-analysis:1"),
             meta: serde_json::json!({}),
         };
 

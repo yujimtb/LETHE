@@ -9,6 +9,37 @@ use unicode_normalization::UnicodeNormalization;
 pub const CANONICAL_JSON_META_KEY: &str = "canonical_json";
 pub const OBJECT_ID_META_KEY: &str = "object_id";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalIdentity {
+    pub object_id: String,
+    pub canonical_json: String,
+    pub idempotency_key: IdempotencyKey,
+}
+
+pub trait ObjectIdExtractor<T> {
+    fn object_id(&self, value: &T) -> String;
+}
+
+pub trait CanonicalTupleBuilder<T> {
+    fn canonical_tuple(&self, value: &T) -> serde_json::Value;
+}
+
+pub fn declare_canonical_identity<T>(
+    source: &str,
+    extractor: &impl ObjectIdExtractor<T>,
+    builder: &impl CanonicalTupleBuilder<T>,
+    value: &T,
+) -> CanonicalIdentity {
+    let object_id = extractor.object_id(value);
+    let canonical_json = canonical_json(&builder.canonical_tuple(value));
+    let idempotency_key = identity_key(source, &object_id, &canonical_json);
+    CanonicalIdentity {
+        object_id,
+        canonical_json,
+        idempotency_key,
+    }
+}
+
 pub fn identity_key(source: &str, object_id: &str, canonical_json: &str) -> IdempotencyKey {
     let hash = hex::encode(sha2::Sha256::digest(canonical_json.as_bytes()));
     IdempotencyKey::new(format!("{source}:{object_id}:{hash}"))
@@ -137,5 +168,29 @@ mod tests {
     fn canonical_body_normalizes_transport_noise_only() {
         assert_eq!(normalize_canonical_body("a\r\nb"), "a\nb");
         assert_eq!(normalize_canonical_body("a  b"), "a  b");
+    }
+
+    struct FixtureContract;
+
+    impl ObjectIdExtractor<&'static str> for FixtureContract {
+        fn object_id(&self, value: &&'static str) -> String {
+            format!("fixture:{value}")
+        }
+    }
+
+    impl CanonicalTupleBuilder<&'static str> for FixtureContract {
+        fn canonical_tuple(&self, value: &&'static str) -> serde_json::Value {
+            serde_json::json!({ "body": value })
+        }
+    }
+
+    #[test]
+    fn canonical_identity_contract_combines_object_id_and_tuple() {
+        let contract = FixtureContract;
+        let identity = declare_canonical_identity("test", &contract, &contract, &"hello");
+
+        assert_eq!(identity.object_id, "fixture:hello");
+        assert!(identity.idempotency_key.as_str().starts_with("test:fixture:hello:"));
+        assert_eq!(identity.canonical_json, "{\"body\":\"hello\"}");
     }
 }

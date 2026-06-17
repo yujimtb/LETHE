@@ -4,10 +4,12 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::Digest;
 
-use crate::domain::{BlobRef, Observation, SupplementalRecord};
+use crate::domain::{BlobRef, IdempotencyKey, Observation, SupplementalRecord};
 use crate::runtime::partition::{
-    identity_keyspec_json, initialize_event_json, routing_keyspec_json,
-    PARTITION_EVENT_INITIALIZE,
+    failover_event_json, identity_keyspec_json, initialize_event_json, parse_partition_event,
+    recover_event_json, routing_keyspec_json, split_commit_event_json, split_prepare_event_json,
+    PartitionTree, PARTITION_EVENT_FAILOVER, PARTITION_EVENT_INITIALIZE, PARTITION_EVENT_RECOVER,
+    PARTITION_EVENT_SPLIT_COMMIT, PARTITION_EVENT_SPLIT_PREPARE, PARTITION_SPLIT_REASON_CAPACITY,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -35,6 +37,15 @@ pub enum DurableAppendOutcome {
     Appended(crate::domain::ObservationId),
     Duplicate(crate::domain::ObservationId),
     CanonicalCollision(crate::domain::ObservationId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RehomeMode {
+    StoredIdentity,
+    RecomputedIdentity {
+        identity_key: IdempotencyKey,
+        canonical_json: String,
+    },
 }
 
 impl SqlitePersistence {
@@ -99,11 +110,7 @@ impl SqlitePersistence {
         &self,
         observation: &Observation,
     ) -> Result<DurableAppendOutcome, PersistenceError> {
-        let identity_key = observation.idempotency_key.as_ref().ok_or_else(|| {
-            PersistenceError::SchemaInvariant(
-                "observation.idempotency_key is required for durable ingest".to_owned(),
-            )
-        })?;
+        let identity_key = &observation.idempotency_key;
         let canonical_json = observation
             .meta
             .get(CANONICAL_JSON_META_KEY)
@@ -159,6 +166,36 @@ impl SqlitePersistence {
                 }
             }
         }
+    }
+
+    pub fn rehome_observation(
+        &self,
+        observation: &Observation,
+        mode: RehomeMode,
+    ) -> Result<DurableAppendOutcome, PersistenceError> {
+        let mut rehomed = observation.clone();
+        match mode {
+            RehomeMode::StoredIdentity => {
+                require_identity_and_canonical_json(&rehomed)?;
+            }
+            RehomeMode::RecomputedIdentity {
+                identity_key,
+                canonical_json,
+            } => {
+                rehomed.idempotency_key = identity_key;
+                let mut meta = match rehomed.meta {
+                    serde_json::Value::Object(map) => map,
+                    _ => serde_json::Map::new(),
+                };
+                meta.insert(
+                    CANONICAL_JSON_META_KEY.to_owned(),
+                    serde_json::Value::String(canonical_json),
+                );
+                rehomed.meta = serde_json::Value::Object(meta);
+            }
+        }
+
+        self.append_observation_idempotent(&rehomed)
     }
 
     pub fn persist_supplemental(&self, record: &SupplementalRecord) -> Result<(), PersistenceError> {
@@ -218,6 +255,146 @@ impl SqlitePersistence {
             blobs.push(fs::read(row?)?);
         }
         Ok(blobs)
+    }
+
+    pub fn append_split_prepare(
+        &self,
+        parent_leaf_id: &str,
+        left_child_leaf_id: &str,
+        right_child_leaf_id: &str,
+    ) -> Result<i64, PersistenceError> {
+        let event_json =
+            split_prepare_event_json(parent_leaf_id, left_child_leaf_id, right_child_leaf_id)
+                .map_err(|err| PersistenceError::SchemaInvariant(err.to_string()))?;
+        self.conn.execute(
+            "INSERT INTO partition_log (
+                event_type,
+                parent_leaf_id,
+                left_child_leaf_id,
+                right_child_leaf_id,
+                reason,
+                control_timestamp,
+                event_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                PARTITION_EVENT_SPLIT_PREPARE,
+                parent_leaf_id,
+                left_child_leaf_id,
+                right_child_leaf_id,
+                PARTITION_SPLIT_REASON_CAPACITY,
+                chrono::Utc::now().to_rfc3339(),
+                event_json,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn append_split_commit(
+        &self,
+        parent_leaf_id: &str,
+        left_child_leaf_id: &str,
+        right_child_leaf_id: &str,
+        bit_index: u32,
+    ) -> Result<i64, PersistenceError> {
+        let event_json = split_commit_event_json(
+            parent_leaf_id,
+            left_child_leaf_id,
+            right_child_leaf_id,
+            bit_index,
+        )
+        .map_err(|err| PersistenceError::SchemaInvariant(err.to_string()))?;
+        self.conn.execute(
+            "INSERT INTO partition_log (
+                event_type,
+                parent_leaf_id,
+                left_child_leaf_id,
+                right_child_leaf_id,
+                bit_index,
+                reason,
+                control_timestamp,
+                event_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                PARTITION_EVENT_SPLIT_COMMIT,
+                parent_leaf_id,
+                left_child_leaf_id,
+                right_child_leaf_id,
+                i64::from(bit_index),
+                PARTITION_SPLIT_REASON_CAPACITY,
+                chrono::Utc::now().to_rfc3339(),
+                event_json,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn append_failover(
+        &self,
+        leaf_id: &str,
+        failover_id: &str,
+    ) -> Result<i64, PersistenceError> {
+        let event_json = failover_event_json(leaf_id, failover_id)
+            .map_err(|err| PersistenceError::SchemaInvariant(err.to_string()))?;
+        self.conn.execute(
+            "INSERT INTO partition_log (
+                event_type,
+                leaf_id,
+                control_timestamp,
+                event_json
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                PARTITION_EVENT_FAILOVER,
+                leaf_id,
+                chrono::Utc::now().to_rfc3339(),
+                event_json,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn append_recover(
+        &self,
+        leaf_id: &str,
+        failover_id: &str,
+    ) -> Result<i64, PersistenceError> {
+        let event_json = recover_event_json(leaf_id, failover_id)
+            .map_err(|err| PersistenceError::SchemaInvariant(err.to_string()))?;
+        self.conn.execute(
+            "INSERT INTO partition_log (
+                event_type,
+                leaf_id,
+                control_timestamp,
+                event_json
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                PARTITION_EVENT_RECOVER,
+                leaf_id,
+                chrono::Utc::now().to_rfc3339(),
+                event_json,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn load_partition_tree(&self) -> Result<PartitionTree, PersistenceError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT event_type, event_json FROM partition_log ORDER BY event_seq")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            let (event_type, event_json) = row?;
+            events.push(
+                parse_partition_event(&event_type, &event_json)
+                    .map_err(|err| PersistenceError::SchemaInvariant(err.to_string()))?,
+            );
+        }
+
+        PartitionTree::from_events(&events)
+            .map_err(|err| PersistenceError::SchemaInvariant(err.to_string()))
     }
 
     pub fn garbage_collect_orphan_blobs(&self) -> Result<usize, PersistenceError> {
@@ -398,6 +575,20 @@ impl SqlitePersistence {
     }
 }
 
+fn require_identity_and_canonical_json(observation: &Observation) -> Result<(), PersistenceError> {
+    if observation
+        .meta
+        .get(CANONICAL_JSON_META_KEY)
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+    {
+        return Err(PersistenceError::SchemaInvariant(
+            "rehome mode StoredIdentity requires observation.meta.canonical_json".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,7 +623,7 @@ mod tests {
             published: Utc::now(),
             recorded_at: Utc::now(),
             consent: None,
-            idempotency_key: Some(IdempotencyKey::new("sample-key")),
+            idempotency_key: IdempotencyKey::new("sample-key"),
             meta: serde_json::json!({
                 CANONICAL_JSON_META_KEY: canonical_json,
             }),
@@ -542,6 +733,114 @@ mod tests {
     }
 
     #[test]
+    fn rehome_mode_a_preserves_stored_identity_and_times() {
+        let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+        let db = tmp.join("test.sqlite3");
+        let blob_dir = tmp.join("blobs");
+        let store = SqlitePersistence::open(&db, &blob_dir).unwrap();
+        let mut first = sample_observation();
+        first.idempotency_key = IdempotencyKey::new("first");
+        first.meta = serde_json::json!({
+            CANONICAL_JSON_META_KEY: serde_json::json!({
+                "source": "test",
+                "object_id": "first",
+                "body": "first"
+            }).to_string(),
+        });
+        store.persist_observation(&first).unwrap();
+
+        let mut observation = sample_observation();
+        observation.id = Observation::new_id();
+        observation.idempotency_key = IdempotencyKey::new("rehome-mode-a");
+        observation.published = chrono::DateTime::parse_from_rfc3339("2026-05-01T08:30:00Z")
+            .unwrap()
+            .to_utc();
+        observation.recorded_at = chrono::DateTime::parse_from_rfc3339("2026-05-01T08:31:00Z")
+            .unwrap()
+            .to_utc();
+        observation.meta = serde_json::json!({
+            CANONICAL_JSON_META_KEY: serde_json::json!({
+                "source": "test",
+                "object_id": "rehome-mode-a",
+                "body": "stored"
+            }).to_string(),
+        });
+
+        let outcome = store
+            .rehome_observation(&observation, RehomeMode::StoredIdentity)
+            .unwrap();
+
+        assert_eq!(outcome, DurableAppendOutcome::Appended(observation.id.clone()));
+        let (append_seq, json): (i64, String) = store
+            .conn
+            .query_row(
+                "SELECT append_seq, observation_json FROM observations WHERE id = ?1",
+                [observation.id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let stored = serde_json::from_str::<Observation>(&json).unwrap();
+
+        assert_eq!(append_seq, 2);
+        assert_eq!(stored.id, observation.id);
+        assert_eq!(stored.published, observation.published);
+        assert_eq!(stored.recorded_at, observation.recorded_at);
+        assert_eq!(stored.idempotency_key, observation.idempotency_key);
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn rehome_mode_b_reserializes_identity_and_canonical_json() {
+        let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+        let db = tmp.join("test.sqlite3");
+        let blob_dir = tmp.join("blobs");
+        let store = SqlitePersistence::open(&db, &blob_dir).unwrap();
+        let observation = sample_observation();
+        let new_key = IdempotencyKey::new("identity-v2");
+        let new_canonical_json = serde_json::json!({
+            "source": "test-v2",
+            "object_id": "sample-key",
+            "body": "world"
+        })
+        .to_string();
+
+        let outcome = store
+            .rehome_observation(
+                &observation,
+                RehomeMode::RecomputedIdentity {
+                    identity_key: new_key.clone(),
+                    canonical_json: new_canonical_json.clone(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome, DurableAppendOutcome::Appended(observation.id.clone()));
+        let (identity_key, canonical_json, json): (String, String, String) = store
+            .conn
+            .query_row(
+                "SELECT identity_key, canonical_json, observation_json FROM observations WHERE id = ?1",
+                [observation.id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let stored = serde_json::from_str::<Observation>(&json).unwrap();
+
+        assert_eq!(identity_key, new_key.as_str());
+        assert_eq!(canonical_json, new_canonical_json);
+        assert_eq!(stored.idempotency_key, new_key);
+        assert_eq!(
+            stored.meta[CANONICAL_JSON_META_KEY].as_str(),
+            Some(new_canonical_json.as_str())
+        );
+        assert_eq!(stored.id, observation.id);
+        assert_eq!(stored.published, observation.published);
+        assert_eq!(stored.recorded_at, observation.recorded_at);
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
     fn persist_and_reload_supplemental() {
         let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
         let db = tmp.join("test.sqlite3");
@@ -602,6 +901,104 @@ mod tests {
         assert!(leaf_id.starts_with("lake:"));
         assert_eq!(routing, crate::runtime::partition::routing_keyspec_json().unwrap());
         assert_eq!(identity, crate::runtime::partition::identity_keyspec_json().unwrap());
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn split_prepare_is_logged_without_changing_replayed_tree() {
+        let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+        let db = tmp.join("test.sqlite3");
+        let blob_dir = tmp.join("blobs");
+        let store = SqlitePersistence::open(&db, &blob_dir).unwrap();
+        let root: String = store
+            .conn
+            .query_row(
+                "SELECT leaf_id FROM partition_log WHERE event_type = 'initialize'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let left = format!("lake:{}", uuid::Uuid::now_v7());
+        let right = format!("lake:{}", uuid::Uuid::now_v7());
+
+        let seq = store.append_split_prepare(&root, &left, &right).unwrap();
+        let tree = store.load_partition_tree().unwrap();
+
+        assert_eq!(seq, 2);
+        assert_eq!(tree.current_leaf_ids(), vec![root]);
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn split_commit_records_capacity_bit_and_replays_tree() {
+        let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+        let db = tmp.join("test.sqlite3");
+        let blob_dir = tmp.join("blobs");
+        let store = SqlitePersistence::open(&db, &blob_dir).unwrap();
+        let root: String = store
+            .conn
+            .query_row(
+                "SELECT leaf_id FROM partition_log WHERE event_type = 'initialize'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let left = format!("lake:{}", uuid::Uuid::now_v7());
+        let right = format!("lake:{}", uuid::Uuid::now_v7());
+
+        let seq = store
+            .append_split_commit(&root, &left, &right, 2)
+            .unwrap();
+        let (bit_index, reason): (i64, String) = store
+            .conn
+            .query_row(
+                "SELECT bit_index, reason FROM partition_log WHERE event_seq = ?1",
+                [seq],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let tree = store.load_partition_tree().unwrap();
+
+        assert_eq!(bit_index, 2);
+        assert_eq!(reason, "capacity");
+        assert_eq!(tree.current_leaf_ids(), vec![left, right]);
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn failover_and_recover_events_record_control_plane_boundaries() {
+        let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+        let db = tmp.join("test.sqlite3");
+        let blob_dir = tmp.join("blobs");
+        let store = SqlitePersistence::open(&db, &blob_dir).unwrap();
+        let root: String = store
+            .conn
+            .query_row(
+                "SELECT leaf_id FROM partition_log WHERE event_type = 'initialize'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let failover_id = format!("spool:{}", uuid::Uuid::now_v7());
+
+        let failover_seq = store.append_failover(&root, &failover_id).unwrap();
+        let recover_seq = store.append_recover(&root, &failover_id).unwrap();
+        let events = store
+            .conn
+            .prepare("SELECT event_seq, event_type FROM partition_log ORDER BY event_seq")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(failover_seq, 2);
+        assert_eq!(recover_seq, 3);
+        assert_eq!(events[1].1, "failover");
+        assert_eq!(events[2].1, "recover");
 
         let _ = fs::remove_dir_all(tmp);
     }

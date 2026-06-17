@@ -8,6 +8,7 @@
 //! 5. Replay produces identical results
 
 use chrono::Utc;
+use lethe::adapter::claude::importer::*;
 use lethe::adapter::config::*;
 use lethe::adapter::gslides::client::*;
 use lethe::adapter::gslides::mapper::*;
@@ -148,6 +149,45 @@ fn setup_registry_for_gslides() -> RegistryStore {
     reg
 }
 
+fn setup_registry_for_claude() -> RegistryStore {
+    let mut reg = RegistryStore::new();
+    reg.register_source_system(SourceSystem {
+        id: SourceSystemRef::new("sys:claude-ai"),
+        name: "Claude.ai".into(),
+        provider: Some("Anthropic".into()),
+        api_version: Some("export-v1".into()),
+        source_class: SourceClass::MutableText,
+    })
+    .unwrap();
+    reg.register_observer(Observer {
+        id: ObserverRef::new("obs:claude-ai-importer"),
+        name: "Claude.ai Importer".into(),
+        observer_type: ObserverType::Crawler,
+        source_system: SourceSystemRef::new("sys:claude-ai"),
+        adapter_version: SemVer::new("1.0.0"),
+        schemas: vec![SchemaRef::new("schema:claude-message")],
+        authority_model: AuthorityModel::LakeAuthoritative,
+        capture_model: CaptureModel::Event,
+        owner: "lethe".into(),
+        trust_level: TrustLevel::Automated,
+    })
+    .unwrap();
+    reg.register_schema(ObservationSchema {
+        id: SchemaRef::new("schema:claude-message"),
+        name: "Claude.ai Message".into(),
+        version: SemVer::new("1.0.0"),
+        subject_type: EntityTypeRef::new("et:message"),
+        target_type: None,
+        payload_schema: serde_json::json!({"type": "object"}),
+        source_contracts: vec![],
+        attachment_config: None,
+        registered_by: None,
+        registered_at: None,
+    })
+    .unwrap();
+    reg
+}
+
 fn slack_config() -> AdapterConfig {
     AdapterConfig {
         observer_id: ObserverRef::new("obs:slack-crawler"),
@@ -216,7 +256,7 @@ fn draft_to_ingest(draft: &ObservationDraft) -> IngestRequest {
         payload: draft.payload.clone(),
         attachments: draft.attachments.clone(),
         published: draft.published,
-        idempotency_key: Some(draft.idempotency_key.clone()),
+        idempotency_key: draft.idempotency_key.clone(),
         meta: draft.meta.clone(),
     }
 }
@@ -345,10 +385,42 @@ fn slack_edit_and_delete_are_separate_observations() {
     let keys: Vec<&str> = lake
         .list()
         .iter()
-        .map(|o| o.idempotency_key.as_ref().unwrap().as_str())
+        .map(|o| o.idempotency_key.as_str())
         .collect();
     assert_eq!(keys.len(), 3);
     assert!(keys[0] != keys[1] && keys[1] != keys[2]);
+}
+
+#[test]
+fn slack_reaction_change_is_duplicate_not_conflict() {
+    let reg = setup_registry_for_slack();
+    let mut lake = LakeStore::new();
+    let blobs = BlobStore::new();
+    let adapter = SlackAdapter::new(FixtureSlackClient::new(), slack_config());
+    let msg = sample_slack_message();
+    let mut reacted = msg.clone();
+    reacted.reactions = vec![SlackReaction {
+        name: "thumbsup".into(),
+        count: 1,
+        users: vec!["U02".into()],
+    }];
+
+    let mut gate = IngestionGate {
+        registry: &reg,
+        lake: &mut lake,
+        blobs: &blobs,
+    };
+    let r1 = gate.ingest(draft_to_ingest(&adapter.map_message(&msg)));
+    assert!(matches!(r1, IngestResult::Ingested { .. }));
+
+    let mut gate = IngestionGate {
+        registry: &reg,
+        lake: &mut lake,
+        blobs: &blobs,
+    };
+    let r2 = gate.ingest(draft_to_ingest(&adapter.map_message(&reacted)));
+    assert!(matches!(r2, IngestResult::Duplicate { .. }));
+    assert_eq!(lake.len(), 1);
 }
 
 #[test]
@@ -575,6 +647,80 @@ fn gslides_heartbeat_ingested() {
     };
     let result = gate.ingest(draft_to_ingest(&hb));
     assert!(matches!(result, IngestResult::Ingested { .. }));
+}
+
+// ===========================================================================
+// Claude.ai → Lake integration
+// ===========================================================================
+
+#[test]
+fn claude_reexport_missing_message_is_noop() {
+    let reg = setup_registry_for_claude();
+    let mut lake = LakeStore::new();
+    let blobs = BlobStore::new();
+    let importer = ClaudeAiImporter::new(SemVer::new("1.0.0"));
+    let first_export = serde_json::json!({
+        "conversations": [{
+            "uuid": "conv-1",
+            "messages": [
+                {
+                    "uuid": "msg-root",
+                    "parent_message_uuid": null,
+                    "sender": "human",
+                    "text": "hello",
+                    "created_at": "2026-05-01T10:00:00Z"
+                },
+                {
+                    "uuid": null,
+                    "parent_message_uuid": "msg-root",
+                    "sender": "assistant",
+                    "text": "hi",
+                    "created_at": "2026-05-01T10:00:01Z"
+                }
+            ]
+        }]
+    })
+    .to_string();
+    let second_export_missing_reply = serde_json::json!({
+        "conversations": [{
+            "uuid": "conv-1",
+            "messages": [{
+                "uuid": "msg-root",
+                "parent_message_uuid": null,
+                "sender": "human",
+                "text": "hello",
+                "created_at": "2026-05-01T10:00:00Z"
+            }]
+        }]
+    })
+    .to_string();
+
+    for draft in importer.import_json_str(&first_export).unwrap() {
+        let mut gate = IngestionGate {
+            registry: &reg,
+            lake: &mut lake,
+            blobs: &blobs,
+        };
+        assert!(matches!(
+            gate.ingest(draft_to_ingest(&draft)),
+            IngestResult::Ingested { .. }
+        ));
+    }
+    assert_eq!(lake.len(), 2);
+
+    for draft in importer.import_json_str(&second_export_missing_reply).unwrap() {
+        let mut gate = IngestionGate {
+            registry: &reg,
+            lake: &mut lake,
+            blobs: &blobs,
+        };
+        assert!(matches!(
+            gate.ingest(draft_to_ingest(&draft)),
+            IngestResult::Duplicate { .. }
+        ));
+    }
+
+    assert_eq!(lake.len(), 2);
 }
 
 // ===========================================================================

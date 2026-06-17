@@ -11,7 +11,9 @@ use chrono::{DateTime, Utc};
 use crate::adapter::error::AdapterError;
 use crate::adapter::config::AdapterConfig;
 use crate::adapter::heartbeat::heartbeat_draft;
-use crate::adapter::idempotency::gslides_revision_key;
+use crate::adapter::idempotency::{
+    canonical_json, identity_key, CANONICAL_JSON_META_KEY, OBJECT_ID_META_KEY,
+};
 use crate::adapter::traits::*;
 use crate::domain::{
     AuthorityModel, BlobRef, CaptureModel, EntityRef, ObserverRef, SchemaRef, SemVer,
@@ -63,8 +65,10 @@ impl<C: GoogleSlidesClient> GoogleSlidesAdapter<C> {
         native_blob_ref: Option<BlobRef>,
         rendered_blob_refs: Vec<BlobRef>,
     ) -> ObservationDraft {
-        let idem_key =
-            gslides_revision_key(&revision.presentation_id, &revision.revision_id);
+        let object_id = format!(
+            "presentation:{}:revision:{}",
+            revision.presentation_id, revision.revision_id
+        );
 
         let subject = EntityRef::new(format!(
             "document:gslides:{}",
@@ -113,6 +117,19 @@ impl<C: GoogleSlidesClient> GoogleSlidesAdapter<C> {
         if let Some(ref nb) = native_blob_ref {
             attachments.push(nb.clone());
         }
+        let attachment_sha256 = attachments
+            .iter()
+            .filter_map(|blob_ref| blob_ref.as_str().strip_prefix("blob:sha256:"))
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let canonical_tuple = serde_json::json!({
+            "presentation_id": revision.presentation_id,
+            "revision_id": revision.revision_id,
+            "modified_time": revision.modified_time.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            "attachment_sha256": attachment_sha256,
+        });
+        let canonical_json = canonical_json(&canonical_tuple);
+        let idem_key = identity_key("google-slides", &object_id, &canonical_json);
 
         ObservationDraft {
             schema: SchemaRef::new(WORKSPACE_SNAPSHOT_SCHEMA),
@@ -129,6 +146,8 @@ impl<C: GoogleSlidesClient> GoogleSlidesAdapter<C> {
             idempotency_key: idem_key,
             meta: serde_json::json!({
                 "sourceAdapterVersion": self.config.adapter_version.as_str(),
+                OBJECT_ID_META_KEY: object_id,
+                CANONICAL_JSON_META_KEY: canonical_json,
             }),
         }
     }
@@ -292,7 +311,11 @@ mod tests {
 
         let draft = adapter.map_revision(&rev, &meta, None, vec![]);
         assert_eq!(draft.schema.as_str(), WORKSPACE_SNAPSHOT_SCHEMA);
-        assert_eq!(draft.idempotency_key.as_str(), "gslides:pres123:rev:rev456");
+        assert!(draft
+            .idempotency_key
+            .as_str()
+            .starts_with("google-slides:presentation:pres123:revision:rev456:"));
+        assert!(draft.meta[CANONICAL_JSON_META_KEY].is_string());
         assert_eq!(draft.subject.as_str(), "document:gslides:pres123");
         assert_eq!(draft.authority_model, AuthorityModel::SourceAuthoritative);
         assert_eq!(draft.capture_model, CaptureModel::Snapshot);

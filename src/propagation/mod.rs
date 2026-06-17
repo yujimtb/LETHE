@@ -5,6 +5,8 @@
 
 pub mod scheduler;
 pub mod watermark;
+pub mod idempotent;
 
-pub use scheduler::PropagationScheduler;
-pub use watermark::{WatermarkState, WatermarkStore};
+pub use idempotent::{assert_at_least_once_idempotent, IdempotentFold};
+pub use scheduler::{LeafTail, PropagationScheduler};
+pub use watermark::{LeafWatermarkState, WatermarkState, WatermarkStore};
