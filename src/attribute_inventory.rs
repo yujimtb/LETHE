@@ -184,7 +184,7 @@ pub fn build_inventory_documents(snapshot: &ProjectionSnapshot) -> Vec<Attribute
     // Aggregate: group by normalized label text.
     // Key = normalized label, Value = aggregated candidate info
     struct LabelAgg {
-        raw_label: String,         // first-seen raw form
+        raw_label: String, // first-seen raw form
         student_names: Vec<String>,
         example_values: BTreeSet<String>,
         ai_property_key: Option<String>,
@@ -385,7 +385,8 @@ impl AttributeInventoryState {
     }
 
     pub fn is_reviewed(&self, candidate: &AttributeCandidate) -> bool {
-        self.reviewed_candidates.contains_key(&candidate.candidate_key)
+        self.reviewed_candidates
+            .contains_key(&candidate.candidate_key)
     }
 
     pub fn review_existing(
@@ -423,7 +424,9 @@ impl AttributeInventoryState {
     ) -> Result<String, String> {
         let id = normalize_attribute_id(display_name);
         if id.is_empty() {
-            return Err("attribute name must contain at least one alphanumeric character".to_string());
+            return Err(
+                "attribute name must contain at least one alphanumeric character".to_string(),
+            );
         }
         if self
             .known_attributes
@@ -441,8 +444,11 @@ impl AttributeInventoryState {
         };
         absorb_candidate(&mut attribute, candidate);
         self.known_attributes.push(attribute);
-        self.known_attributes
-            .sort_by(|left, right| left.display_name.cmp(&right.display_name).then(left.id.cmp(&right.id)));
+        self.known_attributes.sort_by(|left, right| {
+            left.display_name
+                .cmp(&right.display_name)
+                .then(left.id.cmp(&right.id))
+        });
         self.reviewed_candidates.insert(
             candidate.candidate_key.clone(),
             ReviewedCandidate {
@@ -506,7 +512,11 @@ impl AttributeInventoryState {
                 // Check if AI key matches any alias.
                 if let Some(ai_key) = &candidate.ai_property_key {
                     let ai_norm = normalize_label_text(ai_key);
-                    if attribute.source_paths.iter().any(|p| normalize_label_text(p) == ai_norm) {
+                    if attribute
+                        .source_paths
+                        .iter()
+                        .any(|p| normalize_label_text(p) == ai_norm)
+                    {
                         score += 70;
                     }
                 }
@@ -555,7 +565,11 @@ impl AttributeInventoryState {
                 .iter_mut()
                 .find(|attribute| attribute.id == entry.id)
             {
-                let mut aliases = existing.source_paths.iter().cloned().collect::<BTreeSet<_>>();
+                let mut aliases = existing
+                    .source_paths
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
                 aliases.extend(entry.aliases.iter().cloned());
                 existing.source_paths = aliases.into_iter().collect();
 
@@ -575,12 +589,17 @@ impl AttributeInventoryState {
                 });
             }
         }
-        self.known_attributes
-            .sort_by(|left, right| left.display_name.cmp(&right.display_name).then(left.id.cmp(&right.id)));
+        self.known_attributes.sort_by(|left, right| {
+            left.display_name
+                .cmp(&right.display_name)
+                .then(left.id.cmp(&right.id))
+        });
     }
 }
 
-pub fn summarize_documents(documents: &[AttributeInventoryDocument]) -> Vec<DiscoveredAttributeGroup> {
+pub fn summarize_documents(
+    documents: &[AttributeInventoryDocument],
+) -> Vec<DiscoveredAttributeGroup> {
     let mut groups = BTreeMap::<String, DiscoveredAttributeGroup>::new();
     for document in documents {
         for candidate in &document.candidates {
@@ -609,11 +628,18 @@ pub fn summarize_documents(documents: &[AttributeInventoryDocument]) -> Vec<Disc
         }
     }
     let mut result: Vec<_> = groups.into_values().collect();
-    result.sort_by(|a, b| b.document_count.cmp(&a.document_count).then(a.label.cmp(&b.label)));
+    result.sort_by(|a, b| {
+        b.document_count
+            .cmp(&a.document_count)
+            .then(a.label.cmp(&b.label))
+    });
     result
 }
 
-pub fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), Box<dyn std::error::Error>> {
+pub fn write_json_file<T: Serialize>(
+    path: &Path,
+    value: &T,
+) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -622,14 +648,20 @@ pub fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), Box<d
     Ok(())
 }
 
-pub fn read_alias_catalog(path: &Path) -> Result<AttributeAliasCatalog, Box<dyn std::error::Error>> {
+pub fn read_alias_catalog(
+    path: &Path,
+) -> Result<AttributeAliasCatalog, Box<dyn std::error::Error>> {
     let raw = fs::read_to_string(path)?;
     Ok(serde_json::from_str(&raw)?)
 }
 
 fn absorb_candidate(attribute: &mut KnownAttribute, candidate: &AttributeCandidate) {
     // Store the label text itself as a source alias.
-    let mut source_paths = attribute.source_paths.iter().cloned().collect::<BTreeSet<_>>();
+    let mut source_paths = attribute
+        .source_paths
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     source_paths.insert(candidate.value.clone());
     attribute.source_paths = source_paths.into_iter().collect();
 
@@ -718,8 +750,16 @@ mod tests {
     fn extract_bio_labels_handles_half_width_colon() {
         let bio = "Nickname: メンディー\nMBTI: INTJ";
         let labels = extract_bio_labels(bio);
-        assert!(labels.iter().any(|l| l.label == "Nickname" && l.value == "メンディー"));
-        assert!(labels.iter().any(|l| l.label == "MBTI" && l.value == "INTJ"));
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.label == "Nickname" && l.value == "メンディー")
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.label == "MBTI" && l.value == "INTJ")
+        );
     }
 
     #[test]
@@ -736,16 +776,24 @@ mod tests {
             identity: Default::default(),
             person_page: PersonPageOutput {
                 profiles: vec![
-                    make_person("Student A", "呼ばれたい名前：なっしー\n出身地：東京", StudentProperties {
-                        nickname: Some("なっしー".into()),
-                        birthplace: Some("東京".into()),
-                        ..StudentProperties::default()
-                    }),
-                    make_person("Student B", "あだ名：メンディー\n出身地：大阪", StudentProperties {
-                        nickname: Some("メンディー".into()),
-                        birthplace: Some("大阪".into()),
-                        ..StudentProperties::default()
-                    }),
+                    make_person(
+                        "Student A",
+                        "呼ばれたい名前：なっしー\n出身地：東京",
+                        StudentProperties {
+                            nickname: Some("なっしー".into()),
+                            birthplace: Some("東京".into()),
+                            ..StudentProperties::default()
+                        },
+                    ),
+                    make_person(
+                        "Student B",
+                        "あだ名：メンディー\n出身地：大阪",
+                        StudentProperties {
+                            nickname: Some("メンディー".into()),
+                            birthplace: Some("大阪".into()),
+                            ..StudentProperties::default()
+                        },
+                    ),
                 ],
                 ..PersonPageOutput::default()
             },
@@ -810,13 +858,19 @@ mod tests {
         };
 
         let suggestions = state.suggestions_for(&candidate);
-        assert!(!suggestions.is_empty(), "should suggest ニックネーム via AI key match");
+        assert!(
+            !suggestions.is_empty(),
+            "should suggest ニックネーム via AI key match"
+        );
         assert_eq!(suggestions[0].id, "nickname");
     }
 
     #[test]
     fn parse_inventory_commands_supports_review_actions() {
-        assert_eq!(parse_inventory_command("1").unwrap(), InventoryCommand::PickSuggestion(1));
+        assert_eq!(
+            parse_inventory_command("1").unwrap(),
+            InventoryCommand::PickSuggestion(1)
+        );
         assert_eq!(
             parse_inventory_command("e hobbies").unwrap(),
             InventoryCommand::MapExisting("hobbies".into())
@@ -825,8 +879,14 @@ mod tests {
             parse_inventory_command("n Favorite Food").unwrap(),
             InventoryCommand::CreateNew("Favorite Food".into())
         );
-        assert_eq!(parse_inventory_command("s").unwrap(), InventoryCommand::Skip);
-        assert_eq!(parse_inventory_command("q").unwrap(), InventoryCommand::Quit);
+        assert_eq!(
+            parse_inventory_command("s").unwrap(),
+            InventoryCommand::Skip
+        );
+        assert_eq!(
+            parse_inventory_command("q").unwrap(),
+            InventoryCommand::Quit
+        );
     }
 
     #[test]

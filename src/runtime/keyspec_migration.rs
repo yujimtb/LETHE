@@ -67,11 +67,17 @@ impl BlueGreenKeyspecMigration {
     }
 
     pub fn record_bulk_rehome_mode_b(&mut self) -> Result<(), MigrationError> {
-        self.advance(MigrationPhase::NewStructure, MigrationPhase::BulkRehomeModeB)
+        self.advance(
+            MigrationPhase::NewStructure,
+            MigrationPhase::BulkRehomeModeB,
+        )
     }
 
     pub fn record_iterative_catch_up(&mut self) -> Result<(), MigrationError> {
-        self.advance(MigrationPhase::BulkRehomeModeB, MigrationPhase::IterativeCatchUp)
+        self.advance(
+            MigrationPhase::BulkRehomeModeB,
+            MigrationPhase::IterativeCatchUp,
+        )
     }
 
     pub fn freeze(&mut self) -> Result<(), MigrationError> {

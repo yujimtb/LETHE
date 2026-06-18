@@ -77,10 +77,7 @@ pub trait GoogleSlidesClient {
     ) -> Result<RevisionListPage, AdapterError>;
 
     /// Get the native JSON structure of a presentation at a revision.
-    fn get_presentation(
-        &self,
-        presentation_id: &str,
-    ) -> Result<PresentationNative, AdapterError>;
+    fn get_presentation(&self, presentation_id: &str) -> Result<PresentationNative, AdapterError>;
 
     /// Get Drive metadata for a presentation.
     fn get_presentation_meta(
@@ -141,8 +138,7 @@ impl FixtureGoogleSlidesClient {
     }
 
     pub fn with_meta(mut self, meta: PresentationMeta) -> Self {
-        self.metas
-            .insert(meta.presentation_id.clone(), meta);
+        self.metas.insert(meta.presentation_id.clone(), meta);
         self
     }
 
@@ -163,8 +159,10 @@ impl FixtureGoogleSlidesClient {
         slide_object_id: &str,
         bytes: Vec<u8>,
     ) -> Self {
-        self.single_slide_exports
-            .insert((presentation_id.to_string(), slide_object_id.to_string()), bytes);
+        self.single_slide_exports.insert(
+            (presentation_id.to_string(), slide_object_id.to_string()),
+            bytes,
+        );
         self
     }
 }
@@ -181,25 +179,21 @@ impl GoogleSlidesClient for FixtureGoogleSlidesClient {
         })
     }
 
-    fn get_presentation(
-        &self,
-        presentation_id: &str,
-    ) -> Result<PresentationNative, AdapterError> {
+    fn get_presentation(&self, presentation_id: &str) -> Result<PresentationNative, AdapterError> {
         self.presentations
             .get(presentation_id)
             .cloned()
-            .ok_or_else(|| {
-                AdapterError::Other(format!("presentation {presentation_id} not found"))
-            })
+            .ok_or_else(|| AdapterError::Other(format!("presentation {presentation_id} not found")))
     }
 
     fn get_presentation_meta(
         &self,
         presentation_id: &str,
     ) -> Result<PresentationMeta, AdapterError> {
-        self.metas.get(presentation_id).cloned().ok_or_else(|| {
-            AdapterError::Other(format!("meta for {presentation_id} not found"))
-        })
+        self.metas
+            .get(presentation_id)
+            .cloned()
+            .ok_or_else(|| AdapterError::Other(format!("meta for {presentation_id} not found")))
     }
 
     fn render_slide(
@@ -225,10 +219,9 @@ impl GoogleSlidesClient for FixtureGoogleSlidesClient {
     }
 
     fn export_presentation_pptx(&self, presentation_id: &str) -> Result<Vec<u8>, AdapterError> {
-        self.exports
-            .get(presentation_id)
-            .cloned()
-            .ok_or_else(|| AdapterError::Other(format!("pptx export for {presentation_id} not found")))
+        self.exports.get(presentation_id).cloned().ok_or_else(|| {
+            AdapterError::Other(format!("pptx export for {presentation_id} not found"))
+        })
     }
 
     fn export_single_slide_pptx(

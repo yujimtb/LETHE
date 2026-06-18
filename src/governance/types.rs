@@ -77,13 +77,8 @@ impl Role {
                 Capability::RequestWritePreview,
                 Capability::SubmitProposal,
             ],
-            Role::Resident => vec![
-                Capability::ReadOwnProjection,
-                Capability::SearchCatalog,
-            ],
-            Role::External => vec![
-                Capability::SearchCatalog,
-            ],
+            Role::Resident => vec![Capability::ReadOwnProjection, Capability::SearchCatalog],
+            Role::External => vec![Capability::SearchCatalog],
             Role::Agent => vec![
                 Capability::ReadRegistry,
                 Capability::SearchCatalog,
@@ -102,12 +97,25 @@ impl Role {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Operation {
-    Read { target: EntityRef },
-    Write { mode: WriteMode, authority: AuthorityModel },
-    Export { scope: String },
-    Publish { projection: ProjectionRef },
-    RunBuild { projection: ProjectionRef },
-    ReadRestricted { target: EntityRef },
+    Read {
+        target: EntityRef,
+    },
+    Write {
+        mode: WriteMode,
+        authority: AuthorityModel,
+    },
+    Export {
+        scope: String,
+    },
+    Publish {
+        projection: ProjectionRef,
+    },
+    RunBuild {
+        projection: ProjectionRef,
+    },
+    ReadRestricted {
+        target: EntityRef,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +282,12 @@ mod tests {
 
     #[test]
     fn access_scope_round_trips_via_json() {
-        for scope in [AccessScope::Public, AccessScope::Internal, AccessScope::Restricted, AccessScope::HighlySensitive] {
+        for scope in [
+            AccessScope::Public,
+            AccessScope::Internal,
+            AccessScope::Restricted,
+            AccessScope::HighlySensitive,
+        ] {
             let json = serde_json::to_string(&scope).unwrap();
             let back: AccessScope = serde_json::from_str(&json).unwrap();
             assert_eq!(scope, back);
@@ -312,7 +325,10 @@ mod tests {
         assert!(!PolicyOutcome::Allow.is_deny());
 
         let deny = PolicyOutcome::Deny {
-            reason: DenyReason { code: "test".into(), message: "msg".into() },
+            reason: DenyReason {
+                code: "test".into(),
+                message: "msg".into(),
+            },
         };
         assert!(deny.is_deny());
     }

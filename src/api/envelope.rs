@@ -36,7 +36,11 @@ pub struct ErrorResponse {
 
 impl ErrorResponse {
     pub fn bad_request(detail: &str) -> Self {
-        Self { error: "bad_request".into(), detail: Some(detail.into()), retry_after: None }
+        Self {
+            error: "bad_request".into(),
+            detail: Some(detail.into()),
+            retry_after: None,
+        }
     }
 
     pub fn internal_server_error(detail: &str) -> Self {
@@ -48,19 +52,35 @@ impl ErrorResponse {
     }
 
     pub fn unauthorized() -> Self {
-        Self { error: "unauthorized".into(), detail: None, retry_after: None }
+        Self {
+            error: "unauthorized".into(),
+            detail: None,
+            retry_after: None,
+        }
     }
 
     pub fn forbidden(detail: &str) -> Self {
-        Self { error: "forbidden".into(), detail: Some(detail.into()), retry_after: None }
+        Self {
+            error: "forbidden".into(),
+            detail: Some(detail.into()),
+            retry_after: None,
+        }
     }
 
     pub fn not_found() -> Self {
-        Self { error: "not_found".into(), detail: None, retry_after: None }
+        Self {
+            error: "not_found".into(),
+            detail: None,
+            retry_after: None,
+        }
     }
 
     pub fn service_unavailable(retry_after: u32) -> Self {
-        Self { error: "service_unavailable".into(), detail: None, retry_after: Some(retry_after) }
+        Self {
+            error: "service_unavailable".into(),
+            detail: None,
+            retry_after: Some(retry_after),
+        }
     }
 }
 

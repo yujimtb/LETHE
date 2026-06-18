@@ -11,11 +11,11 @@ use chrono::Utc;
 
 use crate::adapter::gslides::mapper::WORKSPACE_SNAPSHOT_SCHEMA;
 use crate::adapter::writeback::traits::WriteRecord;
+use crate::domain::supplemental::InputAnchorSet;
 use crate::domain::{
     ActorRef, EntityRef, Mutability, Observation, ObservationId, SchemaRef, SupplementalId,
     SupplementalRecord,
 };
-use crate::domain::supplemental::InputAnchorSet;
 use crate::lake::LakeStore;
 use crate::supplemental::SupplementalStore;
 
@@ -101,9 +101,7 @@ impl SlideAnalysisProjector {
     }
 
     /// Build a SupplementalRecord for a slide analysis result.
-    pub fn build_supplemental(
-        result: &SlideAnalysisResult,
-    ) -> SupplementalRecord {
+    pub fn build_supplemental(result: &SlideAnalysisResult) -> SupplementalRecord {
         let profile_json = serde_json::to_value(&result.profile).unwrap_or_default();
         let sup_id = result.supplemental_id.clone().unwrap_or_else(|| {
             SupplementalId::new(format!(
@@ -203,8 +201,7 @@ impl SlideAnalysisProjector {
     ) -> crate::adapter::traits::ObservationDraft {
         use crate::adapter::traits::ObservationDraft;
         use crate::domain::{
-            AuthorityModel, CaptureModel, IdempotencyKey, ObserverRef, SemVer,
-            SourceSystemRef,
+            AuthorityModel, CaptureModel, IdempotencyKey, ObserverRef, SemVer, SourceSystemRef,
         };
 
         let idem_key = IdempotencyKey::new(format!(
@@ -301,9 +298,7 @@ mod tests {
             published: Utc::now(),
             recorded_at: Utc::now(),
             consent: None,
-            idempotency_key: IdempotencyKey::new(format!(
-                "gslides:{presentation_id}:rev:rev001"
-            )),
+            idempotency_key: IdempotencyKey::new(format!("gslides:{presentation_id}:rev:rev001")),
             meta: serde_json::json!({}),
         }
     }
@@ -443,12 +438,10 @@ mod tests {
         let _ = lake.append(obs);
 
         let mut sup1 = SupplementalStore::new();
-        let r1 =
-            SlideAnalysisProjector::process_new_slides(&lake, &mut sup1, fixture_analyse);
+        let r1 = SlideAnalysisProjector::process_new_slides(&lake, &mut sup1, fixture_analyse);
 
         let mut sup2 = SupplementalStore::new();
-        let r2 =
-            SlideAnalysisProjector::process_new_slides(&lake, &mut sup2, fixture_analyse);
+        let r2 = SlideAnalysisProjector::process_new_slides(&lake, &mut sup2, fixture_analyse);
 
         assert_eq!(r1.len(), r2.len());
         assert_eq!(r1[0].profile.name, r2[0].profile.name);

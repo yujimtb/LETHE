@@ -57,7 +57,9 @@ struct CliOptions {
     refresh_data: bool,
 }
 
-fn parse_options(args: impl Iterator<Item = String>) -> Result<CliOptions, Box<dyn std::error::Error>> {
+fn parse_options(
+    args: impl Iterator<Item = String>,
+) -> Result<CliOptions, Box<dyn std::error::Error>> {
     let mut limit = 3usize;
     let mut refresh_data = false;
     for arg in args {

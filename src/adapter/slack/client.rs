@@ -121,16 +121,10 @@ pub trait SlackClient {
     ) -> Result<Vec<SlackMessage>, AdapterError>;
 
     /// Fetch channel info (for snapshots).
-    fn conversations_info(
-        &self,
-        channel_id: &str,
-    ) -> Result<SlackChannelSnapshot, AdapterError>;
+    fn conversations_info(&self, channel_id: &str) -> Result<SlackChannelSnapshot, AdapterError>;
 
     /// Download file content.
-    fn file_download(
-        &self,
-        file: &SlackFile,
-    ) -> Result<Vec<u8>, AdapterError>;
+    fn file_download(&self, file: &SlackFile) -> Result<Vec<u8>, AdapterError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -202,20 +196,14 @@ impl SlackClient for FixtureSlackClient {
         Ok(replies)
     }
 
-    fn conversations_info(
-        &self,
-        channel_id: &str,
-    ) -> Result<SlackChannelSnapshot, AdapterError> {
+    fn conversations_info(&self, channel_id: &str) -> Result<SlackChannelSnapshot, AdapterError> {
         self.channels
             .get(channel_id)
             .cloned()
             .ok_or_else(|| AdapterError::Other(format!("channel {channel_id} not found")))
     }
 
-    fn file_download(
-        &self,
-        file: &SlackFile,
-    ) -> Result<Vec<u8>, AdapterError> {
+    fn file_download(&self, file: &SlackFile) -> Result<Vec<u8>, AdapterError> {
         self.files
             .get(&file.id)
             .cloned()

@@ -12,8 +12,8 @@ use crate::adapter::retry::{RetryDecision, should_retry};
 use crate::domain::Observation;
 use crate::lake::BlobStore;
 
-use super::types::StudentProfile;
 use super::provider::{DerivationLineage, DerivationProvider, DerivedStudentProfile};
+use super::types::StudentProfile;
 
 #[derive(Debug, Clone)]
 pub struct GeminiSlideAnalyzer {
@@ -54,13 +54,17 @@ impl GeminiSlideAnalyzer {
         observation: &Observation,
         blobs: &BlobStore,
     ) -> Result<Option<StudentProfile>, AdapterError> {
-        let blob_ref = observation.attachments.first().ok_or_else(|| AdapterError::Other(
-            "slide analysis requires a rendered slide thumbnail attachment".to_string(),
-        ))?;
-        let image = blobs.get(blob_ref).ok_or_else(|| AdapterError::Other(format!(
-            "blob {} not available in blob store",
-            blob_ref.as_str()
-        )))?;
+        let blob_ref = observation.attachments.first().ok_or_else(|| {
+            AdapterError::Other(
+                "slide analysis requires a rendered slide thumbnail attachment".to_string(),
+            )
+        })?;
+        let image = blobs.get(blob_ref).ok_or_else(|| {
+            AdapterError::Other(format!(
+                "blob {} not available in blob store",
+                blob_ref.as_str()
+            ))
+        })?;
         let title = observation
             .payload
             .get("title")
@@ -85,26 +89,24 @@ impl GeminiSlideAnalyzer {
         loop {
             match self.try_extract(image, title, canonical_uri) {
                 Ok(profile) => return Ok(profile),
-                Err(err) => {
-                    match should_retry(&err, attempt, &self.retry_config) {
-                        RetryDecision::RetryAfter(wait) => {
-                            eprintln!(
-                                "gemini attempt {} failed ({}), retrying in {}s",
-                                attempt + 1,
-                                err,
-                                wait.as_secs()
-                            );
-                            thread::sleep(wait);
-                            attempt += 1;
-                        }
-                        RetryDecision::GiveUp { reason } => {
-                            return Err(AdapterError::Other(format!(
-                                "gemini gave up after {} attempt(s): {reason}; last error: {err}",
-                                attempt + 1
-                            )));
-                        }
+                Err(err) => match should_retry(&err, attempt, &self.retry_config) {
+                    RetryDecision::RetryAfter(wait) => {
+                        eprintln!(
+                            "gemini attempt {} failed ({}), retrying in {}s",
+                            attempt + 1,
+                            err,
+                            wait.as_secs()
+                        );
+                        thread::sleep(wait);
+                        attempt += 1;
                     }
-                }
+                    RetryDecision::GiveUp { reason } => {
+                        return Err(AdapterError::Other(format!(
+                            "gemini gave up after {} attempt(s): {reason}; last error: {err}",
+                            attempt + 1
+                        )));
+                    }
+                },
             }
         }
     }
@@ -177,9 +179,10 @@ impl GeminiSlideAnalyzer {
             });
         }
 
-        let parsed: GeminiResponse = serde_json::from_str(&body).map_err(|err| AdapterError::MalformedResponse {
-            message: format!("gemini decode error: {err}; body: {body}"),
-        })?;
+        let parsed: GeminiResponse =
+            serde_json::from_str(&body).map_err(|err| AdapterError::MalformedResponse {
+                message: format!("gemini decode error: {err}; body: {body}"),
+            })?;
 
         // Check finishReason before extracting text
         if let Some(candidate) = parsed.candidates.first() {
@@ -211,8 +214,10 @@ impl GeminiSlideAnalyzer {
             .ok_or_else(|| AdapterError::MalformedResponse {
                 message: format!("gemini returned no text parts; body: {body}"),
             })?;
-        let profile = serde_json::from_str::<StudentProfile>(&text).map_err(|err| AdapterError::MalformedResponse {
-            message: format!("gemini profile decode error: {err}; text: {text}"),
+        let profile = serde_json::from_str::<StudentProfile>(&text).map_err(|err| {
+            AdapterError::MalformedResponse {
+                message: format!("gemini profile decode error: {err}; text: {text}"),
+            }
         })?;
         Ok(Some(profile))
     }
@@ -383,8 +388,8 @@ mod tests {
     #[test]
     fn extraction_schema_is_valid_json() {
         let schema = extraction_json_schema();
-        let parsed: serde_json::Value = serde_json::from_str(schema)
-            .expect("extraction_json_schema must be valid JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(schema).expect("extraction_json_schema must be valid JSON");
         assert!(parsed.get("properties").is_some());
         assert!(parsed.get("email").is_some());
     }

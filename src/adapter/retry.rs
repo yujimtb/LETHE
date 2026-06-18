@@ -18,11 +18,7 @@ pub enum RetryDecision {
 }
 
 /// Evaluate whether a failed attempt should be retried.
-pub fn should_retry(
-    error: &AdapterError,
-    attempt: u32,
-    config: &RetryConfig,
-) -> RetryDecision {
+pub fn should_retry(error: &AdapterError, attempt: u32, config: &RetryConfig) -> RetryDecision {
     if !error.is_retryable() {
         return RetryDecision::GiveUp {
             reason: format!("non-retryable: {error}"),

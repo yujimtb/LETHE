@@ -97,9 +97,18 @@ pub fn seed_projection_catalog() -> ProjectionCatalog {
     catalog.register(identity_spec()).unwrap();
     catalog.register(person_page_spec()).unwrap();
     catalog.register(slide_analysis_spec()).unwrap();
-    catalog.set_status(&ProjectionRef::new("proj:identity-resolution"), ProjectionStatus::Active);
-    catalog.set_status(&ProjectionRef::new("proj:person-page"), ProjectionStatus::Active);
-    catalog.set_status(&ProjectionRef::new("proj:slide-analysis"), ProjectionStatus::Active);
+    catalog.set_status(
+        &ProjectionRef::new("proj:identity-resolution"),
+        ProjectionStatus::Active,
+    );
+    catalog.set_status(
+        &ProjectionRef::new("proj:person-page"),
+        ProjectionStatus::Active,
+    );
+    catalog.set_status(
+        &ProjectionRef::new("proj:slide-analysis"),
+        ProjectionStatus::Active,
+    );
     catalog
 }
 

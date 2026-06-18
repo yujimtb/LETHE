@@ -63,16 +63,15 @@ impl ProjectionRunner {
         let outputs = projector.project(inputs);
         let output_count = outputs.len();
 
-        let mut lineage = LineageManifest::new(
-            spec.id.clone(),
-            spec.version.clone(),
-            build_id.clone(),
-        );
+        let mut lineage =
+            LineageManifest::new(spec.id.clone(), spec.version.clone(), build_id.clone());
         for snap in source_snapshots {
             lineage.add_source(snap);
         }
         lineage.output_count = output_count;
-        lineage.deterministic = spec.deterministic_in.contains(&crate::domain::ReadMode::AcademicPinned);
+        lineage.deterministic = spec
+            .deterministic_in
+            .contains(&crate::domain::ReadMode::AcademicPinned);
 
         BuildResult {
             build_id,
@@ -128,7 +127,10 @@ mod tests {
                 entrypoint: None,
                 projector: "count".into(),
             },
-            outputs: vec![OutputSpec { format: "sql".into(), tables: vec!["counts".into()] }],
+            outputs: vec![OutputSpec {
+                format: "sql".into(),
+                tables: vec!["counts".into()],
+            }],
             reconciliation: None,
             deterministic_in: vec![ReadMode::AcademicPinned],
             gap_action: None,
@@ -161,11 +163,13 @@ mod tests {
         let spec = test_spec();
         let projector = CountProjector;
         let inputs: Vec<String> = vec!["x".into(), "y".into()];
-        let snap = || vec![SourceSnapshot {
-            source_ref: "lake".into(),
-            watermark_position: Some(2),
-            record_count: 2,
-        }];
+        let snap = || {
+            vec![SourceSnapshot {
+                source_ref: "lake".into(),
+                watermark_position: Some(2),
+                record_count: 2,
+            }]
+        };
 
         let r1 = ProjectionRunner::build(&spec, &projector, &inputs, snap());
         let r2 = ProjectionRunner::build(&spec, &projector, &inputs, snap());

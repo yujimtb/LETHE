@@ -33,21 +33,14 @@ pub enum AdapterError {
 impl AdapterError {
     pub fn failure_class(&self) -> FailureClass {
         match self {
-            Self::RateLimited { .. } | Self::Network { .. } => {
-                FailureClass::RetryableEffectFailure
-            }
-            Self::AuthFailure { .. } | Self::Other(_) => {
-                FailureClass::NonRetryableEffectFailure
-            }
+            Self::RateLimited { .. } | Self::Network { .. } => FailureClass::RetryableEffectFailure,
+            Self::AuthFailure { .. } | Self::Other(_) => FailureClass::NonRetryableEffectFailure,
             Self::MalformedResponse { .. } => FailureClass::QuarantineFailure,
             Self::PartialFailure { .. } => FailureClass::RetryableEffectFailure,
         }
     }
 
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self.failure_class(),
-            FailureClass::RetryableEffectFailure
-        )
+        matches!(self.failure_class(), FailureClass::RetryableEffectFailure)
     }
 }

@@ -55,10 +55,7 @@ impl PolicyEngine {
             Some(PolicyOutcome::Deny {
                 reason: DenyReason {
                     code: "insufficient_capability".into(),
-                    message: format!(
-                        "Role {:?} lacks capability {:?}",
-                        request.role, required
-                    ),
+                    message: format!("Role {:?} lacks capability {:?}", request.role, required),
                 },
             })
         }
@@ -153,7 +150,13 @@ mod tests {
     use super::*;
     use crate::domain::values::ActorRef;
 
-    fn make_request(role: Role, operation: Operation, scope: AccessScope, consent: ConsentStatus, env: Environment) -> PolicyRequest {
+    fn make_request(
+        role: Role,
+        operation: Operation,
+        scope: AccessScope,
+        consent: ConsentStatus,
+        env: Environment,
+    ) -> PolicyRequest {
         PolicyRequest {
             actor: ActorRef::new("actor:test"),
             role,
@@ -168,7 +171,9 @@ mod tests {
     fn allow_internal_read() {
         let req = make_request(
             Role::Researcher,
-            Operation::Read { target: crate::domain::values::EntityRef::new("person:alice") },
+            Operation::Read {
+                target: crate::domain::values::EntityRef::new("person:alice"),
+            },
             AccessScope::Internal,
             ConsentStatus::Unrestricted,
             Environment::Production,
@@ -180,7 +185,9 @@ mod tests {
     fn deny_opted_out_subject() {
         let req = make_request(
             Role::SystemAdmin,
-            Operation::Read { target: crate::domain::values::EntityRef::new("person:bob") },
+            Operation::Read {
+                target: crate::domain::values::EntityRef::new("person:bob"),
+            },
             AccessScope::Internal,
             ConsentStatus::OptedOut,
             Environment::Production,
@@ -193,7 +200,9 @@ mod tests {
     fn deny_insufficient_capability() {
         let req = make_request(
             Role::External,
-            Operation::Read { target: crate::domain::values::EntityRef::new("person:x") },
+            Operation::Read {
+                target: crate::domain::values::EntityRef::new("person:x"),
+            },
             AccessScope::Internal,
             ConsentStatus::Unrestricted,
             Environment::Production,
@@ -221,7 +230,9 @@ mod tests {
     fn require_review_for_highly_sensitive_export() {
         let req = make_request(
             Role::SystemAdmin,
-            Operation::Export { scope: "full".into() },
+            Operation::Export {
+                scope: "full".into(),
+            },
             AccessScope::HighlySensitive,
             ConsentStatus::Unrestricted,
             Environment::Export,
@@ -296,7 +307,9 @@ mod tests {
         // Even admin is denied on opted-out data
         let req = make_request(
             Role::SystemAdmin,
-            Operation::Read { target: crate::domain::values::EntityRef::new("person:z") },
+            Operation::Read {
+                target: crate::domain::values::EntityRef::new("person:z"),
+            },
             AccessScope::Internal,
             ConsentStatus::OptedOut,
             Environment::Production,
@@ -319,8 +332,12 @@ mod tests {
 
     #[test]
     fn medium_confidence_requires_review() {
-        assert!(PolicyEngine::requires_review_for_promotion(ConfidenceLevel::Medium));
-        assert!(!PolicyEngine::requires_review_for_promotion(ConfidenceLevel::High));
+        assert!(PolicyEngine::requires_review_for_promotion(
+            ConfidenceLevel::Medium
+        ));
+        assert!(!PolicyEngine::requires_review_for_promotion(
+            ConfidenceLevel::High
+        ));
     }
 
     #[test]

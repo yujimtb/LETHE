@@ -1,7 +1,7 @@
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use axum::body::Body;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -17,7 +17,10 @@ pub fn build_router(service: AppService) -> Router {
         .route("/health/deep", get(health))
         .route("/admin/sync", post(sync_now))
         .route("/public/blobs/{blob_hash}", get(public_blob))
-        .route("/api/projections/{projection_id}/records", get(projection_records))
+        .route(
+            "/api/projections/{projection_id}/records",
+            get(projection_records),
+        )
         .route(
             "/api/projections/{projection_id}/records/{record_id}",
             get(projection_record_detail),
@@ -56,7 +59,9 @@ struct PersonsQuery {
     pagination: PaginationParams,
 }
 
-async fn health(State(service): State<AppService>) -> Result<Json<crate::api::health::HealthResponse>, ApiError> {
+async fn health(
+    State(service): State<AppService>,
+) -> Result<Json<crate::api::health::HealthResponse>, ApiError> {
     Ok(Json(service.health()?))
 }
 
@@ -143,11 +148,13 @@ async fn person_messages(
     Query(query): Query<ReadQuery>,
 ) -> Result<Response, ApiError> {
     service.authorize_headers(&headers, "projection:read")?;
-    Ok(deprecated_alias_response(service.person_messages_response(
-        &person_id,
-        query.mode.as_deref(),
-        query.pin.as_deref(),
-    )?))
+    Ok(deprecated_alias_response(
+        service.person_messages_response(
+            &person_id,
+            query.mode.as_deref(),
+            query.pin.as_deref(),
+        )?,
+    ))
 }
 
 async fn person_timeline(
@@ -157,11 +164,13 @@ async fn person_timeline(
     Query(query): Query<ReadQuery>,
 ) -> Result<Response, ApiError> {
     service.authorize_headers(&headers, "projection:read")?;
-    Ok(deprecated_alias_response(service.person_timeline_response(
-        &person_id,
-        query.mode.as_deref(),
-        query.pin.as_deref(),
-    )?))
+    Ok(deprecated_alias_response(
+        service.person_timeline_response(
+            &person_id,
+            query.mode.as_deref(),
+            query.pin.as_deref(),
+        )?,
+    ))
 }
 
 async fn projection_records(
@@ -322,7 +331,9 @@ fn deprecated_alias_response(
         .insert("deprecation", HeaderValue::from_static("true"));
     response.headers_mut().insert(
         "link",
-        HeaderValue::from_static("</api/projections/proj:person-page/records>; rel=\"successor-version\""),
+        HeaderValue::from_static(
+            "</api/projections/proj:person-page/records>; rel=\"successor-version\"",
+        ),
     );
     response
 }

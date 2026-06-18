@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
-use crate::governance::types::{AuditEvent, AuditEventKind};
 use crate::domain::values::ActorRef;
+use crate::governance::types::{AuditEvent, AuditEventKind};
 
 // ---------------------------------------------------------------------------
 // AuditLog trait — audit event emission hook (M08 §9)
@@ -120,8 +120,16 @@ mod tests {
     fn emit_and_retrieve() {
         let (log, emitter) = make_emitter();
         let actor = ActorRef::new("actor:alice");
-        emitter.emit(&actor, AuditEventKind::WriteExecution, serde_json::json!({"target": "obs:1"}));
-        emitter.emit(&actor, AuditEventKind::Export, serde_json::json!({"scope": "full"}));
+        emitter.emit(
+            &actor,
+            AuditEventKind::WriteExecution,
+            serde_json::json!({"target": "obs:1"}),
+        );
+        emitter.emit(
+            &actor,
+            AuditEventKind::Export,
+            serde_json::json!({"scope": "full"}),
+        );
 
         assert_eq!(log.count(), 2);
         let all = log.all_events();
@@ -152,7 +160,9 @@ mod tests {
         emitter.emit(&actor, AuditEventKind::Approval, serde_json::json!({}));
         emitter.emit(&actor, AuditEventKind::Rejection, serde_json::json!({}));
 
-        let events = emitter.log().events_since(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+        let events = emitter
+            .log()
+            .events_since(chrono::DateTime::<chrono::Utc>::MIN_UTC);
         assert_eq!(events[0].id, "audit:1");
         assert_eq!(events[1].id, "audit:2");
     }

@@ -33,7 +33,9 @@ impl HealthResponse {
             })
             .collect();
 
-        let all_healthy = projections.iter().all(|p| p.health == ProjectionHealth::Healthy);
+        let all_healthy = projections
+            .iter()
+            .all(|p| p.health == ProjectionHealth::Healthy);
         let status = if all_healthy { "ok" } else { "degraded" };
 
         Self {
@@ -48,8 +50,8 @@ impl HealthResponse {
 mod tests {
     use super::*;
     use crate::domain::*;
-    use crate::projection::spec::*;
     use crate::projection::catalog::ProjectionCatalog;
+    use crate::projection::spec::*;
 
     fn lake_spec(id: &str) -> ProjectionSpec {
         ProjectionSpec {
@@ -71,7 +73,10 @@ mod tests {
                 entrypoint: None,
                 projector: "p".into(),
             },
-            outputs: vec![OutputSpec { format: "sql".into(), tables: vec!["t".into()] }],
+            outputs: vec![OutputSpec {
+                format: "sql".into(),
+                tables: vec!["t".into()],
+            }],
             reconciliation: None,
             deterministic_in: vec![],
             gap_action: None,

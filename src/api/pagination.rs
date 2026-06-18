@@ -94,7 +94,10 @@ mod tests {
 
     #[test]
     fn limit_clamped_to_100() {
-        let params = PaginationParams { limit: 200, ..Default::default() };
+        let params = PaginationParams {
+            limit: 200,
+            ..Default::default()
+        };
         let validated = params.validated();
         assert_eq!(validated.limit, 100);
     }
@@ -102,7 +105,11 @@ mod tests {
     #[test]
     fn paginate_basic() {
         let items: Vec<i32> = (0..50).collect();
-        let params = PaginationParams { offset: 10, limit: 5, ..Default::default() };
+        let params = PaginationParams {
+            offset: 10,
+            limit: 5,
+            ..Default::default()
+        };
         let (page, total) = paginate(&items, &params);
         assert_eq!(total, 50);
         assert_eq!(page, vec![10, 11, 12, 13, 14]);
@@ -111,7 +118,11 @@ mod tests {
     #[test]
     fn paginate_beyond_end() {
         let items: Vec<i32> = (0..5).collect();
-        let params = PaginationParams { offset: 10, limit: 5, ..Default::default() };
+        let params = PaginationParams {
+            offset: 10,
+            limit: 5,
+            ..Default::default()
+        };
         let (page, total) = paginate(&items, &params);
         assert_eq!(total, 5);
         assert!(page.is_empty());
@@ -120,7 +131,11 @@ mod tests {
     #[test]
     fn paginate_partial_page() {
         let items: Vec<i32> = (0..8).collect();
-        let params = PaginationParams { offset: 5, limit: 10, ..Default::default() };
+        let params = PaginationParams {
+            offset: 5,
+            limit: 10,
+            ..Default::default()
+        };
         let (page, _) = paginate(&items, &params);
         assert_eq!(page, vec![5, 6, 7]);
     }

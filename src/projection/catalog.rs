@@ -28,9 +28,14 @@ impl ProjectionCatalog {
     /// Register a projection spec. Rejects if DAG would become cyclic.
     pub fn register(&mut self, spec: ProjectionSpec) -> Result<(), CatalogError> {
         // Validate the spec first.
-        spec.validate().map_err(|errs| CatalogError::InvalidSpec(
-            errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; "),
-        ))?;
+        spec.validate().map_err(|errs| {
+            CatalogError::InvalidSpec(
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )
+        })?;
 
         // Check for duplicate id.
         if self.entries.contains_key(spec.id.as_str()) {
@@ -150,9 +155,11 @@ impl ProjectionCatalog {
         self.entries
             .values()
             .filter(|entry| {
-                entry.spec.sources.iter().any(|s| {
-                    s.projection_dep().is_some_and(|dep| dep == id)
-                })
+                entry
+                    .spec
+                    .sources
+                    .iter()
+                    .any(|s| s.projection_dep().is_some_and(|dep| dep == id))
             })
             .map(|entry| entry.spec.id.clone())
             .collect()
@@ -234,7 +241,10 @@ mod tests {
                 entrypoint: None,
                 projector: "proj".into(),
             },
-            outputs: vec![OutputSpec { format: "sql".into(), tables: vec!["t".into()] }],
+            outputs: vec![OutputSpec {
+                format: "sql".into(),
+                tables: vec!["t".into()],
+            }],
             reconciliation: None,
             deterministic_in: vec![],
             gap_action: None,
@@ -279,21 +289,33 @@ mod tests {
         let mut catalog = ProjectionCatalog::new();
         catalog.register(lake_spec("proj:a")).unwrap();
         let result = catalog.register(lake_spec("proj:a"));
-        assert_eq!(result, Err(CatalogError::AlreadyRegistered(ProjectionRef::new("proj:a"))));
+        assert_eq!(
+            result,
+            Err(CatalogError::AlreadyRegistered(ProjectionRef::new(
+                "proj:a"
+            )))
+        );
     }
 
     #[test]
     fn missing_dependency_rejected() {
         let mut catalog = ProjectionCatalog::new();
         let spec = dependent_spec("proj:b", &["proj:nonexistent"]);
-        assert_eq!(catalog.register(spec), Err(CatalogError::MissingDependency(ProjectionRef::new("proj:nonexistent"))));
+        assert_eq!(
+            catalog.register(spec),
+            Err(CatalogError::MissingDependency(ProjectionRef::new(
+                "proj:nonexistent"
+            )))
+        );
     }
 
     #[test]
     fn valid_dependency_chain() {
         let mut catalog = ProjectionCatalog::new();
         catalog.register(lake_spec("proj:a")).unwrap();
-        catalog.register(dependent_spec("proj:b", &["proj:a"])).unwrap();
+        catalog
+            .register(dependent_spec("proj:b", &["proj:a"]))
+            .unwrap();
         assert!(catalog.get(&ProjectionRef::new("proj:b")).is_some());
     }
 
@@ -301,8 +323,12 @@ mod tests {
     fn topological_order_linear() {
         let mut catalog = ProjectionCatalog::new();
         catalog.register(lake_spec("proj:a")).unwrap();
-        catalog.register(dependent_spec("proj:b", &["proj:a"])).unwrap();
-        catalog.register(dependent_spec("proj:c", &["proj:b"])).unwrap();
+        catalog
+            .register(dependent_spec("proj:b", &["proj:a"]))
+            .unwrap();
+        catalog
+            .register(dependent_spec("proj:c", &["proj:b"]))
+            .unwrap();
 
         let order = catalog.topological_order().unwrap();
         let ids: Vec<&str> = order.iter().map(|r| r.as_str()).collect();
@@ -317,8 +343,12 @@ mod tests {
     fn dependents_found() {
         let mut catalog = ProjectionCatalog::new();
         catalog.register(lake_spec("proj:a")).unwrap();
-        catalog.register(dependent_spec("proj:b", &["proj:a"])).unwrap();
-        catalog.register(dependent_spec("proj:c", &["proj:a"])).unwrap();
+        catalog
+            .register(dependent_spec("proj:b", &["proj:a"]))
+            .unwrap();
+        catalog
+            .register(dependent_spec("proj:c", &["proj:a"]))
+            .unwrap();
 
         let deps = catalog.dependents(&ProjectionRef::new("proj:a"));
         assert_eq!(deps.len(), 2);

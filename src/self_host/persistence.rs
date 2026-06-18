@@ -1,15 +1,16 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use sha2::Digest;
 
 use crate::domain::{BlobRef, IdempotencyKey, Observation, SupplementalRecord};
 use crate::runtime::partition::{
-    failover_event_json, identity_keyspec_json, initialize_event_json, parse_partition_event,
-    recover_event_json, routing_keyspec_json, split_commit_event_json, split_prepare_event_json,
-    PartitionTree, PARTITION_EVENT_FAILOVER, PARTITION_EVENT_INITIALIZE, PARTITION_EVENT_RECOVER,
+    PARTITION_EVENT_FAILOVER, PARTITION_EVENT_INITIALIZE, PARTITION_EVENT_RECOVER,
     PARTITION_EVENT_SPLIT_COMMIT, PARTITION_EVENT_SPLIT_PREPARE, PARTITION_SPLIT_REASON_CAPACITY,
+    PartitionTree, failover_event_json, identity_keyspec_json, initialize_event_json,
+    parse_partition_event, recover_event_json, routing_keyspec_json, split_commit_event_json,
+    split_prepare_event_json,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -65,9 +66,9 @@ impl SqlitePersistence {
     }
 
     pub fn load_observations(&self) -> Result<Vec<Observation>, PersistenceError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT observation_json FROM observations ORDER BY append_seq",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT observation_json FROM observations ORDER BY append_seq")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
 
         let mut observations = Vec::new();
@@ -79,9 +80,9 @@ impl SqlitePersistence {
     }
 
     pub fn load_supplementals(&self) -> Result<Vec<SupplementalRecord>, PersistenceError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT supplemental_json FROM supplementals ORDER BY created_at, id",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT supplemental_json FROM supplementals ORDER BY created_at, id")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
 
         let mut supplementals = Vec::new();
@@ -119,7 +120,7 @@ impl SqlitePersistence {
                 PersistenceError::SchemaInvariant(
                     "observation.meta.canonical_json is required for durable ingest".to_owned(),
                 )
-        })?;
+            })?;
         let json = serde_json::to_string(observation)?;
         let inserted = self.conn.execute(
             "INSERT INTO observations (
@@ -198,7 +199,10 @@ impl SqlitePersistence {
         self.append_observation_idempotent(&rehomed)
     }
 
-    pub fn persist_supplemental(&self, record: &SupplementalRecord) -> Result<(), PersistenceError> {
+    pub fn persist_supplemental(
+        &self,
+        record: &SupplementalRecord,
+    ) -> Result<(), PersistenceError> {
         let json = serde_json::to_string(record)?;
         self.conn.execute(
             "INSERT INTO supplementals (id, created_at, supplemental_json) VALUES (?1, ?2, ?3)
@@ -247,7 +251,9 @@ impl SqlitePersistence {
     }
 
     pub fn load_blobs(&self) -> Result<Vec<Vec<u8>>, PersistenceError> {
-        let mut stmt = self.conn.prepare("SELECT file_path FROM blobs ORDER BY file_path")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT file_path FROM blobs ORDER BY file_path")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
 
         let mut blobs = Vec::new();
@@ -595,9 +601,9 @@ mod tests {
     use chrono::Utc;
 
     use crate::domain::{
-        supplemental::InputAnchorSet, ActorRef, AuthorityModel, CaptureModel, EntityRef,
-        IdempotencyKey, Mutability, Observation, ObserverRef, SchemaRef, SemVer, SupplementalId,
-        SupplementalRecord,
+        ActorRef, AuthorityModel, CaptureModel, EntityRef, IdempotencyKey, Mutability, Observation,
+        ObserverRef, SchemaRef, SemVer, SupplementalId, SupplementalRecord,
+        supplemental::InputAnchorSet,
     };
 
     fn sample_observation() -> Observation {
@@ -770,7 +776,10 @@ mod tests {
             .rehome_observation(&observation, RehomeMode::StoredIdentity)
             .unwrap();
 
-        assert_eq!(outcome, DurableAppendOutcome::Appended(observation.id.clone()));
+        assert_eq!(
+            outcome,
+            DurableAppendOutcome::Appended(observation.id.clone())
+        );
         let (append_seq, json): (i64, String) = store
             .conn
             .query_row(
@@ -815,7 +824,10 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(outcome, DurableAppendOutcome::Appended(observation.id.clone()));
+        assert_eq!(
+            outcome,
+            DurableAppendOutcome::Appended(observation.id.clone())
+        );
         let (identity_key, canonical_json, json): (String, String, String) = store
             .conn
             .query_row(
@@ -899,8 +911,14 @@ mod tests {
 
         assert_eq!(event_type, "initialize");
         assert!(leaf_id.starts_with("lake:"));
-        assert_eq!(routing, crate::runtime::partition::routing_keyspec_json().unwrap());
-        assert_eq!(identity, crate::runtime::partition::identity_keyspec_json().unwrap());
+        assert_eq!(
+            routing,
+            crate::runtime::partition::routing_keyspec_json().unwrap()
+        );
+        assert_eq!(
+            identity,
+            crate::runtime::partition::identity_keyspec_json().unwrap()
+        );
 
         let _ = fs::remove_dir_all(tmp);
     }
@@ -948,9 +966,7 @@ mod tests {
         let left = format!("lake:{}", uuid::Uuid::now_v7());
         let right = format!("lake:{}", uuid::Uuid::now_v7());
 
-        let seq = store
-            .append_split_commit(&root, &left, &right, 2)
-            .unwrap();
+        let seq = store.append_split_commit(&root, &left, &right, 2).unwrap();
         let (bit_index, reason): (i64, String) = store
             .conn
             .query_row(
@@ -990,7 +1006,9 @@ mod tests {
             .conn
             .prepare("SELECT event_seq, event_type FROM partition_log ORDER BY event_seq")
             .unwrap()
-            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();

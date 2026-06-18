@@ -614,12 +614,7 @@ fn gslides_with_blob_attachments() {
         viewers: vec![],
     };
 
-    let draft = adapter.map_revision(
-        &rev,
-        &meta,
-        Some(native_blob),
-        vec![rendered_blob],
-    );
+    let draft = adapter.map_revision(&rev, &meta, Some(native_blob), vec![rendered_blob]);
 
     let mut gate = IngestionGate {
         registry: &reg,
@@ -708,7 +703,10 @@ fn claude_reexport_missing_message_is_noop() {
     }
     assert_eq!(lake.len(), 2);
 
-    for draft in importer.import_json_str(&second_export_missing_reply).unwrap() {
+    for draft in importer
+        .import_json_str(&second_export_missing_reply)
+        .unwrap()
+    {
         let mut gate = IngestionGate {
             registry: &reg,
             lake: &mut lake,
@@ -754,7 +752,10 @@ fn revision_snapshot_vs_event_capture_typed() {
 
     let slack_draft = slack_adapter.map_message(&sample_slack_message());
     assert_eq!(slack_draft.capture_model, CaptureModel::Event);
-    assert_eq!(slack_draft.authority_model, AuthorityModel::LakeAuthoritative);
+    assert_eq!(
+        slack_draft.authority_model,
+        AuthorityModel::LakeAuthoritative
+    );
 
     let rev = SlideRevision {
         presentation_id: "p1".into(),

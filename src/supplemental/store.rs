@@ -6,10 +6,8 @@
 
 use std::collections::HashMap;
 
-use crate::domain::{
-    DomainError, Mutability, ObservationId, SupplementalId, SupplementalRecord,
-};
 use crate::domain::supplemental::ConsentMetadata;
+use crate::domain::{DomainError, Mutability, ObservationId, SupplementalId, SupplementalRecord};
 use crate::lake::LakeStore;
 use crate::storage_api::SupplementalStorePort;
 
@@ -59,10 +57,7 @@ impl SupplementalStore {
         }
 
         let id = record.id.clone();
-        let ver = VersionedRecord {
-            version: 1,
-            record,
-        };
+        let ver = VersionedRecord { version: 1, record };
         self.history.push(ver.clone());
         self.records.insert(id.0.clone(), ver);
         Ok(id)
@@ -79,7 +74,10 @@ impl SupplementalStore {
             if entry.record.mutability == Mutability::AppendOnly {
                 return Err(DomainError::Policy(crate::domain::PolicyError {
                     code: "APPEND_ONLY".into(),
-                    message: format!("Record {} is AppendOnly and cannot be overwritten", record.id),
+                    message: format!(
+                        "Record {} is AppendOnly and cannot be overwritten",
+                        record.id
+                    ),
                 }));
             }
 
@@ -241,7 +239,10 @@ impl SupplementalStore {
 
 impl SupplementalStorePort for SupplementalStore {
     fn supplemental_records(&self) -> Vec<&SupplementalRecord> {
-        self.records.values().map(|versioned| &versioned.record).collect()
+        self.records
+            .values()
+            .map(|versioned| &versioned.record)
+            .collect()
     }
 }
 
@@ -252,10 +253,10 @@ impl SupplementalStorePort for SupplementalStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use crate::domain::supplemental::*;
     use crate::domain::*;
     use crate::lake::LakeStore;
+    use chrono::Utc;
 
     fn make_lake_with_obs() -> (LakeStore, ObservationId) {
         let mut lake = LakeStore::new();
@@ -422,7 +423,13 @@ mod tests {
 
         let rec = store.get(&id).unwrap();
         assert!(rec.consent_metadata.is_some());
-        assert!(rec.consent_metadata.as_ref().unwrap().retracted_at.is_some());
+        assert!(
+            rec.consent_metadata
+                .as_ref()
+                .unwrap()
+                .retracted_at
+                .is_some()
+        );
     }
 
     #[test]

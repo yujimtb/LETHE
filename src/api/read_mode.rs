@@ -103,7 +103,10 @@ mod tests {
                 entrypoint: None,
                 projector: "p".into(),
             },
-            outputs: vec![OutputSpec { format: "sql".into(), tables: vec!["t".into()] }],
+            outputs: vec![OutputSpec {
+                format: "sql".into(),
+                tables: vec!["t".into()],
+            }],
             reconciliation: None,
             deterministic_in: vec![ReadMode::AcademicPinned],
             gap_action: None,
@@ -130,7 +133,8 @@ mod tests {
     #[test]
     fn academic_pinned_with_pin() {
         let spec = test_spec();
-        let mode = ReadModeResolver::resolve(&spec, Some("academic-pinned"), Some("v1.0.0")).unwrap();
+        let mode =
+            ReadModeResolver::resolve(&spec, Some("academic-pinned"), Some("v1.0.0")).unwrap();
         assert_eq!(mode, ReadMode::AcademicPinned);
     }
 

@@ -4,9 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::domain::{
-    EntityRef, Observation, ObservationId, ObserverRef, SchemaRef,
-};
+use crate::domain::{EntityRef, Observation, ObservationId, ObserverRef, SchemaRef};
 use crate::storage_api::ObservationStore;
 
 const CANONICAL_JSON_META_KEY: &str = "canonical_json";
@@ -80,12 +78,18 @@ impl LakeStore {
 
     /// Filter observations by schema.
     pub fn by_schema(&self, schema: &SchemaRef) -> Vec<&Observation> {
-        self.observations.iter().filter(|o| o.schema == *schema).collect()
+        self.observations
+            .iter()
+            .filter(|o| o.schema == *schema)
+            .collect()
     }
 
     /// Filter observations by subject.
     pub fn by_subject(&self, subject: &EntityRef) -> Vec<&Observation> {
-        self.observations.iter().filter(|o| o.subject == *subject).collect()
+        self.observations
+            .iter()
+            .filter(|o| o.subject == *subject)
+            .collect()
     }
 
     /// Filter observations by observer.

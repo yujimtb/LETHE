@@ -73,8 +73,10 @@ impl HttpGoogleSlidesClient {
                 });
             }
 
-            return serde_json::from_str::<T>(&body).map_err(|err| AdapterError::MalformedResponse {
-                message: format!("google api {url} decode error: {err}; body: {body}"),
+            return serde_json::from_str::<T>(&body).map_err(|err| {
+                AdapterError::MalformedResponse {
+                    message: format!("google api {url} decode error: {err}; body: {body}"),
+                }
             });
         }
 
@@ -119,12 +121,11 @@ impl HttpGoogleSlidesClient {
                 });
             }
 
-            return response
-                .bytes()
-                .map(|bytes| bytes.to_vec())
-                .map_err(|err| AdapterError::Network {
+            return response.bytes().map(|bytes| bytes.to_vec()).map_err(|err| {
+                AdapterError::Network {
                     message: err.to_string(),
-                });
+                }
+            });
         }
 
         Err(AdapterError::AuthFailure {
@@ -172,8 +173,10 @@ impl HttpGoogleSlidesClient {
                     message: format!("google api {url} returned {status}: {body_text}"),
                 });
             }
-            return serde_json::from_str(&body_text).map_err(|err| AdapterError::MalformedResponse {
-                message: format!("google api {url} decode error: {err}; body: {body_text}"),
+            return serde_json::from_str(&body_text).map_err(|err| {
+                AdapterError::MalformedResponse {
+                    message: format!("google api {url} decode error: {err}; body: {body_text}"),
+                }
             });
         }
 
@@ -255,10 +258,7 @@ impl GoogleSlidesClient for HttpGoogleSlidesClient {
         })
     }
 
-    fn get_presentation(
-        &self,
-        presentation_id: &str,
-    ) -> Result<PresentationNative, AdapterError> {
+    fn get_presentation(&self, presentation_id: &str) -> Result<PresentationNative, AdapterError> {
         let response: PresentationResponse = self.get_json(&format!(
             "https://slides.googleapis.com/v1/presentations/{presentation_id}"
         ))?;
@@ -321,7 +321,9 @@ impl GoogleSlidesClient for HttpGoogleSlidesClient {
         Ok(PresentationMeta {
             presentation_id: response.id,
             title: response.name,
-            container_id: response.parents.and_then(|mut parents| parents.drain(..).next()),
+            container_id: response
+                .parents
+                .and_then(|mut parents| parents.drain(..).next()),
             canonical_uri: response.web_view_link.unwrap_or_else(|| {
                 format!("https://docs.google.com/presentation/d/{presentation_id}")
             }),
@@ -337,7 +339,8 @@ impl GoogleSlidesClient for HttpGoogleSlidesClient {
         slide_object_id: &str,
         format: &str,
     ) -> Result<RenderedSlide, AdapterError> {
-        let mime_type = if format.eq_ignore_ascii_case("jpeg") || format.eq_ignore_ascii_case("jpg") {
+        let mime_type = if format.eq_ignore_ascii_case("jpeg") || format.eq_ignore_ascii_case("jpg")
+        {
             "JPEG"
         } else {
             "PNG"
@@ -345,9 +348,11 @@ impl GoogleSlidesClient for HttpGoogleSlidesClient {
         let thumbnail: ThumbnailResponse = self.get_json(&format!(
             "https://slides.googleapis.com/v1/presentations/{presentation_id}/pages/{slide_object_id}/thumbnail?thumbnailProperties.mimeType={mime_type}&thumbnailProperties.thumbnailSize=LARGE"
         ))?;
-        let content_url = thumbnail.content_url.ok_or_else(|| AdapterError::MalformedResponse {
-            message: "missing thumbnail contentUrl".to_string(),
-        })?;
+        let content_url = thumbnail
+            .content_url
+            .ok_or_else(|| AdapterError::MalformedResponse {
+                message: "missing thumbnail contentUrl".to_string(),
+            })?;
         let data = self.get_bytes(&content_url)?;
 
         Ok(RenderedSlide {
@@ -395,10 +400,11 @@ impl GoogleSlidesClient for HttpGoogleSlidesClient {
                 "name": format!("lethe-temp-{presentation_id}-{slide_object_id}")
             }),
         )?;
-        let copied: DriveCopyResponse =
-            serde_json::from_value(copied_value).map_err(|err| AdapterError::MalformedResponse {
+        let copied: DriveCopyResponse = serde_json::from_value(copied_value).map_err(|err| {
+            AdapterError::MalformedResponse {
                 message: format!("failed to decode drive copy response: {err}"),
-            })?;
+            }
+        })?;
 
         let export_result = (|| -> Result<Vec<u8>, AdapterError> {
             let copied_presentation = self.get_presentation(&copied.id)?;
@@ -429,7 +435,10 @@ impl GoogleSlidesClient for HttpGoogleSlidesClient {
             "https://www.googleapis.com/drive/v3/files/{}",
             copied.id
         )) {
-            eprintln!("failed to delete temporary presentation {}: {}", copied.id, err);
+            eprintln!(
+                "failed to delete temporary presentation {}: {}",
+                copied.id, err
+            );
         }
 
         export_result
@@ -498,16 +507,27 @@ impl GoogleTokenSource {
     }
 
     fn exchange_refresh_token(&self, http: &Client) -> Result<String, AdapterError> {
-
-        let client_id = self.config.client_id.clone().ok_or_else(|| AdapterError::AuthFailure {
-            message: "missing LETHE_GOOGLE_CLIENT_ID".to_string(),
-        })?;
-        let client_secret = self.config.client_secret.clone().ok_or_else(|| AdapterError::AuthFailure {
-            message: "missing LETHE_GOOGLE_CLIENT_SECRET".to_string(),
-        })?;
-        let refresh_token = self.config.refresh_token.clone().ok_or_else(|| AdapterError::AuthFailure {
-            message: "missing LETHE_GOOGLE_REFRESH_TOKEN".to_string(),
-        })?;
+        let client_id = self
+            .config
+            .client_id
+            .clone()
+            .ok_or_else(|| AdapterError::AuthFailure {
+                message: "missing LETHE_GOOGLE_CLIENT_ID".to_string(),
+            })?;
+        let client_secret =
+            self.config
+                .client_secret
+                .clone()
+                .ok_or_else(|| AdapterError::AuthFailure {
+                    message: "missing LETHE_GOOGLE_CLIENT_SECRET".to_string(),
+                })?;
+        let refresh_token =
+            self.config
+                .refresh_token
+                .clone()
+                .ok_or_else(|| AdapterError::AuthFailure {
+                    message: "missing LETHE_GOOGLE_REFRESH_TOKEN".to_string(),
+                })?;
 
         let token_response = http
             .post("https://oauth2.googleapis.com/token")
@@ -525,13 +545,19 @@ impl GoogleTokenSource {
 
         if !token_response.status().is_success() {
             return Err(AdapterError::AuthFailure {
-                message: format!("google oauth token exchange failed: {}", token_response.status()),
+                message: format!(
+                    "google oauth token exchange failed: {}",
+                    token_response.status()
+                ),
             });
         }
 
-        let token: OAuthTokenResponse = token_response.json().map_err(|err| AdapterError::MalformedResponse {
-            message: err.to_string(),
-        })?;
+        let token: OAuthTokenResponse =
+            token_response
+                .json()
+                .map_err(|err| AdapterError::MalformedResponse {
+                    message: err.to_string(),
+                })?;
 
         let access_token = token.access_token;
         let expires_in = token.expires_in.unwrap_or(3600).saturating_sub(60);

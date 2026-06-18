@@ -1,6 +1,8 @@
 //! M09 — AdapterConfig
 
-use crate::domain::{AuthorityModel, CaptureModel, ObserverRef, SchemaRef, SemVer, SourceSystemRef};
+use crate::domain::{
+    AuthorityModel, CaptureModel, ObserverRef, SchemaRef, SemVer, SourceSystemRef,
+};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 

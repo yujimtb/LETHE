@@ -5,13 +5,13 @@
 
 pub mod catalog;
 pub mod lineage;
-pub mod spec;
 pub mod runner;
+pub mod spec;
 
 pub use catalog::ProjectionCatalog;
 pub use lineage::LineageManifest;
-pub use spec::{
-    BuildSpec, GapAction, OutputSpec, ProjectionSpec, ReadModePolicy,
-    ReconciliationPolicy, SourceDecl, SourceRef,
-};
 pub use runner::{BuildResult, BuildStatus, ProjectionRunner};
+pub use spec::{
+    BuildSpec, GapAction, OutputSpec, ProjectionSpec, ReadModePolicy, ReconciliationPolicy,
+    SourceDecl, SourceRef,
+};

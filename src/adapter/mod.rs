@@ -8,8 +8,8 @@
 //! - Heartbeat Observation generator
 
 pub mod config;
-pub mod content_model;
 pub mod conformance;
+pub mod content_model;
 pub mod error;
 pub mod heartbeat;
 pub mod idempotency;
@@ -17,8 +17,8 @@ pub mod retry;
 pub mod traits;
 
 pub mod claude;
-pub mod slack;
 pub mod gslides;
+pub mod slack;
 pub mod writeback;
 
 pub use config::*;

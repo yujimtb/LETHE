@@ -64,11 +64,7 @@ impl FilteringGate {
 
     /// Apply a masking strategy to a top-level field in a JSON object.
     /// Returns true if the field was found and masked.
-    fn apply_mask(
-        value: &mut serde_json::Value,
-        field_path: &str,
-        strategy: MaskStrategy,
-    ) -> bool {
+    fn apply_mask(value: &mut serde_json::Value, field_path: &str, strategy: MaskStrategy) -> bool {
         match value {
             serde_json::Value::Object(obj) => {
                 // Support single-level dotted paths (e.g., "contact.email")
@@ -91,16 +87,11 @@ impl FilteringGate {
                                 if let Some(val) = obj.get(key) {
                                     let hash = format!(
                                         "{:x}",
-                                        sha2::Digest::finalize(
-                                            sha2::Sha256::new_with_prefix(
-                                                val.to_string().as_bytes(),
-                                            ),
-                                        )
+                                        sha2::Digest::finalize(sha2::Sha256::new_with_prefix(
+                                            val.to_string().as_bytes(),
+                                        ),)
                                     );
-                                    obj.insert(
-                                        key.to_string(),
-                                        serde_json::Value::String(hash),
-                                    );
+                                    obj.insert(key.to_string(), serde_json::Value::String(hash));
                                 }
                             }
                         }
@@ -222,7 +213,8 @@ mod tests {
             "email": "admin@example.com",
             "phone": "070-0000-0000"
         });
-        let result = FilteringGate::filter(&payload, AccessScope::HighlySensitive, &restricted_fields());
+        let result =
+            FilteringGate::filter(&payload, AccessScope::HighlySensitive, &restricted_fields());
         assert_eq!(result.payload["real_name"], "Admin");
         assert_eq!(result.payload["email"], "admin@example.com");
         assert!(result.masked_fields.is_empty());

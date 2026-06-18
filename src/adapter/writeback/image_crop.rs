@@ -34,10 +34,19 @@ pub fn crop_from_thumbnail(
 ) -> Result<Vec<u8>, CropError> {
     let image = image::load_from_memory(thumbnail_png)?;
     let rgba = image.to_rgba8();
-    let region = crop_region(rgba.width(), rgba.height(), center_x_pct, center_y_pct, crop_type)?;
-    let cropped = image::imageops::crop_imm(&rgba, region.left, region.top, region.width, region.height).to_image();
+    let region = crop_region(
+        rgba.width(),
+        rgba.height(),
+        center_x_pct,
+        center_y_pct,
+        crop_type,
+    )?;
+    let cropped =
+        image::imageops::crop_imm(&rgba, region.left, region.top, region.width, region.height)
+            .to_image();
     let mut bytes = Vec::new();
-    image::DynamicImage::ImageRgba8(cropped).write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)?;
+    image::DynamicImage::ImageRgba8(cropped)
+        .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)?;
     Ok(bytes)
 }
 
@@ -97,12 +106,9 @@ mod tests {
     use super::*;
 
     fn sample_png(width: u32, height: u32) -> Vec<u8> {
-        let image = image::RgbaImage::from_fn(width, height, |x, y| image::Rgba([
-            (x % 255) as u8,
-            (y % 255) as u8,
-            120,
-            255,
-        ]));
+        let image = image::RgbaImage::from_fn(width, height, |x, y| {
+            image::Rgba([(x % 255) as u8, (y % 255) as u8, 120, 255])
+        });
         let mut bytes = Vec::new();
         image::DynamicImage::ImageRgba8(image)
             .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)

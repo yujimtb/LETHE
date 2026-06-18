@@ -5,11 +5,11 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
 use chrono::SecondsFormat;
+use chrono::{DateTime, Utc};
 
-use crate::adapter::error::AdapterError;
 use crate::adapter::config::AdapterConfig;
+use crate::adapter::error::AdapterError;
 use crate::adapter::heartbeat::heartbeat_draft;
 use crate::adapter::idempotency::*;
 use crate::adapter::traits::*;
@@ -59,10 +59,7 @@ impl<C: SlackClient> SlackAdapter<C> {
         let published = parse_slack_ts(&msg.ts).unwrap_or_else(Utc::now);
         let identity = declare_canonical_identity("slack", self, self, msg);
 
-        let subject = EntityRef::new(format!(
-            "message:slack:{}-{}",
-            msg.channel_id, msg.ts
-        ));
+        let subject = EntityRef::new(format!("message:slack:{}-{}", msg.channel_id, msg.ts));
 
         let mut meta = serde_json::json!({
             "sourceAdapterVersion": self.config.adapter_version.as_str(),
@@ -71,10 +68,8 @@ impl<C: SlackClient> SlackAdapter<C> {
         });
 
         if msg.message_type == SlackMessageType::Delete {
-            meta["retracts"] = serde_json::json!(format!(
-                "message:slack:{}-{}",
-                msg.channel_id, msg.ts
-            ));
+            meta["retracts"] =
+                serde_json::json!(format!("message:slack:{}-{}", msg.channel_id, msg.ts));
         }
 
         let mut payload = serde_json::json!({
@@ -240,9 +235,7 @@ impl<C: SlackClient> SourceAdapter for SlackAdapter<C> {
         // Try to deserialize as SlackMessage first, then as channel snapshot.
         if let Ok(msg) = serde_json::from_value::<SlackMessage>(raw.data.clone()) {
             vec![self.map_message(&msg)]
-        } else if let Ok(snap) =
-            serde_json::from_value::<SlackChannelSnapshot>(raw.data.clone())
-        {
+        } else if let Ok(snap) = serde_json::from_value::<SlackChannelSnapshot>(raw.data.clone()) {
             vec![self.map_channel_snapshot(&snap)]
         } else {
             vec![]
@@ -283,8 +276,8 @@ fn parse_slack_ts(ts: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::error::AdapterError;
     use crate::adapter::config::*;
+    use crate::adapter::error::AdapterError;
     use std::time::Duration;
 
     fn test_config() -> AdapterConfig {
@@ -343,10 +336,12 @@ mod tests {
         let draft = adapter.map_message(&msg);
 
         assert_eq!(draft.schema.as_str(), SLACK_MESSAGE_SCHEMA);
-        assert!(draft
-            .idempotency_key
-            .as_str()
-            .starts_with("slack:channel:C01ABC:ts:1234567890.123456:"));
+        assert!(
+            draft
+                .idempotency_key
+                .as_str()
+                .starts_with("slack:channel:C01ABC:ts:1234567890.123456:")
+        );
         assert!(draft.meta[CANONICAL_JSON_META_KEY].is_string());
         assert_eq!(
             draft.subject.as_str(),
@@ -370,10 +365,12 @@ mod tests {
         });
 
         let draft = adapter.map_message(&msg);
-        assert!(draft
-            .idempotency_key
-            .as_str()
-            .starts_with("slack:channel:C01ABC:ts:1234567890.123456:"));
+        assert!(
+            draft
+                .idempotency_key
+                .as_str()
+                .starts_with("slack:channel:C01ABC:ts:1234567890.123456:")
+        );
         assert_eq!(draft.payload["message_type"], "edit");
         assert!(draft.payload["edited"].is_object());
     }
@@ -385,10 +382,12 @@ mod tests {
         msg.message_type = SlackMessageType::Delete;
 
         let draft = adapter.map_message(&msg);
-        assert!(draft
-            .idempotency_key
-            .as_str()
-            .starts_with("slack:channel:C01ABC:ts:1234567890.123456:"));
+        assert!(
+            draft
+                .idempotency_key
+                .as_str()
+                .starts_with("slack:channel:C01ABC:ts:1234567890.123456:")
+        );
         assert_eq!(draft.payload["message_type"], "delete");
         assert!(draft.meta["retracts"].is_string());
     }

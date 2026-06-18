@@ -8,11 +8,11 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use crate::adapter::error::AdapterError;
 use crate::adapter::config::AdapterConfig;
+use crate::adapter::error::AdapterError;
 use crate::adapter::heartbeat::heartbeat_draft;
 use crate::adapter::idempotency::{
-    canonical_json, identity_key, CANONICAL_JSON_META_KEY, OBJECT_ID_META_KEY,
+    CANONICAL_JSON_META_KEY, OBJECT_ID_META_KEY, canonical_json, identity_key,
 };
 use crate::adapter::traits::*;
 use crate::domain::{
@@ -70,10 +70,7 @@ impl<C: GoogleSlidesClient> GoogleSlidesAdapter<C> {
             revision.presentation_id, revision.revision_id
         );
 
-        let subject = EntityRef::new(format!(
-            "document:gslides:{}",
-            revision.presentation_id
-        ));
+        let subject = EntityRef::new(format!("document:gslides:{}", revision.presentation_id));
 
         let capture_mode = if rendered_blob_refs.is_empty() {
             "snapshot"
@@ -233,8 +230,8 @@ impl<C: GoogleSlidesClient> SourceAdapter for GoogleSlidesAdapter<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::error::AdapterError;
     use crate::adapter::config::*;
+    use crate::adapter::error::AdapterError;
     use std::time::Duration;
 
     fn test_config() -> AdapterConfig {
@@ -311,10 +308,12 @@ mod tests {
 
         let draft = adapter.map_revision(&rev, &meta, None, vec![]);
         assert_eq!(draft.schema.as_str(), WORKSPACE_SNAPSHOT_SCHEMA);
-        assert!(draft
-            .idempotency_key
-            .as_str()
-            .starts_with("google-slides:presentation:pres123:revision:rev456:"));
+        assert!(
+            draft
+                .idempotency_key
+                .as_str()
+                .starts_with("google-slides:presentation:pres123:revision:rev456:")
+        );
         assert!(draft.meta[CANONICAL_JSON_META_KEY].is_string());
         assert_eq!(draft.subject.as_str(), "document:gslides:pres123");
         assert_eq!(draft.authority_model, AuthorityModel::SourceAuthoritative);
@@ -418,8 +417,7 @@ mod tests {
 
     #[test]
     fn cursor_management() {
-        let mut adapter =
-            GoogleSlidesAdapter::new(FixtureGoogleSlidesClient::new(), test_config());
+        let mut adapter = GoogleSlidesAdapter::new(FixtureGoogleSlidesClient::new(), test_config());
         assert!(adapter.get_cursor("pres123").is_none());
 
         adapter.update_cursor("pres123", "rev456");
@@ -432,8 +430,7 @@ mod tests {
     #[test]
     fn adapter_metadata_in_observations() {
         let adapter = GoogleSlidesAdapter::new(FixtureGoogleSlidesClient::new(), test_config());
-        let draft =
-            adapter.map_revision(&sample_revision(), &sample_meta(), None, vec![]);
+        let draft = adapter.map_revision(&sample_revision(), &sample_meta(), None, vec![]);
         assert_eq!(draft.meta["sourceAdapterVersion"], "1.0.0");
     }
 }

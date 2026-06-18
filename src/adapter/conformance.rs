@@ -8,11 +8,17 @@ pub fn source_adapter_contract<A: SourceAdapter>(
 ) {
     let heartbeat = adapter.heartbeat();
     assert_eq!(heartbeat.observer, *adapter.observer_ref());
-    assert_eq!(heartbeat.source_system.as_ref(), Some(adapter.source_system_ref()));
+    assert_eq!(
+        heartbeat.source_system.as_ref(),
+        Some(adapter.source_system_ref())
+    );
 
     for draft in adapter.to_observations(raw) {
         assert_eq!(draft.observer, *adapter.observer_ref());
-        assert_eq!(draft.source_system.as_ref(), Some(adapter.source_system_ref()));
+        assert_eq!(
+            draft.source_system.as_ref(),
+            Some(adapter.source_system_ref())
+        );
         assert!(!draft.idempotency_key.as_str().trim().is_empty());
     }
 

@@ -83,14 +83,21 @@ impl HealthAggregator {
         components: &[ComponentHealth],
         projections: &HashMap<String, ProjectionHealthInfo>,
     ) -> HealthStatus {
-        let any_unhealthy = components.iter().any(|c| c.status == HealthStatus::Unhealthy);
+        let any_unhealthy = components
+            .iter()
+            .any(|c| c.status == HealthStatus::Unhealthy);
         if any_unhealthy {
             return HealthStatus::Unhealthy;
         }
 
-        let any_degraded = components.iter().any(|c| c.status == HealthStatus::Degraded)
+        let any_degraded = components
+            .iter()
+            .any(|c| c.status == HealthStatus::Degraded)
             || projections.values().any(|p| {
-                matches!(p.status, ProjectionHealth::Degraded | ProjectionHealth::Broken)
+                matches!(
+                    p.status,
+                    ProjectionHealth::Degraded | ProjectionHealth::Broken
+                )
             });
         if any_degraded {
             return HealthStatus::Degraded;
@@ -175,7 +182,11 @@ mod tests {
     #[test]
     fn health_round_trips_via_json() {
         let health = agg().aggregate(
-            vec![ComponentHealth { name: "lake".into(), status: HealthStatus::Ok, message: None }],
+            vec![ComponentHealth {
+                name: "lake".into(),
+                status: HealthStatus::Ok,
+                message: None,
+            }],
             vec![],
         );
         let json = serde_json::to_string(&health).unwrap();

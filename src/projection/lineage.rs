@@ -30,11 +30,7 @@ pub struct LineageManifest {
 
 impl LineageManifest {
     /// Create a new lineage manifest for a build.
-    pub fn new(
-        projection_id: ProjectionRef,
-        version: SemVer,
-        build_id: String,
-    ) -> Self {
+    pub fn new(projection_id: ProjectionRef, version: SemVer, build_id: String) -> Self {
         Self {
             projection_id,
             version,

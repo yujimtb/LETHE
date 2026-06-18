@@ -8,9 +8,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    AuthorityModel, BlobRef, CaptureModel, EntityRef, IdempotencyKey,
-    ActorRef, IngestResult, Observation, ObserverRef, QuarantineTicket, SchemaRef,
-    SemVer, SourceSystemRef, MAX_CLOCK_SKEW,
+    ActorRef, AuthorityModel, BlobRef, CaptureModel, EntityRef, IdempotencyKey, IngestResult,
+    MAX_CLOCK_SKEW, Observation, ObserverRef, QuarantineTicket, SchemaRef, SemVer, SourceSystemRef,
 };
 use crate::governance::engine::PolicyEngine;
 use crate::governance::types::{
@@ -65,7 +64,9 @@ impl IngestionGate<'_> {
             AppendOutcome::Conflict(existing_id) => IngestResult::Quarantined {
                 ticket: QuarantineTicket {
                     id: uuid::Uuid::now_v7().to_string(),
-                    reason: format!("sha256-collision: existing observation {existing_id} has different canonical_json"),
+                    reason: format!(
+                        "sha256-collision: existing observation {existing_id} has different canonical_json"
+                    ),
                 },
             },
         }

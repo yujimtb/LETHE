@@ -104,7 +104,11 @@ impl StudentProfile {
         if !self.name.trim().is_empty() {
             score += 4;
         }
-        if self.bio_text.as_ref().is_some_and(|text| !text.trim().is_empty()) {
+        if self
+            .bio_text
+            .as_ref()
+            .is_some_and(|text| !text.trim().is_empty())
+        {
             score += 12;
         }
         if self.profile_pic.is_some() {
@@ -140,7 +144,9 @@ impl ProfilePic {
     }
 
     fn is_meaningful(&self) -> bool {
-        self.description.as_ref().is_some_and(|value| !value.is_empty())
+        self.description
+            .as_ref()
+            .is_some_and(|value| !value.is_empty())
             || self.url.as_ref().is_some_and(|value| !value.is_empty())
             || self.coordinates.is_some()
     }
@@ -171,7 +177,9 @@ impl GalleryImage {
     }
 
     fn is_meaningful(&self) -> bool {
-        self.description.as_ref().is_some_and(|value| !value.is_empty())
+        self.description
+            .as_ref()
+            .is_some_and(|value| !value.is_empty())
             || self.url.as_ref().is_some_and(|value| !value.is_empty())
             || self.coordinates.is_some()
     }
@@ -195,15 +203,31 @@ pub struct StudentProperties {
     pub mbti: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "SNS")]
     pub sns: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_vec_or_default", rename = "Hobbies")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_vec_or_default",
+        rename = "Hobbies"
+    )]
     pub hobbies: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_vec_or_default", rename = "Interests")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_vec_or_default",
+        rename = "Interests"
+    )]
     pub interests: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_vec_or_default", rename = "Likes")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_vec_or_default",
+        rename = "Likes"
+    )]
     pub likes: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "Dislikes")]
     pub dislikes: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_vec_or_default", rename = "Hashtags")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_vec_or_default",
+        rename = "Hashtags"
+    )]
     pub hashtags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "New Challenges")]
     pub new_challenges: Option<String>,
@@ -363,7 +387,10 @@ fn normalize_string_list(values: &mut Vec<String>) {
             if trimmed.is_empty() || is_placeholder_value(trimmed) {
                 continue;
             }
-            if !normalized.iter().any(|existing: &String| existing.eq_ignore_ascii_case(trimmed)) {
+            if !normalized
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(trimmed))
+            {
                 normalized.push(trimmed.to_string());
             }
         }

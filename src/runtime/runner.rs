@@ -56,9 +56,7 @@ impl LocalBuildRunner {
     /// Verify the sandbox invariants (network policy, timeout configured).
     pub fn verify_sandbox(&self) -> Vec<String> {
         let mut issues = Vec::new();
-        if self.config.network_policy
-            != crate::runtime::config::NetworkPolicy::DefaultDeny
-        {
+        if self.config.network_policy != crate::runtime::config::NetworkPolicy::DefaultDeny {
             issues.push("Build network policy is not DefaultDeny".to_string());
         }
         if self.config.timeout.is_zero() {
@@ -138,12 +136,10 @@ mod tests {
         BuildSpec {
             projection_id: "proj:person-page".into(),
             entrypoint: "build.sql".into(),
-            source_pins: vec![
-                SourcePin {
-                    source_ref: "lake".into(),
-                    watermark: "wm:100".into(),
-                },
-            ],
+            source_pins: vec![SourcePin {
+                source_ref: "lake".into(),
+                watermark: "wm:100".into(),
+            }],
         }
     }
 

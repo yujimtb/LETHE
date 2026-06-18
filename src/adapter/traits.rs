@@ -1,7 +1,9 @@
 //! M09 — SourceAdapter trait and core protocol types
 
-use crate::domain::{BlobRef, EntityRef, IdempotencyKey, ObserverRef, SchemaRef, SemVer, SourceSystemRef};
 use crate::domain::{AuthorityModel, CaptureModel};
+use crate::domain::{
+    BlobRef, EntityRef, IdempotencyKey, ObserverRef, SchemaRef, SemVer, SourceSystemRef,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 

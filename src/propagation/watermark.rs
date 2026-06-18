@@ -76,12 +76,7 @@ impl WatermarkStore {
             .or_insert_with(|| WatermarkState::new(projection_id.clone()))
     }
 
-    pub fn update(
-        &mut self,
-        projection_id: &ProjectionRef,
-        position: usize,
-        status: BuildStatus,
-    ) {
+    pub fn update(&mut self, projection_id: &ProjectionRef, position: usize, status: BuildStatus) {
         let state = self
             .states
             .entry(projection_id.as_str().to_string())
@@ -137,9 +132,7 @@ impl WatermarkStore {
     ) -> &LeafWatermarkState {
         self.leaf_states
             .entry((projection_id.as_str().to_owned(), leaf_id.to_owned()))
-            .or_insert_with(|| {
-                LeafWatermarkState::new(projection_id.clone(), leaf_id.to_owned())
-            })
+            .or_insert_with(|| LeafWatermarkState::new(projection_id.clone(), leaf_id.to_owned()))
     }
 
     pub fn update_leaf(
@@ -152,9 +145,7 @@ impl WatermarkStore {
         let state = self
             .leaf_states
             .entry((projection_id.as_str().to_owned(), leaf_id.to_owned()))
-            .or_insert_with(|| {
-                LeafWatermarkState::new(projection_id.clone(), leaf_id.to_owned())
-            });
+            .or_insert_with(|| LeafWatermarkState::new(projection_id.clone(), leaf_id.to_owned()));
 
         assert!(
             append_seq >= state.last_processed_append_seq,
@@ -189,9 +180,8 @@ impl WatermarkStore {
             .leaf_states
             .get_mut(&(projection_id.as_str().to_owned(), leaf_id.to_owned()))
         {
-            state.pending_count = Some(
-                leaf_append_seq.saturating_sub(state.last_processed_append_seq),
-            );
+            state.pending_count =
+                Some(leaf_append_seq.saturating_sub(state.last_processed_append_seq));
         }
     }
 

@@ -66,12 +66,7 @@ pub fn slack_delete_key(channel_id: &str, ts: &str) -> IdempotencyKey {
     IdempotencyKey::new(format!("slack:{channel_id}:{ts}:delete"))
 }
 
-pub fn slack_reaction_key(
-    channel_id: &str,
-    ts: &str,
-    user: &str,
-    emoji: &str,
-) -> IdempotencyKey {
+pub fn slack_reaction_key(channel_id: &str, ts: &str, user: &str, emoji: &str) -> IdempotencyKey {
     IdempotencyKey::new(format!("slack:{channel_id}:{ts}:react:{user}:{emoji}"))
 }
 
@@ -81,9 +76,7 @@ pub fn slack_file_key(channel_id: &str, ts: &str, file_id: &str) -> IdempotencyK
 
 /// Google Slides idempotency key pattern (M11).
 pub fn gslides_revision_key(presentation_id: &str, revision_id: &str) -> IdempotencyKey {
-    IdempotencyKey::new(format!(
-        "gslides:{presentation_id}:rev:{revision_id}"
-    ))
+    IdempotencyKey::new(format!("gslides:{presentation_id}:rev:{revision_id}"))
 }
 
 /// Heartbeat idempotency key — includes observer name and timestamp window
@@ -131,10 +124,7 @@ mod tests {
     #[test]
     fn slack_file_key_format() {
         let k = slack_file_key("C01ABC", "1234567890.123456", "F01DEF");
-        assert_eq!(
-            k.as_str(),
-            "slack:C01ABC:1234567890.123456:file:F01DEF"
-        );
+        assert_eq!(k.as_str(), "slack:C01ABC:1234567890.123456:file:F01DEF");
     }
 
     #[test]
@@ -190,7 +180,12 @@ mod tests {
         let identity = declare_canonical_identity("test", &contract, &contract, &"hello");
 
         assert_eq!(identity.object_id, "fixture:hello");
-        assert!(identity.idempotency_key.as_str().starts_with("test:fixture:hello:"));
+        assert!(
+            identity
+                .idempotency_key
+                .as_str()
+                .starts_with("test:fixture:hello:")
+        );
         assert_eq!(identity.canonical_json, "{\"body\":\"hello\"}");
     }
 }

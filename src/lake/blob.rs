@@ -33,7 +33,9 @@ impl BlobStore {
     /// Idempotent: storing the same content twice is a no-op.
     pub fn put(&mut self, data: &[u8]) -> BlobRef {
         let hash = hex::encode(Sha256::digest(data));
-        self.blobs.entry(hash.clone()).or_insert_with(|| data.to_vec());
+        self.blobs
+            .entry(hash.clone())
+            .or_insert_with(|| data.to_vec());
         BlobRef::new(format!("blob:sha256:{hash}"))
     }
 

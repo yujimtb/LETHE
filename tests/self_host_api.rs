@@ -21,7 +21,14 @@ fn temp_paths() -> (PathBuf, PathBuf, PathBuf) {
     (root, db, blobs)
 }
 
-fn slack_observation(user_id: &str, email: &str, name: &str, text: &str, channel: &str, key: &str) -> Observation {
+fn slack_observation(
+    user_id: &str,
+    email: &str,
+    name: &str,
+    text: &str,
+    channel: &str,
+    key: &str,
+) -> Observation {
     Observation {
         id: Observation::new_id(),
         schema: SchemaRef::new("schema:slack-message"),
@@ -175,7 +182,10 @@ fn self_host_persons_endpoint_returns_projection_data() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-    assert_eq!(json["projection_metadata"]["projection_id"], "proj:person-page");
+    assert_eq!(
+        json["projection_metadata"]["projection_id"],
+        "proj:person-page"
+    );
     assert_eq!(json["data"]["total"], 1);
     assert_eq!(json["data"]["data"][0]["display_name"], "田中太郎");
 
@@ -211,7 +221,10 @@ fn public_blob_endpoint_serves_persisted_blob_bytes() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        response.headers().get("content-type").and_then(|value| value.to_str().ok()),
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
         Some("image/png")
     );
     let body = runtime
@@ -288,7 +301,10 @@ fn self_host_person_detail_hides_restricted_identities() {
 
     assert_eq!(detail_json["data"]["display_name"], "田中太郎");
     assert!(detail_json["data"].get("identities").is_none());
-    assert_eq!(detail_json["data"]["related_slides"][0]["title"], "田中の自己紹介");
+    assert_eq!(
+        detail_json["data"]["related_slides"][0]["title"],
+        "田中の自己紹介"
+    );
 
     let _ = std::fs::remove_dir_all(root);
 }

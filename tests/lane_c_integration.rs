@@ -8,7 +8,7 @@ use serde_json::json;
 
 use lethe::api::envelope::ResponseEnvelope;
 use lethe::api::health::HealthResponse;
-use lethe::api::pagination::{paginate, PaginationParams};
+use lethe::api::pagination::{PaginationParams, paginate};
 use lethe::api::read_mode::ReadModeResolver;
 use lethe::domain::*;
 use lethe::governance::filter::FilteringGate;
@@ -16,17 +16,24 @@ use lethe::governance::types::{AccessScope, MaskStrategy, RestrictedFieldSpec};
 use lethe::identity::projector::IdentityProjector;
 use lethe::lake::store::LakeStore;
 use lethe::person_page::projector::PersonPageProjector;
+use lethe::projection::BuildStatus;
 use lethe::projection::catalog::ProjectionCatalog;
 use lethe::projection::runner::Projector;
 use lethe::projection::spec::*;
-use lethe::projection::BuildStatus;
 use lethe::propagation::watermark::WatermarkStore;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn slack_observation(user_id: &str, email: &str, name: &str, text: &str, channel: &str, key: &str) -> Observation {
+fn slack_observation(
+    user_id: &str,
+    email: &str,
+    name: &str,
+    text: &str,
+    channel: &str,
+    key: &str,
+) -> Observation {
     Observation {
         id: Observation::new_id(),
         schema: SchemaRef::new("schema:slack-message"),
@@ -178,11 +185,42 @@ fn end_to_end_observation_to_person_page() {
     let mut lake = LakeStore::new();
 
     let obs = vec![
-        slack_observation("U100", "tanaka@example.jp", "田中太郎", "おはよう", "general", "s1"),
-        slack_observation("U100", "tanaka@example.jp", "田中太郎", "会議開始", "project-a", "s2"),
-        slack_observation("U200", "suzuki@example.jp", "鈴木花子", "了解です", "general", "s3"),
-        gslides_observation(&["tanaka@example.jp"], "tanaka@example.jp", "田中の自己紹介", "g1"),
-        gslides_observation(&["suzuki@example.jp", "tanaka@example.jp"], "suzuki@example.jp", "共同プレゼン", "g2"),
+        slack_observation(
+            "U100",
+            "tanaka@example.jp",
+            "田中太郎",
+            "おはよう",
+            "general",
+            "s1",
+        ),
+        slack_observation(
+            "U100",
+            "tanaka@example.jp",
+            "田中太郎",
+            "会議開始",
+            "project-a",
+            "s2",
+        ),
+        slack_observation(
+            "U200",
+            "suzuki@example.jp",
+            "鈴木花子",
+            "了解です",
+            "general",
+            "s3",
+        ),
+        gslides_observation(
+            &["tanaka@example.jp"],
+            "tanaka@example.jp",
+            "田中の自己紹介",
+            "g1",
+        ),
+        gslides_observation(
+            &["suzuki@example.jp", "tanaka@example.jp"],
+            "suzuki@example.jp",
+            "共同プレゼン",
+            "g2",
+        ),
     ];
 
     for o in &obs {
@@ -345,9 +383,14 @@ fn watermark_incremental_propagation() {
 
 #[test]
 fn api_response_envelope_contract() {
-    let obs = vec![
-        slack_observation("U1", "test@example.com", "Test", "hello", "general", "s1"),
-    ];
+    let obs = vec![slack_observation(
+        "U1",
+        "test@example.com",
+        "Test",
+        "hello",
+        "general",
+        "s1",
+    )];
 
     let projector = IdentityProjector::new("1.0.0");
     let identity = &projector.project(&obs)[0];
@@ -429,9 +472,14 @@ fn api_read_mode_resolver_for_person_page() {
 
 #[test]
 fn filtering_before_exposure_masks_restricted_fields() {
-    let obs = vec![
-        slack_observation("U1", "secret@example.com", "Secret User", "private msg", "dm", "s1"),
-    ];
+    let obs = vec![slack_observation(
+        "U1",
+        "secret@example.com",
+        "Secret User",
+        "private msg",
+        "dm",
+        "s1",
+    )];
 
     let projector = IdentityProjector::new("1.0.0");
     let identity = &projector.project(&obs)[0];
@@ -457,7 +505,10 @@ fn filtering_before_exposure_masks_restricted_fields() {
     // Restricted scope should see identities.
     let result2 = FilteringGate::filter(&profile_json, AccessScope::Restricted, &restricted_specs);
     let identities2 = result2.payload.get("identities");
-    assert!(identities2.is_some(), "restricted scope should see identities");
+    assert!(
+        identities2.is_some(),
+        "restricted scope should see identities"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -523,8 +574,12 @@ fn scheduler_propagates_through_dag() {
     }
 
     // All watermarks should be at 1 now.
-    let id_wm = wm_store.get(&ProjectionRef::new("proj:identity-resolution")).unwrap();
-    let pp_wm = wm_store.get(&ProjectionRef::new("proj:person-page")).unwrap();
+    let id_wm = wm_store
+        .get(&ProjectionRef::new("proj:identity-resolution"))
+        .unwrap();
+    let pp_wm = wm_store
+        .get(&ProjectionRef::new("proj:person-page"))
+        .unwrap();
     assert_eq!(id_wm.last_processed_position, 1);
     assert_eq!(pp_wm.last_processed_position, 1);
 }

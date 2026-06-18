@@ -1,8 +1,8 @@
-pub mod types;
-pub mod observation;
-pub mod supplemental;
 pub mod command;
 pub mod error;
+pub mod observation;
+pub mod supplemental;
+pub mod types;
 pub mod values;
 
 pub use error::*;

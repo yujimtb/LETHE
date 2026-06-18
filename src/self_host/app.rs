@@ -2,10 +2,12 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Cursor, Read};
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Utc};
 use axum::http::HeaderMap;
+use chrono::{DateTime, Utc};
 
-use crate::adapter::config::{AdapterConfig, BackoffStrategy, RateLimitConfig, RetryConfig, SchemaBinding};
+use crate::adapter::config::{
+    AdapterConfig, BackoffStrategy, RateLimitConfig, RetryConfig, SchemaBinding,
+};
 use crate::adapter::gslides::client::GoogleSlidesClient;
 use crate::adapter::gslides::mapper::GoogleSlidesAdapter;
 use crate::adapter::slack::client::SlackClient;
@@ -15,20 +17,19 @@ use crate::adapter::writeback::notion::client::{NotionClient, NotionConfig};
 use crate::adapter::writeback::traits::{SaaSWriteAdapter, WriteAction, WriteRecord};
 use crate::api::envelope::{ProjectionMetadata, ResponseEnvelope};
 use crate::api::health::HealthResponse;
-use crate::api::pagination::{paginate, PaginatedResponse, PaginationParams};
+use crate::api::pagination::{PaginatedResponse, PaginationParams, paginate};
 use crate::api::read_mode::{ReadModeError, ReadModeResolver};
 use crate::attribute_inventory::{AttributeInventoryDocument, build_inventory_documents};
 use crate::domain::{
     ActorRef, AuthorityModel, BlobRef, CaptureModel, EntityRef, IngestResult, Observation,
-    ObserverRef, ProjectionRef, ProjectionStatus, ReadMode, SchemaRef, SemVer,
-    SourceSystemRef,
+    ObserverRef, ProjectionRef, ProjectionStatus, ReadMode, SchemaRef, SemVer, SourceSystemRef,
 };
-use crate::governance::engine::PolicyEngine;
 use crate::governance::audit::{AuditLog, InMemoryAuditLog};
+use crate::governance::engine::PolicyEngine;
 use crate::governance::filter::FilteringGate;
 use crate::governance::types::{
-    AccessScope, AuditEvent, AuditEventKind, ConsentStatus, Environment, MaskStrategy, Operation, PolicyOutcome,
-    PolicyRequest, RestrictedFieldSpec, Role,
+    AccessScope, AuditEvent, AuditEventKind, ConsentStatus, Environment, MaskStrategy, Operation,
+    PolicyOutcome, PolicyRequest, RestrictedFieldSpec, Role,
 };
 use crate::identity::projector::IdentityProjector;
 use crate::identity::types::IdentityResolutionOutput;
@@ -238,19 +239,27 @@ impl AppCore {
             .next()
             .unwrap_or_default();
         let supplemental_records = self.supplemental.by_kind("slide-analysis");
-        let person_page = PersonPageProjector::project(&identity, self.lake.list(), &supplemental_records);
+        let person_page =
+            PersonPageProjector::project(&identity, self.lake.list(), &supplemental_records);
         self.snapshot = ProjectionSnapshot {
             identity,
             person_page,
             built_at: Utc::now(),
         };
-        self.catalog
-            .set_status(&ProjectionRef::new("proj:identity-resolution"), ProjectionStatus::Active);
-        self.catalog
-            .set_status(&ProjectionRef::new("proj:person-page"), ProjectionStatus::Active);
+        self.catalog.set_status(
+            &ProjectionRef::new("proj:identity-resolution"),
+            ProjectionStatus::Active,
+        );
+        self.catalog.set_status(
+            &ProjectionRef::new("proj:person-page"),
+            ProjectionStatus::Active,
+        );
     }
 
-    fn prepare_observation(&mut self, draft: ObservationDraft) -> Result<Observation, IngestResult> {
+    fn prepare_observation(
+        &mut self,
+        draft: ObservationDraft,
+    ) -> Result<Observation, IngestResult> {
         let request = IngestRequest {
             schema: draft.schema,
             schema_version: draft.schema_version,
@@ -283,10 +292,7 @@ impl AppCore {
         self.supplemental.upsert_with_rollback(record, &self.lake)
     }
 
-    fn rollback_supplemental(
-        &mut self,
-        rollback: crate::supplemental::store::UpsertRollback,
-    ) {
+    fn rollback_supplemental(&mut self, rollback: crate::supplemental::store::UpsertRollback) {
         self.supplemental.rollback_upsert(rollback);
     }
 }
@@ -387,9 +393,9 @@ impl AppService {
         let raw = header
             .to_str()
             .map_err(|_| SelfHostError::Auth("invalid authorization header".to_string()))?;
-        let token = raw
-            .strip_prefix("Bearer ")
-            .ok_or_else(|| SelfHostError::Auth("authorization must use Bearer token".to_string()))?;
+        let token = raw.strip_prefix("Bearer ").ok_or_else(|| {
+            SelfHostError::Auth("authorization must use Bearer token".to_string())
+        })?;
         let matched = self
             .config
             .api_tokens
@@ -454,9 +460,9 @@ impl AppService {
             self.config.public_base_url.as_deref(),
             &source_image_index,
         )
-            .into_iter()
-            .map(|candidate| candidate.preview)
-            .collect())
+        .into_iter()
+        .map(|candidate| candidate.preview)
+        .collect())
     }
 
     pub fn notion_review_sync(
@@ -518,7 +524,10 @@ impl AppService {
                         self.config.public_base_url.as_deref(),
                         source_image_index.get(frontend.source_document_id.as_str()),
                     )?;
-                    Some(RankedNotionWriteCandidate { preview, write_record })
+                    Some(RankedNotionWriteCandidate {
+                        preview,
+                        write_record,
+                    })
                 })
                 .collect::<Vec<_>>();
             ranked.sort_by_key(|candidate| candidate.preview.rank);
@@ -558,14 +567,19 @@ impl AppService {
 
         Ok(NotionReviewSyncReport {
             sync_report,
-            candidates: candidates.into_iter().map(|candidate| candidate.preview).collect(),
+            candidates: candidates
+                .into_iter()
+                .map(|candidate| candidate.preview)
+                .collect(),
             notion_synced: writes.len(),
             writes,
             cleaned_up,
         })
     }
 
-    pub fn attribute_inventory_documents(&self) -> Result<Vec<AttributeInventoryDocument>, SelfHostError> {
+    pub fn attribute_inventory_documents(
+        &self,
+    ) -> Result<Vec<AttributeInventoryDocument>, SelfHostError> {
         let core = self.core_lock()?;
         Ok(build_inventory_documents(&core.snapshot))
     }
@@ -575,7 +589,8 @@ impl AppService {
         let mut google_ingested = 0usize;
         let mut duplicates = 0usize;
 
-        let slack_adapter = SlackAdapter::new(self.slack_client.clone(), self.slack_adapter_config());
+        let slack_adapter =
+            SlackAdapter::new(self.slack_client.clone(), self.slack_adapter_config());
         for channel_id in &self.config.slack.channel_ids {
             let cursor_key = format!("slack:{channel_id}:oldest_ts");
             let oldest = non_empty_state(self.persistence_lock()?.get_state(&cursor_key)?);
@@ -584,9 +599,12 @@ impl AppService {
             let mut thread_roots = self.known_thread_roots(channel_id)?;
 
             loop {
-                let page = self
-                    .slack_client
-                    .conversations_history(channel_id, oldest.as_deref(), page_cursor.as_deref(), 200)?;
+                let page = self.slack_client.conversations_history(
+                    channel_id,
+                    oldest.as_deref(),
+                    page_cursor.as_deref(),
+                    200,
+                )?;
                 for message in page.messages {
                     if let Some(thread_root) = thread_root_ts(&message) {
                         thread_roots.insert(thread_root.to_string());
@@ -635,7 +653,8 @@ impl AppService {
             _ => {}
         }
 
-        let google_adapter = GoogleSlidesAdapter::new(self.google_client.clone(), self.google_adapter_config());
+        let google_adapter =
+            GoogleSlidesAdapter::new(self.google_client.clone(), self.google_adapter_config());
         for presentation_id in &self.config.google.presentation_ids {
             let cursor_key = format!("gslides:{presentation_id}:revision");
             let last_revision = self.persistence_lock()?.get_state(&cursor_key)?;
@@ -656,11 +675,15 @@ impl AppService {
             revisions.sort_by_key(|revision| revision.modified_time);
 
             let should_reset = last_revision.as_ref().is_some_and(|needle| {
-                !revisions.iter().any(|revision| revision.revision_id == *needle)
+                !revisions
+                    .iter()
+                    .any(|revision| revision.revision_id == *needle)
             });
-            let new_revisions = revisions_after_cursor(revisions, last_revision.as_deref(), should_reset);
+            let new_revisions =
+                revisions_after_cursor(revisions, last_revision.as_deref(), should_reset);
 
-            let Some(captured_revision) = latest_revision_to_capture(&new_revisions).cloned() else {
+            let Some(captured_revision) = latest_revision_to_capture(&new_revisions).cloned()
+            else {
                 continue;
             };
 
@@ -670,7 +693,10 @@ impl AppService {
             let rendered_blobs = presentation
                 .slides
                 .first()
-                .map(|slide| self.google_client.render_slide(presentation_id, &slide.object_id, "png"))
+                .map(|slide| {
+                    self.google_client
+                        .render_slide(presentation_id, &slide.object_id, "png")
+                })
                 .transpose()?
                 .map(|rendered| self.store_blob(&rendered.data))
                 .transpose()?
@@ -705,15 +731,11 @@ impl AppService {
         let should_rebuild_snapshot = slack_ingested > 0 || google_ingested > 0;
 
         let schema = crate::domain::SchemaRef::new("schema:workspace-object-snapshot");
-        let slide_observations: Vec<crate::domain::Observation> = core
-            .lake
-            .by_schema(&schema)
-            .into_iter()
-            .cloned()
-            .collect();
-        let slide_obs_by_presentation = slide_observations
-            .iter()
-            .fold(HashMap::<String, crate::domain::Observation>::new(), |mut acc, obs| {
+        let slide_observations: Vec<crate::domain::Observation> =
+            core.lake.by_schema(&schema).into_iter().cloned().collect();
+        let slide_obs_by_presentation = slide_observations.iter().fold(
+            HashMap::<String, crate::domain::Observation>::new(),
+            |mut acc, obs| {
                 let Some(presentation_id) = obs
                     .payload
                     .pointer("/artifact/sourceObjectId")
@@ -729,7 +751,8 @@ impl AppService {
                     }
                 }
                 acc
-            });
+            },
+        );
         let slide_analysis_records: Vec<crate::domain::SupplementalRecord> = core
             .supplemental
             .by_kind("slide-analysis")
@@ -752,10 +775,18 @@ impl AppService {
                 .slides
                 .iter()
                 .take(self.config.slide_analysis_limit)
-                .any(|slide| match find_slide_analysis_record(&slide_analysis_records, presentation_id, &slide.object_id) {
-                    Some(record) if self.slide_analyzer.is_some() => analysis_record_needs_refresh(record, &analysis_model),
-                    Some(_) => false,
-                    None => true,
+                .any(|slide| {
+                    match find_slide_analysis_record(
+                        &slide_analysis_records,
+                        presentation_id,
+                        &slide.object_id,
+                    ) {
+                        Some(record) if self.slide_analyzer.is_some() => {
+                            analysis_record_needs_refresh(record, &analysis_model)
+                        }
+                        Some(_) => false,
+                        None => true,
+                    }
                 })
             {
                 needs_analysis = true;
@@ -783,8 +814,10 @@ impl AppService {
                     .unwrap_or_default()
                     .to_string();
 
-                let candidate_slide_indices =
-                    ranked_self_intro_slide_indices(&presentation, self.config.slide_analysis_limit);
+                let candidate_slide_indices = ranked_self_intro_slide_indices(
+                    &presentation,
+                    self.config.slide_analysis_limit,
+                );
                 let mut consumed_slide_indices = HashSet::new();
 
                 for slide_index in candidate_slide_indices {
@@ -793,13 +826,23 @@ impl AppService {
                     }
 
                     let slide = &presentation.slides[slide_index];
-                    if let Some(existing) = find_slide_analysis_record(&slide_analysis_records, presentation_id, &slide.object_id) {
-                        if !self.slide_analyzer.is_some() || !analysis_record_needs_refresh(existing, &analysis_model) {
+                    if let Some(existing) = find_slide_analysis_record(
+                        &slide_analysis_records,
+                        presentation_id,
+                        &slide.object_id,
+                    ) {
+                        if !self.slide_analyzer.is_some()
+                            || !analysis_record_needs_refresh(existing, &analysis_model)
+                        {
                             continue;
                         }
                     }
 
-                    let rendered = self.google_client.render_slide(presentation_id, &slide.object_id, "png")?;
+                    let rendered = self.google_client.render_slide(
+                        presentation_id,
+                        &slide.object_id,
+                        "png",
+                    )?;
                     let thumbnail_blob_ref = core.blobs.put(&rendered.data);
                     self.persistence_lock()?.persist_blob(&rendered.data)?;
                     let Some(mut profile) = self
@@ -808,7 +851,8 @@ impl AppService {
                             observation,
                             &canonical_uri,
                         )
-                        .or_else(|| heuristic_profile_for_slide(observation, slide)) else {
+                        .or_else(|| heuristic_profile_for_slide(observation, slide))
+                    else {
                         continue;
                     };
                     profile.normalize_in_place();
@@ -828,32 +872,41 @@ impl AppService {
                     let mut companion_result = None;
 
                     if let Some(next_slide) = presentation.slides.get(slide_index + 1) {
-                        let companion_rendered = self.google_client.render_slide(presentation_id, &next_slide.object_id, "png")?;
+                        let companion_rendered = self.google_client.render_slide(
+                            presentation_id,
+                            &next_slide.object_id,
+                            "png",
+                        )?;
                         let Some(mut companion_profile) = self
                             .extract_student_profile_from_png(
                                 &companion_rendered.data,
                                 observation,
                                 &canonical_uri,
                             )
-                            .or_else(|| heuristic_profile_for_slide(observation, next_slide)) else {
-                                continue;
-                            };
+                            .or_else(|| heuristic_profile_for_slide(observation, next_slide))
+                        else {
+                            continue;
+                        };
                         companion_profile.normalize_in_place();
 
-                        companion_profile.source_slide_object_id = Some(next_slide.object_id.clone());
+                        companion_profile.source_slide_object_id =
+                            Some(next_slide.object_id.clone());
                         companion_profile.source_document_id = Some(format!(
                             "document:gslides:{presentation_id}#slide:{}",
                             next_slide.object_id
                         ));
                         companion_profile.source_canonical_uri = Some(canonical_uri.clone());
                         companion_profile.thumbnail_url = companion_rendered.content_url.clone();
-                        companion_profile.companion_to_slide_object_id = Some(slide.object_id.clone());
+                        companion_profile.companion_to_slide_object_id =
+                            Some(slide.object_id.clone());
                         resolve_slide_image_urls(&presentation, next_slide, &mut companion_profile);
 
                         if should_merge_companion_slide(&profile, &companion_profile, observation) {
                             let companion_blob_ref = core.blobs.put(&companion_rendered.data);
-                            self.persistence_lock()?.persist_blob(&companion_rendered.data)?;
-                            companion_profile.thumbnail_blob_ref = Some(companion_blob_ref.as_str().to_string());
+                            self.persistence_lock()?
+                                .persist_blob(&companion_rendered.data)?;
+                            companion_profile.thumbnail_blob_ref =
+                                Some(companion_blob_ref.as_str().to_string());
                             merge_companion_profile(&mut profile, &companion_profile);
                             consumed_companion = true;
                             consumed_slide_indices.insert(slide_index + 1);
@@ -889,28 +942,33 @@ impl AppService {
                     if consumed_companion {
                         if let Some(next_slide) = presentation.slides.get(slide_index + 1) {
                             let mut companion_profile = profile.clone();
-                            companion_profile.source_slide_object_id = Some(next_slide.object_id.clone());
+                            companion_profile.source_slide_object_id =
+                                Some(next_slide.object_id.clone());
                             companion_profile.source_document_id = Some(format!(
                                 "document:gslides:{presentation_id}#slide:{}",
                                 next_slide.object_id
                             ));
-                            companion_profile.companion_to_slide_object_id = Some(slide.object_id.clone());
+                            companion_profile.companion_to_slide_object_id =
+                                Some(slide.object_id.clone());
                             companion_profile.thumbnail_blob_ref = None;
                             companion_profile.profile_pic = None;
-                            companion_result = Some(crate::slide_analysis::types::SlideAnalysisResult {
-                                source_observation_id: observation.id.clone(),
-                                presentation_id: presentation_id.clone(),
-                                profile: companion_profile,
-                                person_entity,
-                                supplemental_id: Some(crate::domain::SupplementalId::new(format!(
-                                    "sup:slide-analysis:{presentation_id}:{}",
-                                    next_slide.object_id
-                                ))),
-                                analyzed_at: Utc::now(),
-                                model_version: Some(analysis_model.clone()),
-                                slide_object_id: Some(next_slide.object_id.clone()),
-                                thumbnail_blob_ref: None,
-                            });
+                            companion_result =
+                                Some(crate::slide_analysis::types::SlideAnalysisResult {
+                                    source_observation_id: observation.id.clone(),
+                                    presentation_id: presentation_id.clone(),
+                                    profile: companion_profile,
+                                    person_entity,
+                                    supplemental_id: Some(crate::domain::SupplementalId::new(
+                                        format!(
+                                            "sup:slide-analysis:{presentation_id}:{}",
+                                            next_slide.object_id
+                                        ),
+                                    )),
+                                    analyzed_at: Utc::now(),
+                                    model_version: Some(analysis_model.clone()),
+                                    slide_object_id: Some(next_slide.object_id.clone()),
+                                    thumbnail_blob_ref: None,
+                                });
                         }
                     }
 
@@ -923,28 +981,35 @@ impl AppService {
             slide_analyses = analysis_results.len();
 
             for result in &analysis_results {
-                let record = crate::slide_analysis::SlideAnalysisProjector::build_supplemental(result);
+                let record =
+                    crate::slide_analysis::SlideAnalysisProjector::build_supplemental(result);
                 let rollback = core
                     .upsert_supplemental(record)
                     .map_err(|err| SelfHostError::Ingestion(err.to_string()))?;
-                let persisted_record = core
-                    .supplemental
-                    .get(&rollback.id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        SelfHostError::Ingestion(format!(
-                            "supplemental {} missing after upsert",
-                            rollback.id
-                        ))
-                    })?;
-                if let Err(err) = self.persistence_lock()?.persist_supplemental(&persisted_record) {
+                let persisted_record =
+                    core.supplemental
+                        .get(&rollback.id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            SelfHostError::Ingestion(format!(
+                                "supplemental {} missing after upsert",
+                                rollback.id
+                            ))
+                        })?;
+                if let Err(err) = self
+                    .persistence_lock()?
+                    .persist_supplemental(&persisted_record)
+                {
                     core.rollback_supplemental(rollback);
                     return Err(SelfHostError::Persistence(err));
                 }
             }
 
             for result in &analysis_results {
-                let draft = crate::slide_analysis::SlideAnalysisProjector::create_analysis_observation(result);
+                let draft =
+                    crate::slide_analysis::SlideAnalysisProjector::create_analysis_observation(
+                        result,
+                    );
                 let observation = match core.prepare_observation(draft) {
                     Ok(observation) => observation,
                     Err(IngestResult::Rejected { message, .. }) => {
@@ -1063,7 +1128,12 @@ impl AppService {
 
         Ok(ResponseEnvelope {
             data: self.apply_filter(payload),
-            projection_metadata: self.projection_metadata(&core.catalog, "proj:person-page", mode, core.snapshot.built_at)?,
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:person-page",
+                mode,
+                core.snapshot.built_at,
+            )?,
         })
     }
 
@@ -1108,10 +1178,16 @@ impl AppService {
             .find(|activity| activity.person_id == profile.person_id)
             .ok_or_else(|| SelfHostError::NotFound(format!("activity for {person_id}")))?;
 
-        let detail: PersonDetailResponse = PersonPageProjector::to_detail(profile, &slides, &messages, activity);
+        let detail: PersonDetailResponse =
+            PersonPageProjector::to_detail(profile, &slides, &messages, activity);
         Ok(ResponseEnvelope {
             data: self.apply_filter(serde_json::to_value(detail)?),
-            projection_metadata: self.projection_metadata(&core.catalog, "proj:person-page", mode, core.snapshot.built_at)?,
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:person-page",
+                mode,
+                core.snapshot.built_at,
+            )?,
         })
     }
 
@@ -1135,7 +1211,12 @@ impl AppService {
 
         Ok(ResponseEnvelope {
             data: self.apply_filter(serde_json::to_value(slides)?),
-            projection_metadata: self.projection_metadata(&core.catalog, "proj:person-page", mode, core.snapshot.built_at)?,
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:person-page",
+                mode,
+                core.snapshot.built_at,
+            )?,
         })
     }
 
@@ -1159,7 +1240,12 @@ impl AppService {
 
         Ok(ResponseEnvelope {
             data: self.apply_filter(serde_json::to_value(messages)?),
-            projection_metadata: self.projection_metadata(&core.catalog, "proj:person-page", mode, core.snapshot.built_at)?,
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:person-page",
+                mode,
+                core.snapshot.built_at,
+            )?,
         })
     }
 
@@ -1214,13 +1300,21 @@ impl AppService {
 
         Ok(ResponseEnvelope {
             data: self.apply_filter(serde_json::to_value(events)?),
-            projection_metadata: self.projection_metadata(&core.catalog, "proj:person-page", mode, core.snapshot.built_at)?,
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:person-page",
+                mode,
+                core.snapshot.built_at,
+            )?,
         })
     }
 
     pub fn health(&self) -> Result<HealthResponse, SelfHostError> {
         let core = self.core_lock()?;
-        Ok(HealthResponse::from_catalog(&core.catalog, env!("CARGO_PKG_VERSION")))
+        Ok(HealthResponse::from_catalog(
+            &core.catalog,
+            env!("CARGO_PKG_VERSION"),
+        ))
     }
 
     fn authorize_read(&self, target: EntityRef) -> Result<(), SelfHostError> {
@@ -1296,8 +1390,12 @@ impl AppService {
         let result = self.append_prepared_observation(&mut core, observation)?;
 
         match &result {
-            IngestResult::Rejected { message, .. } => Err(SelfHostError::Ingestion(message.clone())),
-            IngestResult::Quarantined { ticket } => Err(SelfHostError::Ingestion(ticket.reason.clone())),
+            IngestResult::Rejected { message, .. } => {
+                Err(SelfHostError::Ingestion(message.clone()))
+            }
+            IngestResult::Quarantined { ticket } => {
+                Err(SelfHostError::Ingestion(ticket.reason.clone()))
+            }
             _ => Ok(result),
         }
     }
@@ -1314,30 +1412,26 @@ impl AppService {
             .append_observation_idempotent(&observation)?;
 
         let result = match durable_outcome {
-            DurableAppendOutcome::Appended(id) => {
-                match core.lake.append_idempotent(observation) {
-                    crate::lake::store::AppendOutcome::Appended(_) => {
-                        IngestResult::Ingested { id, recorded_at }
-                    }
-                    crate::lake::store::AppendOutcome::Duplicate(existing_id)
-                    | crate::lake::store::AppendOutcome::Conflict(existing_id) => {
-                        return Err(SelfHostError::Ingestion(format!(
-                            "SQLite accepted observation {id}, but cache already contains {existing_id}"
-                        )));
-                    }
+            DurableAppendOutcome::Appended(id) => match core.lake.append_idempotent(observation) {
+                crate::lake::store::AppendOutcome::Appended(_) => {
+                    IngestResult::Ingested { id, recorded_at }
                 }
-            }
+                crate::lake::store::AppendOutcome::Duplicate(existing_id)
+                | crate::lake::store::AppendOutcome::Conflict(existing_id) => {
+                    return Err(SelfHostError::Ingestion(format!(
+                        "SQLite accepted observation {id}, but cache already contains {existing_id}"
+                    )));
+                }
+            },
             DurableAppendOutcome::Duplicate(existing_id) => IngestResult::Duplicate { existing_id },
-            DurableAppendOutcome::CanonicalCollision(existing_id) => {
-                IngestResult::Quarantined {
-                    ticket: crate::domain::QuarantineTicket {
-                        id: uuid::Uuid::now_v7().to_string(),
-                        reason: format!(
-                            "sha256-collision: existing observation {existing_id} has different canonical_json"
-                        ),
-                    },
-                }
-            }
+            DurableAppendOutcome::CanonicalCollision(existing_id) => IngestResult::Quarantined {
+                ticket: crate::domain::QuarantineTicket {
+                    id: uuid::Uuid::now_v7().to_string(),
+                    reason: format!(
+                        "sha256-collision: existing observation {existing_id} has different canonical_json"
+                    ),
+                },
+            },
         };
         Ok(result)
     }
@@ -1389,9 +1483,11 @@ impl AppService {
         let cursor_key = thread_cursor_key(channel_id, thread_ts);
         let reply_oldest = non_empty_state(self.persistence_lock()?.get_state(&cursor_key)?)
             .unwrap_or_else(|| thread_ts.to_string());
-        let replies = self
-            .slack_replies_client
-            .conversations_replies(channel_id, thread_ts, Some(reply_oldest.as_str()))?;
+        let replies = self.slack_replies_client.conversations_replies(
+            channel_id,
+            thread_ts,
+            Some(reply_oldest.as_str()),
+        )?;
         let mut latest_reply_ts = Some(reply_oldest);
         let mut ingested = 0usize;
         let mut duplicates = 0usize;
@@ -1411,7 +1507,8 @@ impl AppService {
         }
 
         if let Some(latest_reply_ts) = latest_reply_ts.as_deref() {
-            self.persistence_lock()?.set_state(&cursor_key, latest_reply_ts)?;
+            self.persistence_lock()?
+                .set_state(&cursor_key, latest_reply_ts)?;
         }
 
         Ok((ingested, duplicates))
@@ -1425,7 +1522,10 @@ impl AppService {
             .into_iter()
             .cloned()
             .collect();
-        Ok(known_thread_roots_from_observations(&observations, channel_id))
+        Ok(known_thread_roots_from_observations(
+            &observations,
+            channel_id,
+        ))
     }
 
     fn extract_student_profile_from_png(
@@ -1458,8 +1558,12 @@ impl AppService {
         self.core.lock().map_err(|_| SelfHostError::LockPoisoned)
     }
 
-    fn persistence_lock(&self) -> Result<std::sync::MutexGuard<'_, SqlitePersistence>, SelfHostError> {
-        self.persistence.lock().map_err(|_| SelfHostError::LockPoisoned)
+    fn persistence_lock(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, SqlitePersistence>, SelfHostError> {
+        self.persistence
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)
     }
 
     fn slack_adapter_config(&self) -> AdapterConfig {
@@ -1559,9 +1663,7 @@ fn latest_revision_to_capture(
     revisions.last()
 }
 
-fn thread_root_ts(
-    message: &crate::adapter::slack::client::SlackMessage,
-) -> Option<&str> {
+fn thread_root_ts(message: &crate::adapter::slack::client::SlackMessage) -> Option<&str> {
     if message.reply_count == 0 {
         return None;
     }
@@ -1732,16 +1834,25 @@ fn merge_companion_profile(
         let description = companion
             .bio_text
             .clone()
-            .or_else(|| companion.profile_pic.as_ref().and_then(|pic| pic.description.clone()))
+            .or_else(|| {
+                companion
+                    .profile_pic
+                    .as_ref()
+                    .and_then(|pic| pic.description.clone())
+            })
             .or_else(|| Some("Continuation slide".to_string()));
-        primary.gallery_images.push(crate::slide_analysis::types::GalleryImage {
-            coordinates: None,
-            description,
-            url: Some(companion_thumbnail_url.clone()),
-        });
+        primary
+            .gallery_images
+            .push(crate::slide_analysis::types::GalleryImage {
+                coordinates: None,
+                description,
+                url: Some(companion_thumbnail_url.clone()),
+            });
     }
 
-    primary.gallery_images.extend(companion.gallery_images.clone());
+    primary
+        .gallery_images
+        .extend(companion.gallery_images.clone());
 
     if let Some(companion_bio) = companion
         .bio_text
@@ -1763,24 +1874,57 @@ fn merge_companion_profile(
         primary.profile_pic = companion.profile_pic.clone();
     }
 
-    merge_optional_field(&mut primary.properties.nickname, &companion.properties.nickname);
-    merge_optional_field(&mut primary.properties.birthplace, &companion.properties.birthplace);
+    merge_optional_field(
+        &mut primary.properties.nickname,
+        &companion.properties.nickname,
+    );
+    merge_optional_field(
+        &mut primary.properties.birthplace,
+        &companion.properties.birthplace,
+    );
     merge_optional_field(&mut primary.properties.dob, &companion.properties.dob);
     merge_optional_field(&mut primary.properties.major, &companion.properties.major);
-    merge_optional_field(&mut primary.properties.affiliation, &companion.properties.affiliation);
+    merge_optional_field(
+        &mut primary.properties.affiliation,
+        &companion.properties.affiliation,
+    );
     merge_optional_field(&mut primary.properties.mbti, &companion.properties.mbti);
     merge_optional_field(&mut primary.properties.sns, &companion.properties.sns);
-    merge_optional_field(&mut primary.properties.dislikes, &companion.properties.dislikes);
-    merge_optional_field(&mut primary.properties.new_challenges, &companion.properties.new_challenges);
-    merge_optional_field(&mut primary.properties.ask_me_about, &companion.properties.ask_me_about);
-    merge_optional_field(&mut primary.properties.turning_point, &companion.properties.turning_point);
+    merge_optional_field(
+        &mut primary.properties.dislikes,
+        &companion.properties.dislikes,
+    );
+    merge_optional_field(
+        &mut primary.properties.new_challenges,
+        &companion.properties.new_challenges,
+    );
+    merge_optional_field(
+        &mut primary.properties.ask_me_about,
+        &companion.properties.ask_me_about,
+    );
+    merge_optional_field(
+        &mut primary.properties.turning_point,
+        &companion.properties.turning_point,
+    );
     merge_optional_field(&mut primary.properties.btw, &companion.properties.btw);
-    merge_optional_field(&mut primary.properties.message, &companion.properties.message);
+    merge_optional_field(
+        &mut primary.properties.message,
+        &companion.properties.message,
+    );
 
-    append_distinct_strings(&mut primary.properties.hobbies, &companion.properties.hobbies);
-    append_distinct_strings(&mut primary.properties.interests, &companion.properties.interests);
+    append_distinct_strings(
+        &mut primary.properties.hobbies,
+        &companion.properties.hobbies,
+    );
+    append_distinct_strings(
+        &mut primary.properties.interests,
+        &companion.properties.interests,
+    );
     append_distinct_strings(&mut primary.properties.likes, &companion.properties.likes);
-    append_distinct_strings(&mut primary.properties.hashtags, &companion.properties.hashtags);
+    append_distinct_strings(
+        &mut primary.properties.hashtags,
+        &companion.properties.hashtags,
+    );
     append_distinct_strings(&mut primary.attributes, &companion.attributes);
 }
 
@@ -1806,8 +1950,10 @@ fn resolve_slide_image_urls(
             let target = normalize_coordinate_target(coordinates, page_size);
             if let Some(matched) = find_nearest_slide_image(target, &available_images) {
                 let matched_object_id = matched.object_id.clone();
-                let matched_url =
-                    apply_rotation_to_google_image_url(&matched.content_url, matched.rotation_degrees);
+                let matched_url = apply_rotation_to_google_image_url(
+                    &matched.content_url,
+                    matched.rotation_degrees,
+                );
                 profile_pic.url = Some(matched_url);
                 available_images.retain(|image| image.object_id != matched_object_id);
             }
@@ -1821,7 +1967,11 @@ fn resolve_slide_image_urls(
     }
 
     for gallery_image in &mut profile.gallery_images {
-        if gallery_image.url.as_deref().is_some_and(|url| url.starts_with("http")) {
+        if gallery_image
+            .url
+            .as_deref()
+            .is_some_and(|url| url.starts_with("http"))
+        {
             continue;
         }
         let Some(coordinates) = gallery_image.coordinates.as_ref() else {
@@ -1962,7 +2112,10 @@ fn find_nearest_slide_image(
             .cmp(&left.0.z_index)
             .then_with(|| left.1.total_cmp(&right.1))
     });
-    with_distance.into_iter().map(|(candidate, _)| candidate).next()
+    with_distance
+        .into_iter()
+        .map(|(candidate, _)| candidate)
+        .next()
 }
 
 fn apply_rotation_to_google_image_url(url: &str, rotation_degrees: i32) -> String {
@@ -1971,7 +2124,10 @@ fn apply_rotation_to_google_image_url(url: &str, rotation_degrees: i32) -> Strin
     }
     let mut parts = url.splitn(2, '?');
     let mut base = parts.next().unwrap_or_default().to_string();
-    let query = parts.next().map(|value| format!("?{value}")).unwrap_or_default();
+    let query = parts
+        .next()
+        .map(|value| format!("?{value}"))
+        .unwrap_or_default();
     if base.contains('=') {
         base.push_str(&format!("-r{rotation_degrees}"));
     } else {
@@ -1981,7 +2137,10 @@ fn apply_rotation_to_google_image_url(url: &str, rotation_degrees: i32) -> Strin
 }
 
 fn merge_optional_field(target: &mut Option<String>, source: &Option<String>) {
-    if target.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+    if target
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
         return;
     }
     *target = source.clone();
@@ -2013,7 +2172,13 @@ fn ensure_profile_identifier(
 
     let fallback = slide_object_id
         .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch.to_ascii_lowercase() } else { '-' })
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect::<String>();
     profile.generated_email = Some(format!("slide-{fallback}@hlab.college"));
 }
@@ -2027,17 +2192,23 @@ fn find_slide_analysis_record<'a>(
         if record.kind != "slide-analysis" {
             return false;
         }
-        let Ok(profile) = serde_json::from_value::<crate::slide_analysis::types::StudentProfile>(record.payload.clone()) else {
+        let Ok(profile) = serde_json::from_value::<crate::slide_analysis::types::StudentProfile>(
+            record.payload.clone(),
+        ) else {
             return false;
         };
-        profile.source_document_id.as_deref() == Some(&format!(
-            "document:gslides:{presentation_id}#slide:{slide_object_id}"
-        )) || profile.source_slide_object_id.as_deref() == Some(slide_object_id)
+        profile.source_document_id.as_deref()
+            == Some(&format!(
+                "document:gslides:{presentation_id}#slide:{slide_object_id}"
+            ))
+            || profile.source_slide_object_id.as_deref() == Some(slide_object_id)
     })
 }
 
 fn analysis_record_is_rich(record: &crate::domain::SupplementalRecord) -> bool {
-    let Ok(mut profile) = serde_json::from_value::<crate::slide_analysis::types::StudentProfile>(record.payload.clone()) else {
+    let Ok(mut profile) = serde_json::from_value::<crate::slide_analysis::types::StudentProfile>(
+        record.payload.clone(),
+    ) else {
         return false;
     };
     profile.normalize_in_place();
@@ -2127,7 +2298,8 @@ fn notion_write_record_for_person(
     let title = notion_title_for_profile(&profile, frontend);
     let mut payload = serde_json::to_value(profile).ok()?;
     let payload_object = payload.as_object_mut()?;
-    if let Some(stable_thumbnail_url) = notion_thumbnail_url_for_profile(&frontend.profile, public_base_url)
+    if let Some(stable_thumbnail_url) =
+        notion_thumbnail_url_for_profile(&frontend.profile, public_base_url)
     {
         payload_object.insert(
             "thumbnail_url".to_string(),
@@ -2174,7 +2346,9 @@ fn stable_public_blob_url(public_base_url: Option<&str>, blob_ref: Option<&str>)
     Some(format!("{base_url}/public/blobs/{hash}"))
 }
 
-fn stable_google_slides_thumbnail_url(profile: &crate::slide_analysis::types::StudentProfile) -> Option<String> {
+fn stable_google_slides_thumbnail_url(
+    profile: &crate::slide_analysis::types::StudentProfile,
+) -> Option<String> {
     let (presentation_id, parsed_slide_object_id) =
         parse_google_slide_document_id(profile.source_document_id.as_deref()?)?;
     let slide_object_id = profile
@@ -2205,7 +2379,11 @@ fn build_notion_source_image_index(
     let mut index = HashMap::new();
 
     for observation in observations {
-        if !observation.subject.as_str().starts_with("document:gslides:") {
+        if !observation
+            .subject
+            .as_str()
+            .starts_with("document:gslides:")
+        {
             continue;
         }
         let Some(blob_ref) = observation
@@ -2220,52 +2398,53 @@ fn build_notion_source_image_index(
         let Some(blob_bytes) = blobs.get(&blob_ref) else {
             continue;
         };
-        let Ok(presentation) =
-            serde_json::from_slice::<crate::adapter::gslides::client::PresentationNative>(
-                blob_bytes,
-            )
-        else {
+        let Ok(presentation) = serde_json::from_slice::<
+            crate::adapter::gslides::client::PresentationNative,
+        >(blob_bytes) else {
             continue;
         };
 
         let page_size = page_size_for_presentation(&presentation);
         let pptx_slide_images = page_size.and_then(|page_size| {
-            pptx_slide_images_for_presentation(&presentation.presentation_id, page_size, google_client)
+            pptx_slide_images_for_presentation(
+                &presentation.presentation_id,
+                page_size,
+                google_client,
+            )
         });
 
         for (slide_index, slide) in presentation.slides.iter().enumerate() {
-            let candidates = if let (Some(slides), Some(page_size)) =
-                (pptx_slide_images.as_ref(), page_size)
-            {
-                slides
-                    .get(slide_index)
-                    .map(|pptx_images| {
-                        notion_source_image_candidates_from_pptx_slide(
-                            slide,
-                            pptx_images,
-                            page_size,
-                            blobs,
-                            persistence,
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        notion_source_image_candidates_from_slide(
-                            &presentation,
-                            slide,
-                            blobs,
-                            google_client,
-                            persistence,
-                        )
-                    })
-            } else {
-                notion_source_image_candidates_from_slide(
-                    &presentation,
-                    slide,
-                    blobs,
-                    google_client,
-                    persistence,
-                )
-            };
+            let candidates =
+                if let (Some(slides), Some(page_size)) = (pptx_slide_images.as_ref(), page_size) {
+                    slides
+                        .get(slide_index)
+                        .map(|pptx_images| {
+                            notion_source_image_candidates_from_pptx_slide(
+                                slide,
+                                pptx_images,
+                                page_size,
+                                blobs,
+                                persistence,
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            notion_source_image_candidates_from_slide(
+                                &presentation,
+                                slide,
+                                blobs,
+                                google_client,
+                                persistence,
+                            )
+                        })
+                } else {
+                    notion_source_image_candidates_from_slide(
+                        &presentation,
+                        slide,
+                        blobs,
+                        google_client,
+                        persistence,
+                    )
+                };
             if candidates.is_empty() {
                 continue;
             }
@@ -2291,8 +2470,13 @@ fn build_targeted_notion_source_image_index(
 ) -> NotionSourceImageIndex {
     let mut observation_by_presentation = HashMap::new();
     for observation in observations {
-        if observation.subject.as_str().starts_with("document:gslides:") {
-            observation_by_presentation.insert(observation.subject.as_str().to_string(), observation);
+        if observation
+            .subject
+            .as_str()
+            .starts_with("document:gslides:")
+        {
+            observation_by_presentation
+                .insert(observation.subject.as_str().to_string(), observation);
         }
     }
 
@@ -2305,7 +2489,9 @@ fn build_targeted_notion_source_image_index(
         else {
             continue;
         };
-        let Some(observation) = observation_by_presentation.get(&format!("document:gslides:{presentation_id}")) else {
+        let Some(observation) =
+            observation_by_presentation.get(&format!("document:gslides:{presentation_id}"))
+        else {
             continue;
         };
         let Some(blob_ref) = observation
@@ -2320,9 +2506,9 @@ fn build_targeted_notion_source_image_index(
         let Some(blob_bytes) = blobs.get(&blob_ref) else {
             continue;
         };
-        let Ok(presentation) =
-            serde_json::from_slice::<crate::adapter::gslides::client::PresentationNative>(blob_bytes)
-        else {
+        let Ok(presentation) = serde_json::from_slice::<
+            crate::adapter::gslides::client::PresentationNative,
+        >(blob_bytes) else {
             continue;
         };
         let Some(page_size) = page_size_for_presentation(&presentation) else {
@@ -2435,8 +2621,12 @@ fn notion_source_image_candidates_from_pptx_slide(
         .iter()
         .enumerate()
         .filter_map(|(index, pptx_image)| {
-            let matched_native =
-                match_native_slide_image_candidate(&native_images, pptx_image.center_x_pct, pptx_image.center_y_pct, page_size);
+            let matched_native = match_native_slide_image_candidate(
+                &native_images,
+                pptx_image.center_x_pct,
+                pptx_image.center_y_pct,
+                page_size,
+            );
             let blob_ref = persistence.persist_blob(&pptx_image.bytes).ok()?;
             blobs.put(&pptx_image.bytes);
             Some(NotionSourceImageCandidate {
@@ -2444,7 +2634,12 @@ fn notion_source_image_candidates_from_pptx_slide(
                     .map(|candidate| candidate.object_id.clone())
                     .unwrap_or_else(|| format!("pptx-image-{index}")),
                 source_url: matched_native
-                    .map(|candidate| apply_rotation_to_google_image_url(&candidate.content_url, candidate.rotation_degrees))
+                    .map(|candidate| {
+                        apply_rotation_to_google_image_url(
+                            &candidate.content_url,
+                            candidate.rotation_degrees,
+                        )
+                    })
                     .unwrap_or_default(),
                 blob_ref: blob_ref.as_str().to_string(),
                 center_x_pct: pptx_image.center_x_pct,
@@ -2470,10 +2665,7 @@ fn notion_source_image_candidate_from_element(
     let bytes = match google_client.download_bytes(&content_url) {
         Ok(bytes) => bytes,
         Err(err) => {
-            eprintln!(
-                "source image download failed for {}: {}",
-                object_id, err
-            );
+            eprintln!("source image download failed for {}: {}", object_id, err);
             return None;
         }
     };
@@ -2530,7 +2722,12 @@ fn match_native_slide_image_candidate<'a>(
         let right_x = (right.center_x / page_size.width_emu as f64) * 100.0;
         let right_y = (right.center_y / page_size.height_emu as f64) * 100.0;
         squared_distance(left_x, left_y, center_x_pct, center_y_pct)
-            .total_cmp(&squared_distance(right_x, right_y, center_x_pct, center_y_pct))
+            .total_cmp(&squared_distance(
+                right_x,
+                right_y,
+                center_x_pct,
+                center_y_pct,
+            ))
             .then_with(|| right.z_index.cmp(&left.z_index))
     })
 }
@@ -2588,7 +2785,10 @@ fn parse_pptx_slide_images(
             let Some(target) = rel_targets.get(embed_id) else {
                 continue;
             };
-            let Some(xfrm) = pic.descendants().find(|node| node.tag_name().name() == "xfrm") else {
+            let Some(xfrm) = pic
+                .descendants()
+                .find(|node| node.tag_name().name() == "xfrm")
+            else {
                 continue;
             };
             let Some(off) = xfrm.children().find(|node| node.tag_name().name() == "off") else {
@@ -2597,10 +2797,22 @@ fn parse_pptx_slide_images(
             let Some(ext) = xfrm.children().find(|node| node.tag_name().name() == "ext") else {
                 continue;
             };
-            let x = off.attribute("x").and_then(|value| value.parse::<f64>().ok()).unwrap_or_default();
-            let y = off.attribute("y").and_then(|value| value.parse::<f64>().ok()).unwrap_or_default();
-            let cx = ext.attribute("cx").and_then(|value| value.parse::<f64>().ok()).unwrap_or_default();
-            let cy = ext.attribute("cy").and_then(|value| value.parse::<f64>().ok()).unwrap_or_default();
+            let x = off
+                .attribute("x")
+                .and_then(|value| value.parse::<f64>().ok())
+                .unwrap_or_default();
+            let y = off
+                .attribute("y")
+                .and_then(|value| value.parse::<f64>().ok())
+                .unwrap_or_default();
+            let cx = ext
+                .attribute("cx")
+                .and_then(|value| value.parse::<f64>().ok())
+                .unwrap_or_default();
+            let cy = ext
+                .attribute("cy")
+                .and_then(|value| value.parse::<f64>().ok())
+                .unwrap_or_default();
             let bytes = read_zip_entry_bytes(&mut archive, target)?;
             images.push(PptxSlideImageCandidate {
                 bytes,
@@ -2721,7 +2933,6 @@ fn audit_kind_for_scope(scope: &str) -> AuditEventKind {
     }
 }
 
-
 fn notion_title_for_profile(
     profile: &crate::slide_analysis::types::StudentProfile,
     frontend: &FrontendProfile,
@@ -2753,12 +2964,7 @@ fn ranked_self_intro_slide_indices(
         })
         .collect::<Vec<_>>();
 
-    ranked.sort_by(|left, right| {
-        right
-            .1
-            .cmp(&left.1)
-            .then(left.0.cmp(&right.0))
-    });
+    ranked.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
 
     ranked
         .into_iter()
@@ -2914,9 +3120,7 @@ fn collect_slide_text_values(
 
 fn slide_has_image_elements(slide: &crate::adapter::gslides::client::SlideNative) -> bool {
     slide.page_elements.iter().any(|element| {
-        element
-            .get("image")
-            .is_some()
+        element.get("image").is_some()
             || element
                 .get("shape")
                 .and_then(|shape| shape.get("shapeType"))
@@ -2929,9 +3133,11 @@ fn find_first_email(fragments: &[String]) -> Option<String> {
     fragments.iter().find_map(|fragment| {
         fragment
             .split_whitespace()
-            .map(|token| token.trim_matches(|ch: char| {
-                matches!(ch, '<' | '>' | '(' | ')' | '[' | ']' | ',' | ';')
-            }))
+            .map(|token| {
+                token.trim_matches(|ch: char| {
+                    matches!(ch, '<' | '>' | '(' | ')' | '[' | ']' | ',' | ';')
+                })
+            })
             .find(|token| token.contains('@') && token.contains('.'))
             .map(|token| token.to_lowercase())
     })
@@ -2966,10 +3172,10 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
+    use crate::adapter::gslides::client::SlideRevision;
     use crate::adapter::slack::client::{SlackMessage, SlackMessageType};
     use crate::adapter::traits::ObservationDraft;
     use crate::domain::supplemental::InputAnchorSet;
-    use crate::adapter::gslides::client::SlideRevision;
     use chrono::Utc;
 
     use super::{
@@ -2980,13 +3186,13 @@ mod tests {
         thread_cursor_key, thread_root_ts,
     };
     use crate::domain::{
-        ActorRef, AuthorityModel, CaptureModel, EntityRef, IdempotencyKey, Mutability,
-        Observation, ObserverRef, SchemaRef, SemVer, SupplementalId, SupplementalRecord,
+        ActorRef, AuthorityModel, CaptureModel, EntityRef, IdempotencyKey, Mutability, Observation,
+        ObserverRef, SchemaRef, SemVer, SupplementalId, SupplementalRecord,
     };
+    use crate::governance::audit::InMemoryAuditLog;
     use crate::self_host::config::{
         ApiTokenConfig, GoogleConfig, ResourceLimits, SecretString, SelfHostConfig, SlackConfig,
     };
-    use crate::governance::audit::InMemoryAuditLog;
     use crate::self_host::google::HttpGoogleSlidesClient;
     use crate::self_host::persistence::SqlitePersistence;
     use crate::self_host::slack::HttpSlackClient;
@@ -3032,10 +3238,7 @@ mod tests {
             }
         }
 
-        let observations = vec![
-            observation("one", "dup-key"),
-            observation("two", "dup-key"),
-        ];
+        let observations = vec![observation("one", "dup-key"), observation("two", "dup-key")];
 
         let err = AppCore::new(observations, vec![], vec![]).unwrap_err();
         assert!(matches!(err, SelfHostError::Ingestion(_)));
@@ -3063,8 +3266,7 @@ mod tests {
         ];
 
         assert_eq!(
-            latest_revision_to_capture(&revisions)
-                .map(|revision| revision.revision_id.as_str()),
+            latest_revision_to_capture(&revisions).map(|revision| revision.revision_id.as_str()),
             Some("rev-2")
         );
     }
@@ -3171,9 +3373,7 @@ mod tests {
                 published: Utc::now(),
                 recorded_at: Utc::now(),
                 consent: None,
-                idempotency_key: IdempotencyKey::new(format!(
-                    "slack:{channel_id}:{ts}"
-                )),
+                idempotency_key: IdempotencyKey::new(format!("slack:{channel_id}:{ts}")),
                 meta: serde_json::json!({}),
             }
         }
@@ -3593,7 +3793,8 @@ mod tests {
 
     #[test]
     fn ingest_draft_duplicate_is_decided_by_persistence_without_cache_append() {
-        let root = std::env::temp_dir().join(format!("lethe-self-host-test-{}", uuid::Uuid::now_v7()));
+        let root =
+            std::env::temp_dir().join(format!("lethe-self-host-test-{}", uuid::Uuid::now_v7()));
         let db = root.join("lethe.sqlite3");
         let blobs = root.join("blobs");
         let persistence = SqlitePersistence::open(&db, &blobs).unwrap();
@@ -3622,7 +3823,9 @@ mod tests {
                 }).to_string(),
             }),
         };
-        persistence.persist_observation(&persisted_observation).unwrap();
+        persistence
+            .persist_observation(&persisted_observation)
+            .unwrap();
 
         let config = test_config(db.clone(), blobs.clone());
         let service = AppService {
@@ -3667,9 +3870,20 @@ mod tests {
         };
 
         let result = service.ingest_draft(draft).unwrap();
-        assert!(matches!(result, crate::domain::IngestResult::Duplicate { .. }));
+        assert!(matches!(
+            result,
+            crate::domain::IngestResult::Duplicate { .. }
+        ));
         assert_eq!(service.core_lock().unwrap().lake.len(), 0);
-        assert_eq!(service.persistence_lock().unwrap().load_observations().unwrap().len(), 1);
+        assert_eq!(
+            service
+                .persistence_lock()
+                .unwrap()
+                .load_observations()
+                .unwrap()
+                .len(),
+            1
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3727,7 +3941,9 @@ mod tests {
 
         let core = AppCore::new(vec![observation], vec![], vec![supplemental]).unwrap();
         assert_eq!(
-            core.snapshot.person_page.profiles[0].self_intro_text.as_deref(),
+            core.snapshot.person_page.profiles[0]
+                .self_intro_text
+                .as_deref(),
             Some("私は田中太郎です")
         );
     }

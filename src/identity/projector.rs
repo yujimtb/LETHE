@@ -132,10 +132,7 @@ impl IdentityProjector {
         }
 
         // Extract owner (skip if already seen as editor)
-        if let Some(owner) = payload
-            .pointer("/relations/owner")
-            .and_then(|v| v.as_str())
-        {
+        if let Some(owner) = payload.pointer("/relations/owner").and_then(|v| v.as_str()) {
             if seen_emails.insert(owner.to_lowercase()) {
                 candidates.push(PersonCandidate {
                     source: "google".into(),
@@ -162,11 +159,7 @@ impl IdentityProjector {
 
         let mut identifiers = Vec::new();
 
-        if let Some(email) = obs
-            .payload
-            .get("person_email")
-            .and_then(|v| v.as_str())
-        {
+        if let Some(email) = obs.payload.get("person_email").and_then(|v| v.as_str()) {
             identifiers.push(SourceIdentifier {
                 source: "slide-analysis".into(),
                 identifier_type: IdentifierType::Email,
@@ -199,9 +192,7 @@ impl IdentityProjector {
     /// Match strategy:
     /// - Email exact match → High confidence
     /// - Name fuzzy match → Medium confidence
-    pub fn cross_source_match(
-        candidates: &[PersonCandidate],
-    ) -> Vec<ResolutionCandidate> {
+    pub fn cross_source_match(candidates: &[PersonCandidate]) -> Vec<ResolutionCandidate> {
         let mut matches = Vec::new();
         let mut candidate_counter = 0u64;
 
@@ -312,7 +303,8 @@ impl IdentityProjector {
         // Merge high-confidence matches and accepted candidates.
         for m in matches {
             let should_merge = m.confidence == ConfidenceLevel::High
-                || (m.confidence == ConfidenceLevel::Medium && m.status == CandidateStatus::Accepted);
+                || (m.confidence == ConfidenceLevel::Medium
+                    && m.status == CandidateStatus::Accepted);
 
             if should_merge {
                 let a = Self::parse_pc_index(&m.person_a_id);
@@ -391,9 +383,10 @@ impl IdentityProjector {
             all_identifiers.sort_by(|left, right| {
                 left.source
                     .cmp(&right.source)
-                    .then(Self::identifier_type_rank(left.identifier_type).cmp(
-                        &Self::identifier_type_rank(right.identifier_type),
-                    ))
+                    .then(
+                        Self::identifier_type_rank(left.identifier_type)
+                            .cmp(&Self::identifier_type_rank(right.identifier_type)),
+                    )
                     .then(left.value.cmp(&right.value))
             });
             all_identifiers.dedup();
@@ -596,7 +589,10 @@ mod tests {
         let matches = IdentityProjector::cross_source_match(&candidates);
 
         // No email match → no high confidence match. They are separate.
-        let email_matches: Vec<_> = matches.iter().filter(|m| m.match_type == MatchType::EmailExact).collect();
+        let email_matches: Vec<_> = matches
+            .iter()
+            .filter(|m| m.match_type == MatchType::EmailExact)
+            .collect();
         assert!(email_matches.is_empty());
     }
 
@@ -604,7 +600,11 @@ mod tests {
     fn accepted_candidate_gets_merged() {
         let observations = vec![
             slack_obs("U123", "Alice", Some("alice-slack@example.com"), "s1"),
-            gslides_obs(&["alice-google@example.com"], "alice-google@example.com", "g1"),
+            gslides_obs(
+                &["alice-google@example.com"],
+                "alice-google@example.com",
+                "g1",
+            ),
         ];
 
         let candidates = IdentityProjector::extract_candidates(&observations);
@@ -662,9 +662,12 @@ mod tests {
 
     #[test]
     fn by_identifier_lookup() {
-        let observations = vec![
-            slack_obs("U999", "Test User", Some("test@example.com"), "s1"),
-        ];
+        let observations = vec![slack_obs(
+            "U999",
+            "Test User",
+            Some("test@example.com"),
+            "s1",
+        )];
 
         let projector = IdentityProjector::new("1.0.0");
         let results = projector.project(&observations);

@@ -415,7 +415,9 @@ pub fn routing_key(
     ])
 }
 
-pub fn routing_key_from_observation(observation: &Observation) -> Result<RoutingKey, PartitionError> {
+pub fn routing_key_from_observation(
+    observation: &Observation,
+) -> Result<RoutingKey, PartitionError> {
     let source = observation
         .source_system
         .as_ref()
@@ -796,10 +798,14 @@ fn validate_split_leaf_ids(
     validate_leaf_id(left_child_leaf_id)?;
     validate_leaf_id(right_child_leaf_id)?;
     if parent_leaf_id == left_child_leaf_id {
-        return Err(PartitionError::DuplicateLeafId(left_child_leaf_id.to_owned()));
+        return Err(PartitionError::DuplicateLeafId(
+            left_child_leaf_id.to_owned(),
+        ));
     }
     if parent_leaf_id == right_child_leaf_id || left_child_leaf_id == right_child_leaf_id {
-        return Err(PartitionError::DuplicateLeafId(right_child_leaf_id.to_owned()));
+        return Err(PartitionError::DuplicateLeafId(
+            right_child_leaf_id.to_owned(),
+        ));
     }
     Ok(())
 }
@@ -857,7 +863,11 @@ mod tests {
         assert_eq!(spec.structure, "source:object_id:sha256(canonical_content)");
         assert!(spec.canonical_content.include.contains(&"body"));
         assert!(spec.canonical_content.exclude.contains(&"reactions"));
-        assert!(spec.canonical_content.normalization.contains(&"unicode_nfc"));
+        assert!(
+            spec.canonical_content
+                .normalization
+                .contains(&"unicode_nfc")
+        );
     }
 
     #[test]
@@ -1000,14 +1010,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan.rehome_targets.len(), 2);
-        assert!(plan
-            .rehome_targets
-            .iter()
-            .any(|target| target.target_leaf_id == left));
-        assert!(plan
-            .rehome_targets
-            .iter()
-            .any(|target| target.target_leaf_id == right));
+        assert!(
+            plan.rehome_targets
+                .iter()
+                .any(|target| target.target_leaf_id == left)
+        );
+        assert!(
+            plan.rehome_targets
+                .iter()
+                .any(|target| target.target_leaf_id == right)
+        );
     }
 
     #[test]

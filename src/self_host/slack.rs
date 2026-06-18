@@ -20,10 +20,11 @@ impl HttpSlackClient {
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {token}"))
-                .map_err(|err| AdapterError::AuthFailure {
+            HeaderValue::from_str(&format!("Bearer {token}")).map_err(|err| {
+                AdapterError::AuthFailure {
                     message: err.to_string(),
-                })?,
+                }
+            })?,
         );
 
         let http = Client::builder()
@@ -81,7 +82,10 @@ impl HttpSlackClient {
         Ok(self.conversations_info(channel_id)?.channel_name)
     }
 
-    fn user_profiles(&self, user_ids: &[String]) -> Result<std::collections::HashMap<String, SlackUser>, AdapterError> {
+    fn user_profiles(
+        &self,
+        user_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, SlackUser>, AdapterError> {
         let mut users = std::collections::HashMap::new();
         for user_id in user_ids {
             if users.contains_key(user_id) {
@@ -107,7 +111,10 @@ impl SlackClient for HttpSlackClient {
         cursor: Option<&str>,
         limit: u32,
     ) -> Result<SlackHistoryPage, AdapterError> {
-        let mut query = vec![("channel", channel_id), ("limit", Box::leak(limit.to_string().into_boxed_str()))];
+        let mut query = vec![
+            ("channel", channel_id),
+            ("limit", Box::leak(limit.to_string().into_boxed_str())),
+        ];
         if let Some(oldest) = oldest {
             query.push(("oldest", oldest));
         }
@@ -115,7 +122,8 @@ impl SlackClient for HttpSlackClient {
             query.push(("cursor", cursor));
         }
 
-        let response: ConversationsHistoryResponse = self.get_json("conversations.history", &query)?;
+        let response: ConversationsHistoryResponse =
+            self.get_json("conversations.history", &query)?;
         if !response.ok {
             return Err(map_slack_error(response.error));
         }
@@ -185,21 +193,18 @@ impl SlackClient for HttpSlackClient {
         Ok(messages)
     }
 
-    fn conversations_info(
-        &self,
-        channel_id: &str,
-    ) -> Result<SlackChannelSnapshot, AdapterError> {
-        let response: ConversationsInfoResponse = self.get_json(
-            "conversations.info",
-            &[("channel", channel_id)],
-        )?;
+    fn conversations_info(&self, channel_id: &str) -> Result<SlackChannelSnapshot, AdapterError> {
+        let response: ConversationsInfoResponse =
+            self.get_json("conversations.info", &[("channel", channel_id)])?;
         if !response.ok {
             return Err(map_slack_error(response.error));
         }
 
-        let channel = response.channel.ok_or_else(|| AdapterError::MalformedResponse {
-            message: "missing channel payload".to_string(),
-        })?;
+        let channel = response
+            .channel
+            .ok_or_else(|| AdapterError::MalformedResponse {
+                message: "missing channel payload".to_string(),
+            })?;
 
         Ok(SlackChannelSnapshot {
             channel_id: channel.id,
@@ -213,15 +218,13 @@ impl SlackClient for HttpSlackClient {
         })
     }
 
-    fn file_download(
-        &self,
-        file: &SlackFile,
-    ) -> Result<Vec<u8>, AdapterError> {
-        let download_url = file.download_url.as_deref().ok_or_else(|| {
-            AdapterError::MalformedResponse {
-                message: format!("slack file {} missing download url", file.id),
-            }
-        })?;
+    fn file_download(&self, file: &SlackFile) -> Result<Vec<u8>, AdapterError> {
+        let download_url =
+            file.download_url
+                .as_deref()
+                .ok_or_else(|| AdapterError::MalformedResponse {
+                    message: format!("slack file {} missing download url", file.id),
+                })?;
         let response = self
             .http
             .get(download_url)
@@ -248,9 +251,12 @@ impl SlackClient for HttpSlackClient {
             });
         }
 
-        response.bytes().map(|body| body.to_vec()).map_err(|err| AdapterError::Network {
-            message: err.to_string(),
-        })
+        response
+            .bytes()
+            .map(|body| body.to_vec())
+            .map_err(|err| AdapterError::Network {
+                message: err.to_string(),
+            })
     }
 }
 

@@ -9,16 +9,14 @@ use std::path::PathBuf;
 
 use reqwest::blocking::multipart::{Form, Part};
 use reqwest::blocking::{Client, Response};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::adapter::error::AdapterError;
+use crate::adapter::writeback::traits::{SaaSWriteAdapter, WriteAction, WriteRecord, WriteResult};
 use crate::attribute_inventory::{AttributeAliasCatalog, AttributeAliasDefinition};
-use crate::adapter::writeback::traits::{
-    SaaSWriteAdapter, WriteAction, WriteRecord, WriteResult,
-};
 use crate::slide_analysis::types::{ImageCoordinates, StudentProfile, StudentProperties};
 
 // ---------------------------------------------------------------------------
@@ -109,24 +107,28 @@ impl NotionClient {
                 message: err.to_string(),
             })?;
         let schema = Self::load_database_schema(&http, &config)?;
-        Ok(Self { http, config, schema })
+        Ok(Self {
+            http,
+            config,
+            schema,
+        })
     }
 
     fn auth_headers_for_version(&self, api_version: &str) -> Result<HeaderMap, AdapterError> {
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", self.config.token))
-                .map_err(|err| AdapterError::AuthFailure {
+            HeaderValue::from_str(&format!("Bearer {}", self.config.token)).map_err(|err| {
+                AdapterError::AuthFailure {
                     message: format!("invalid Notion bearer token header: {err}"),
-                })?,
+                }
+            })?,
         );
         headers.insert(
             "Notion-Version",
-            HeaderValue::from_str(api_version)
-                .map_err(|err| AdapterError::Other(format!(
-                    "invalid Notion-Version header: {err}"
-                )))?,
+            HeaderValue::from_str(api_version).map_err(|err| {
+                AdapterError::Other(format!("invalid Notion-Version header: {err}"))
+            })?,
         );
         Ok(headers)
     }
@@ -196,12 +198,17 @@ impl NotionClient {
             )));
         }
 
-        response.json::<T>().map_err(|err| AdapterError::MalformedResponse {
-            message: err.to_string(),
-        })
+        response
+            .json::<T>()
+            .map_err(|err| AdapterError::MalformedResponse {
+                message: err.to_string(),
+            })
     }
 
-    fn load_database_schema(http: &Client, config: &NotionConfig) -> Result<DatabaseSchema, AdapterError> {
+    fn load_database_schema(
+        http: &Client,
+        config: &NotionConfig,
+    ) -> Result<DatabaseSchema, AdapterError> {
         let client = Self {
             http: http.clone(),
             config: config.clone(),
@@ -212,7 +219,8 @@ impl NotionClient {
                 actual_names_by_normalized: HashMap::new(),
             },
         };
-        let database: NotionDatabase = client.api_call("GET", &format!("/databases/{}", config.database_id), None)?;
+        let database: NotionDatabase =
+            client.api_call("GET", &format!("/databases/{}", config.database_id), None)?;
 
         let mut title_property = None;
         let mut email_property = None;
@@ -240,8 +248,14 @@ impl NotionClient {
         })
     }
 
-    fn find_page(&self, email: Option<&str>, title: &str) -> Result<Option<NotionPage>, AdapterError> {
-        let filter = if let (Some(email), Some(email_property)) = (email, self.schema.email_property.as_ref()) {
+    fn find_page(
+        &self,
+        email: Option<&str>,
+        title: &str,
+    ) -> Result<Option<NotionPage>, AdapterError> {
+        let filter = if let (Some(email), Some(email_property)) =
+            (email, self.schema.email_property.as_ref())
+        {
             serde_json::json!({
                 "filter": {
                     "property": email_property,
@@ -260,8 +274,11 @@ impl NotionClient {
                 }
             })
         };
-        let result: NotionQueryResult =
-            self.api_call("POST", &format!("/databases/{}/query", self.config.database_id), Some(&filter))?;
+        let result: NotionQueryResult = self.api_call(
+            "POST",
+            &format!("/databases/{}/query", self.config.database_id),
+            Some(&filter),
+        )?;
         Ok(result.results.into_iter().next())
     }
 
@@ -351,7 +368,12 @@ impl NotionClient {
         Ok(result.results)
     }
 
-    fn upload_file(&self, filename: &str, content_type: &str, bytes: &[u8]) -> Result<String, AdapterError> {
+    fn upload_file(
+        &self,
+        filename: &str,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> Result<String, AdapterError> {
         let create_payload = serde_json::json!({
             "filename": filename,
             "content_type": content_type,
@@ -391,28 +413,35 @@ impl NotionClient {
 
     fn persist_blob_bytes(&self, bytes: &[u8]) -> Result<String, AdapterError> {
         let blob_dir = self.config.blob_dir.as_deref().ok_or_else(|| {
-            AdapterError::Other("Notion image materialization requires blob_dir in configuration".to_string())
+            AdapterError::Other(
+                "Notion image materialization requires blob_dir in configuration".to_string(),
+            )
         })?;
         fs::create_dir_all(blob_dir).map_err(|err| {
-            AdapterError::Other(format!("failed to create blob dir {}: {err}", blob_dir.display()))
+            AdapterError::Other(format!(
+                "failed to create blob dir {}: {err}",
+                blob_dir.display()
+            ))
         })?;
         let hash = hex::encode(Sha256::digest(bytes));
         let blob_path = blob_dir.join(&hash);
         if !blob_path.exists() {
             fs::write(&blob_path, bytes).map_err(|err| {
-                AdapterError::Other(format!("failed to persist cropped blob {}: {err}", blob_path.display()))
+                AdapterError::Other(format!(
+                    "failed to persist cropped blob {}: {err}",
+                    blob_path.display()
+                ))
             })?;
         }
         Ok(hash)
     }
 
     fn load_blob_bytes(&self, blob_ref: &str) -> Result<Vec<u8>, AdapterError> {
-        let hash = blob_ref_sha256(blob_ref)
-            .ok_or_else(|| AdapterError::Other(format!("invalid thumbnail blob ref: {blob_ref}")))?;
+        let hash = blob_ref_sha256(blob_ref).ok_or_else(|| {
+            AdapterError::Other(format!("invalid thumbnail blob ref: {blob_ref}"))
+        })?;
         let blob_dir = self.config.blob_dir.as_deref().ok_or_else(|| {
-            AdapterError::Other(
-                "Notion file upload requires blob_dir in configuration".to_string(),
-            )
+            AdapterError::Other("Notion file upload requires blob_dir in configuration".to_string())
         })?;
         let blob_path = blob_dir.join(hash);
         std::fs::read(&blob_path).map_err(|err| {
@@ -453,7 +482,10 @@ impl NotionClient {
         Ok(NotionMediaRef::FileUpload(upload_id))
     }
 
-    fn build_cover_media(&self, profile: &StudentProfile) -> Result<Option<NotionMediaRef>, AdapterError> {
+    fn build_cover_media(
+        &self,
+        profile: &StudentProfile,
+    ) -> Result<Option<NotionMediaRef>, AdapterError> {
         if let Some(blob_ref) = profile.thumbnail_blob_ref.as_deref() {
             let bytes = self.load_blob_bytes(blob_ref)?;
             return self
@@ -544,7 +576,10 @@ impl NotionClient {
         let Some(url) = url else {
             return Ok(None);
         };
-        let Some(candidate) = source_images.iter().find(|candidate| candidate.source_url == url) else {
+        let Some(candidate) = source_images
+            .iter()
+            .find(|candidate| candidate.source_url == url)
+        else {
             return Ok(None);
         };
         let bytes = self.load_blob_bytes(&candidate.blob_ref)?;
@@ -568,7 +603,11 @@ impl NotionClient {
     }
 
     /// Convert student profile payload to Notion property updates.
-    fn build_property_updates(&self, title: &str, payload: &serde_json::Value) -> serde_json::Value {
+    fn build_property_updates(
+        &self,
+        title: &str,
+        payload: &serde_json::Value,
+    ) -> serde_json::Value {
         let props = payload.get("properties").cloned().unwrap_or_default();
         let mut notion_props = serde_json::Map::new();
 
@@ -595,7 +634,9 @@ impl NotionClient {
             }
         }
 
-        let add_text = |map: &mut serde_json::Map<String, serde_json::Value>, key: &str, value: Option<String>| {
+        let add_text = |map: &mut serde_json::Map<String, serde_json::Value>,
+                        key: &str,
+                        value: Option<String>| {
             if let Some(value) = value.filter(|text| !text.trim().is_empty()) {
                 map.insert(
                     key.to_string(),
@@ -604,11 +645,9 @@ impl NotionClient {
             }
         };
 
-        let add_text_if_exists = |
-            map: &mut serde_json::Map<String, serde_json::Value>,
-            candidates: &[&str],
-            value: Option<String>,
-        | {
+        let add_text_if_exists = |map: &mut serde_json::Map<String, serde_json::Value>,
+                                  candidates: &[&str],
+                                  value: Option<String>| {
             let Some(value) = value.filter(|text| !text.trim().is_empty()) else {
                 return;
             };
@@ -617,34 +656,44 @@ impl NotionClient {
             };
             match property.property_type.as_str() {
                 "url" if value.starts_with("http://") || value.starts_with("https://") => {
-                    map.insert(property_name.to_string(), serde_json::json!({ "url": value }));
+                    map.insert(
+                        property_name.to_string(),
+                        serde_json::json!({ "url": value }),
+                    );
                 }
                 "email" if value.contains('@') => {
-                    map.insert(property_name.to_string(), serde_json::json!({ "email": value }));
+                    map.insert(
+                        property_name.to_string(),
+                        serde_json::json!({ "email": value }),
+                    );
                 }
                 "date" => {
-                    map.insert(property_name.to_string(), serde_json::json!({
-                        "date": {
-                            "start": value,
-                        }
-                    }));
+                    map.insert(
+                        property_name.to_string(),
+                        serde_json::json!({
+                            "date": {
+                                "start": value,
+                            }
+                        }),
+                    );
                 }
                 "status" => {
-                    map.insert(property_name.to_string(), serde_json::json!({
-                        "status": {
-                            "name": value,
-                        }
-                    }));
+                    map.insert(
+                        property_name.to_string(),
+                        serde_json::json!({
+                            "status": {
+                                "name": value,
+                            }
+                        }),
+                    );
                 }
                 _ => add_text(map, property_name, Some(value)),
             }
         };
 
-        let add_checkbox_if_exists = |
-            map: &mut serde_json::Map<String, serde_json::Value>,
-            candidates: &[&str],
-            value: Option<bool>,
-        | {
+        let add_checkbox_if_exists = |map: &mut serde_json::Map<String, serde_json::Value>,
+                                      candidates: &[&str],
+                                      value: Option<bool>| {
             let Some(value) = value else {
                 return;
             };
@@ -659,30 +708,59 @@ impl NotionClient {
             }
         };
 
-        add_text_if_exists(&mut notion_props, &["Birthplace", "出身地"], json_text(&props["Birthplace"]));
-        add_text_if_exists(&mut notion_props, &["DoB", "生年月日"], json_text(&props["DoB"]));
+        add_text_if_exists(
+            &mut notion_props,
+            &["Birthplace", "出身地"],
+            json_text(&props["Birthplace"]),
+        );
+        add_text_if_exists(
+            &mut notion_props,
+            &["DoB", "生年月日"],
+            json_text(&props["DoB"]),
+        );
 
         let tag_str = json_list_text(props.get("Hashtags"));
         add_text_if_exists(
             &mut notion_props,
-            &["Hashtag", "Hashtags", "ハッシュタグ", "私を表すハッシュタグ"],
+            &[
+                "Hashtag",
+                "Hashtags",
+                "ハッシュタグ",
+                "私を表すハッシュタグ",
+            ],
             tag_str.clone(),
         );
         add_text_if_exists(
             &mut notion_props,
-            &["Hashtags", "Hashtag", "ハッシュタグ", "私を表すハッシュタグ"],
+            &[
+                "Hashtags",
+                "Hashtag",
+                "ハッシュタグ",
+                "私を表すハッシュタグ",
+            ],
             tag_str,
         );
 
         add_text_if_exists(
             &mut notion_props,
-            &["Major_Interests", "Major_interests", "専攻・興味分野", "専攻-興味分野"],
-            props.get("Major").and_then(|v| v.as_str()).map(ToOwned::to_owned),
+            &[
+                "Major_Interests",
+                "Major_interests",
+                "専攻・興味分野",
+                "専攻-興味分野",
+            ],
+            props
+                .get("Major")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned),
         );
         add_text_if_exists(
             &mut notion_props,
             &["Major", "専攻", "専攻分野"],
-            props.get("Major").and_then(|v| v.as_str()).map(ToOwned::to_owned),
+            props
+                .get("Major")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned),
         );
 
         add_text_if_exists(
@@ -762,7 +840,11 @@ impl NotionClient {
             &mut notion_props,
             &["Source Slide URL"],
             metadata_str(payload, "source_slide_url")
-                .or_else(|| payload.get("source_canonical_uri").and_then(|value| value.as_str()))
+                .or_else(|| {
+                    payload
+                        .get("source_canonical_uri")
+                        .and_then(|value| value.as_str())
+                })
                 .map(ToOwned::to_owned),
         );
         add_text_if_exists(
@@ -796,11 +878,10 @@ impl NotionClient {
 
 impl SaaSWriteAdapter for NotionClient {
     fn write_record(&self, record: &WriteRecord) -> Result<WriteResult, AdapterError> {
-        let mut profile = serde_json::from_value::<StudentProfile>(record.payload.clone()).map_err(|err| {
-            AdapterError::MalformedResponse {
+        let mut profile = serde_json::from_value::<StudentProfile>(record.payload.clone())
+            .map_err(|err| AdapterError::MalformedResponse {
                 message: format!("invalid StudentProfile payload for Notion write-back: {err}"),
-            }
-        })?;
+            })?;
         profile.normalize_in_place();
 
         let email = profile
@@ -809,9 +890,10 @@ impl SaaSWriteAdapter for NotionClient {
             .or(profile.generated_email.as_deref())
             .unwrap_or(&record.entity_id);
 
-        let mut normalized_payload = serde_json::to_value(&profile).map_err(|err| AdapterError::MalformedResponse {
-            message: format!("failed to re-serialize normalized StudentProfile: {err}"),
-        })?;
+        let mut normalized_payload =
+            serde_json::to_value(&profile).map_err(|err| AdapterError::MalformedResponse {
+                message: format!("failed to re-serialize normalized StudentProfile: {err}"),
+            })?;
         if let (Some(target), Some(metadata)) = (
             normalized_payload.as_object_mut(),
             record.payload.get("_lethe"),
@@ -843,9 +925,7 @@ impl SaaSWriteAdapter for NotionClient {
         } else {
             match self.find_page(Some(email), &record.title)? {
                 Some(page) => (page.id.clone(), WriteAction::Updated),
-                None => {
-                    (String::new(), WriteAction::Created)
-                }
+                None => (String::new(), WriteAction::Created),
             }
         };
 
@@ -864,7 +944,10 @@ impl SaaSWriteAdapter for NotionClient {
             let page = self.create_page(&property_updates, cover.as_ref(), icon.as_ref())?;
             page.id
         } else {
-            if property_updates.as_object().is_some_and(|m| !m.is_empty()) || cover.is_some() || icon.is_some() {
+            if property_updates.as_object().is_some_and(|m| !m.is_empty())
+                || cover.is_some()
+                || icon.is_some()
+            {
                 self.update_page(&page_id, &property_updates, cover.as_ref(), icon.as_ref())?;
             }
             page_id
@@ -990,7 +1073,8 @@ fn match_source_image_candidate<'a>(
     let target_x = normalize_image_selection_coordinate(coordinates.x)?;
     let target_y = normalize_image_selection_coordinate(coordinates.y)?;
     candidates.iter().min_by(|left, right| {
-        let left_distance = squared_distance(left.center_x_pct, left.center_y_pct, target_x, target_y);
+        let left_distance =
+            squared_distance(left.center_x_pct, left.center_y_pct, target_x, target_y);
         let right_distance =
             squared_distance(right.center_x_pct, right.center_y_pct, target_x, target_y);
         left_distance.total_cmp(&right_distance)
@@ -1065,7 +1149,11 @@ impl NotionMediaRef {
 fn page_api_version_from_media_refs<'a, const N: usize>(
     refs: [Option<&'a NotionMediaRef>; N],
 ) -> &'static str {
-    if refs.into_iter().flatten().any(|value| matches!(value, NotionMediaRef::FileUpload(_))) {
+    if refs
+        .into_iter()
+        .flatten()
+        .any(|value| matches!(value, NotionMediaRef::FileUpload(_)))
+    {
         NotionClient::FILE_UPLOAD_API_VERSION
     } else {
         "2022-06-28"
@@ -1106,7 +1194,9 @@ fn build_page_blocks(
     if let Some(section) = build_gallery_section(profile, gallery_urls) {
         sections.push(section);
     }
-    if let Some(section) = build_source_section(source_url.or(profile.source_canonical_uri.as_deref())) {
+    if let Some(section) =
+        build_source_section(source_url.or(profile.source_canonical_uri.as_deref()))
+    {
         sections.push(section);
     }
 
@@ -1163,19 +1253,35 @@ fn build_about_section(
 
 fn build_about_rows(properties: &StudentProperties) -> Vec<(String, AboutValue)> {
     let mut rows = Vec::new();
-    if let Some(value) = properties.nickname.as_deref().filter(|value| !value.is_empty()) {
+    if let Some(value) = properties
+        .nickname
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
         rows.push(("呼び名".to_string(), AboutValue::Text(value.to_string())));
     }
-    if let Some(value) = properties.birthplace.as_deref().filter(|value| !value.is_empty()) {
+    if let Some(value) = properties
+        .birthplace
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
         rows.push(("出身".to_string(), AboutValue::Text(value.to_string())));
     }
     if let Some(value) = properties.dob.as_deref().filter(|value| !value.is_empty()) {
         rows.push(("誕生日".to_string(), AboutValue::Text(value.to_string())));
     }
-    if let Some(value) = properties.major.as_deref().filter(|value| !value.is_empty()) {
+    if let Some(value) = properties
+        .major
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
         rows.push(("専攻".to_string(), AboutValue::Text(value.to_string())));
     }
-    if let Some(value) = properties.affiliation.as_deref().filter(|value| !value.is_empty()) {
+    if let Some(value) = properties
+        .affiliation
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
         rows.push(("所属".to_string(), AboutValue::Text(value.to_string())));
     }
     if let Some(value) = properties.mbti.as_deref().filter(|value| !value.is_empty()) {
@@ -1293,7 +1399,11 @@ fn build_gallery_section(
                 continue;
             };
             let mut children = vec![media.to_image_block()];
-            if let Some(description) = image.description.as_deref().filter(|value| !value.trim().is_empty()) {
+            if let Some(description) = image
+                .description
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
                 children.push(serde_json::json!({
                     "object": "block",
                     "type": "paragraph",
@@ -1332,7 +1442,9 @@ fn build_gallery_section(
 }
 
 fn build_source_section(source_url: Option<&str>) -> Option<Vec<serde_json::Value>> {
-    let source_url = source_url.map(str::trim).filter(|value| !value.is_empty())?;
+    let source_url = source_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
     Some(vec![
         heading_2_block("Source"),
         serde_json::json!({
@@ -1404,7 +1516,10 @@ fn truncate_rich_text_content(content: &str) -> String {
     let mut chars = content.chars();
     let truncated = chars.by_ref().take(MAX_CHARS).collect::<String>();
     if chars.next().is_some() {
-        let mut shortened = truncated.chars().take(MAX_CHARS.saturating_sub(1)).collect::<String>();
+        let mut shortened = truncated
+            .chars()
+            .take(MAX_CHARS.saturating_sub(1))
+            .collect::<String>();
         shortened.push('…');
         shortened
     } else {
@@ -1418,7 +1533,11 @@ enum AboutValue {
 }
 
 fn json_text(value: &serde_json::Value) -> Option<String> {
-    value.as_str().map(str::trim).filter(|value| !value.is_empty()).map(str::to_string)
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn json_list_values(value: Option<&serde_json::Value>) -> Vec<String> {
@@ -1505,7 +1624,10 @@ fn catalog_attribute_value(
             json_list_values(props.get("Interests")),
         ]),
         "所属" => json_text(&props["Affiliation"]),
-        "氏名" => payload.get("name").and_then(|value| value.as_str()).map(ToOwned::to_owned),
+        "氏名" => payload
+            .get("name")
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned),
         "生年月日" => json_text(&props["DoB"]),
         "趣味-特技" => json_list_text(props.get("Hobbies")),
         _ => None,
@@ -1520,7 +1642,10 @@ fn normalize_property_name(value: &str) -> String {
         .collect()
 }
 
-fn metadata_pointer<'a>(payload: &'a serde_json::Value, field: &str) -> Option<&'a serde_json::Value> {
+fn metadata_pointer<'a>(
+    payload: &'a serde_json::Value,
+    field: &str,
+) -> Option<&'a serde_json::Value> {
     payload.pointer(&format!("/_lethe/{field}"))
 }
 
@@ -1603,7 +1728,9 @@ mod tests {
             attributes: vec![],
             source_slide_object_id: Some("slide-1".into()),
             source_document_id: Some("document:gslides:test#slide:slide-1".into()),
-            source_canonical_uri: Some("https://docs.google.com/presentation/d/test/edit#slide=id.slide-1".into()),
+            source_canonical_uri: Some(
+                "https://docs.google.com/presentation/d/test/edit#slide=id.slide-1".into(),
+            ),
             thumbnail_blob_ref: None,
             thumbnail_url: None,
             companion_to_slide_object_id: None,
@@ -1623,9 +1750,15 @@ mod tests {
         match value {
             serde_json::Value::Object(map) => {
                 usize::from(map.get("type").and_then(|value| value.as_str()) == Some(block_type))
-                    + map.values().map(|child| count_block_type(child, block_type)).sum::<usize>()
+                    + map
+                        .values()
+                        .map(|child| count_block_type(child, block_type))
+                        .sum::<usize>()
             }
-            serde_json::Value::Array(values) => values.iter().map(|child| count_block_type(child, block_type)).sum(),
+            serde_json::Value::Array(values) => values
+                .iter()
+                .map(|child| count_block_type(child, block_type))
+                .sum(),
             _ => 0,
         }
     }
@@ -1679,16 +1812,24 @@ mod tests {
         profile.properties.likes = vec!["コーンスープ".into()];
         profile.properties.new_challenges = Some("海外で学ぶ".into());
 
-        let gallery = vec![(0usize, NotionMediaRef::External("https://example.com/gallery.png".into()))];
+        let gallery = vec![(
+            0usize,
+            NotionMediaRef::External("https://example.com/gallery.png".into()),
+        )];
         let blocks = build_page_blocks(
             &profile,
-            Some(&NotionMediaRef::External("https://example.com/profile.png".into())),
+            Some(&NotionMediaRef::External(
+                "https://example.com/profile.png".into(),
+            )),
             &gallery,
             profile.source_canonical_uri.as_deref(),
         );
 
         assert_eq!(blocks.first().unwrap()["type"], "callout");
-        assert_eq!(heading_titles(&blocks), vec!["About", "Highlights", "Gallery", "Source"]);
+        assert_eq!(
+            heading_titles(&blocks),
+            vec!["About", "Highlights", "Gallery", "Source"]
+        );
         assert!(blocks.iter().any(|block| block["type"] == "toggle"));
         assert!(blocks.iter().any(|block| block["type"] == "bookmark"));
     }
@@ -1696,8 +1837,13 @@ mod tests {
     #[test]
     fn missing_hobbies_interests_likes_skips_highlights() {
         let profile = sample_profile();
-        let blocks = build_page_blocks(&profile, None, &[], profile.source_canonical_uri.as_deref());
-        assert!(!heading_titles(&blocks).iter().any(|title| title == "Highlights"));
+        let blocks =
+            build_page_blocks(&profile, None, &[], profile.source_canonical_uri.as_deref());
+        assert!(
+            !heading_titles(&blocks)
+                .iter()
+                .any(|title| title == "Highlights")
+        );
     }
 
     #[test]
@@ -1705,9 +1851,16 @@ mod tests {
         let mut profile = sample_profile();
         profile.properties.new_challenges = Some("Rust を学ぶ".into());
         let blocks = build_page_blocks(&profile, None, &[], None);
-        let toggles = blocks.iter().filter(|block| block["type"] == "toggle").count();
+        let toggles = blocks
+            .iter()
+            .filter(|block| block["type"] == "toggle")
+            .count();
         assert_eq!(toggles, 1);
-        assert!(blocks.iter().any(|block| block.to_string().contains("New Challenges")));
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.to_string().contains("New Challenges"))
+        );
     }
 
     #[test]
@@ -1721,10 +1874,18 @@ mod tests {
             })
             .collect();
         let gallery = (0..12)
-            .map(|index| (index, NotionMediaRef::External(format!("https://example.com/{index}.png"))))
+            .map(|index| {
+                (
+                    index,
+                    NotionMediaRef::External(format!("https://example.com/{index}.png")),
+                )
+            })
             .collect::<Vec<_>>();
         let blocks = build_page_blocks(&profile, None, &gallery, None);
-        let image_count = blocks.iter().map(|block| count_block_type(block, "image")).sum::<usize>();
+        let image_count = blocks
+            .iter()
+            .map(|block| count_block_type(block, "image"))
+            .sum::<usize>();
         assert_eq!(image_count, 9);
     }
 
@@ -1740,7 +1901,11 @@ mod tests {
         let blocks = build_page_blocks(&profile, None, &gallery, None);
         let gallery_section = build_gallery_section(&profile, &gallery).unwrap();
         assert!(blocks.iter().any(|block| block["type"] == "image"));
-        assert!(!gallery_section.iter().any(|block| block["type"] == "column_list"));
+        assert!(
+            !gallery_section
+                .iter()
+                .any(|block| block["type"] == "column_list")
+        );
     }
 
     #[test]
@@ -1748,7 +1913,8 @@ mod tests {
         let mut profile = sample_profile();
         profile.bio_text = None;
         profile.properties.hobbies = vec!["写真".into()];
-        let blocks = build_page_blocks(&profile, None, &[], profile.source_canonical_uri.as_deref());
+        let blocks =
+            build_page_blocks(&profile, None, &[], profile.source_canonical_uri.as_deref());
         assert_ne!(blocks.first().unwrap()["type"], "divider");
         assert_ne!(blocks.last().unwrap()["type"], "divider");
         for pair in blocks.windows(2) {
@@ -1761,9 +1927,13 @@ mod tests {
         let mut profile = sample_profile();
         profile.properties.sns = Some("https://example.com/sns".into());
         let blocks = build_page_blocks(&profile, None, &[], None);
-        let about = blocks.iter().find(|block| block["type"] == "table").unwrap();
+        let about = blocks
+            .iter()
+            .find(|block| block["type"] == "table")
+            .unwrap();
         assert_eq!(
-            about["table"]["children"][0]["table_row"]["cells"][1][0]["text"]["link"]["url"].as_str(),
+            about["table"]["children"][0]["table_row"]["cells"][1][0]["text"]["link"]["url"]
+                .as_str(),
             Some("https://example.com/sns")
         );
     }
@@ -1773,7 +1943,10 @@ mod tests {
         let mut profile = sample_profile();
         profile.properties.nickname = Some("さやか".into());
         let blocks = build_page_blocks(&profile, None, &[], None);
-        let about = blocks.iter().find(|block| block["type"] == "table").unwrap();
+        let about = blocks
+            .iter()
+            .find(|block| block["type"] == "table")
+            .unwrap();
         assert_eq!(about["table"]["children"].as_array().unwrap().len(), 1);
     }
 
@@ -1787,7 +1960,10 @@ mod tests {
             }
         });
         let props = fixture_client("LETHE Person ID").build_property_updates("田中太郎", &payload);
-        assert_eq!(props["Major_interests"]["rich_text"][0]["text"]["content"].as_str(), Some("CS"));
+        assert_eq!(
+            props["Major_interests"]["rich_text"][0]["text"]["content"].as_str(),
+            Some("CS")
+        );
         assert!(props.get("Birthplace").is_some());
         assert!(props.get("Name").is_some());
     }
@@ -1827,29 +2003,33 @@ mod tests {
     #[test]
     fn build_property_updates_supports_japanese_alias_named_properties() {
         let mut client = fixture_client("LETHE Person ID");
-        client.schema.actual_names_by_normalized.extend([
-            ("呼ばれたい名前", "呼ばれたい名前"),
-            ("趣味特技", "趣味・特技"),
-            ("好きなもの", "好きなもの"),
-            ("カレッジで挑戦したいこと", "カレッジで挑戦したいこと"),
-        ]
-        .into_iter()
-        .map(|(normalized, actual)| (normalized.to_string(), actual.to_string())));
-        client.schema.properties.extend([
-            ("呼ばれたい名前", "rich_text"),
-            ("趣味・特技", "rich_text"),
-            ("好きなもの", "rich_text"),
-            ("カレッジで挑戦したいこと", "rich_text"),
-        ]
-        .into_iter()
-        .map(|(name, property_type)| {
-            (
-                name.to_string(),
-                NotionProperty {
-                    property_type: property_type.to_string(),
-                },
-            )
-        }));
+        client.schema.actual_names_by_normalized.extend(
+            [
+                ("呼ばれたい名前", "呼ばれたい名前"),
+                ("趣味特技", "趣味・特技"),
+                ("好きなもの", "好きなもの"),
+                ("カレッジで挑戦したいこと", "カレッジで挑戦したいこと"),
+            ]
+            .into_iter()
+            .map(|(normalized, actual)| (normalized.to_string(), actual.to_string())),
+        );
+        client.schema.properties.extend(
+            [
+                ("呼ばれたい名前", "rich_text"),
+                ("趣味・特技", "rich_text"),
+                ("好きなもの", "rich_text"),
+                ("カレッジで挑戦したいこと", "rich_text"),
+            ]
+            .into_iter()
+            .map(|(name, property_type)| {
+                (
+                    name.to_string(),
+                    NotionProperty {
+                        property_type: property_type.to_string(),
+                    },
+                )
+            }),
+        );
 
         let payload = serde_json::json!({
             "properties": {
@@ -1910,9 +2090,13 @@ mod tests {
 
     #[test]
     fn media_ref_external_image_block_uses_external_type() {
-        let block = NotionMediaRef::External("https://example.com/thumb.png".into()).to_image_block();
+        let block =
+            NotionMediaRef::External("https://example.com/thumb.png".into()).to_image_block();
         assert_eq!(block["type"], "image");
         assert_eq!(block["image"]["type"], "external");
-        assert_eq!(block["image"]["external"]["url"], "https://example.com/thumb.png");
+        assert_eq!(
+            block["image"]["external"]["url"],
+            "https://example.com/thumb.png"
+        );
     }
 }

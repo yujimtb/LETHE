@@ -7,8 +7,8 @@ use zip::ZipArchive;
 
 use crate::adapter::error::AdapterError;
 use crate::adapter::idempotency::{
-    canonical_json, identity_key, normalize_canonical_body, CANONICAL_JSON_META_KEY,
-    OBJECT_ID_META_KEY,
+    CANONICAL_JSON_META_KEY, OBJECT_ID_META_KEY, canonical_json, identity_key,
+    normalize_canonical_body,
 };
 use crate::adapter::traits::ObservationDraft;
 use crate::domain::{
@@ -59,18 +59,19 @@ impl ClaudeAiImporter {
     }
 
     pub fn import_zip(&self, bytes: &[u8]) -> Result<Vec<ObservationDraft>, AdapterError> {
-        let mut archive = ZipArchive::new(Cursor::new(bytes))
-            .map_err(|err| AdapterError::MalformedResponse {
+        let mut archive =
+            ZipArchive::new(Cursor::new(bytes)).map_err(|err| AdapterError::MalformedResponse {
                 message: format!("invalid claude.ai zip: {err}"),
             })?;
         let mut drafts = Vec::new();
 
         for index in 0..archive.len() {
-            let mut file = archive
-                .by_index(index)
-                .map_err(|err| AdapterError::MalformedResponse {
-                    message: format!("invalid zip entry: {err}"),
-                })?;
+            let mut file =
+                archive
+                    .by_index(index)
+                    .map_err(|err| AdapterError::MalformedResponse {
+                        message: format!("invalid zip entry: {err}"),
+                    })?;
             if !file.name().ends_with(".json") {
                 continue;
             }

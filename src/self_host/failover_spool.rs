@@ -3,10 +3,12 @@
 use std::fs;
 use std::path::Path;
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 use crate::domain::Observation;
-use crate::self_host::persistence::{DurableAppendOutcome, PersistenceError, RehomeMode, SqlitePersistence};
+use crate::self_host::persistence::{
+    DurableAppendOutcome, PersistenceError, RehomeMode, SqlitePersistence,
+};
 
 const CANONICAL_JSON_META_KEY: &str = "canonical_json";
 
@@ -65,9 +67,8 @@ impl FailoverSpool {
         let observations = self.load_ordered()?;
         let mut outcomes = Vec::with_capacity(observations.len());
         for observation in observations {
-            outcomes.push(
-                destination.rehome_observation(&observation, RehomeMode::StoredIdentity)?,
-            );
+            outcomes
+                .push(destination.rehome_observation(&observation, RehomeMode::StoredIdentity)?);
         }
         self.retire()?;
         Ok(outcomes)
@@ -87,9 +88,11 @@ impl FailoverSpool {
 
     pub fn is_retired(&self) -> Result<bool, PersistenceError> {
         self.conn
-            .query_row("SELECT retired FROM spool_metadata WHERE id = 1", [], |row| {
-                row.get::<_, i64>(0)
-            })
+            .query_row(
+                "SELECT retired FROM spool_metadata WHERE id = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
             .map(|retired| retired == 1)
             .map_err(PersistenceError::from)
     }
@@ -183,7 +186,8 @@ mod tests {
     fn spool_keeps_duplicates_and_drain_deduplicates_at_destination() {
         let tmp = std::env::temp_dir().join(format!("lethe-spool-test-{}", uuid::Uuid::now_v7()));
         let spool = FailoverSpool::open(&tmp.join("spool.sqlite3")).unwrap();
-        let destination = SqlitePersistence::open(&tmp.join("leaf.sqlite3"), &tmp.join("blobs")).unwrap();
+        let destination =
+            SqlitePersistence::open(&tmp.join("leaf.sqlite3"), &tmp.join("blobs")).unwrap();
         let first = observation("dup-key");
         let mut duplicate = first.clone();
         duplicate.id = Observation::new_id();

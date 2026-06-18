@@ -5,7 +5,9 @@
 
 use std::collections::HashMap;
 
-use crate::domain::{DomainError, EntityTypeRef, ObserverRef, ProjectionRef, SchemaRef, SemVer, SourceSystemRef};
+use crate::domain::{
+    DomainError, EntityTypeRef, ObserverRef, ProjectionRef, SchemaRef, SemVer, SourceSystemRef,
+};
 
 use super::{
     EntityType, ObservationSchema, Observer, ProjectionCatalogEntry, SchemaVersion, SourceSystem,
@@ -76,7 +78,9 @@ impl RegistryStore {
             )));
         }
         // Subject type must exist (or be wildcard "et:*").
-        if schema.subject_type.0 != "et:*" && !self.entity_types.contains_key(&schema.subject_type.0) {
+        if schema.subject_type.0 != "et:*"
+            && !self.entity_types.contains_key(&schema.subject_type.0)
+        {
             return Err(DomainError::Validation(format!(
                 "Subject EntityType {} does not exist",
                 schema.subject_type
@@ -103,7 +107,12 @@ impl RegistryStore {
             .schemas
             .get(&id.0)
             .ok_or_else(|| DomainError::NotFound(format!("Schema {} not found", id)))?;
-        validate_schema_compatibility(&current.version, &current.payload_schema, &version, &payload_schema)?;
+        validate_schema_compatibility(
+            &current.version,
+            &current.payload_schema,
+            &version,
+            &payload_schema,
+        )?;
         if !self.schemas.contains_key(&id.0) {
             return Err(DomainError::NotFound(format!("Schema {} not found", id)));
         }
@@ -317,8 +326,16 @@ mod tests {
     #[test]
     fn base_types_are_seeded() {
         let store = RegistryStore::new();
-        assert!(store.get_entity_type(&EntityTypeRef::new("et:person")).is_some());
-        assert!(store.get_entity_type(&EntityTypeRef::new("et:document")).is_some());
+        assert!(
+            store
+                .get_entity_type(&EntityTypeRef::new("et:person"))
+                .is_some()
+        );
+        assert!(
+            store
+                .get_entity_type(&EntityTypeRef::new("et:document"))
+                .is_some()
+        );
     }
 
     #[test]

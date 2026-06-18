@@ -73,7 +73,10 @@ pub fn streaming_k_way_merge(
         ensure_sorted(stream)?;
     }
 
-    let mut streams = leaf_streams.into_iter().map(Vec::into_iter).collect::<Vec<_>>();
+    let mut streams = leaf_streams
+        .into_iter()
+        .map(Vec::into_iter)
+        .collect::<Vec<_>>();
     let mut heap = BinaryHeap::new();
     for (leaf_index, stream) in streams.iter_mut().enumerate() {
         if let Some(observation) = stream.next() {
@@ -177,15 +180,15 @@ impl PartialOrd for HeapItem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
     use crate::domain::{
         AuthorityModel, CaptureModel, EntityRef, IdempotencyKey, Observation, ObservationId,
         ObserverRef, SchemaRef, SemVer, SourceSystemRef,
     };
     use crate::runtime::partition::{
-        initialize_event_json, parse_partition_event, split_commit_event_json, PartitionTree,
-        PARTITION_EVENT_INITIALIZE, PARTITION_EVENT_SPLIT_COMMIT,
+        PARTITION_EVENT_INITIALIZE, PARTITION_EVENT_SPLIT_COMMIT, PartitionTree,
+        initialize_event_json, parse_partition_event, split_commit_event_json,
     };
+    use chrono::TimeZone;
 
     fn leaf_id() -> String {
         format!("lake:{}", uuid::Uuid::now_v7())
@@ -261,9 +264,11 @@ mod tests {
         let second = observation("obs:2", "2026-04-01T00:00:00Z", "2026-04-01T00:02:00Z");
         let third = observation("obs:3", "2026-04-02T00:00:00Z", "2026-04-02T00:01:00Z");
 
-        let merged =
-            streaming_k_way_merge(vec![vec![first.clone(), third.clone()], vec![second.clone()]])
-                .unwrap();
+        let merged = streaming_k_way_merge(vec![
+            vec![first.clone(), third.clone()],
+            vec![second.clone()],
+        ])
+        .unwrap();
 
         assert_eq!(
             merged

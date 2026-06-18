@@ -66,27 +66,21 @@ impl PersonPageProjector {
                 self_intro_slide_id: frontend_profile
                     .as_ref()
                     .map(|profile| profile.source_document_id.clone()),
-                self_intro_thumbnail: frontend_profile
-                    .as_ref()
-                    .and_then(|profile| {
-                        profile
-                            .thumbnail_url
-                            .clone()
-                            .or_else(|| profile.thumbnail_ref.clone())
-                    }),
+                self_intro_thumbnail: frontend_profile.as_ref().and_then(|profile| {
+                    profile
+                        .thumbnail_url
+                        .clone()
+                        .or_else(|| profile.thumbnail_ref.clone())
+                }),
                 identities: person
                     .identifiers
                     .iter()
-                    .filter_map(|ident| {
-                        match ident.identifier_type {
-                            IdentifierType::Email | IdentifierType::UserId => {
-                                Some(IdentityInfo {
-                                    system: ident.source.clone(),
-                                    external_id: ident.value.clone(),
-                                })
-                            }
-                            _ => None,
-                        }
+                    .filter_map(|ident| match ident.identifier_type {
+                        IdentifierType::Email | IdentifierType::UserId => Some(IdentityInfo {
+                            system: ident.source.clone(),
+                            external_id: ident.value.clone(),
+                        }),
+                        _ => None,
                     })
                     .collect(),
                 source_count: person.sources.len(),
@@ -125,7 +119,8 @@ impl PersonPageProjector {
                 continue;
             }
 
-            let mut profile = match serde_json::from_value::<StudentProfile>(record.payload.clone()) {
+            let mut profile = match serde_json::from_value::<StudentProfile>(record.payload.clone())
+            {
                 Ok(profile) => profile,
                 Err(_) => continue,
             };
@@ -149,7 +144,9 @@ impl PersonPageProjector {
                 .or(profile.generated_email.as_deref())
                 .and_then(|value| identifier_map.get(value))
                 .cloned()
-                .or_else(|| Self::person_id_from_slide_observation(source_observation, identifier_map));
+                .or_else(|| {
+                    Self::person_id_from_slide_observation(source_observation, identifier_map)
+                });
             let Some(person_id) = person_id else {
                 continue;
             };
@@ -159,20 +156,20 @@ impl PersonPageProjector {
                     .source_document_id
                     .clone()
                     .unwrap_or_else(|| source_observation.subject.as_str().to_string()),
-                source_canonical_uri: profile
-                    .source_canonical_uri
-                    .clone()
-                    .or_else(|| {
-                        source_observation
-                            .payload
-                            .pointer("/artifact/canonicalUri")
-                            .and_then(|value| value.as_str())
-                            .map(ToOwned::to_owned)
-                    }),
-                thumbnail_ref: profile
-                    .thumbnail_blob_ref
-                    .clone()
-                    .or_else(|| record.derived_from.blobs.first().map(|blob| blob.as_str().to_string())),
+                source_canonical_uri: profile.source_canonical_uri.clone().or_else(|| {
+                    source_observation
+                        .payload
+                        .pointer("/artifact/canonicalUri")
+                        .and_then(|value| value.as_str())
+                        .map(ToOwned::to_owned)
+                }),
+                thumbnail_ref: profile.thumbnail_blob_ref.clone().or_else(|| {
+                    record
+                        .derived_from
+                        .blobs
+                        .first()
+                        .map(|blob| blob.as_str().to_string())
+                }),
                 thumbnail_url: profile.thumbnail_url.clone(),
                 profile,
             };
@@ -182,7 +179,8 @@ impl PersonPageProjector {
             match results.get(person_id.as_str()) {
                 Some((current_score, current_created_at, _))
                     if *current_score > richness_score
-                        || (*current_score == richness_score && *current_created_at >= created_at) => {}
+                        || (*current_score == richness_score
+                            && *current_created_at >= created_at) => {}
                 _ => {
                     results.insert(
                         person_id.as_str().to_string(),
@@ -395,7 +393,11 @@ impl PersonPageProjector {
         }
 
         // Check via owner in GSlides.
-        if let Some(owner) = obs.payload.pointer("/relations/owner").and_then(|v| v.as_str()) {
+        if let Some(owner) = obs
+            .payload
+            .pointer("/relations/owner")
+            .and_then(|v| v.as_str())
+        {
             if let Some(pid) = identifier_map.get(owner) {
                 if *pid == person.person_id {
                     return true;
@@ -458,11 +460,14 @@ impl PersonPageProjector {
         messages: &[PersonMessage],
         activity: &PersonActivity,
     ) -> PersonDetailResponse {
-        let self_introduction = profile.self_intro_text.as_ref().map(|text| SelfIntroduction {
-            text: text.clone(),
-            slide_id: profile.self_intro_slide_id.clone(),
-            thumbnail_url: profile.self_intro_thumbnail.clone(),
-        });
+        let self_introduction = profile
+            .self_intro_text
+            .as_ref()
+            .map(|text| SelfIntroduction {
+                text: text.clone(),
+                slide_id: profile.self_intro_slide_id.clone(),
+                thumbnail_url: profile.self_intro_thumbnail.clone(),
+            });
 
         PersonDetailResponse {
             person_id: profile.person_id.clone(),
@@ -482,8 +487,8 @@ impl PersonPageProjector {
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::supplemental::InputAnchorSet;
     use super::*;
+    use crate::domain::supplemental::InputAnchorSet;
     use crate::domain::*;
     use crate::governance::types::ConfidenceLevel;
     use crate::identity::types::*;
@@ -602,9 +607,13 @@ mod tests {
     #[test]
     fn unrelated_observation_excluded() {
         let identity = sample_identity();
-        let observations = vec![
-            slack_obs("U999", "other@example.com", "unrelated", "general", "s1"),
-        ];
+        let observations = vec![slack_obs(
+            "U999",
+            "other@example.com",
+            "unrelated",
+            "general",
+            "s1",
+        )];
 
         let output = PersonPageProjector::project(&identity, &observations, &[]);
         assert_eq!(output.messages.len(), 0);
@@ -613,14 +622,22 @@ mod tests {
     #[test]
     fn person_detail_response_builds() {
         let identity = sample_identity();
-        let observations = vec![
-            slack_obs("U123", "tanaka@example.jp", "hello", "general", "s1"),
-        ];
+        let observations = vec![slack_obs(
+            "U123",
+            "tanaka@example.jp",
+            "hello",
+            "general",
+            "s1",
+        )];
 
         let output = PersonPageProjector::project(&identity, &observations, &[]);
         let profile = &output.profiles[0];
         let activity = &output.activities[0];
-        let msgs: Vec<_> = output.messages.iter().filter(|m| m.person_id == profile.person_id).collect();
+        let msgs: Vec<_> = output
+            .messages
+            .iter()
+            .filter(|m| m.person_id == profile.person_id)
+            .collect();
 
         let detail = PersonPageProjector::to_detail(
             profile,
@@ -836,11 +853,8 @@ mod tests {
             lineage: None,
         };
 
-        let output = PersonPageProjector::project(
-            &identity,
-            &[observation],
-            &[&sparse_newer, &richer],
-        );
+        let output =
+            PersonPageProjector::project(&identity, &[observation], &[&sparse_newer, &richer]);
 
         assert_eq!(
             output.profiles[0]

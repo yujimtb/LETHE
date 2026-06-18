@@ -51,8 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!(
         "Loaded {} unique label(s), {} pending review(s).",
-        total_candidates,
-        pending
+        total_candidates, pending
     );
     println!("State file: {}", options.state_path.display());
 
@@ -112,18 +111,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 let suggestions = state.suggestions_for(candidate);
                 println!();
-                println!(
-                    "Label [{} pending]",
-                    pending
-                );
+                println!("Label [{} pending]", pending);
                 println!("  Label:    {}", candidate.value);
-                println!("  Students: {} ({})", candidate.student_count,
-                    candidate.student_names.iter().take(5).cloned().collect::<Vec<_>>().join(", "));
+                println!(
+                    "  Students: {} ({})",
+                    candidate.student_count,
+                    candidate
+                        .student_names
+                        .iter()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
                 if let Some(ai_key) = &candidate.ai_property_key {
                     println!("  AI key:   {}", ai_key);
                 }
                 if !candidate.example_values.is_empty() {
-                    println!("  Examples: {}", candidate.example_values.iter().take(3).cloned().collect::<Vec<_>>().join(", "));
+                    println!(
+                        "  Examples: {}",
+                        candidate
+                            .example_values
+                            .iter()
+                            .take(3)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
                 }
                 if suggestions.is_empty() {
                     println!("  Suggestions: none");
@@ -243,7 +257,9 @@ struct CliOptions {
     interactive: bool,
 }
 
-fn parse_options(args: impl Iterator<Item = String>) -> Result<CliOptions, Box<dyn std::error::Error>> {
+fn parse_options(
+    args: impl Iterator<Item = String>,
+) -> Result<CliOptions, Box<dyn std::error::Error>> {
     let mut refresh_data = false;
     let mut state_path = PathBuf::from(".\\data\\attribute_inventory_state.json");
     let mut offset = 0usize;

@@ -154,7 +154,10 @@ mod tests {
             self_intro_text: None,
             self_intro_slide_id: None,
             self_intro_thumbnail: None,
-            identities: vec![IdentityInfo { system: "slack".into(), external_id: "U123".into() }],
+            identities: vec![IdentityInfo {
+                system: "slack".into(),
+                external_id: "U123".into(),
+            }],
             source_count: 1,
             last_activity: None,
             profile_updated_at: Utc::now(),

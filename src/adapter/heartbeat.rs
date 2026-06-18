@@ -6,8 +6,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::domain::{
-    AuthorityModel, CaptureModel, EntityRef, ObserverRef, SchemaRef, SemVer,
-    SourceSystemRef,
+    AuthorityModel, CaptureModel, EntityRef, ObserverRef, SchemaRef, SemVer, SourceSystemRef,
 };
 
 use super::idempotency::heartbeat_key;

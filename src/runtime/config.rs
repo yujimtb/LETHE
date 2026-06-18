@@ -192,7 +192,11 @@ mod tests {
 
     #[test]
     fn network_policy_variants() {
-        for policy in [NetworkPolicy::DefaultDeny, NetworkPolicy::AllowList, NetworkPolicy::Unrestricted] {
+        for policy in [
+            NetworkPolicy::DefaultDeny,
+            NetworkPolicy::AllowList,
+            NetworkPolicy::Unrestricted,
+        ] {
             let json = serde_json::to_string(&policy).unwrap();
             let back: NetworkPolicy = serde_json::from_str(&json).unwrap();
             assert_eq!(policy, back);
@@ -202,10 +206,13 @@ mod tests {
     #[test]
     fn observer_health_override() {
         let mut cfg = HealthConfig::default();
-        cfg.observer_overrides.insert("obs:slack-crawler".into(), ObserverHealthThreshold {
-            heartbeat_interval: Duration::from_secs(30),
-            max_gap: Duration::from_secs(120),
-        });
+        cfg.observer_overrides.insert(
+            "obs:slack-crawler".into(),
+            ObserverHealthThreshold {
+                heartbeat_interval: Duration::from_secs(30),
+                max_gap: Duration::from_secs(120),
+            },
+        );
         let json = serde_json::to_string(&cfg).unwrap();
         let back: HealthConfig = serde_json::from_str(&json).unwrap();
         let override_val = back.observer_overrides.get("obs:slack-crawler").unwrap();

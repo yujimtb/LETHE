@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{ProjectionKind, ReadMode, SchemaRef, SemVer, ProjectionRef};
+use crate::domain::{ProjectionKind, ProjectionRef, ReadMode, SchemaRef, SemVer};
 
 /// A reference to a projection source.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -10,8 +10,15 @@ use crate::domain::{ProjectionKind, ReadMode, SchemaRef, SemVer, ProjectionRef};
 pub enum SourceRef {
     Lake,
     Supplemental,
-    Projection { id: ProjectionRef, version: String },
-    SourceNative { system: String, read_mode: ReadMode, fallback: Option<String> },
+    Projection {
+        id: ProjectionRef,
+        version: String,
+    },
+    SourceNative {
+        system: String,
+        read_mode: ReadMode,
+        fallback: Option<String>,
+    },
 }
 
 /// A single source declaration inside a ProjectionSpec.
@@ -152,7 +159,10 @@ impl ProjectionSpec {
         }
 
         // Multi-source requires reconciliation (M05 §4.3).
-        let has_source_native = self.sources.iter().any(|s| matches!(s.source, SourceRef::SourceNative { .. }));
+        let has_source_native = self
+            .sources
+            .iter()
+            .any(|s| matches!(s.source, SourceRef::SourceNative { .. }));
         if self.sources.len() > 1 && self.reconciliation.is_none() {
             errors.push(SpecValidationError::MultiSourceWithoutReconciliation);
         }

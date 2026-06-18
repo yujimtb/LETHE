@@ -120,7 +120,11 @@ mod tests {
 
     #[test]
     fn candidate_status_round_trips() {
-        for status in [CandidateStatus::Pending, CandidateStatus::Accepted, CandidateStatus::Rejected] {
+        for status in [
+            CandidateStatus::Pending,
+            CandidateStatus::Accepted,
+            CandidateStatus::Rejected,
+        ] {
             let json = serde_json::to_string(&status).unwrap();
             let back: CandidateStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(status, back);

@@ -105,7 +105,9 @@ pub enum ConfigError {
     MissingEnv(&'static str),
     #[error("invalid environment variable {name}: {message}")]
     InvalidEnv { name: &'static str, message: String },
-    #[error("google credentials require either LETHE_GOOGLE_ACCESS_TOKEN or the trio LETHE_GOOGLE_CLIENT_ID, LETHE_GOOGLE_CLIENT_SECRET, LETHE_GOOGLE_REFRESH_TOKEN")]
+    #[error(
+        "google credentials require either LETHE_GOOGLE_ACCESS_TOKEN or the trio LETHE_GOOGLE_CLIENT_ID, LETHE_GOOGLE_CLIENT_SECRET, LETHE_GOOGLE_REFRESH_TOKEN"
+    )]
     MissingGoogleCredentials,
 }
 
@@ -113,16 +115,19 @@ impl SelfHostConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
         let _ = dotenvy::dotenv();
 
-        let bind_addr = env::var("LETHE_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+        let bind_addr =
+            env::var("LETHE_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
         let public_base_url = env::var("LETHE_PUBLIC_BASE_URL")
             .ok()
             .filter(|v| !v.trim().is_empty())
             .map(|value| normalize_public_base_url("LETHE_PUBLIC_BASE_URL", value))
             .transpose()?;
-        let database_path =
-            PathBuf::from(env::var("LETHE_DATABASE_PATH").unwrap_or_else(|_| "./data/lethe.sqlite3".to_string()));
-        let blob_dir =
-            PathBuf::from(env::var("LETHE_BLOB_DIR").unwrap_or_else(|_| "./data/blobs".to_string()));
+        let database_path = PathBuf::from(
+            env::var("LETHE_DATABASE_PATH").unwrap_or_else(|_| "./data/lethe.sqlite3".to_string()),
+        );
+        let blob_dir = PathBuf::from(
+            env::var("LETHE_BLOB_DIR").unwrap_or_else(|_| "./data/blobs".to_string()),
+        );
         let poll_interval = Duration::from_secs(parse_u64_env("LETHE_POLL_SECONDS", 300)?);
         let api_tokens = parse_api_tokens_env("LETHE_API_TOKENS")?;
         let resource_limits = ResourceLimits {
@@ -141,10 +146,18 @@ impl SelfHostConfig {
         };
 
         let google = GoogleConfig {
-            access_token: env::var("LETHE_GOOGLE_ACCESS_TOKEN").ok().filter(|v| !v.trim().is_empty()),
-            client_id: env::var("LETHE_GOOGLE_CLIENT_ID").ok().filter(|v| !v.trim().is_empty()),
-            client_secret: env::var("LETHE_GOOGLE_CLIENT_SECRET").ok().filter(|v| !v.trim().is_empty()),
-            refresh_token: env::var("LETHE_GOOGLE_REFRESH_TOKEN").ok().filter(|v| !v.trim().is_empty()),
+            access_token: env::var("LETHE_GOOGLE_ACCESS_TOKEN")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            client_id: env::var("LETHE_GOOGLE_CLIENT_ID")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            client_secret: env::var("LETHE_GOOGLE_CLIENT_SECRET")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            refresh_token: env::var("LETHE_GOOGLE_REFRESH_TOKEN")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
             presentation_ids: parse_csv_env("LETHE_GOOGLE_PRESENTATION_IDS", true)?,
         };
         let slide_analysis_limit = parse_usize_env("LETHE_GOOGLE_SLIDE_ANALYSIS_LIMIT", 10)?;
@@ -159,8 +172,12 @@ impl SelfHostConfig {
         }
 
         let notion = match (
-            env::var("LETHE_NOTION_TOKEN").ok().filter(|v| !v.trim().is_empty()),
-            env::var("LETHE_NOTION_DATABASE_ID").ok().filter(|v| !v.trim().is_empty()),
+            env::var("LETHE_NOTION_TOKEN")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            env::var("LETHE_NOTION_DATABASE_ID")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
         ) {
             (Some(token), Some(database_id)) => Some(NotionWritebackConfig { token, database_id }),
             _ => None,
@@ -198,11 +215,17 @@ impl SelfHostConfig {
 fn parse_api_tokens_env(name: &'static str) -> Result<Vec<ApiTokenConfig>, ConfigError> {
     let raw = required_env(name)?;
     let mut tokens = Vec::new();
-    for entry in raw.split(',').map(str::trim).filter(|entry| !entry.is_empty()) {
-        let (token, scopes) = entry.split_once(':').ok_or_else(|| ConfigError::InvalidEnv {
-            name,
-            message: "entries must use token:scope+scope format".to_string(),
-        })?;
+    for entry in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let (token, scopes) = entry
+            .split_once(':')
+            .ok_or_else(|| ConfigError::InvalidEnv {
+                name,
+                message: "entries must use token:scope+scope format".to_string(),
+            })?;
         let scopes = scopes
             .split('+')
             .map(str::trim)
