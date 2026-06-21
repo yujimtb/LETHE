@@ -186,7 +186,7 @@ impl IngestionGate<'_> {
                 authority: req.authority_model,
             },
             data_scope: AccessScope::Internal,
-            consent_status: ConsentStatus::Unrestricted,
+            consent_status: ConsentStatus::RestrictedCapture,
             environment: Environment::Production,
         });
         if let PolicyOutcome::Deny { reason } = policy {

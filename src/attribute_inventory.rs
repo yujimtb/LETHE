@@ -798,6 +798,7 @@ mod tests {
                 ..PersonPageOutput::default()
             },
             built_at: Utc::now(),
+            lineage: ProjectionSnapshot::default().lineage,
         };
 
         let docs = build_inventory_documents(&snapshot);

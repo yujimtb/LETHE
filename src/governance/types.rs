@@ -122,7 +122,7 @@ pub enum Operation {
 // ConsentStatus — per-entity consent state (M08 §4)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsentStatus {
     /// No restriction — internal use allowed.

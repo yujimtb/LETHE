@@ -16,7 +16,14 @@ pub fn build_router(service: AppService) -> Router {
         .route("/health", get(health))
         .route("/health/deep", get(health))
         .route("/admin/sync", post(sync_now))
-        .route("/public/blobs/{blob_hash}", get(public_blob))
+        .route(
+            "/api/projections/{projection_id}/blobs/{blob_hash}",
+            get(projection_blob),
+        )
+        .route(
+            "/api/projections/{projection_id}/lineage",
+            get(projection_lineage),
+        )
         .route(
             "/api/projections/{projection_id}/records",
             get(projection_records),
@@ -76,14 +83,17 @@ async fn sync_now(
     Ok(Json(report))
 }
 
-async fn public_blob(
+async fn projection_blob(
     State(service): State<AppService>,
-    Path(blob_hash): Path<String>,
+    headers: HeaderMap,
+    Path((projection_id, blob_hash)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
+    service.authorize_headers(&headers, "read:persons")?;
+    ensure_projection_person_page(&projection_id)?;
     let Some(blob_ref) = blob_ref_from_hash(&blob_hash) else {
         return Err(ApiError::not_found());
     };
-    let Some(bytes) = service.blob_bytes(&blob_ref)? else {
+    let Some(bytes) = service.projection_blob_bytes(&blob_ref)? else {
         return Err(ApiError::not_found());
     };
 
@@ -93,9 +103,19 @@ async fn public_blob(
         .insert(CONTENT_TYPE, HeaderValue::from_static("image/png"));
     response.headers_mut().insert(
         CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=31536000, immutable"),
+        HeaderValue::from_static("private, max-age=31536000, immutable"),
     );
     Ok(response)
+}
+
+async fn projection_lineage(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Path(projection_id): Path<String>,
+) -> Result<Json<crate::projection::lineage::LineageManifest>, ApiError> {
+    service.authorize_headers(&headers, "read:persons")?;
+    ensure_projection_person_page(&projection_id)?;
+    Ok(Json(service.lineage_manifest("proj:person-page")?))
 }
 
 async fn list_persons(

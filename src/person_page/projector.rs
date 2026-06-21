@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 
 use crate::domain::{EntityRef, Observation, ObservationId, SchemaRef, SupplementalRecord};
+use crate::governance::types::ConsentStatus;
 use crate::identity::types::{IdentifierType, IdentityResolutionOutput, ResolvedPerson};
 use crate::slide_analysis::types::StudentProfile;
 
@@ -15,6 +16,8 @@ use super::types::*;
 
 /// Person page projector — pure functional core.
 pub struct PersonPageProjector;
+
+pub const CONSENT_DECISION_SCHEMA: &str = "schema:consent-decision";
 
 impl PersonPageProjector {
     /// Build person page output from identity resolution and observations.
@@ -39,6 +42,9 @@ impl PersonPageProjector {
         );
 
         for person in &identity.resolved_persons {
+            if Self::consent_status_for_person(person, observations) == ConsentStatus::OptedOut {
+                continue;
+            }
             let (slides, messages) =
                 Self::collect_related(person, observations, &person_identifiers);
 
@@ -103,6 +109,48 @@ impl PersonPageProjector {
         }
     }
 
+    /// Resolve the latest explicit consent decision for a person.
+    ///
+    /// The default is restricted capture. Decisions can target the resolved
+    /// person directly via `subject`, or one of its source identifiers via the
+    /// payload `identifier` field.
+    pub fn consent_status_for_person(
+        person: &ResolvedPerson,
+        observations: &[Observation],
+    ) -> ConsentStatus {
+        observations
+            .iter()
+            .filter(|observation| observation.schema.as_str() == CONSENT_DECISION_SCHEMA)
+            .filter(|observation| {
+                observation.subject == person.person_id
+                    || observation
+                        .payload
+                        .get("identifier")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|identifier| {
+                            person
+                                .identifiers
+                                .iter()
+                                .any(|candidate| candidate.value == identifier)
+                        })
+            })
+            .max_by(|left, right| {
+                (left.published, left.recorded_at, left.id.as_str()).cmp(&(
+                    right.published,
+                    right.recorded_at,
+                    right.id.as_str(),
+                ))
+            })
+            .and_then(|observation| {
+                observation
+                    .payload
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .and_then(parse_consent_status)
+            .unwrap_or_default()
+    }
+
     fn build_frontend_profile_map(
         observations: &[Observation],
         supplemental_records: &[&SupplementalRecord],
@@ -116,6 +164,11 @@ impl PersonPageProjector {
 
         for record in supplemental_records {
             if record.kind != "slide-analysis" {
+                continue;
+            }
+            if record.consent_metadata.as_ref().is_some_and(|metadata| {
+                metadata.retracted_at.is_some() || metadata.opt_out_effective_at.is_some()
+            }) {
                 continue;
             }
 
@@ -478,6 +531,15 @@ impl PersonPageProjector {
             recent_messages: messages.to_vec(),
             activity_summary: activity.clone(),
         }
+    }
+}
+
+fn parse_consent_status(value: &str) -> Option<ConsentStatus> {
+    match value {
+        "unrestricted" => Some(ConsentStatus::Unrestricted),
+        "restricted_capture" => Some(ConsentStatus::RestrictedCapture),
+        "opted_out" => Some(ConsentStatus::OptedOut),
+        _ => None,
     }
 }
 

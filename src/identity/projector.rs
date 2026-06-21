@@ -4,7 +4,7 @@
 //! Phase 2: cross-source matching (email exact, name fuzzy)
 //! Phase 3: resolution graph construction
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Utc};
 
@@ -194,12 +194,10 @@ impl IdentityProjector {
     /// - Name fuzzy match → Medium confidence
     pub fn cross_source_match(candidates: &[PersonCandidate]) -> Vec<ResolutionCandidate> {
         let mut matches = Vec::new();
-        let mut candidate_counter = 0u64;
-
         // Index: email → list of (candidate_index, source)
-        let mut email_index: HashMap<String, Vec<(usize, &str)>> = HashMap::new();
+        let mut email_index: BTreeMap<String, Vec<(usize, &str)>> = BTreeMap::new();
         // Index: normalized name → list of (candidate_index, source)
-        let mut name_index: HashMap<String, Vec<(usize, &str)>> = HashMap::new();
+        let mut name_index: BTreeMap<String, Vec<(usize, &str)>> = BTreeMap::new();
 
         for (i, candidate) in candidates.iter().enumerate() {
             for ident in &candidate.identifiers {
@@ -222,16 +220,15 @@ impl IdentityProjector {
         }
 
         // Email exact matches (cross-source only).
-        for (_, entries) in &email_index {
+        for entries in email_index.values() {
             let sources: Vec<_> = entries.iter().map(|(_, s)| *s).collect();
             if entries.len() >= 2 && sources.iter().any(|s| *s != sources[0]) {
                 // Cross-source email match.
                 for i in 0..entries.len() {
                     for j in (i + 1)..entries.len() {
                         if entries[i].1 != entries[j].1 {
-                            candidate_counter += 1;
                             matches.push(ResolutionCandidate {
-                                candidate_id: format!("rc:{candidate_counter}"),
+                                candidate_id: format!("rc:email:{}:{}", entries[i].0, entries[j].0),
                                 person_a_id: format!("pc:{}", entries[i].0),
                                 person_b_id: format!("pc:{}", entries[j].0),
                                 match_type: MatchType::EmailExact,
@@ -245,15 +242,14 @@ impl IdentityProjector {
         }
 
         // Name fuzzy matches (cross-source only).
-        for (_, entries) in &name_index {
+        for entries in name_index.values() {
             let sources: Vec<_> = entries.iter().map(|(_, s)| *s).collect();
             if entries.len() >= 2 && sources.iter().any(|s| *s != sources[0]) {
                 for i in 0..entries.len() {
                     for j in (i + 1)..entries.len() {
                         if entries[i].1 != entries[j].1 {
-                            candidate_counter += 1;
                             matches.push(ResolutionCandidate {
-                                candidate_id: format!("rc:{candidate_counter}"),
+                                candidate_id: format!("rc:name:{}:{}", entries[i].0, entries[j].0),
                                 person_a_id: format!("pc:{}", entries[i].0),
                                 person_b_id: format!("pc:{}", entries[j].0),
                                 match_type: MatchType::NameFuzzy,
@@ -658,6 +654,56 @@ mod tests {
             serde_json::to_value(&r1).unwrap(),
             serde_json::to_value(&r2).unwrap()
         );
+    }
+
+    #[test]
+    fn candidate_ids_and_order_are_deterministic() {
+        let candidates = vec![
+            PersonCandidate {
+                source: "slack".into(),
+                identifiers: vec![
+                    SourceIdentifier {
+                        source: "slack".into(),
+                        identifier_type: IdentifierType::Email,
+                        value: "z@example.com".into(),
+                    },
+                    SourceIdentifier {
+                        source: "slack".into(),
+                        identifier_type: IdentifierType::DisplayName,
+                        value: "Same Name".into(),
+                    },
+                ],
+                display_name: Some("Same Name".into()),
+                observed_at: DateTime::<Utc>::UNIX_EPOCH,
+            },
+            PersonCandidate {
+                source: "google".into(),
+                identifiers: vec![
+                    SourceIdentifier {
+                        source: "google".into(),
+                        identifier_type: IdentifierType::Email,
+                        value: "z@example.com".into(),
+                    },
+                    SourceIdentifier {
+                        source: "google".into(),
+                        identifier_type: IdentifierType::DisplayName,
+                        value: "Same Name".into(),
+                    },
+                ],
+                display_name: Some("Same Name".into()),
+                observed_at: DateTime::<Utc>::UNIX_EPOCH,
+            },
+        ];
+
+        let first = IdentityProjector::cross_source_match(&candidates);
+        let second = IdentityProjector::cross_source_match(&candidates);
+
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(&second).unwrap()
+        );
+        assert_eq!(first[0].candidate_id, "rc:email:0:1");
+        assert_eq!(first[1].candidate_id, "rc:name:0:1");
     }
 
     #[test]

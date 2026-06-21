@@ -109,10 +109,10 @@
 ## ADR-012 Query / API / Serving Contract
 
 - **Status:** Needs Example
-- **Why it matters:** Projection API を透過的かつ安定にするには、latest / pinned / stale fallback の具体例が必要。
-- **Current direction:** Projection 同士も API を持ち、利用面では最新版優先。ただし pinned access も契約化する。
-- **User signal:** 古いデータでも取得不能よりは良い。具体例が欲しい。
-- **Next decision:** operational-latest, academic-pinned, stale cache fallback の 3 例を用意する。
+- **Why it matters:** Projection API の latest / pinned と失敗時の意味を明確にする必要がある。
+- **Current direction:** Projection 同士も API を持ち、利用面では最新版優先。ただし pinned access も契約化し、取得不能時は明示エラーにする。
+- **User signal:** 暗黙の代替経路は設けず、失敗理由を保持する。
+- **Next decision:** operational-latest と academic-pinned の具体例を用意する。
 
 ## ADR-013 Security and Secret Handling
 
@@ -196,8 +196,8 @@
 ## ADR-021 Source-Native Read Contract
 
 - **Status:** Ready to Merge
-- **Why it matters:** source-native を直接読む Projection の lineage 表現とフォールバック動作を明確にする。
-- **Current direction:** AcademicPinned では禁止、OperationalLatest では許可、ApplicationCached では cache 優先。fallback ladder に加え、Lake 併用時は reconciliation policy を必須にする。
+- **Why it matters:** source-native を直接読む Projection の lineage 表現と失敗動作を明確にする。
+- **Current direction:** AcademicPinned では禁止、OperationalLatest では許可、ApplicationCached は cache のみを読む。入力取得失敗は明示エラーとし、Lake 併用時は reconciliation policy を必須にする。
 - **User signal:** 提案の方向性で合意。
 - **Next decision:** domain_algebra.md §5.5 と projection-engine.md に反映済み。adapter 例を追加したら archive 候補。
 

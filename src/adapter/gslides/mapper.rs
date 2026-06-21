@@ -181,7 +181,7 @@ impl<C: GoogleSlidesClient> SourceAdapter for GoogleSlidesAdapter<C> {
         }
     }
 
-    fn to_observations(&self, raw: &RawData) -> Vec<ObservationDraft> {
+    fn to_observations(&self, raw: &RawData) -> Result<Vec<ObservationDraft>, AdapterError> {
         // For revision-based data, we need meta context to build a full observation.
         // This trait method is used for simple transformations; the full pipeline
         // uses map_revision directly.
@@ -198,9 +198,16 @@ impl<C: GoogleSlidesClient> SourceAdapter for GoogleSlidesAdapter<C> {
                 editors: vec![],
                 viewers: vec![],
             };
-            vec![self.map_revision(&rev, &placeholder_meta, None, vec![])]
+            Ok(vec![self.map_revision(
+                &rev,
+                &placeholder_meta,
+                None,
+                vec![],
+            )])
         } else {
-            vec![]
+            Err(AdapterError::MalformedResponse {
+                message: "Google Slides raw data is not a SlideRevision".to_string(),
+            })
         }
     }
 
@@ -402,7 +409,7 @@ mod tests {
             data: serde_json::to_value(&sample_revision()).unwrap(),
             blobs: vec![],
         };
-        let drafts = adapter.to_observations(&raw);
+        let drafts = adapter.to_observations(&raw).unwrap();
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].schema.as_str(), WORKSPACE_SNAPSHOT_SCHEMA);
     }

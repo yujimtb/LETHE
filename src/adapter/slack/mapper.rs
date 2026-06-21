@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 
-use chrono::SecondsFormat;
 use chrono::{DateTime, Utc};
 
 use crate::adapter::config::AdapterConfig;
@@ -55,8 +54,10 @@ impl<C: SlackClient> SlackAdapter<C> {
     }
 
     /// Map a single Slack message to an ObservationDraft.
-    pub fn map_message(&self, msg: &SlackMessage) -> ObservationDraft {
-        let published = parse_slack_ts(&msg.ts).unwrap_or_else(Utc::now);
+    pub fn map_message(&self, msg: &SlackMessage) -> Result<ObservationDraft, AdapterError> {
+        let published = parse_slack_ts(&msg.ts).ok_or_else(|| AdapterError::MalformedResponse {
+            message: format!("invalid Slack timestamp: {}", msg.ts),
+        })?;
         let identity = declare_canonical_identity("slack", self, self, msg);
 
         let subject = EntityRef::new(format!("message:slack:{}-{}", msg.channel_id, msg.ts));
@@ -112,7 +113,7 @@ impl<C: SlackClient> SlackAdapter<C> {
             .filter_map(|f| f.blob_ref.as_ref().map(|r| BlobRef::new(r.clone())))
             .collect();
 
-        ObservationDraft {
+        Ok(ObservationDraft {
             schema: SchemaRef::new(SLACK_MESSAGE_SCHEMA),
             schema_version: SemVer::new(SLACK_MESSAGE_SCHEMA_VERSION),
             observer: ObserverRef::new(OBSERVER_ID),
@@ -126,7 +127,7 @@ impl<C: SlackClient> SlackAdapter<C> {
             published,
             idempotency_key: identity.idempotency_key,
             meta,
-        }
+        })
     }
 
     /// Map a Slack channel snapshot to an ObservationDraft.
@@ -187,7 +188,6 @@ impl<C: SlackClient> ObjectIdExtractor<SlackMessage> for SlackAdapter<C> {
 
 impl<C: SlackClient> CanonicalTupleBuilder<SlackMessage> for SlackAdapter<C> {
     fn canonical_tuple(&self, msg: &SlackMessage) -> serde_json::Value {
-        let published = parse_slack_ts(&msg.ts).unwrap_or_else(Utc::now);
         let attachment_sha256 = msg
             .files
             .iter()
@@ -204,7 +204,7 @@ impl<C: SlackClient> CanonicalTupleBuilder<SlackMessage> for SlackAdapter<C> {
         serde_json::json!({
             "sender": msg.user_id,
             "body": normalize_canonical_body(canonical_body),
-            "event_time": published.to_rfc3339_opts(SecondsFormat::Micros, true),
+            "event_time": msg.ts,
             "attachment_sha256": attachment_sha256,
         })
     }
@@ -231,14 +231,16 @@ impl<C: SlackClient> SourceAdapter for SlackAdapter<C> {
         }
     }
 
-    fn to_observations(&self, raw: &RawData) -> Vec<ObservationDraft> {
+    fn to_observations(&self, raw: &RawData) -> Result<Vec<ObservationDraft>, AdapterError> {
         // Try to deserialize as SlackMessage first, then as channel snapshot.
         if let Ok(msg) = serde_json::from_value::<SlackMessage>(raw.data.clone()) {
-            vec![self.map_message(&msg)]
+            Ok(vec![self.map_message(&msg)?])
         } else if let Ok(snap) = serde_json::from_value::<SlackChannelSnapshot>(raw.data.clone()) {
-            vec![self.map_channel_snapshot(&snap)]
+            Ok(vec![self.map_channel_snapshot(&snap)])
         } else {
-            vec![]
+            Err(AdapterError::MalformedResponse {
+                message: "Slack raw data is neither a message nor a channel snapshot".to_string(),
+            })
         }
     }
 
@@ -263,9 +265,12 @@ impl<C: SlackClient> SourceAdapter for SlackAdapter<C> {
 
 /// Parse Slack's epoch.micro timestamp to DateTime<Utc>.
 fn parse_slack_ts(ts: &str) -> Option<DateTime<Utc>> {
-    let parts: Vec<&str> = ts.split('.').collect();
-    let secs: i64 = parts.first()?.parse().ok()?;
-    let micros: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let (seconds, fractional) = ts.split_once('.')?;
+    if fractional.len() != 6 || !fractional.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let secs: i64 = seconds.parse().ok()?;
+    let micros: u32 = fractional.parse().ok()?;
     DateTime::from_timestamp(secs, micros * 1000)
 }
 
@@ -333,7 +338,7 @@ mod tests {
     fn map_regular_message() {
         let adapter = SlackAdapter::new(FixtureSlackClient::new(), test_config());
         let msg = sample_message();
-        let draft = adapter.map_message(&msg);
+        let draft = adapter.map_message(&msg).unwrap();
 
         assert_eq!(draft.schema.as_str(), SLACK_MESSAGE_SCHEMA);
         assert!(
@@ -364,7 +369,7 @@ mod tests {
             ts: "1234567891.000000".into(),
         });
 
-        let draft = adapter.map_message(&msg);
+        let draft = adapter.map_message(&msg).unwrap();
         assert!(
             draft
                 .idempotency_key
@@ -381,7 +386,7 @@ mod tests {
         let mut msg = sample_message();
         msg.message_type = SlackMessageType::Delete;
 
-        let draft = adapter.map_message(&msg);
+        let draft = adapter.map_message(&msg).unwrap();
         assert!(
             draft
                 .idempotency_key
@@ -398,7 +403,7 @@ mod tests {
         let mut msg = sample_message();
         msg.thread_ts = Some("1234567880.000000".into());
 
-        let draft = adapter.map_message(&msg);
+        let draft = adapter.map_message(&msg).unwrap();
         assert_eq!(draft.payload["thread_ts"], "1234567880.000000");
     }
 
@@ -416,7 +421,7 @@ mod tests {
             blob_ref: Some("blob:sha256:abcdef".into()),
         }];
 
-        let draft = adapter.map_message(&msg);
+        let draft = adapter.map_message(&msg).unwrap();
         assert_eq!(draft.attachments.len(), 1);
         assert_eq!(draft.attachments[0].as_str(), "blob:sha256:abcdef");
         assert!(draft.payload["files"].is_array());
@@ -446,8 +451,8 @@ mod tests {
     fn same_message_same_idempotency_key() {
         let adapter = SlackAdapter::new(FixtureSlackClient::new(), test_config());
         let msg = sample_message();
-        let d1 = adapter.map_message(&msg);
-        let d2 = adapter.map_message(&msg);
+        let d1 = adapter.map_message(&msg).unwrap();
+        let d2 = adapter.map_message(&msg).unwrap();
         assert_eq!(d1.idempotency_key, d2.idempotency_key);
     }
 
@@ -462,8 +467,8 @@ mod tests {
             users: vec!["U02".into()],
         }];
 
-        let d1 = adapter.map_message(&msg);
-        let d2 = adapter.map_message(&with_reaction);
+        let d1 = adapter.map_message(&msg).unwrap();
+        let d2 = adapter.map_message(&with_reaction).unwrap();
 
         crate::adapter::conformance::canonical_identity_stable_under_side_state_change(&d1, &d2);
     }
@@ -479,8 +484,8 @@ mod tests {
             ts: "1234567891.000000".into(),
         });
 
-        let d1 = adapter.map_message(&msg);
-        let d2 = adapter.map_message(&wrapper_changed);
+        let d1 = adapter.map_message(&msg).unwrap();
+        let d2 = adapter.map_message(&wrapper_changed).unwrap();
 
         crate::adapter::conformance::canonical_identity_stable_under_side_state_change(&d1, &d2);
     }
@@ -497,8 +502,8 @@ mod tests {
             ts: "1234567891.000000".into(),
         });
 
-        let d1 = adapter.map_message(&msg);
-        let d2 = adapter.map_message(&edited);
+        let d1 = adapter.map_message(&msg).unwrap();
+        let d2 = adapter.map_message(&edited).unwrap();
 
         crate::adapter::conformance::canonical_identity_changes_on_content_change(&d1, &d2);
     }
@@ -531,7 +536,7 @@ mod tests {
             data: serde_json::to_value(&msg).unwrap(),
             blobs: vec![],
         };
-        let drafts = adapter.to_observations(&raw);
+        let drafts = adapter.to_observations(&raw).unwrap();
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].payload["text"], "Hello everyone!");
     }
@@ -559,14 +564,32 @@ mod tests {
     #[test]
     fn adapter_metadata_in_observations() {
         let adapter = SlackAdapter::new(FixtureSlackClient::new(), test_config());
-        let draft = adapter.map_message(&sample_message());
+        let draft = adapter.map_message(&sample_message()).unwrap();
         assert_eq!(draft.meta["sourceAdapterVersion"], "1.0.0");
         assert_eq!(draft.schema_version.as_str(), SLACK_MESSAGE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn invalid_timestamp_is_rejected_without_wall_clock_fallback() {
+        let adapter = SlackAdapter::new(FixtureSlackClient::new(), test_config());
+        let mut msg = sample_message();
+        msg.ts = "not-a-slack-timestamp".to_string();
+
+        let err = adapter.map_message(&msg).unwrap_err();
+
+        assert!(matches!(err, AdapterError::MalformedResponse { .. }));
     }
 
     #[test]
     fn parse_slack_ts_works() {
         let dt = parse_slack_ts("1234567890.123456").unwrap();
         assert_eq!(dt.timestamp(), 1234567890);
+    }
+
+    #[test]
+    fn parse_slack_ts_rejects_missing_or_malformed_fraction() {
+        assert!(parse_slack_ts("1234567890").is_none());
+        assert!(parse_slack_ts("1234567890.123").is_none());
+        assert!(parse_slack_ts("1234567890.abcdef").is_none());
     }
 }

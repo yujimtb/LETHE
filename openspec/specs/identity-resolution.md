@@ -218,6 +218,7 @@ spec:
 | 4 | confidence が low の person は自動 merge しない | algorithm check |
 | 5 | medium confidence は承認前に `resolved_persons` へ入れない | candidate / person split check |
 | 6 | incremental apply で結果が安定 | replay test |
+| 7 | 同一入力では candidate ID と配列順が一致する | deterministic replay test |
 
 ---
 
@@ -233,6 +234,7 @@ spec:
 | 6 | candidate reject | status = rejected | |
 | 7 | pending medium candidate | person list には出ない | |
 | 8 | by-identifier lookup (email) | 正しい person 返却 | |
+| 9 | 同一入力を複数回 build | candidate ID と出力順が完全一致 | |
 
 ---
 

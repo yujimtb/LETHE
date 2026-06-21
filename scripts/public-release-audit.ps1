@@ -93,17 +93,22 @@ function Assert-EnvExampleSafe {
         'LETHE_DATABASE_PATH' = './data/lethe.sqlite3'
         'LETHE_BLOB_DIR' = './data/blobs'
         'LETHE_POLL_SECONDS' = '300'
+        'LETHE_API_TOKENS' = 'read-token:read:persons+read:timeline,sync-token:admin:sync'
+        'LETHE_MAX_BLOB_BYTES' = '10485760'
+        'LETHE_MAX_PAYLOAD_BYTES' = '1048576'
+        'LETHE_MAX_SYNC_ITEMS' = '10000'
+        'LETHE_MAX_PAGE_SIZE' = '100'
         'LETHE_SLACK_BOT_TOKEN' = 'xoxb-your-slack-bot-token'
+        'LETHE_SLACK_THREAD_TOKEN' = 'xoxp-your-thread-read-token'
         'LETHE_SLACK_CHANNEL_IDS' = 'C01234567,C08999999'
         'LETHE_GOOGLE_ACCESS_TOKEN' = ''
         'LETHE_GOOGLE_CLIENT_ID' = ''
         'LETHE_GOOGLE_CLIENT_SECRET' = ''
         'LETHE_GOOGLE_REFRESH_TOKEN' = ''
-        'LETHE_GEMINI_API_KEY' = ''
-        'LETHE_GEMINI_MODEL' = 'gemini-2.5-flash'
+        'LETHE_GEMINI_API_KEY' = 'your-gemini-api-key'
+        'LETHE_GEMINI_MODEL' = 'gemini-3-flash-preview'
+        'LETHE_GOOGLE_SLIDE_ANALYSIS_LIMIT' = '10'
         'LETHE_GOOGLE_PRESENTATION_IDS' = 'your-presentation-id'
-        'LETHE_NOTION_TOKEN' = ''
-        'LETHE_NOTION_DATABASE_ID' = ''
     }
 
     $content = Get-Content -Path $envExamplePath
@@ -137,7 +142,6 @@ function Assert-NoSecretPatterns {
         'Google access token' = 'ya29\.[0-9A-Za-z._-]+'
         'Google OAuth client secret' = 'GOCSPX-[0-9A-Za-z_-]{10,}'
         'Google refresh token' = '1//[0-9A-Za-z._-]+'
-        'Notion token' = 'ntn_[A-Za-z0-9]{20,}'
         'Google API key' = 'AIza[0-9A-Za-z_-]{20,}'
         'Gemini API key' = 'AQ\.[A-Za-z0-9._-]{20,}'
         'Private key block' = '-----BEGIN (RSA|EC|OPENSSH|DSA|PGP) PRIVATE KEY-----'
@@ -145,7 +149,7 @@ function Assert-NoSecretPatterns {
 
     foreach ($name in $patternMap.Keys) {
         $pattern = $patternMap[$name]
-        $matches = @(git grep -n -I -E $pattern -- . ':(exclude).env.example' ':(exclude)README.md' ':(exclude)SECURITY.md' ':(exclude)tests/**' ':(exclude)src/self_host/app.rs' 2>$null)
+        $matches = @(git grep -n -I -E -e $pattern -- . ':(exclude).env.example' ':(exclude)README.md' ':(exclude)SECURITY.md' ':(exclude)tests/**' ':(exclude)src/self_host/app.rs' ':(exclude)scripts/public-release-audit.ps1' 2>$null)
         foreach ($match in $matches) {
             Add-Violation $Violations "$name match in tracked file: $match"
         }

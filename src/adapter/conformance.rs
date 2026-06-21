@@ -13,7 +13,10 @@ pub fn source_adapter_contract<A: SourceAdapter>(
         Some(adapter.source_system_ref())
     );
 
-    for draft in adapter.to_observations(raw) {
+    for draft in adapter
+        .to_observations(raw)
+        .expect("adapter mapping must succeed for conformance fixtures")
+    {
         assert_eq!(draft.observer, *adapter.observer_ref());
         assert_eq!(
             draft.source_system.as_ref(),

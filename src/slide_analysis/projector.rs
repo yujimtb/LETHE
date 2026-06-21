@@ -1,16 +1,12 @@
 //! Slide Analysis Projector — transforms workspace-object-snapshot
-//! observations into supplemental records and SaaS write-back records.
+//! observations into supplemental records.
 //!
 //! Pipeline:
 //! 1. Select slide snapshot observations from the lake
 //! 2. For each, extract/accept a StudentProfile (from AI or pre-populated payload)
 //! 3. Store as a SupplementalRecord (kind = "slide-analysis")
-//! 4. Produce a WriteRecord suitable for SaaS write-back (e.g. Notion)
-
-use chrono::Utc;
 
 use crate::adapter::gslides::mapper::WORKSPACE_SNAPSHOT_SCHEMA;
-use crate::adapter::writeback::traits::WriteRecord;
 use crate::domain::supplemental::InputAnchorSet;
 use crate::domain::{
     ActorRef, EntityRef, Mutability, Observation, ObservationId, SchemaRef, SupplementalId,
@@ -90,7 +86,7 @@ impl SlideAnalysisProjector {
                 profile,
                 person_entity,
                 supplemental_id: Some(sup_id),
-                analyzed_at: Utc::now(),
+                analyzed_at: observation.recorded_at,
                 model_version: Some(model_version.to_string()),
                 slide_object_id: None,
                 thumbnail_blob_ref: None,
@@ -102,7 +98,8 @@ impl SlideAnalysisProjector {
 
     /// Build a SupplementalRecord for a slide analysis result.
     pub fn build_supplemental(result: &SlideAnalysisResult) -> SupplementalRecord {
-        let profile_json = serde_json::to_value(&result.profile).unwrap_or_default();
+        let profile_json =
+            serde_json::to_value(&result.profile).expect("StudentProfile serialization must work");
         let sup_id = result.supplemental_id.clone().unwrap_or_else(|| {
             SupplementalId::new(format!(
                 "sup:slide-analysis:{}:{}",
@@ -119,7 +116,7 @@ impl SlideAnalysisProjector {
             },
             payload: profile_json,
             created_by: ActorRef::new("actor:slide-analysis-projector"),
-            created_at: Utc::now(),
+            created_at: result.analyzed_at,
             mutability: Mutability::ManagedCache,
             record_version: Some("1".to_string()),
             model_version: result.model_version.clone(),
@@ -163,35 +160,12 @@ impl SlideAnalysisProjector {
         // Store supplemental records
         for result in &results {
             let record = Self::build_supplemental(result);
-            let _ = supplemental.add(record, lake);
+            supplemental
+                .add(record, lake)
+                .expect("derived observation must exist in the supplied lake");
         }
 
         results
-    }
-
-    /// Convert a `SlideAnalysisResult` into a `WriteRecord` suitable for
-    /// pushing to a SaaS write-back adapter (e.g. Notion).
-    pub fn to_write_record(
-        result: &SlideAnalysisResult,
-        external_id: Option<String>,
-    ) -> WriteRecord {
-        let profile = &result.profile;
-        let title = profile.name.clone();
-        let entity_id = profile
-            .email
-            .as_deref()
-            .or(profile.generated_email.as_deref())
-            .unwrap_or(result.person_entity.as_str())
-            .to_string();
-
-        let payload = serde_json::to_value(profile).unwrap_or_default();
-
-        WriteRecord {
-            entity_id,
-            title,
-            payload,
-            external_id,
-        }
     }
 
     /// Ingest a new observation into the lake for a slide analysis event.
@@ -262,6 +236,7 @@ mod tests {
     use crate::domain::*;
     use crate::lake::LakeStore;
     use crate::supplemental::SupplementalStore;
+    use chrono::Utc;
 
     fn make_slide_observation(presentation_id: &str) -> Observation {
         Observation {
@@ -362,40 +337,6 @@ mod tests {
         let r2 =
             SlideAnalysisProjector::process_new_slides(&lake, &mut supplemental, fixture_analyse);
         assert_eq!(r2.len(), 0);
-    }
-
-    #[test]
-    fn to_write_record_uses_email() {
-        let result = SlideAnalysisResult {
-            source_observation_id: ObservationId::new("obs-1"),
-            presentation_id: "pres123".into(),
-            profile: StudentProfile {
-                email: Some("alice@hlab.college".into()),
-                generated_email: None,
-                name: "Alice".into(),
-                bio_text: None,
-                profile_pic: None,
-                gallery_images: vec![],
-                properties: Default::default(),
-                attributes: vec![],
-                source_slide_object_id: None,
-                source_document_id: None,
-                source_canonical_uri: None,
-                thumbnail_blob_ref: None,
-                thumbnail_url: None,
-                companion_to_slide_object_id: None,
-            },
-            person_entity: EntityRef::new("person:alice@hlab.college"),
-            supplemental_id: Some(SupplementalId::new("sup:1")),
-            analyzed_at: Utc::now(),
-            model_version: Some("fixture".into()),
-            slide_object_id: Some("slide-1".into()),
-            thumbnail_blob_ref: None,
-        };
-        let wr = SlideAnalysisProjector::to_write_record(&result, None);
-        assert_eq!(wr.entity_id, "alice@hlab.college");
-        assert_eq!(wr.title, "Alice");
-        assert!(wr.external_id.is_none());
     }
 
     #[test]
