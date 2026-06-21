@@ -5,8 +5,6 @@
 use std::collections::HashMap;
 
 use lethe_core::domain::{EntityRef, Observation, ObservationId, ObserverRef, SchemaRef};
-use lethe_storage_api::ObservationStore;
-
 const CANONICAL_JSON_META_KEY: &str = "canonical_json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,12 +122,6 @@ impl LakeStore {
 
     pub fn is_empty(&self) -> bool {
         self.observations.is_empty()
-    }
-}
-
-impl ObservationStore for LakeStore {
-    fn observations(&self) -> &[Observation] {
-        self.list()
     }
 }
 

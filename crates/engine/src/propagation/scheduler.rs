@@ -5,7 +5,9 @@ use crate::projection::catalog::ProjectionCatalog;
 use crate::projection::runner::BuildStatus;
 use lethe_core::domain::{ProjectionHealth, ProjectionRef};
 
+use super::idempotent::CommutativeIdempotentObservationFold;
 use super::watermark::WatermarkStore;
+use lethe_storage_api::{ProjectionLeafWatermark, StoragePorts};
 
 /// Result of a single propagation cycle for one projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +35,63 @@ pub struct LeafTail {
 pub struct PropagationScheduler;
 
 impl PropagationScheduler {
+    pub fn propagate_persistent(
+        projection_id: &ProjectionRef,
+        storage: &dyn StoragePorts,
+        batch_size: usize,
+        fold: &mut dyn CommutativeIdempotentObservationFold,
+    ) -> Result<Vec<LeafTail>, String> {
+        if batch_size == 0 {
+            return Err("persistent propagation batch_size must be positive".to_owned());
+        }
+        let mut applied = Vec::new();
+        for position in storage
+            .leaf_positions()
+            .map_err(|error| error.to_string())?
+        {
+            let watermark = storage
+                .projection_leaf_watermark(projection_id, &position.leaf_id)
+                .map_err(|error| error.to_string())?;
+            if watermark.append_seq >= position.append_seq {
+                continue;
+            }
+            let mut cursor = watermark.append_seq;
+            let start = cursor;
+            let mut count = 0usize;
+            loop {
+                let page = storage
+                    .observations_for_leaf_after(&position.leaf_id, cursor, batch_size)
+                    .map_err(|error| error.to_string())?;
+                if page.is_empty() {
+                    break;
+                }
+                for stored in &page {
+                    fold.apply(&stored.observation)?;
+                    cursor = stored.append_seq;
+                    count += 1;
+                }
+                if page.len() < batch_size {
+                    break;
+                }
+            }
+            storage
+                .commit_projection_leaf_watermark(&ProjectionLeafWatermark {
+                    projection_id: projection_id.clone(),
+                    leaf_id: position.leaf_id.clone(),
+                    append_seq: cursor,
+                    status: "success".to_owned(),
+                })
+                .map_err(|error| error.to_string())?;
+            applied.push(LeafTail {
+                leaf_id: position.leaf_id,
+                from_append_seq_exclusive: start as usize,
+                to_append_seq_inclusive: cursor as usize,
+                new_records: count,
+            });
+        }
+        Ok(applied)
+    }
+
     /// Run a single poll cycle for one projection.
     ///
     /// Returns the incremental observations and the new position.

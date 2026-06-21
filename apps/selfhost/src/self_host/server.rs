@@ -16,7 +16,7 @@ use lethe_core::domain::BlobRef;
 pub fn build_router(service: AppService) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/health/deep", get(health))
+        .route("/health/deep", get(deep_health))
         .route("/admin/sync", post(sync_now))
         .route(
             "/api/projections/{projection_id}/blobs/{blob_hash}",
@@ -65,6 +65,14 @@ struct PersonsQuery {
 
 async fn health(State(service): State<AppService>) -> Result<Json<HealthResponse>, ApiError> {
     Ok(Json(service.health()?))
+}
+
+async fn deep_health(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+) -> Result<Json<HealthResponse>, ApiError> {
+    service.authorize_headers(&headers, "admin:health")?;
+    Ok(Json(service.deep_health()?))
 }
 
 async fn sync_now(

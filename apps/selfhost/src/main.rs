@@ -2,7 +2,11 @@ use lethe_selfhost::self_host::app::AppService;
 use lethe_selfhost::self_host::config::SelfHostConfig;
 use lethe_selfhost::self_host::server::build_router;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init()?;
     let config = SelfHostConfig::from_env()?;
     let service = AppService::bootstrap(config.clone())?;
 
@@ -14,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let startup_service = service.clone();
         tokio::task::spawn_blocking(move || {
             if let Err(err) = startup_service.sync_all() {
-                eprintln!("initial sync failed: {err}");
+                tracing::error!(error = %err, "initial sync failed");
             }
         });
 
@@ -22,14 +26,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let router = build_router(service.clone());
         let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
-        println!("LETHE self-host listening on http://{}", config.bind_addr);
+        tracing::info!(bind_addr = %config.bind_addr, "LETHE self-host listening");
         axum::serve(listener, router)
             .with_graceful_shutdown(async {
                 let _ = tokio::signal::ctrl_c().await;
             })
             .await?;
 
-        Ok::<(), Box<dyn std::error::Error>>(())
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     })?;
 
     Ok(())

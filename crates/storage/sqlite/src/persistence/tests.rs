@@ -3,7 +3,7 @@ use chrono::Utc;
 
 use lethe_core::domain::{
     ActorRef, AuthorityModel, CaptureModel, EntityRef, IdempotencyKey, Mutability, Observation,
-    ObserverRef, SchemaRef, SemVer, SupplementalId, SupplementalRecord,
+    ObserverRef, SchemaRef, SemVer, SourceSystemRef, SupplementalId, SupplementalRecord,
     supplemental::InputAnchorSet,
 };
 
@@ -19,7 +19,7 @@ fn sample_observation() -> Observation {
         schema: SchemaRef::new("schema:test"),
         schema_version: SemVer::new("1.0.0"),
         observer: ObserverRef::new("obs:test"),
-        source_system: None,
+        source_system: Some(SourceSystemRef::new("sys:test")),
         actor: None,
         authority_model: AuthorityModel::LakeAuthoritative,
         capture_model: CaptureModel::Event,
@@ -33,6 +33,7 @@ fn sample_observation() -> Observation {
         idempotency_key: IdempotencyKey::new("sample-key"),
         meta: serde_json::json!({
             CANONICAL_JSON_META_KEY: canonical_json,
+            "source_container": "test",
         }),
     }
 }
@@ -42,7 +43,7 @@ fn persist_and_reload_observation() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let db = tmp.join("test.sqlite3");
     let blob_dir = tmp.join("blobs");
-    let store = SqlitePersistence::open(&db, &blob_dir).unwrap();
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
     let observation = sample_observation();
 
     store.persist_observation(&observation).unwrap();
@@ -78,7 +79,7 @@ fn duplicate_persist_observation_surfaces_constraint_error() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let db = tmp.join("test.sqlite3");
     let blob_dir = tmp.join("blobs");
-    let store = SqlitePersistence::open(&db, &blob_dir).unwrap();
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
     let observation = sample_observation();
 
     store.persist_observation(&observation).unwrap();
@@ -93,7 +94,7 @@ fn idempotent_append_returns_duplicate_for_same_canonical_json() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let db = tmp.join("test.sqlite3");
     let blob_dir = tmp.join("blobs");
-    let store = SqlitePersistence::open(&db, &blob_dir).unwrap();
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
     let observation = sample_observation();
 
     let first = store.append_observation_idempotent(&observation).unwrap();
@@ -116,7 +117,7 @@ fn idempotent_append_detects_canonical_json_collision() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let db = tmp.join("test.sqlite3");
     let blob_dir = tmp.join("blobs");
-    let store = SqlitePersistence::open(&db, &blob_dir).unwrap();
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
     let observation = sample_observation();
     let mut collision = observation.clone();
     collision.id = Observation::new_id();
@@ -126,6 +127,7 @@ fn idempotent_append_detects_canonical_json_collision() {
             "object_id": "sample-key",
             "body": "changed"
         }).to_string(),
+        "source_container": "test",
     });
 
     store.append_observation_idempotent(&observation).unwrap();
@@ -144,7 +146,7 @@ fn rehome_mode_a_preserves_stored_identity_and_times() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let db = tmp.join("test.sqlite3");
     let blob_dir = tmp.join("blobs");
-    let store = SqlitePersistence::open(&db, &blob_dir).unwrap();
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
     let mut first = sample_observation();
     first.idempotency_key = IdempotencyKey::new("first");
     first.meta = serde_json::json!({
@@ -153,6 +155,7 @@ fn rehome_mode_a_preserves_stored_identity_and_times() {
             "object_id": "first",
             "body": "first"
         }).to_string(),
+        "source_container": "test",
     });
     store.persist_observation(&first).unwrap();
 
@@ -171,6 +174,7 @@ fn rehome_mode_a_preserves_stored_identity_and_times() {
             "object_id": "rehome-mode-a",
             "body": "stored"
         }).to_string(),
+        "source_container": "test",
     });
 
     let outcome = store
@@ -205,7 +209,7 @@ fn rehome_mode_b_reserializes_identity_and_canonical_json() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let db = tmp.join("test.sqlite3");
     let blob_dir = tmp.join("blobs");
-    let store = SqlitePersistence::open(&db, &blob_dir).unwrap();
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
     let observation = sample_observation();
     let new_key = IdempotencyKey::new("identity-v2");
     let new_canonical_json = serde_json::json!({
@@ -258,7 +262,7 @@ fn persist_and_reload_supplemental() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let db = tmp.join("test.sqlite3");
     let blob_dir = tmp.join("blobs");
-    let store = SqlitePersistence::open(&db, &blob_dir).unwrap();
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
     let observation = sample_observation();
     let supplemental = sample_supplemental(&observation.id);
 
@@ -278,7 +282,7 @@ fn migration_ledger_records_current_schema_version() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let db = tmp.join("test.sqlite3");
     let blob_dir = tmp.join("blobs");
-    let store = SqlitePersistence::open(&db, &blob_dir).unwrap();
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
     let version: i64 = store
         .conn
         .query_row(
@@ -297,7 +301,7 @@ fn open_records_partition_initialize_with_pinned_keyspecs() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let db = tmp.join("test.sqlite3");
     let blob_dir = tmp.join("blobs");
-    let store = SqlitePersistence::open(&db, &blob_dir).unwrap();
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
 
     let (event_type, leaf_id, routing, identity): (String, String, String, String) = store
         .conn
@@ -329,7 +333,7 @@ fn split_prepare_is_logged_without_changing_replayed_tree() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let db = tmp.join("test.sqlite3");
     let blob_dir = tmp.join("blobs");
-    let store = SqlitePersistence::open(&db, &blob_dir).unwrap();
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
     let root: String = store
         .conn
         .query_row(
@@ -355,7 +359,7 @@ fn split_commit_records_capacity_bit_and_replays_tree() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let db = tmp.join("test.sqlite3");
     let blob_dir = tmp.join("blobs");
-    let store = SqlitePersistence::open(&db, &blob_dir).unwrap();
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
     let root: String = store
         .conn
         .query_row(
@@ -390,7 +394,7 @@ fn failover_and_recover_events_record_control_plane_boundaries() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let db = tmp.join("test.sqlite3");
     let blob_dir = tmp.join("blobs");
-    let store = SqlitePersistence::open(&db, &blob_dir).unwrap();
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
     let root: String = store
         .conn
         .query_row(
@@ -427,7 +431,7 @@ fn partition_log_is_append_only() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let db = tmp.join("test.sqlite3");
     let blob_dir = tmp.join("blobs");
-    let store = SqlitePersistence::open(&db, &blob_dir).unwrap();
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
 
     let err = store
         .conn
@@ -446,13 +450,171 @@ fn garbage_collect_orphan_blobs_removes_unreferenced_files() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let db = tmp.join("test.sqlite3");
     let blob_dir = tmp.join("blobs");
-    let store = SqlitePersistence::open(&db, &blob_dir).unwrap();
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
     let orphan = blob_dir.join("f".repeat(64));
     fs::write(&orphan, b"orphan").unwrap();
 
     let removed = store.garbage_collect_orphan_blobs().unwrap();
     assert_eq!(removed, 1);
     assert!(!orphan.exists());
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn sqlite_implements_storage_port_conformance_suite() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let store =
+        SqlitePersistence::open(&tmp.join("test.sqlite3"), &tmp.join("blobs"), &[7; 32]).unwrap();
+
+    lethe_storage_api::conformance::observation_store_round_trip(&store);
+    lethe_storage_api::conformance::blob_store_round_trip(&store);
+    lethe_storage_api::conformance::materializer_round_trip(&store);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn capacity_split_physically_rehomes_parent_rows_before_commit() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let store =
+        SqlitePersistence::open(&tmp.join("test.sqlite3"), &tmp.join("blobs"), &[7; 32]).unwrap();
+    let first = sample_observation();
+    let mut second = sample_observation();
+    second.id = Observation::new_id();
+    second.idempotency_key = IdempotencyKey::new("sample-key-2");
+    second.published += chrono::TimeDelta::days(35);
+    second.meta = serde_json::json!({
+        CANONICAL_JSON_META_KEY: serde_json::json!({
+            "source": "test",
+            "object_id": "sample-key-2",
+            "body": "world"
+        }).to_string(),
+        "source_container": "test",
+    });
+    store.persist_observation(&first).unwrap();
+    store.persist_observation(&second).unwrap();
+
+    assert!(store.split_leaf_if_capacity(2).unwrap());
+    let positions = store.leaf_positions().unwrap();
+    assert_eq!(positions.len(), 2);
+    assert_eq!(
+        positions
+            .iter()
+            .map(|position| position.append_seq)
+            .filter(|v| *v > 0)
+            .count(),
+        2
+    );
+    let tree = store.load_partition_tree().unwrap();
+    assert_eq!(tree.current_leaf_ids().len(), 2);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn projection_leaf_watermark_is_persistent_and_monotonic() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let store =
+        SqlitePersistence::open(&tmp.join("test.sqlite3"), &tmp.join("blobs"), &[7; 32]).unwrap();
+    let projection = lethe_core::domain::ProjectionRef::new("proj:test");
+    let leaf = store
+        .load_partition_tree()
+        .unwrap()
+        .root_leaf_id()
+        .to_owned();
+    let mut watermark = store.projection_leaf_watermark(&projection, &leaf).unwrap();
+    assert_eq!(watermark.append_seq, 0);
+    watermark.append_seq = 7;
+    store.commit_projection_leaf_watermark(&watermark).unwrap();
+    assert_eq!(
+        store
+            .projection_leaf_watermark(&projection, &leaf)
+            .unwrap()
+            .append_seq,
+        7
+    );
+
+    watermark.append_seq = 6;
+    assert!(store.commit_projection_leaf_watermark(&watermark).is_err());
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn blue_green_migration_rewrites_identity_and_retires_old_structure() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let store =
+        SqlitePersistence::open(&tmp.join("test.sqlite3"), &tmp.join("blobs"), &[7; 32]).unwrap();
+    let observation = sample_observation();
+    let id = observation.id.clone();
+    store.persist_observation(&observation).unwrap();
+
+    store
+        .blue_green_migrate("routing-keyspec/v2", "identity-keyspec/v2", |observation| {
+            Ok(BlueGreenTransform {
+                identity_key: IdempotencyKey::new(format!(
+                    "v2:{}",
+                    observation.idempotency_key.as_str()
+                )),
+                canonical_json: serde_json::json!({
+                    "version": 2,
+                    "id": observation.id.as_str(),
+                })
+                .to_string(),
+                routing_key: "v2-routing-key".to_owned(),
+            })
+        })
+        .unwrap();
+
+    let stored = store.observation_by_id(&id).unwrap().unwrap();
+    assert_eq!(stored.observation.id, id);
+    assert_eq!(stored.observation.idempotency_key.as_str(), "v2:sample-key");
+    let expected_canonical = serde_json::json!({"version": 2, "id": id.as_str()}).to_string();
+    assert_eq!(
+        stored
+            .observation
+            .meta
+            .get(CANONICAL_JSON_META_KEY)
+            .and_then(serde_json::Value::as_str),
+        Some(expected_canonical.as_str())
+    );
+    let history_count: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM keyspec_history", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(history_count, 1);
+    let initialize_count: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM partition_log", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(initialize_count, 1);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn persisted_secrets_are_encrypted_at_rest() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let store =
+        SqlitePersistence::open(&tmp.join("test.sqlite3"), &tmp.join("blobs"), &[7; 32]).unwrap();
+    store
+        .put_encrypted_secret("secret:google-refresh", b"plain-refresh-token")
+        .unwrap();
+
+    let stored_ciphertext: Vec<u8> = store
+        .conn
+        .query_row(
+            "SELECT ciphertext FROM encrypted_secrets WHERE secret_ref = ?1",
+            ["secret:google-refresh"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_ne!(stored_ciphertext, b"plain-refresh-token");
+    assert_eq!(
+        store.get_encrypted_secret("secret:google-refresh").unwrap(),
+        Some(b"plain-refresh-token".to_vec())
+    );
 
     let _ = fs::remove_dir_all(tmp);
 }

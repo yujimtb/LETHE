@@ -151,7 +151,7 @@ mod tests {
 
     use lethe_core::domain::{
         AuthorityModel, CaptureModel, EntityRef, IdempotencyKey, Observation, ObserverRef,
-        SchemaRef, SemVer,
+        SchemaRef, SemVer, SourceSystemRef,
     };
 
     fn observation(key: &str) -> Observation {
@@ -160,7 +160,7 @@ mod tests {
             schema: SchemaRef::new("schema:test"),
             schema_version: SemVer::new("1.0.0"),
             observer: ObserverRef::new("obs:test"),
-            source_system: None,
+            source_system: Some(SourceSystemRef::new("sys:test")),
             actor: None,
             authority_model: AuthorityModel::LakeAuthoritative,
             capture_model: CaptureModel::Event,
@@ -178,6 +178,7 @@ mod tests {
                     "object_id": key,
                     "body": "same"
                 }).to_string(),
+                "source_container": "test",
             }),
         }
     }
@@ -187,7 +188,8 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("lethe-spool-test-{}", uuid::Uuid::now_v7()));
         let spool = FailoverSpool::open(&tmp.join("spool.sqlite3")).unwrap();
         let destination =
-            SqlitePersistence::open(&tmp.join("leaf.sqlite3"), &tmp.join("blobs")).unwrap();
+            SqlitePersistence::open(&tmp.join("leaf.sqlite3"), &tmp.join("blobs"), &[7; 32])
+                .unwrap();
         let first = observation("dup-key");
         let mut duplicate = first.clone();
         duplicate.id = Observation::new_id();

@@ -19,6 +19,32 @@ pub struct HealthResponse {
     pub status: String,
     pub version: String,
     pub projections: Vec<ProjectionHealthInfo>,
+    pub dependencies: Vec<DependencyHealthInfo>,
+    pub last_sync: LastSyncHealth,
+    pub metrics: SyncMetrics,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DependencyHealthInfo {
+    pub name: String,
+    pub status: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LastSyncHealth {
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SyncMetrics {
+    pub fetched: u64,
+    pub ingested: u64,
+    pub skipped: u64,
+    pub failed: u64,
+    pub quarantined: u64,
+    pub latency_ms: u64,
 }
 
 impl HealthResponse {
@@ -42,7 +68,29 @@ impl HealthResponse {
             status: status.into(),
             version: app_version.into(),
             projections,
+            dependencies: Vec::new(),
+            last_sync: LastSyncHealth::default(),
+            metrics: SyncMetrics::default(),
         }
+    }
+
+    pub fn with_runtime(
+        mut self,
+        dependencies: Vec<DependencyHealthInfo>,
+        last_sync: LastSyncHealth,
+        metrics: SyncMetrics,
+    ) -> Self {
+        if dependencies
+            .iter()
+            .any(|dependency| dependency.status != "ok")
+            || last_sync.error.is_some()
+        {
+            self.status = "degraded".to_owned();
+        }
+        self.dependencies = dependencies;
+        self.last_sync = last_sync;
+        self.metrics = metrics;
+        self
     }
 }
 

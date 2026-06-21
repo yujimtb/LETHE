@@ -7,6 +7,12 @@ impl AppService {
         pin: Option<&str>,
         pagination: &PaginationParams,
     ) -> Result<ResponseEnvelope<serde_json::Value>, SelfHostError> {
+        if pagination.limit == 0 || pagination.limit > self.config.resource_limits.max_page_size {
+            return Err(SelfHostError::ReadMode(format!(
+                "page limit must be between 1 and {}",
+                self.config.resource_limits.max_page_size
+            )));
+        }
         let core = self.core_lock()?;
         let mode = self.resolve_read_mode(&core.catalog, "proj:person-page", read_mode, pin)?;
         self.authorize_read(

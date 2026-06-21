@@ -477,7 +477,7 @@ impl GoogleTokenSource {
         }
 
         if let Some(token) = self.config.access_token.clone() {
-            return Ok(token);
+            return Ok(token.expose().to_owned());
         }
 
         self.exchange_refresh_token(http)
@@ -511,30 +511,30 @@ impl GoogleTokenSource {
             .client_id
             .clone()
             .ok_or_else(|| AdapterError::AuthFailure {
-                message: "missing LETHE_GOOGLE_CLIENT_ID".to_string(),
+                message: "missing google client id secret".to_string(),
             })?;
         let client_secret =
             self.config
                 .client_secret
                 .clone()
                 .ok_or_else(|| AdapterError::AuthFailure {
-                    message: "missing LETHE_GOOGLE_CLIENT_SECRET".to_string(),
+                    message: "missing google client secret".to_string(),
                 })?;
         let refresh_token =
             self.config
                 .refresh_token
                 .clone()
                 .ok_or_else(|| AdapterError::AuthFailure {
-                    message: "missing LETHE_GOOGLE_REFRESH_TOKEN".to_string(),
+                    message: "missing google refresh token".to_string(),
                 })?;
 
         let token_response = http
             .post("https://oauth2.googleapis.com/token")
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
             .form(&[
-                ("client_id", client_id.as_str()),
-                ("client_secret", client_secret.as_str()),
-                ("refresh_token", refresh_token.as_str()),
+                ("client_id", client_id.expose()),
+                ("client_secret", client_secret.expose()),
+                ("refresh_token", refresh_token.expose()),
                 ("grant_type", "refresh_token"),
             ])
             .send()

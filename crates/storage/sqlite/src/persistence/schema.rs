@@ -7,11 +7,17 @@ impl SqlitePersistence {
             CREATE TABLE IF NOT EXISTS observations (
                 append_seq INTEGER PRIMARY KEY AUTOINCREMENT,
                 id TEXT NOT NULL UNIQUE,
-                identity_key TEXT NOT NULL UNIQUE,
+                leaf_id TEXT NOT NULL CHECK (leaf_id LIKE 'lake:%'),
+                routing_key TEXT NOT NULL,
+                identity_key TEXT NOT NULL,
                 canonical_json TEXT NOT NULL,
                 recorded_at TEXT NOT NULL,
-                observation_json TEXT NOT NULL
+                observation_json TEXT NOT NULL,
+                UNIQUE (leaf_id, identity_key)
             );
+
+            CREATE INDEX IF NOT EXISTS observations_leaf_append
+                ON observations(leaf_id, append_seq);
 
             CREATE TABLE IF NOT EXISTS sync_state (
                 key TEXT PRIMARY KEY,
@@ -27,6 +33,63 @@ impl SqlitePersistence {
                 id TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL,
                 supplemental_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS projection_materializations (
+                projection_id TEXT PRIMARY KEY,
+                records_json TEXT NOT NULL,
+                materialized_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS projection_leaf_watermarks (
+                projection_id TEXT NOT NULL,
+                leaf_id TEXT NOT NULL CHECK (leaf_id LIKE 'lake:%'),
+                append_seq INTEGER NOT NULL CHECK (append_seq >= 0),
+                status TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (projection_id, leaf_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS dead_letters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_instance TEXT NOT NULL,
+                item_key TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                payload_json TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                event_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sync_metrics (
+                source_instance TEXT PRIMARY KEY,
+                fetched INTEGER NOT NULL,
+                ingested INTEGER NOT NULL,
+                skipped INTEGER NOT NULL,
+                failed INTEGER NOT NULL,
+                quarantined INTEGER NOT NULL,
+                latency_ms INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS encrypted_secrets (
+                secret_ref TEXT PRIMARY KEY,
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS keyspec_history (
+                migration_id TEXT PRIMARY KEY,
+                routing_keyspec_version TEXT NOT NULL,
+                identity_keyspec_version TEXT NOT NULL,
+                partition_log_json TEXT NOT NULL,
+                retired_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -97,7 +160,7 @@ impl SqlitePersistence {
             "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
             params![
                 CURRENT_SCHEMA_VERSION,
-                "partition_log_and_append_seq_observations",
+                "authoritative_leaf_storage_and_runtime_state",
                 chrono::Utc::now().to_rfc3339(),
             ],
         )?;
