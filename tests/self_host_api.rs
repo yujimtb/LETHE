@@ -2,13 +2,15 @@ use std::path::PathBuf;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use lethe::domain::supplemental::InputAnchorSet;
 use lethe::domain::{
-    AuthorityModel, CaptureModel, EntityRef, IdempotencyKey, Observation, ObserverRef, SchemaRef,
-    SemVer, SourceSystemRef,
+    ActorRef, AuthorityModel, CaptureModel, EntityRef, IdempotencyKey, Mutability, Observation,
+    ObserverRef, SchemaRef, SemVer, SourceSystemRef, SupplementalId, SupplementalRecord,
 };
 use lethe::self_host::app::AppService;
 use lethe::self_host::config::{
     ApiTokenConfig, GoogleConfig, ResourceLimits, SecretString, SelfHostConfig, SlackConfig,
+    SlideAiConfig,
 };
 use lethe::self_host::persistence::SqlitePersistence;
 use lethe::self_host::server::build_router;
@@ -104,7 +106,6 @@ fn gslides_observation(editors: &[&str], owner: &str, title: &str, key: &str) ->
 fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
     SelfHostConfig {
         bind_addr: "127.0.0.1:0".into(),
-        public_base_url: None,
         database_path: db,
         blob_dir: blobs,
         poll_interval: std::time::Duration::from_secs(300),
@@ -118,10 +119,9 @@ fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
             max_sync_items: 10_000,
             max_page_size: 100,
         },
-        sources: vec![],
         slack: SlackConfig {
             bot_token: "xoxb-test-token".into(),
-            thread_token: None,
+            thread_token: "xoxp-test-thread-token".into(),
             channel_ids: vec!["C01ABC".into()],
         },
         google: GoogleConfig {
@@ -132,8 +132,10 @@ fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
             presentation_ids: vec!["pres123".into()],
         },
         slide_analysis_limit: 10,
-        slide_ai: None,
-        notion: None,
+        slide_ai: SlideAiConfig {
+            api_key: "test-gemini-key".into(),
+            model: "test-gemini-model".into(),
+        },
     }
 }
 
@@ -165,14 +167,15 @@ fn self_host_persons_endpoint_returns_projection_data() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let response = runtime
         .block_on(async {
-            app.oneshot(
-                Request::builder()
-                    .uri("/api/persons")
-                    .header("authorization", "Bearer test-api-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/persons")
+                        .header("authorization", "Bearer test-api-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
         })
         .unwrap();
 
@@ -186,18 +189,177 @@ fn self_host_persons_endpoint_returns_projection_data() {
         json["projection_metadata"]["projection_id"],
         "proj:person-page"
     );
+    assert!(
+        json["projection_metadata"]["lineage_ref"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("lineage:person-page:build-"))
+    );
     assert_eq!(json["data"]["total"], 1);
     assert_eq!(json["data"]["data"][0]["display_name"], "田中太郎");
+
+    let lineage_response = runtime
+        .block_on(async {
+            app.oneshot(
+                Request::builder()
+                    .uri("/api/projections/proj:person-page/lineage")
+                    .header("authorization", "Bearer test-api-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        })
+        .unwrap();
+    assert_eq!(lineage_response.status(), StatusCode::OK);
+    let lineage_body = runtime
+        .block_on(async { axum::body::to_bytes(lineage_response.into_body(), usize::MAX).await })
+        .unwrap();
+    let lineage_json: serde_json::Value = serde_json::from_slice(&lineage_body).unwrap();
+    assert_eq!(lineage_json["projection_id"], "proj:person-page");
+    assert_eq!(lineage_json["input_refs"].as_array().unwrap().len(), 2);
 
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn public_blob_endpoint_serves_persisted_blob_bytes() {
+fn opted_out_person_is_excluded_by_filtering_projection() {
+    let (root, db, blobs) = temp_paths();
+    let persistence = SqlitePersistence::open(&db, &blobs).unwrap();
+    persistence
+        .persist_observation(&slack_observation(
+            "U200",
+            "optout@example.jp",
+            "非表示対象",
+            "private",
+            "general",
+            "optout-s1",
+        ))
+        .unwrap();
+    persistence
+        .persist_observation(&gslides_observation(
+            &["optout@example.jp"],
+            "optout@example.jp",
+            "非表示対象の自己紹介",
+            "optout-g1",
+        ))
+        .unwrap();
+    persistence
+        .persist_observation(&Observation {
+            id: Observation::new_id(),
+            schema: SchemaRef::new("schema:consent-decision"),
+            schema_version: SemVer::new("1.0.0"),
+            observer: ObserverRef::new("obs:consent-ledger"),
+            source_system: Some(SourceSystemRef::new("sys:lethe-governance")),
+            actor: Some(EntityRef::new("person:reviewer")),
+            authority_model: AuthorityModel::LakeAuthoritative,
+            capture_model: CaptureModel::Event,
+            subject: EntityRef::new("person:consent-subject"),
+            target: None,
+            payload: serde_json::json!({
+                "status": "opted_out",
+                "identifier": "optout@example.jp",
+                "reason": "subject request"
+            }),
+            attachments: vec![],
+            published: chrono::Utc::now(),
+            recorded_at: chrono::Utc::now(),
+            consent: None,
+            idempotency_key: IdempotencyKey::new("consent:optout@example.jp:opted-out"),
+            meta: serde_json::json!({
+                "canonical_json": serde_json::json!({
+                    "identifier": "optout@example.jp",
+                    "status": "opted_out"
+                }).to_string()
+            }),
+        })
+        .unwrap();
+
+    let app = build_router(AppService::bootstrap(test_config(db, blobs)).unwrap());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let response = runtime
+        .block_on(async {
+            app.oneshot(
+                Request::builder()
+                    .uri("/api/projections/proj:person-page/records")
+                    .header("authorization", "Bearer test-api-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        })
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = runtime
+        .block_on(async { axum::body::to_bytes(response.into_body(), usize::MAX).await })
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["total"], 0);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn projection_blob_endpoint_requires_auth_and_rejects_raw_cas_access() {
     let (root, db, blobs) = temp_paths();
     let persistence = SqlitePersistence::open(&db, &blobs).unwrap();
     let blob_ref = persistence.persist_blob(b"png-bytes").unwrap();
+    let unreferenced_blob_ref = persistence.persist_blob(b"private-bytes").unwrap();
+    let slack = slack_observation(
+        "U100",
+        "tanaka@example.jp",
+        "田中太郎",
+        "hello",
+        "general",
+        "blob-s1",
+    );
+    let slide = gslides_observation(
+        &["tanaka@example.jp"],
+        "tanaka@example.jp",
+        "田中の自己紹介",
+        "blob-g1",
+    );
+    persistence.persist_observation(&slack).unwrap();
+    persistence.persist_observation(&slide).unwrap();
+    persistence
+        .persist_supplemental(&SupplementalRecord {
+            id: SupplementalId::new("sup:blob-profile"),
+            kind: "slide-analysis".into(),
+            derived_from: InputAnchorSet {
+                observations: vec![slide.id.clone()],
+                blobs: vec![blob_ref.clone()],
+                supplementals: vec![],
+            },
+            payload: serde_json::json!({
+                "email": "tanaka@example.jp",
+                "generated_email": null,
+                "name": "田中太郎",
+                "bio_text": "自己紹介",
+                "profile_pic": null,
+                "gallery_images": [],
+                "properties": {},
+                "attributes": [],
+                "source_slide_object_id": "slide-1",
+                "source_document_id": "document:gslides:blob-g1#slide:slide-1",
+                "source_canonical_uri": null,
+                "thumbnail_blob_ref": blob_ref.as_str(),
+                "thumbnail_url": null,
+                "companion_to_slide_object_id": null
+            }),
+            created_by: ActorRef::new("actor:test"),
+            created_at: chrono::Utc::now(),
+            mutability: Mutability::ManagedCache,
+            record_version: Some("1".into()),
+            model_version: Some("fixture".into()),
+            consent_metadata: None,
+            lineage: None,
+        })
+        .unwrap();
     let blob_hash = blob_ref
+        .as_str()
+        .strip_prefix("blob:sha256:")
+        .unwrap()
+        .to_string();
+    let unreferenced_hash = unreferenced_blob_ref
         .as_str()
         .strip_prefix("blob:sha256:")
         .unwrap()
@@ -206,18 +368,53 @@ fn public_blob_endpoint_serves_persisted_blob_bytes() {
     let app = build_router(AppService::bootstrap(test_config(db, blobs)).unwrap());
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
+    let unauthenticated_response = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/api/projections/proj:person-page/blobs/{blob_hash}"
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(unauthenticated_response.status(), StatusCode::UNAUTHORIZED);
+
+    let raw_cas_response = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/api/projections/proj:person-page/blobs/{unreferenced_hash}"
+                        ))
+                        .header("authorization", "Bearer test-api-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(raw_cas_response.status(), StatusCode::NOT_FOUND);
+
     let response = runtime
         .block_on(async {
             app.oneshot(
                 Request::builder()
-                    .uri(format!("/public/blobs/{blob_hash}"))
+                    .uri(format!(
+                        "/api/projections/proj:person-page/blobs/{blob_hash}"
+                    ))
+                    .header("authorization", "Bearer test-api-token")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
         })
         .unwrap();
-
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response

@@ -11,7 +11,8 @@ LETHE を特定ドメイン固定の単一 crate から、Cargo workspace と ef
 - 依存方向は `scripts/check_dependency_layers.ps1` で検査する。
 - storage effect は `ObservationStore`, `BlobStorePort`, `SupplementalStorePort`, `ProjectionMaterializer` trait を通る。
 - blob 参照は `blob:sha256:{hex}` の content-addressing とする。
-- source adapter は `SourceAdapter` / writeback trait と宣言的 `AdapterConfig` を contract とする。
+- read-side source adapter は `SourceAdapter` と宣言的 `AdapterConfig` を contract とする。
+- M07 Write-Back は Post-MVP であり、現行 adapter contract と self-host runtime に write path を含めない。
 - derivation provider は `DerivationProvider` trait と lineage metadata を持つ。
 - identity claim は email 固定ではなく、`IdentifierType` と `IdentityResolutionStrategy` で構成可能な claim 種別として扱う。
 - selfhost config は source instance 配列へ正規化され、secret は `credential_ref` で参照する。

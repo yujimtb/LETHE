@@ -147,6 +147,6 @@ These are not separate bugs, but they explain why the current suite stays green:
 
 1. Fix the Slack channel-field mismatch and the Slack cursor empty-string bug.
 2. Repair Slack file-share ingestion so real files become real blobs.
-3. Stop swallowing errors in propagation, slide analysis, and Notion write-back.
+3. Stop swallowing errors in propagation and slide analysis.
 4. Remove wall-clock timestamps from pure projection outputs, or inject deterministic build time explicitly.
 5. Tighten validation and filtering so multi-source specs and restricted arrays behave as intended.

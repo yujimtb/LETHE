@@ -51,7 +51,7 @@ ProjectionResult =
 |---|---|---|---|
 | AcademicPinned | 必須 | 再現性、引用 | **禁止** |
 | OperationalLatest | 緩い | 鮮度、運用 | **許可** |
-| ApplicationCached | 中間 | 低コスト、高速 | cache miss 時 fallback 可 |
+| ApplicationCached | 中間 | 低コスト、高速 | cache miss は明示エラー |
 
 ### 4.1 Source-Native Read Contract
 
@@ -59,17 +59,13 @@ ProjectionResult =
 sources:
   - ref: "source-native:sys:google-slides"
     readMode: "operational-latest"
-    fallback: "lake-snapshot"
     freshnessSla: "best-effort"
-    lineageCapture: "timestamp-only"
+    lineageCapture: "input-refs"
 ```
 
-### 4.2 Fallback Ladder
+### 4.2 Failure Semantics
 
-1. Source-native latest (available なら)
-2. Lake の最新 snapshot
-3. Projection の前回 cache
-4. Stale result + staleness warning
+source-native、Lake snapshot、Projection cache は spec で宣言された入力だけを使用する。取得失敗や cache miss を別経路で代替してはならず、build / read を明示的に失敗させる。
 
 ### 4.3 Multi-Source Reconciliation
 
@@ -113,7 +109,6 @@ spec:
       version: ">=1.0.0"
     - ref: "source-native:sys:{name}"
       readMode: ReadMode
-      fallback: string?
 
   # ── 構築設定 ──
   engine: string                    # "duckdb", "neo4j", "python", etc.
@@ -268,6 +263,7 @@ LineageManifest =
   , buildId       : BuildId
   , builtAt       : Timestamp
   , sources       : [SourceSnapshot]
+  , inputRefs     : [ObservationRef | SupplementalRef]
   , inputCount    : int
   , outputCount   : int
   , deterministic : boolean
@@ -305,6 +301,7 @@ major bump 後も旧データで動作継続。新形式は Projection 更新が
 | 5 | lineage manifest は全 build で生成 | build pipeline check |
 | 6 | multi-source spec は reconciliation を必須宣言 | spec validation |
 | 7 | ManagedCache supplemental を academic-pinned で読む場合は version pin 必須 | spec validation |
+| 8 | `lineage_ref` は入力参照を含む取得可能な manifest を指す | API integration test |
 
 ---
 

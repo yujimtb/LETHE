@@ -73,7 +73,10 @@ pub trait SourceAdapter {
     fn fetch_snapshot(&self, target_id: &str) -> FetchResult;
 
     /// Pure mapping: transform raw source data into Observation drafts.
-    fn to_observations(&self, raw: &RawData) -> Vec<ObservationDraft>;
+    ///
+    /// Malformed source data must be surfaced explicitly; adapters must not
+    /// silently drop records or synthesize replacement values.
+    fn to_observations(&self, raw: &RawData) -> Result<Vec<ObservationDraft>, AdapterError>;
 
     /// Generate a heartbeat Observation draft.
     fn heartbeat(&self) -> ObservationDraft;

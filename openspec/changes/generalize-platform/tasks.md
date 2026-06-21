@@ -29,7 +29,7 @@ merge gate となる。要件 ID は `specs/platform-generalization/spec.md`
 
 - [x] 1.1 scope 付き token 認証を API 層に導入(`/health` 除く)
 - [x] 1.2 capability model と scope のマッピングを M08 に追記
-- [x] 1.3 `GET /public/blobs/{sha256}` を署名付き URL 化
+- [x] 1.3 Projection-scoped blob route に認証と filtered-reference check を導入
 - [x] 1.4 `IngestionGate` → `PolicyEngine` 接続 + quarantine surface
 - [x] 1.5 AuditLog を write / export / filtering の必須経路に固定 (ROB-08 一部)
 
@@ -39,8 +39,8 @@ ROB-02「consent のない Observation」)
 
 ## Phase 2 — Adapter Generality & Failure Isolation (GEN-03, ROB-03, ROB-04)
 
-- [x] 2.1 `SourceReader` / `Observer` / `WriteBackAdapter` trait を定義
-- [x] 2.2 Slack / Google Slides / Notion を trait 実装へ移植
+- [x] 2.1 read-side `SourceAdapter` trait を定義
+- [x] 2.2 Slack / Google Slides を trait 実装へ移植
 - [x] 2.3 adapter 宣言メタデータ(credential / rate limit / cursor)を
       Source Contract に拡張
 - [x] 2.4 共通ミドルウェア(retry / backoff / circuit breaker / rate limit)

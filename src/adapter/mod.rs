@@ -19,7 +19,6 @@ pub mod traits;
 pub mod claude;
 pub mod gslides;
 pub mod slack;
-pub mod writeback;
 
 pub use config::*;
 pub use conformance::*;

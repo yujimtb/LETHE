@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = AppService::bootstrap(config)?;
 
     if options.refresh_data {
-        let report = service.sync_without_notion_writeback()?;
+        let report = service.sync_all()?;
         println!(
             "Data sync refreshed: slack_ingested={}, google_ingested={}, slide_analyses={}, duplicates={}",
             report.slack_ingested, report.google_ingested, report.slide_analyses, report.duplicates

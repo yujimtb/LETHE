@@ -36,7 +36,6 @@ client request
 |---|---|---|---|
 | `operational-latest` | 最新の materialized data | source-native-preferred | GUI 表示 |
 | `academic-pinned` | pin 時点のデータで再現可能 | lake-only + pin | 論文引用 |
-| `stale-fallback` | 最新取得失敗時に前回データ返却 | projection-cache | 可用性重視 |
 
 ### 3.1 Read Mode Resolution
 
@@ -49,15 +48,14 @@ def resolve_read_mode(request, projection_spec) -> ReadMode:
     """
 ```
 
-### 3.2 Stale Fallback
+### 3.2 Failure Semantics
 
 operational-latest で最新データ取得に失敗した場合:
 
 ```text
-1. projection cache から前回 build 結果を返却
-2. X-LETHE-Stale: true header 付与
-3. X-LETHE-Built-At: <timestamp> header 付与
-4. background で rebuild enqueue
+1. stale cache や別 source へ暗黙に切り替えない
+2. Projection が利用不能なら 503 を返す
+3. 取得・解析・設定エラーは原因を保持して失敗させる
 ```
 
 ---
@@ -86,9 +84,15 @@ operational-latest で最新データ取得に失敗した場合:
 |---|---|
 | `X-LETHE-Projection-Id` | Projection ID |
 | `X-LETHE-Read-Mode` | 使用された read mode |
-| `X-LETHE-Stale` | stale data かどうか (true/false) |
 | `X-LETHE-Built-At` | 最新 build timestamp |
 | `X-LETHE-Lineage-Ref` | lineage 参照 |
+
+### 4.2 Protected Blob and Lineage Access
+
+- `GET /api/projections/{projection_id}/blobs/{sha256}` は認証と Projection read scope を要求する
+- blob は filter 済み Projection 出力内に参照が存在する場合だけ返す
+- raw CAS を hash だけで公開してはならない
+- `GET /api/projections/{projection_id}/lineage` は response の `lineage_ref` が指す manifest を返す
 
 ---
 
@@ -218,8 +222,9 @@ Response:
 | 1 | Filtering-before-Exposure Law: restricted data は必ず filtering | middleware integration test |
 | 2 | 全レスポンスに projection_metadata 付与 | response schema test |
 | 3 | read mode は projection spec で宣言されたもののみ | validation |
-| 4 | stale fallback 時は X-LETHE-Stale: true | header check |
-| 5 | pagination limit ≤ 100 | validation |
+| 4 | blob は認証済みかつ filter 済み Projection から参照される場合のみ返す | API integration test |
+| 5 | `lineage_ref` は取得可能な manifest を指す | lineage endpoint test |
+| 6 | pagination limit ≤ 100 | validation |
 
 ---
 
@@ -236,7 +241,9 @@ Response:
 | 7 | Projection not built | 503 + retry_after | |
 | 8 | restricted field in person | field masked | |
 | 9 | GET /api/health | status ok | |
-| 10 | Stale fallback triggered | X-LETHE-Stale: true | |
+| 10 | 未認証 blob request | 401 | |
+| 11 | Projection 未参照の raw CAS blob | 404 | |
+| 12 | lineage endpoint | input Observation / Supplemental refs を含む manifest | |
 
 ---
 
@@ -249,6 +256,8 @@ Response:
 - Read mode resolution
 - Response envelope with projection metadata
 - Filtering middleware
+- Projection-scoped blob serving
+- Lineage manifest serving
 - Pagination utilities
 - Health check endpoint
 

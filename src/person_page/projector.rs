@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 
 use crate::domain::{EntityRef, Observation, ObservationId, SchemaRef, SupplementalRecord};
+use crate::governance::types::ConsentStatus;
 use crate::identity::types::{IdentifierType, IdentityResolutionOutput, ResolvedPerson};
 use crate::slide_analysis::types::StudentProfile;
 
@@ -15,6 +16,8 @@ use super::types::*;
 
 /// Person page projector — pure functional core.
 pub struct PersonPageProjector;
+
+pub const CONSENT_DECISION_SCHEMA: &str = "schema:consent-decision";
 
 impl PersonPageProjector {
     /// Build person page output from identity resolution and observations.
@@ -39,6 +42,9 @@ impl PersonPageProjector {
         );
 
         for person in &identity.resolved_persons {
+            if Self::consent_status_for_person(person, observations) == ConsentStatus::OptedOut {
+                continue;
+            }
             let (slides, messages) =
                 Self::collect_related(person, observations, &person_identifiers);
 
@@ -103,6 +109,48 @@ impl PersonPageProjector {
         }
     }
 
+    /// Resolve the latest explicit consent decision for a person.
+    ///
+    /// The default is restricted capture. Decisions can target the resolved
+    /// person directly via `subject`, or one of its source identifiers via the
+    /// payload `identifier` field.
+    pub fn consent_status_for_person(
+        person: &ResolvedPerson,
+        observations: &[Observation],
+    ) -> ConsentStatus {
+        observations
+            .iter()
+            .filter(|observation| observation.schema.as_str() == CONSENT_DECISION_SCHEMA)
+            .filter(|observation| {
+                observation.subject == person.person_id
+                    || observation
+                        .payload
+                        .get("identifier")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|identifier| {
+                            person
+                                .identifiers
+                                .iter()
+                                .any(|candidate| candidate.value == identifier)
+                        })
+            })
+            .max_by(|left, right| {
+                (left.published, left.recorded_at, left.id.as_str()).cmp(&(
+                    right.published,
+                    right.recorded_at,
+                    right.id.as_str(),
+                ))
+            })
+            .and_then(|observation| {
+                observation
+                    .payload
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .and_then(parse_consent_status)
+            .unwrap_or_default()
+    }
+
     fn build_frontend_profile_map(
         observations: &[Observation],
         supplemental_records: &[&SupplementalRecord],
@@ -116,6 +164,11 @@ impl PersonPageProjector {
 
         for record in supplemental_records {
             if record.kind != "slide-analysis" {
+                continue;
+            }
+            if record.consent_metadata.as_ref().is_some_and(|metadata| {
+                metadata.retracted_at.is_some() || metadata.opt_out_effective_at.is_some()
+            }) {
                 continue;
             }
 
@@ -350,29 +403,23 @@ impl PersonPageProjector {
         identifier_map: &HashMap<String, EntityRef>,
     ) -> bool {
         // Check via user_id in payload.
-        if let Some(user_id) = obs.payload.get("user_id").and_then(|v| v.as_str()) {
-            if let Some(pid) = identifier_map.get(user_id) {
-                if *pid == person.person_id {
-                    return true;
-                }
-            }
+        if let Some(user_id) = obs.payload.get("user_id").and_then(|v| v.as_str())
+            && identifier_map.get(user_id) == Some(&person.person_id)
+        {
+            return true;
         }
 
         // Check via email in payload.
-        if let Some(email) = obs.payload.get("email").and_then(|v| v.as_str()) {
-            if let Some(pid) = identifier_map.get(email) {
-                if *pid == person.person_id {
-                    return true;
-                }
-            }
+        if let Some(email) = obs.payload.get("email").and_then(|v| v.as_str())
+            && identifier_map.get(email) == Some(&person.person_id)
+        {
+            return true;
         }
 
-        if let Some(email) = obs.payload.get("person_email").and_then(|v| v.as_str()) {
-            if let Some(pid) = identifier_map.get(email) {
-                if *pid == person.person_id {
-                    return true;
-                }
-            }
+        if let Some(email) = obs.payload.get("person_email").and_then(|v| v.as_str())
+            && identifier_map.get(email) == Some(&person.person_id)
+        {
+            return true;
         }
 
         // Check via editors in GSlides.
@@ -382,12 +429,10 @@ impl PersonPageProjector {
             .and_then(|v| v.as_array())
         {
             for editor in editors {
-                if let Some(email) = editor.as_str() {
-                    if let Some(pid) = identifier_map.get(email) {
-                        if *pid == person.person_id {
-                            return true;
-                        }
-                    }
+                if let Some(email) = editor.as_str()
+                    && identifier_map.get(email) == Some(&person.person_id)
+                {
+                    return true;
                 }
             }
         }
@@ -397,12 +442,9 @@ impl PersonPageProjector {
             .payload
             .pointer("/relations/owner")
             .and_then(|v| v.as_str())
+            && identifier_map.get(owner) == Some(&person.person_id)
         {
-            if let Some(pid) = identifier_map.get(owner) {
-                if *pid == person.person_id {
-                    return true;
-                }
-            }
+            return true;
         }
 
         false
@@ -478,6 +520,15 @@ impl PersonPageProjector {
             recent_messages: messages.to_vec(),
             activity_summary: activity.clone(),
         }
+    }
+}
+
+fn parse_consent_status(value: &str) -> Option<ConsentStatus> {
+    match value {
+        "unrestricted" => Some(ConsentStatus::Unrestricted),
+        "restricted_capture" => Some(ConsentStatus::RestrictedCapture),
+        "opted_out" => Some(ConsentStatus::OptedOut),
+        _ => None,
     }
 }
 

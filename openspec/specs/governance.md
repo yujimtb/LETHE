@@ -266,9 +266,12 @@ evaluateRequest(request, context) =
 
 MVP では以下のみ実装:
 - internal-only access (全ユーザーが Internal ロール)
-- restricted capture flag (boolean)
-- 最小 audit log (write / export イベント)
-- filtering projection の stub
+- `schema:consent-decision` による `unrestricted` / `restricted_capture` / `opted_out` の明示 decision
+- decision 未登録時の既定値は `restricted_capture`
+- 最新 decision が `opted_out` の人物を Person Page Projection から除外
+- 最小 audit log (restricted read / sync イベント)
+- response 前の構造的 field filtering
+- filter 済み Projection が参照する blob のみを配信
 
 MVP で実装しないもの:
 - full role-based access control
