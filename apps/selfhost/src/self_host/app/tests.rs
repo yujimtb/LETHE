@@ -2,16 +2,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
+use lethe_adapter_api::retry::ResilientExecutor;
 use lethe_adapter_api::traits::ObservationDraft;
 use lethe_adapter_gslides::gslides::client::{PresentationNative, SlideNative, SlideRevision};
 use lethe_adapter_slack::slack::client::{SlackMessage, SlackMessageType};
 use lethe_core::domain::supplemental::InputAnchorSet;
 
 use super::{
-    AppCore, AppService, SelfHostError, extract_slide_text_fragments,
-    infer_profile_name_from_fragments, known_thread_roots_from_observations,
-    latest_revision_to_capture, non_empty_state, ranked_self_intro_slide_indices,
-    thread_cursor_key, thread_root_ts,
+    AppCore, AppService, GoogleSourceRuntime, SelfHostError, SlackSourceRuntime,
+    extract_slide_text_fragments, infer_profile_name_from_fragments,
+    known_thread_roots_from_observations, latest_revision_to_capture, namespace_draft,
+    non_empty_state, ranked_self_intro_slide_indices, thread_cursor_key, thread_root_ts,
 };
 use crate::self_host::config::{
     ApiTokenConfig, GoogleConfig, ResourceLimits, SecretString, SelfHostConfig, SlackConfig,
@@ -36,6 +37,40 @@ fn non_empty_state_filters_blank_values() {
     assert_eq!(
         non_empty_state(Some("1234567890.123456".to_string())).as_deref(),
         Some("1234567890.123456")
+    );
+}
+
+#[test]
+fn source_instance_namespace_separates_identical_source_keys() {
+    let draft = ObservationDraft {
+        schema: SchemaRef::new("schema:test"),
+        schema_version: SemVer::new("1.0.0"),
+        observer: ObserverRef::new("obs:test"),
+        source_system: Some(SourceSystemRef::new("sys:test")),
+        authority_model: AuthorityModel::LakeAuthoritative,
+        capture_model: CaptureModel::Event,
+        subject: EntityRef::new("entity:test"),
+        target: None,
+        payload: serde_json::json!({}),
+        attachments: vec![],
+        published: Utc::now(),
+        idempotency_key: IdempotencyKey::new("same-key"),
+        meta: serde_json::json!({
+            "canonical_json": "{}",
+            "source_container": "same-container",
+        }),
+    };
+
+    let first = namespace_draft(draft.clone(), "instance-a");
+    let second = namespace_draft(draft, "instance-b");
+
+    assert_ne!(first.idempotency_key, second.idempotency_key);
+    assert_eq!(
+        first
+            .meta
+            .get("source_container")
+            .and_then(serde_json::Value::as_str),
+        Some("instance-a:same-container")
     );
 }
 
@@ -107,6 +142,7 @@ fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
         bind_addr: "127.0.0.1:0".into(),
         database_path: db,
         blob_dir: blobs,
+        secret_encryption_key: [7; 32],
         poll_interval: std::time::Duration::from_secs(300),
         api_tokens: vec![ApiTokenConfig {
             token: SecretString::new("test-api-token").unwrap(),
@@ -117,22 +153,26 @@ fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
             max_payload_bytes: 1024 * 1024,
             max_sync_items: 10_000,
             max_page_size: 100,
+            max_leaf_observations: 100_000,
+            retention_days: 30,
         },
-        slack: SlackConfig {
-            bot_token: "xoxb-test-token".into(),
-            thread_token: "xoxp-test-thread-token".into(),
+        slack_sources: vec![SlackConfig {
+            id: "slack-test".into(),
+            bot_token: SecretString::new("xoxb-test-token").unwrap(),
+            thread_token: SecretString::new("xoxp-test-thread-token").unwrap(),
             channel_ids: vec!["C01ABC".into()],
-        },
-        google: GoogleConfig {
-            access_token: Some("ya29.test-token".into()),
+        }],
+        google_sources: vec![GoogleConfig {
+            id: "google-test".into(),
+            access_token: Some(SecretString::new("ya29.test-token").unwrap()),
             client_id: None,
             client_secret: None,
             refresh_token: None,
             presentation_ids: vec!["pres123".into()],
-        },
+        }],
         slide_analysis_limit: 10,
         slide_ai: SlideAiConfig {
-            api_key: "test-gemini-key".into(),
+            api_key: SecretString::new("test-gemini-key").unwrap(),
             model: "test-gemini-model".into(),
         },
     }
@@ -335,7 +375,7 @@ fn ingest_draft_duplicate_is_decided_by_persistence_without_cache_append() {
     let root = std::env::temp_dir().join(format!("lethe-self-host-test-{}", uuid::Uuid::now_v7()));
     let db = root.join("lethe.sqlite3");
     let blobs = root.join("blobs");
-    let persistence = SqlitePersistence::open(&db, &blobs).unwrap();
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
     let persisted_observation = Observation {
         id: Observation::new_id(),
         schema: SchemaRef::new("schema:slack-message"),
@@ -359,6 +399,7 @@ fn ingest_draft_duplicate_is_decided_by_persistence_without_cache_append() {
                 "object_id": "channel:C01ABC:ts:dup-ts",
                 "body": "persisted"
             }).to_string(),
+            "source_container": "slack-test:C01ABC",
         }),
     };
     persistence
@@ -368,13 +409,30 @@ fn ingest_draft_duplicate_is_decided_by_persistence_without_cache_append() {
     let config = test_config(db.clone(), blobs.clone());
     let service = AppService {
         core: Arc::new(Mutex::new(AppCore::new(vec![], vec![], vec![]).unwrap())),
-        persistence: Arc::new(Mutex::new(persistence)),
+        persistence: Arc::new(Mutex::new(Box::new(persistence))),
         config: Arc::new(config.clone()),
-        slack_client: HttpSlackClient::new(config.slack.bot_token.clone()).unwrap(),
-        slack_replies_client: HttpSlackClient::new(config.slack.thread_token.clone()).unwrap(),
-        google_client: HttpGoogleSlidesClient::new(&config.google).unwrap(),
-        slide_analyzer: GeminiSlideAnalyzer::new(&config.slide_ai.api_key, &config.slide_ai.model)
+        slack_sources: vec![SlackSourceRuntime {
+            config: config.slack_sources[0].clone(),
+            client: HttpSlackClient::new(config.slack_sources[0].bot_token.expose().to_owned())
+                .unwrap(),
+            replies_client: HttpSlackClient::new(
+                config.slack_sources[0].thread_token.expose().to_owned(),
+            )
             .unwrap(),
+        }],
+        google_sources: vec![GoogleSourceRuntime {
+            config: config.google_sources[0].clone(),
+            client: HttpGoogleSlidesClient::new(&config.google_sources[0]).unwrap(),
+        }],
+        slide_analyzer: GeminiSlideAnalyzer::new(
+            config.slide_ai.api_key.expose(),
+            &config.slide_ai.model,
+        )
+        .unwrap(),
+        resilient_executor: Arc::new(ResilientExecutor::new(
+            3,
+            std::time::Duration::from_secs(60),
+        )),
         audit_log: Arc::new(InMemoryAuditLog::new()),
     };
 
@@ -404,6 +462,7 @@ fn ingest_draft_duplicate_is_decided_by_persistence_without_cache_append() {
                 "object_id": "channel:C01ABC:ts:dup-ts",
                 "body": "persisted"
             }).to_string(),
+            "source_container": "slack-test:C01ABC",
         }),
     };
 
@@ -414,7 +473,7 @@ fn ingest_draft_duplicate_is_decided_by_persistence_without_cache_append() {
         service
             .persistence_lock()
             .unwrap()
-            .load_observations()
+            .observation_page(0, 10)
             .unwrap()
             .len(),
         1

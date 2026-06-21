@@ -1,0 +1,44 @@
+[server]
+bind_addr = "127.0.0.1:8080"
+
+[storage]
+database_path = "./data/lethe.sqlite3"
+blob_dir = "./data/blobs"
+encryption_key_env = "LETHE_STORAGE_ENCRYPTION_KEY"
+
+[runtime]
+poll_seconds = 300
+
+[limits]
+max_blob_bytes = 10485760
+max_payload_bytes = 1048576
+max_sync_items = 10000
+max_page_size = 100
+max_leaf_observations = 100000
+retention_days = 30
+
+[[api_tokens]]
+token_env = "LETHE_API_READ_TOKEN"
+scopes = ["read:persons", "read:timeline"]
+
+[[api_tokens]]
+token_env = "LETHE_API_SYNC_TOKEN"
+scopes = ["admin:sync", "admin:health"]
+
+[sources]
+
+[[sources.slack]]
+id = "slack-primary"
+bot_token_env = "LETHE_SLACK_PRIMARY_BOT_TOKEN"
+thread_token_env = "LETHE_SLACK_PRIMARY_THREAD_TOKEN"
+channel_ids = ["C01234567", "C08999999"]
+
+[[sources.google_slides]]
+id = "gslides-primary"
+access_token_env = "LETHE_GOOGLE_PRIMARY_ACCESS_TOKEN"
+presentation_ids = ["replace-with-presentation-id"]
+
+[derivation]
+gemini_api_key_env = "LETHE_GEMINI_API_KEY"
+gemini_model = "gemini-3-flash-preview"
+slide_analysis_limit = 10

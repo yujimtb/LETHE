@@ -82,7 +82,7 @@ api ── core, engine
 projection-person ── core, policy, engine, profile-model
 adapter-* ── core, adapter-api, profile-model（必要なもののみ）
 derivation-gemini ── core, engine, adapter-api, profile-model
-storage-sqlite ── core, runtime
+storage-sqlite ── core, runtime, storage-api
 selfhost ── 上記の配線
 tools ── selfhost
 ```

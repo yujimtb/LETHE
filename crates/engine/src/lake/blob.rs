@@ -6,22 +6,10 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 use lethe_core::domain::BlobRef;
-use lethe_storage_api::BlobStorePort;
-
 /// A simple content-addressable store for binary attachments.
 #[derive(Debug, Default)]
 pub struct BlobStore {
     blobs: HashMap<String, Vec<u8>>,
-}
-
-impl BlobStorePort for BlobStore {
-    fn put_blob(&mut self, data: &[u8]) -> BlobRef {
-        self.put(data)
-    }
-
-    fn get_blob(&self, blob_ref: &BlobRef) -> Option<&[u8]> {
-        self.get(blob_ref)
-    }
 }
 
 impl BlobStore {
@@ -88,11 +76,5 @@ mod tests {
         let store = BlobStore::new();
         let missing = BlobRef::new("blob:sha256:0000000000000000");
         assert!(store.get(&missing).is_none());
-    }
-
-    #[test]
-    fn blob_store_port_conformance() {
-        let mut store = BlobStore::new();
-        lethe_storage_api::conformance::blob_store_round_trip(&mut store);
     }
 }

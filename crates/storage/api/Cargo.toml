@@ -4,5 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+chrono.workspace = true
 lethe-core = { path = "../../core" }
 serde_json.workspace = true
+thiserror.workspace = true

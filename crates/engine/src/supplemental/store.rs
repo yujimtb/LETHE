@@ -11,8 +11,6 @@ use lethe_core::domain::supplemental::ConsentMetadata;
 use lethe_core::domain::{
     DomainError, Mutability, ObservationId, SupplementalId, SupplementalRecord,
 };
-use lethe_storage_api::SupplementalStorePort;
-
 /// Versioned snapshot of a supplemental record (for ManagedCache history).
 #[derive(Debug, Clone)]
 pub struct VersionedRecord {
@@ -236,15 +234,6 @@ impl SupplementalStore {
 
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
-    }
-}
-
-impl SupplementalStorePort for SupplementalStore {
-    fn supplemental_records(&self) -> Vec<&SupplementalRecord> {
-        self.records
-            .values()
-            .map(|versioned| &versioned.record)
-            .collect()
     }
 }
 

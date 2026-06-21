@@ -266,7 +266,7 @@ pub(super) fn slide_image_candidate_from_element(
     let rotation_degrees = image
         .get("imageProperties")
         .and_then(|value| value.get("cropProperties"))
-        .and_then(|_| Some(0))
+        .map(|_| 0)
         .unwrap_or(0);
 
     Some(SlideImageCandidate {

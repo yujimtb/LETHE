@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
 use crate::attribute_inventory::{AttributeInventoryDocument, build_inventory_documents};
-use crate::self_host::config::SelfHostConfig;
+use crate::self_host::config::{GoogleConfig, SelfHostConfig, SlackConfig};
 use crate::self_host::google::HttpGoogleSlidesClient;
 use crate::self_host::registry::{seed_projection_catalog, seed_registry};
 use crate::self_host::slack::HttpSlackClient;
@@ -14,13 +14,14 @@ use lethe_adapter_api::config::{
     AdapterConfig, BackoffStrategy, RateLimitConfig, RetryConfig, SchemaBinding,
 };
 use lethe_adapter_api::error::AdapterError;
+use lethe_adapter_api::retry::ResilientExecutor;
 use lethe_adapter_api::traits::{ObservationDraft, SourceAdapter};
 use lethe_adapter_gslides::gslides::client::GoogleSlidesClient;
 use lethe_adapter_gslides::gslides::mapper::GoogleSlidesAdapter;
 use lethe_adapter_slack::slack::client::SlackClient;
 use lethe_adapter_slack::slack::mapper::SlackAdapter;
 use lethe_api::api::envelope::{ProjectionMetadata, ResponseEnvelope};
-use lethe_api::api::health::HealthResponse;
+use lethe_api::api::health::{DependencyHealthInfo, HealthResponse, LastSyncHealth, SyncMetrics};
 use lethe_api::api::pagination::{PaginatedResponse, PaginationParams, paginate};
 use lethe_api::api::read_mode::{ReadModeError, ReadModeResolver};
 use lethe_core::domain::{
@@ -49,9 +50,8 @@ use lethe_projection_person::person_page::projector::PersonPageProjector;
 use lethe_projection_person::person_page::types::{
     PersonDetailResponse, PersonListItem, PersonPageOutput, TimelineEvent,
 };
-use lethe_storage_sqlite::persistence::{
-    DurableAppendOutcome, PersistenceError, SqlitePersistence,
-};
+use lethe_storage_api::{AppendOutcome as DurableAppendOutcome, StorageError, StoragePorts};
+use lethe_storage_sqlite::persistence::{PersistenceError, SqlitePersistence};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SelfHostError {
@@ -59,6 +59,8 @@ pub enum SelfHostError {
     Config(#[from] crate::self_host::config::ConfigError),
     #[error(transparent)]
     Persistence(#[from] PersistenceError),
+    #[error(transparent)]
+    Storage(#[from] StorageError),
     #[error(transparent)]
     Adapter(#[from] AdapterError),
     #[error("read mode error: {0}")]
@@ -104,7 +106,7 @@ struct SlideImageCandidate {
     rotation_degrees: i32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProjectionSnapshot {
     pub identity: IdentityResolutionOutput,
     pub person_page: PersonPageOutput,
@@ -137,9 +139,11 @@ pub struct AppCore {
     pub snapshot: ProjectionSnapshot,
     pub last_sync_at: Option<DateTime<Utc>>,
     pub last_sync_error: Option<String>,
+    pub sync_metrics: SyncMetrics,
 }
 
 impl AppCore {
+    #[cfg(test)]
     fn new(
         observations: Vec<Observation>,
         persisted_blobs: Vec<Vec<u8>>,
@@ -177,6 +181,7 @@ impl AppCore {
             snapshot: ProjectionSnapshot::default(),
             last_sync_at: None,
             last_sync_error: None,
+            sync_metrics: SyncMetrics::default(),
         };
         core.rebuild_snapshot();
         Ok(core)
@@ -215,6 +220,29 @@ impl AppCore {
             &ProjectionRef::new("proj:person-page"),
             ProjectionStatus::Active,
         );
+    }
+
+    fn empty_with_snapshot(snapshot: Option<ProjectionSnapshot>) -> Self {
+        let mut core = Self {
+            registry: seed_registry(),
+            catalog: seed_projection_catalog(),
+            lake: LakeStore::new(),
+            blobs: BlobStore::new(),
+            supplemental: SupplementalStore::new(),
+            snapshot: snapshot.unwrap_or_default(),
+            last_sync_at: None,
+            last_sync_error: None,
+            sync_metrics: SyncMetrics::default(),
+        };
+        core.catalog.set_status(
+            &ProjectionRef::new("proj:identity-resolution"),
+            ProjectionStatus::Active,
+        );
+        core.catalog.set_status(
+            &ProjectionRef::new("proj:person-page"),
+            ProjectionStatus::Active,
+        );
+        core
     }
 
     fn prepare_observation(
@@ -265,39 +293,136 @@ impl AppCore {
 #[derive(Clone)]
 pub struct AppService {
     core: Arc<Mutex<AppCore>>,
-    persistence: Arc<Mutex<SqlitePersistence>>,
+    persistence: Arc<Mutex<Box<dyn StoragePorts>>>,
     config: Arc<SelfHostConfig>,
-    slack_client: HttpSlackClient,
-    slack_replies_client: HttpSlackClient,
-    google_client: HttpGoogleSlidesClient,
+    slack_sources: Vec<SlackSourceRuntime>,
+    google_sources: Vec<GoogleSourceRuntime>,
     slide_analyzer: GeminiSlideAnalyzer,
+    resilient_executor: Arc<ResilientExecutor>,
     audit_log: Arc<InMemoryAuditLog>,
+}
+
+impl ProjectionSnapshot {
+    pub fn build(
+        observations: Vec<Observation>,
+        persisted_supplementals: Vec<lethe_core::domain::SupplementalRecord>,
+    ) -> Result<Self, SelfHostError> {
+        let mut lake = LakeStore::new();
+        for observation in observations {
+            lake.append(observation).map_err(|existing_id| {
+                SelfHostError::Ingestion(format!(
+                    "duplicate persisted observation detected during projection build: {existing_id}"
+                ))
+            })?;
+        }
+        let mut supplemental = SupplementalStore::new();
+        for record in persisted_supplementals {
+            supplemental.upsert(record, &lake).map_err(|error| {
+                SelfHostError::Ingestion(format!(
+                    "invalid persisted supplemental during projection build: {error}"
+                ))
+            })?;
+        }
+        let identity = IdentityProjector::new("1.0.0")
+            .project(lake.list())
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        let supplemental_records = supplemental.by_kind("slide-analysis");
+        let person_page =
+            PersonPageProjector::project(&identity, lake.list(), &supplemental_records);
+        let built_at = Utc::now();
+        let lineage = build_person_page_lineage(
+            lake.list(),
+            &supplemental_records,
+            person_page.profiles.len()
+                + person_page.slides.len()
+                + person_page.messages.len()
+                + person_page.activities.len(),
+            built_at,
+        );
+        Ok(Self {
+            identity,
+            person_page,
+            built_at,
+            lineage,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct SlackSourceRuntime {
+    config: SlackConfig,
+    client: HttpSlackClient,
+    replies_client: HttpSlackClient,
+}
+
+#[derive(Clone)]
+struct GoogleSourceRuntime {
+    config: GoogleConfig,
+    client: HttpGoogleSlidesClient,
 }
 
 impl AppService {
     pub fn bootstrap(config: SelfHostConfig) -> Result<Self, SelfHostError> {
-        let persistence = SqlitePersistence::open(&config.database_path, &config.blob_dir)?;
-        let observations = persistence.load_observations()?;
-        let blobs = persistence.load_blobs()?;
-        let supplementals = persistence.load_supplementals()?;
-        let slack_client = HttpSlackClient::new(config.slack.bot_token.clone())?;
-        let slack_replies_client = HttpSlackClient::new(config.slack.thread_token.clone())?;
-        let google_client = HttpGoogleSlidesClient::new(&config.google)?;
+        let persistence = SqlitePersistence::open(
+            &config.database_path,
+            &config.blob_dir,
+            &config.secret_encryption_key,
+        )?;
+        let persisted_snapshot = lethe_storage_api::ProjectionMaterializer::projection_records(
+            &persistence,
+            &ProjectionRef::new("proj:person-page"),
+        )?
+        .map(serde_json::from_value)
+        .transpose()?;
+        if persisted_snapshot.is_none()
+            && lethe_storage_api::ObservationStore::leaf_positions(&persistence)?
+                .iter()
+                .any(|position| position.append_seq > 0)
+        {
+            return Err(SelfHostError::Storage(StorageError::Invariant(
+                "observations exist but proj:person-page materialization is missing; run an explicit rebuild"
+                    .to_owned(),
+            )));
+        }
+        let slack_sources = config
+            .slack_sources
+            .iter()
+            .cloned()
+            .map(|source| {
+                Ok(SlackSourceRuntime {
+                    client: HttpSlackClient::new(source.bot_token.expose().to_owned())?,
+                    replies_client: HttpSlackClient::new(source.thread_token.expose().to_owned())?,
+                    config: source,
+                })
+            })
+            .collect::<Result<Vec<_>, AdapterError>>()?;
+        let google_sources = config
+            .google_sources
+            .iter()
+            .cloned()
+            .map(|source| {
+                Ok(GoogleSourceRuntime {
+                    client: HttpGoogleSlidesClient::new(&source)?,
+                    config: source,
+                })
+            })
+            .collect::<Result<Vec<_>, AdapterError>>()?;
         let slide_analyzer =
-            GeminiSlideAnalyzer::new(&config.slide_ai.api_key, &config.slide_ai.model)?;
+            GeminiSlideAnalyzer::new(config.slide_ai.api_key.expose(), &config.slide_ai.model)?;
 
         Ok(Self {
-            core: Arc::new(Mutex::new(AppCore::new(
-                observations,
-                blobs,
-                supplementals,
-            )?)),
-            persistence: Arc::new(Mutex::new(persistence)),
+            core: Arc::new(Mutex::new(AppCore::empty_with_snapshot(persisted_snapshot))),
+            persistence: Arc::new(Mutex::new(Box::new(persistence))),
             config: Arc::new(config),
-            slack_client,
-            slack_replies_client,
-            google_client,
+            slack_sources,
+            google_sources,
             slide_analyzer,
+            resilient_executor: Arc::new(ResilientExecutor::new(
+                3,
+                std::time::Duration::from_secs(60),
+            )),
             audit_log: Arc::new(InMemoryAuditLog::new()),
         })
     }
@@ -310,9 +435,9 @@ impl AppService {
                 let cloned = service.clone();
                 let result = tokio::task::spawn_blocking(move || cloned.sync_all()).await;
                 if let Err(err) = result {
-                    eprintln!("poll task join error: {err}");
+                    tracing::error!(error = %err, "poll task join failed");
                 } else if let Ok(Err(err)) = result {
-                    eprintln!("poll sync error: {err}");
+                    tracing::error!(error = %err, "poll sync failed");
                 }
                 tokio::time::sleep(interval).await;
             }
@@ -383,13 +508,29 @@ impl AppService {
     }
 
     fn emit_audit(&self, actor: &str, kind: AuditEventKind, detail: serde_json::Value) {
-        self.audit_log.emit(AuditEvent {
+        let event = AuditEvent {
             id: format!("audit:{}", uuid::Uuid::now_v7()),
             timestamp: Utc::now(),
             actor: ActorRef::new(actor),
             kind,
             detail,
-        });
+        };
+        match serde_json::to_string(&event) {
+            Ok(json) => {
+                if let Ok(store) = self.persistence.lock()
+                    && let Err(error) = store.record_audit_event(
+                        &event.id,
+                        &event.timestamp.to_rfc3339(),
+                        event.actor.as_str(),
+                        &json,
+                    )
+                {
+                    tracing::error!(error = %error, "failed to persist audit event");
+                }
+            }
+            Err(error) => tracing::error!(error = %error, "failed to serialize audit event"),
+        }
+        self.audit_log.emit(event);
     }
 
     pub fn attribute_inventory_documents(
@@ -408,6 +549,8 @@ mod sync;
 mod sync_support;
 
 use media_support::*;
+#[cfg(test)]
+use service_support::namespace_draft;
 use service_support::{build_person_page_lineage, consent_status_for_person_id};
 use slide_support::*;
 use sync_support::*;

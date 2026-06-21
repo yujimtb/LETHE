@@ -4,10 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+aes-gcm.workspace = true
 chrono.workspace = true
 hex.workspace = true
 lethe-core = { path = "../../core" }
 lethe-runtime = { path = "../../runtime" }
+lethe-storage-api = { path = "../api" }
 rusqlite.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

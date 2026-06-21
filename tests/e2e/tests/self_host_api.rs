@@ -7,7 +7,7 @@ use lethe_core::domain::{
     ActorRef, AuthorityModel, CaptureModel, EntityRef, IdempotencyKey, Mutability, Observation,
     ObserverRef, SchemaRef, SemVer, SourceSystemRef, SupplementalId, SupplementalRecord,
 };
-use lethe_selfhost::self_host::app::AppService;
+use lethe_selfhost::self_host::app::{AppService, ProjectionSnapshot};
 use lethe_selfhost::self_host::config::{
     ApiTokenConfig, GoogleConfig, ResourceLimits, SecretString, SelfHostConfig, SlackConfig,
     SlideAiConfig,
@@ -62,6 +62,7 @@ fn slack_observation(
                 "object_id": key,
                 "body": text,
             }).to_string(),
+            "source_container": format!("slack-test:{channel}"),
         }),
     }
 }
@@ -99,15 +100,32 @@ fn gslides_observation(editors: &[&str], owner: &str, title: &str, key: &str) ->
                 "object_id": key,
                 "title": title,
             }).to_string(),
+            "source_container": "google-test",
         }),
     }
 }
 
 fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
+    if db.exists() {
+        let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+        let observations = persistence.load_observations().unwrap();
+        if !observations.is_empty() {
+            let snapshot =
+                ProjectionSnapshot::build(observations, persistence.load_supplementals().unwrap())
+                    .unwrap();
+            persistence
+                .materialize_projection(
+                    &lethe_core::domain::ProjectionRef::new("proj:person-page"),
+                    &serde_json::to_value(snapshot).unwrap(),
+                )
+                .unwrap();
+        }
+    }
     SelfHostConfig {
         bind_addr: "127.0.0.1:0".into(),
         database_path: db,
         blob_dir: blobs,
+        secret_encryption_key: [7; 32],
         poll_interval: std::time::Duration::from_secs(300),
         api_tokens: vec![ApiTokenConfig {
             token: SecretString::new("test-api-token").unwrap(),
@@ -118,22 +136,26 @@ fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
             max_payload_bytes: 1024 * 1024,
             max_sync_items: 10_000,
             max_page_size: 100,
+            max_leaf_observations: 100_000,
+            retention_days: 30,
         },
-        slack: SlackConfig {
-            bot_token: "xoxb-test-token".into(),
-            thread_token: "xoxp-test-thread-token".into(),
+        slack_sources: vec![SlackConfig {
+            id: "slack-test".into(),
+            bot_token: SecretString::new("xoxb-test-token").unwrap(),
+            thread_token: SecretString::new("xoxp-test-thread-token").unwrap(),
             channel_ids: vec!["C01ABC".into()],
-        },
-        google: GoogleConfig {
-            access_token: Some("ya29.test-token".into()),
+        }],
+        google_sources: vec![GoogleConfig {
+            id: "google-test".into(),
+            access_token: Some(SecretString::new("ya29.test-token").unwrap()),
             client_id: None,
             client_secret: None,
             refresh_token: None,
             presentation_ids: vec!["pres123".into()],
-        },
+        }],
         slide_analysis_limit: 10,
         slide_ai: SlideAiConfig {
-            api_key: "test-gemini-key".into(),
+            api_key: SecretString::new("test-gemini-key").unwrap(),
             model: "test-gemini-model".into(),
         },
     }
@@ -142,7 +164,7 @@ fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
 #[test]
 fn self_host_persons_endpoint_returns_projection_data() {
     let (root, db, blobs) = temp_paths();
-    let persistence = SqlitePersistence::open(&db, &blobs).unwrap();
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
     persistence
         .persist_observation(&slack_observation(
             "U100",
@@ -223,7 +245,7 @@ fn self_host_persons_endpoint_returns_projection_data() {
 #[test]
 fn opted_out_person_is_excluded_by_filtering_projection() {
     let (root, db, blobs) = temp_paths();
-    let persistence = SqlitePersistence::open(&db, &blobs).unwrap();
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
     persistence
         .persist_observation(&slack_observation(
             "U200",
@@ -268,7 +290,8 @@ fn opted_out_person_is_excluded_by_filtering_projection() {
                 "canonical_json": serde_json::json!({
                     "identifier": "optout@example.jp",
                     "status": "opted_out"
-                }).to_string()
+                }).to_string(),
+                "source_container": "governance"
             }),
         })
         .unwrap();
@@ -301,7 +324,7 @@ fn opted_out_person_is_excluded_by_filtering_projection() {
 #[test]
 fn projection_blob_endpoint_requires_auth_and_rejects_raw_cas_access() {
     let (root, db, blobs) = temp_paths();
-    let persistence = SqlitePersistence::open(&db, &blobs).unwrap();
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
     let blob_ref = persistence.persist_blob(b"png-bytes").unwrap();
     let unreferenced_blob_ref = persistence.persist_blob(b"private-bytes").unwrap();
     let slack = slack_observation(
@@ -434,7 +457,7 @@ fn projection_blob_endpoint_requires_auth_and_rejects_raw_cas_access() {
 #[test]
 fn self_host_person_detail_hides_restricted_identities() {
     let (root, db, blobs) = temp_paths();
-    let persistence = SqlitePersistence::open(&db, &blobs).unwrap();
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
     persistence
         .persist_observation(&slack_observation(
             "U100",

@@ -38,6 +38,10 @@ workspace root は virtual manifest です。Rust 実装を持つルート `src/
 - identity resolution と Person Page Projection
 - scope 付き Bearer token、consent、Filtering-before-Exposure
 - Projection lineage と、Projection が参照する blob の限定配信
+- storage Effect Ports と per-leaf SQLite authoritative store
+- 容量駆動 split、永続 per-leaf watermark、blue/green keyspec migration
+- retry / rate limit / circuit breaker、dead-letter、部分成功 sync
+- structured multi-source config、structured tracing、metrics、deep health
 
 M07 Write-Back は Post-MVP の仕様のみ存在し、write router や
 source-native write adapter は実装していません。
@@ -76,8 +80,11 @@ python ./scripts/check_markdown_links.py
   `client_id` / `client_secret` / `refresh_token`
 - Gemini API key
 
-`.env.example` を基に、credential、source ID、runtime path、resource limit を
-すべて明示して起動します。
+`config.example.toml` をコピーして構造化設定を作成し、`.env.example` に列挙した
+環境変数をプロセス環境へ設定します。アプリケーションが読む設定入口は
+`LETHE_CONFIG_PATH` のみです。TOML には secret 値を書かず、`*_env` で環境変数名を
+参照します。Slack / Google Slides source は配列で複数 instance を定義でき、
+instance ごとに独立 cursor と failure isolation を持ちます。
 
 ```powershell
 cargo run -p lethe-selfhost
@@ -89,7 +96,7 @@ cargo run -p lethe-selfhost
 主な endpoint:
 
 - `GET /health`
-- `GET /health/deep`
+- `GET /health/deep` (`admin:health`)
 - `POST /admin/sync` (`admin:sync`)
 - `GET /api/projections/{projection_id}/records` (`read:persons`)
 - `GET /api/projections/{projection_id}/records/{record_id}`
@@ -110,6 +117,12 @@ cargo run -p lethe-selfhost
 ## Runtime guarantees
 
 - SQLite の UNIQUE 制約を ingest の正規重複判定に使用します。
+- SQLite は per-leaf authoritative store で、起動時に Lake 全体を RAM 展開しません。
+- Projection materialization、per-leaf watermark、dead-letter、audit、metrics は
+  SQLite に永続化します。
+- secret を永続化する場合は AES-256-GCM で暗号化します。
+- blob / payload / sync item / page / leaf capacity 上限を超えた処理は明示的に拒否し、
+  retention と orphan blob GC を sync 後に適用します。
 - consent decision がない人物は `restricted_capture` として扱い、最新 decision が
   `opted_out` の人物は Projection から除外します。
 - blob は filter 済み Person Page が参照するものだけを認証付きで返します。

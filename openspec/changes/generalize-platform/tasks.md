@@ -17,9 +17,9 @@ merge gate となる。要件 ID は `specs/platform-generalization/spec.md`
       `lethe-storage-api`, `lethe-storage-sqlite`, `lethe-adapter-*`,
       `lethe-runtime`, `lethe-selfhost`, `lethe-projection-person`)
 - [x] 0.2 CI に依存方向検査(`cargo deny` / custom check)を追加
-- [ ] 0.3 `ObservationStore` / `BlobStore` / `SupplementalStore` /
+- [x] 0.3 `ObservationStore` / `BlobStore` / `SupplementalStore` /
       `ProjectionMaterializer` trait を定義し、既存 SQLite 実装を移植
-- [ ] 0.4 storage conformance test suite を作成し SQLite 実装で通過
+- [x] 0.4 storage conformance test suite を作成し SQLite 実装で通過
 - [x] 0.5 blob 参照を sha256 content-addressing 契約として固定
 
 **Gate P0:** 全 crate ビルド + 既存 `cargo test` 通過 + conformance 通過
@@ -31,7 +31,7 @@ merge gate となる。要件 ID は `specs/platform-generalization/spec.md`
 - [x] 1.2 capability model と scope のマッピングを M08 に追記
 - [x] 1.3 Projection-scoped blob route に認証と filtered-reference check を導入
 - [x] 1.4 `IngestionGate` → `PolicyEngine` 接続 + quarantine surface
-- [ ] 1.5 AuditLog を write / export / filtering の必須経路に固定 (ROB-08 一部)
+- [x] 1.5 AuditLog を write / export / filtering の必須経路に固定 (ROB-08 一部)
 
 **Gate P1:** 未認証アクセス拒否・quarantine の Scenario テスト通過
 (ROB-01「未認証アクセスの拒否」「blob 期限付きアクセス」/
@@ -43,8 +43,8 @@ ROB-02「consent のない Observation」)
 - [x] 2.2 Slack / Google Slides を trait 実装へ移植
 - [x] 2.3 adapter 宣言メタデータ(credential / rate limit / cursor)を
       Source Contract に拡張
-- [ ] 2.4 共通ミドルウェア(retry / backoff / circuit breaker / rate limit)
-- [ ] 2.5 dead-letter queue + 部分成功レポート
+- [x] 2.4 共通ミドルウェア(retry / backoff / circuit breaker / rate limit)
+- [x] 2.5 dead-letter queue + 部分成功レポート
 - [x] 2.6 cursor 永続化と中断再開の統合テスト
 - [x] 2.7 idempotencyKey の冪等スキップ / 矛盾 quarantine 二分 +
       property test
@@ -65,7 +65,7 @@ ROB-04「1 件失敗の隔離」「中断からの再開」)
 - [x] 3.5 `DerivationProvider` trait 化(Gemini を一実装へ)+
       出力スキーマ検証
 - [x] 3.6 identity claim の複数種別対応と戦略の Registry 構成化
-- [ ] 3.7 構造化 config(複数 source インスタンス、secret 参照分離)
+- [x] 3.7 構造化 config(複数 source インスタンス、secret 参照分離)
 
 **Gate P3:** person crate 除外ビルドが成功(GEN-01「寮ドメインを含まない
 ビルド」「型非依存 API ルート」/ GEN-05 / GEN-06 / GEN-07 / GEN-08 の
@@ -74,12 +74,12 @@ ROB-04「1 件失敗の隔離」「中断からの再開」)
 ## Phase 4 — Operational Quality (ROB-05〜ROB-09)
 
 - [x] 4.1 原子性単位の明文化 + orphan blob GC
-- [ ] 4.2 ストリーミング bootstrap + API ページネーション必須化
+- [x] 4.2 ストリーミング bootstrap + API ページネーション必須化
 - [x] 4.3 versioned migration 基盤 + golden replay test を CI へ
-- [ ] 4.4 tracing / metrics / deep health check
-- [ ] 4.5 secret 型ラップ + redaction テスト + 保存時暗号化
+- [x] 4.4 tracing / metrics / deep health check
+- [x] 4.5 secret 型ラップ + redaction テスト + 保存時暗号化
 - [x] 4.6 公開監査スクリプトのクロスプラットフォーム化(CI 組込み)
-- [ ] 4.7 リソース上限(blob / payload / sync / page size)+ retention 接続
+- [x] 4.7 リソース上限(blob / payload / sync / page size)+ retention 接続
 
 **Gate P4:** 全 Scenario テスト通過、`_index.md` 更新、change を archive
 (ROB-05〜ROB-09 の各 Scenario 通過)

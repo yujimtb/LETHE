@@ -1,144 +1,275 @@
+use super::service_support::namespace_draft;
 use super::*;
 
 impl AppService {
     pub fn sync_all(&self) -> Result<SyncReport, SelfHostError> {
+        let started_at = std::time::Instant::now();
         let mut slack_ingested = 0usize;
         let mut google_ingested = 0usize;
         let mut duplicates = 0usize;
+        let mut quarantined = 0usize;
+        let mut fetched = 0usize;
+        let mut dead_letters = Vec::new();
 
-        let slack_adapter =
-            SlackAdapter::new(self.slack_client.clone(), self.slack_adapter_config());
-        for channel_id in &self.config.slack.channel_ids {
-            let cursor_key = format!("slack:{channel_id}:oldest_ts");
-            let oldest = non_empty_state(self.persistence_lock()?.get_state(&cursor_key)?);
-            let mut page_cursor: Option<String> = None;
-            let mut latest_ts = oldest.clone();
-            let mut thread_roots = self.known_thread_roots(channel_id)?;
-
-            loop {
-                let page = self.slack_client.conversations_history(
-                    channel_id,
-                    oldest.as_deref(),
-                    page_cursor.as_deref(),
-                    200,
-                )?;
-                for message in page.messages {
-                    if let Some(thread_root) = thread_root_ts(&message) {
-                        thread_roots.insert(thread_root.to_string());
-                    }
-                    match self.ingest_slack_message(
-                        &slack_adapter,
-                        &self.slack_client,
-                        channel_id,
-                        message,
-                        &mut latest_ts,
-                    )? {
-                        IngestResult::Ingested { .. } => slack_ingested += 1,
-                        IngestResult::Duplicate { .. } => duplicates += 1,
-                        _ => {}
-                    }
+        let slack_policy = self.slack_adapter_config();
+        for source in &self.slack_sources {
+            let slack_adapter = SlackAdapter::new(source.client.clone(), slack_policy.clone());
+            for channel_id in &source.config.channel_ids {
+                if fetched >= self.config.resource_limits.max_sync_items {
+                    break;
                 }
-                if page.has_more {
+                let cursor_key = format!("{}:slack:{channel_id}:oldest_ts", source.config.id);
+                let oldest = non_empty_state(self.persistence_lock()?.get_state(&cursor_key)?);
+                let mut page_cursor: Option<String> = None;
+                let mut latest_ts = oldest.clone();
+                let mut thread_roots = self.known_thread_roots(channel_id)?;
+
+                loop {
+                    let circuit = format!("slack:{}:{channel_id}", source.config.id);
+                    let page = match self.resilient_executor.execute(
+                        &circuit,
+                        &slack_policy.retry,
+                        &slack_policy.rate_limit,
+                        || {
+                            source.client.conversations_history(
+                                channel_id,
+                                oldest.as_deref(),
+                                page_cursor.as_deref(),
+                                200,
+                            )
+                        },
+                    ) {
+                        Ok(page) => page,
+                        Err(error) => {
+                            dead_letters.push(DeadLetter {
+                                source: source.config.id.clone(),
+                                reason: error.to_string(),
+                            });
+                            break;
+                        }
+                    };
+                    for message in page.messages {
+                        if fetched >= self.config.resource_limits.max_sync_items {
+                            break;
+                        }
+                        fetched += 1;
+                        if let Some(thread_root) = thread_root_ts(&message) {
+                            thread_roots.insert(thread_root.to_string());
+                        }
+                        match self.ingest_slack_message(
+                            &slack_adapter,
+                            &source.client,
+                            &source.config.id,
+                            channel_id,
+                            message,
+                            &mut latest_ts,
+                        ) {
+                            Ok(IngestResult::Ingested { .. }) => slack_ingested += 1,
+                            Ok(IngestResult::Duplicate { .. }) => duplicates += 1,
+                            Ok(IngestResult::Quarantined { .. }) => quarantined += 1,
+                            Ok(_) => {}
+                            Err(error) => dead_letters.push(DeadLetter {
+                                source: source.config.id.clone(),
+                                reason: error.to_string(),
+                            }),
+                        }
+                    }
+                    if fetched >= self.config.resource_limits.max_sync_items || !page.has_more {
+                        break;
+                    }
                     page_cursor = page.next_cursor;
-                } else {
-                    break;
+                }
+
+                for thread_ts in thread_roots {
+                    if fetched >= self.config.resource_limits.max_sync_items {
+                        break;
+                    }
+                    match self.sync_thread_replies(&slack_adapter, source, channel_id, &thread_ts) {
+                        Ok((ingested, dupes)) => {
+                            slack_ingested += ingested;
+                            duplicates += dupes;
+                        }
+                        Err(error) => dead_letters.push(DeadLetter {
+                            source: source.config.id.clone(),
+                            reason: error.to_string(),
+                        }),
+                    }
+                }
+
+                match self.resilient_executor.execute(
+                    &format!("slack:{}:{channel_id}", source.config.id),
+                    &slack_policy.retry,
+                    &slack_policy.rate_limit,
+                    || source.client.conversations_info(channel_id),
+                ) {
+                    Ok(channel_snapshot) => match self.ingest_draft(namespace_draft(
+                        slack_adapter.map_channel_snapshot(&channel_snapshot),
+                        &source.config.id,
+                    )) {
+                        Ok(IngestResult::Ingested { .. }) => slack_ingested += 1,
+                        Ok(IngestResult::Duplicate { .. }) => duplicates += 1,
+                        Ok(IngestResult::Quarantined { .. }) => quarantined += 1,
+                        Ok(_) => {}
+                        Err(error) => dead_letters.push(DeadLetter {
+                            source: source.config.id.clone(),
+                            reason: error.to_string(),
+                        }),
+                    },
+                    Err(error) => dead_letters.push(DeadLetter {
+                        source: source.config.id.clone(),
+                        reason: error.to_string(),
+                    }),
+                }
+
+                if let Some(latest_ts) = latest_ts.as_deref() {
+                    self.persistence_lock()?.set_state(&cursor_key, latest_ts)?;
                 }
             }
 
-            for thread_ts in thread_roots {
-                let (ingested, dupes) =
-                    self.sync_thread_replies(&slack_adapter, channel_id, &thread_ts)?;
-                slack_ingested += ingested;
-                duplicates += dupes;
-            }
-
-            let channel_snapshot = self.slack_client.conversations_info(channel_id)?;
-            match self.ingest_draft(slack_adapter.map_channel_snapshot(&channel_snapshot))? {
-                IngestResult::Ingested { .. } => slack_ingested += 1,
-                IngestResult::Duplicate { .. } => duplicates += 1,
-                _ => {}
-            }
-
-            if let Some(latest_ts) = latest_ts.as_deref() {
-                self.persistence_lock()?.set_state(&cursor_key, latest_ts)?;
+            match self.ingest_draft(namespace_draft(
+                slack_adapter.heartbeat(),
+                &source.config.id,
+            )) {
+                Ok(IngestResult::Ingested { .. }) => slack_ingested += 1,
+                Ok(IngestResult::Duplicate { .. }) => duplicates += 1,
+                Ok(IngestResult::Quarantined { .. }) => quarantined += 1,
+                Ok(_) => {}
+                Err(error) => dead_letters.push(DeadLetter {
+                    source: source.config.id.clone(),
+                    reason: error.to_string(),
+                }),
             }
         }
 
-        match self.ingest_draft(slack_adapter.heartbeat())? {
-            IngestResult::Ingested { .. } => slack_ingested += 1,
-            IngestResult::Duplicate { .. } => duplicates += 1,
-            _ => {}
-        }
-
-        let google_adapter =
-            GoogleSlidesAdapter::new(self.google_client.clone(), self.google_adapter_config());
-        for presentation_id in &self.config.google.presentation_ids {
-            let cursor_key = format!("gslides:{presentation_id}:revision");
-            let last_revision = self.persistence_lock()?.get_state(&cursor_key)?;
-
-            let mut page_token: Option<String> = None;
-            let mut revisions = Vec::new();
-            loop {
-                let page = self
-                    .google_client
-                    .list_revisions(presentation_id, page_token.as_deref())?;
-                revisions.extend(page.revisions);
-                if let Some(token) = page.next_page_token {
-                    page_token = Some(token);
-                } else {
+        let google_policy = self.google_adapter_config();
+        for source in &self.google_sources {
+            let google_adapter =
+                GoogleSlidesAdapter::new(source.client.clone(), google_policy.clone());
+            for presentation_id in &source.config.presentation_ids {
+                if fetched >= self.config.resource_limits.max_sync_items {
                     break;
                 }
+                let cursor_key = format!("{}:gslides:{presentation_id}:revision", source.config.id);
+                let last_revision = self.persistence_lock()?.get_state(&cursor_key)?;
+                let mut page_token: Option<String> = None;
+                let mut revisions = Vec::new();
+                loop {
+                    let page = match self.resilient_executor.execute(
+                        &format!("gslides:{}:{presentation_id}", source.config.id),
+                        &google_policy.retry,
+                        &google_policy.rate_limit,
+                        || {
+                            source
+                                .client
+                                .list_revisions(presentation_id, page_token.as_deref())
+                        },
+                    ) {
+                        Ok(page) => page,
+                        Err(error) => {
+                            dead_letters.push(DeadLetter {
+                                source: source.config.id.clone(),
+                                reason: error.to_string(),
+                            });
+                            break;
+                        }
+                    };
+                    revisions.extend(page.revisions);
+                    if let Some(token) = page.next_page_token {
+                        page_token = Some(token);
+                    } else {
+                        break;
+                    }
+                }
+                revisions.sort_by_key(|revision| revision.modified_time);
+                let should_reset = last_revision.as_ref().is_some_and(|needle| {
+                    !revisions
+                        .iter()
+                        .any(|revision| revision.revision_id == *needle)
+                });
+                let new_revisions =
+                    revisions_after_cursor(revisions, last_revision.as_deref(), should_reset);
+                let Some(captured_revision) = latest_revision_to_capture(&new_revisions).cloned()
+                else {
+                    continue;
+                };
+                fetched += 1;
+
+                let capture = (|| -> Result<IngestResult, SelfHostError> {
+                    let circuit = format!("gslides:{}:{presentation_id}", source.config.id);
+                    let meta = self.resilient_executor.execute(
+                        &circuit,
+                        &google_policy.retry,
+                        &google_policy.rate_limit,
+                        || source.client.get_presentation_meta(presentation_id),
+                    )?;
+                    let presentation = self.resilient_executor.execute(
+                        &circuit,
+                        &google_policy.retry,
+                        &google_policy.rate_limit,
+                        || source.client.get_presentation(presentation_id),
+                    )?;
+                    let native_blob = self.store_blob(&serde_json::to_vec(&presentation)?)?;
+                    let rendered_blobs = presentation
+                        .slides
+                        .first()
+                        .map(|slide| {
+                            self.resilient_executor.execute(
+                                &circuit,
+                                &google_policy.retry,
+                                &google_policy.rate_limit,
+                                || {
+                                    source.client.render_slide(
+                                        presentation_id,
+                                        &slide.object_id,
+                                        "png",
+                                    )
+                                },
+                            )
+                        })
+                        .transpose()?
+                        .map(|rendered| self.store_blob(&rendered.data))
+                        .transpose()?
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    self.ingest_draft(namespace_draft(
+                        google_adapter.map_revision(
+                            &captured_revision,
+                            &meta,
+                            Some(native_blob),
+                            rendered_blobs,
+                        ),
+                        &source.config.id,
+                    ))
+                })();
+                match capture {
+                    Ok(IngestResult::Ingested { .. }) => google_ingested += 1,
+                    Ok(IngestResult::Duplicate { .. }) => duplicates += 1,
+                    Ok(IngestResult::Quarantined { .. }) => quarantined += 1,
+                    Ok(_) => {}
+                    Err(error) => {
+                        dead_letters.push(DeadLetter {
+                            source: source.config.id.clone(),
+                            reason: error.to_string(),
+                        });
+                        continue;
+                    }
+                }
+                self.persistence_lock()?
+                    .set_state(&cursor_key, &captured_revision.revision_id)?;
             }
-            revisions.sort_by_key(|revision| revision.modified_time);
-
-            let should_reset = last_revision.as_ref().is_some_and(|needle| {
-                !revisions
-                    .iter()
-                    .any(|revision| revision.revision_id == *needle)
-            });
-            let new_revisions =
-                revisions_after_cursor(revisions, last_revision.as_deref(), should_reset);
-
-            let Some(captured_revision) = latest_revision_to_capture(&new_revisions).cloned()
-            else {
-                continue;
-            };
-
-            let meta = self.google_client.get_presentation_meta(presentation_id)?;
-            let presentation = self.google_client.get_presentation(presentation_id)?;
-            let native_blob = self.store_blob(&serde_json::to_vec(&presentation)?)?;
-            let rendered_blobs = presentation
-                .slides
-                .first()
-                .map(|slide| {
-                    self.google_client
-                        .render_slide(presentation_id, &slide.object_id, "png")
-                })
-                .transpose()?
-                .map(|rendered| self.store_blob(&rendered.data))
-                .transpose()?
-                .into_iter()
-                .collect::<Vec<_>>();
-
-            match self.ingest_draft(google_adapter.map_revision(
-                &captured_revision,
-                &meta,
-                Some(native_blob),
-                rendered_blobs,
-            ))? {
-                IngestResult::Ingested { .. } => google_ingested += 1,
-                IngestResult::Duplicate { .. } => duplicates += 1,
-                _ => {}
+            match self.ingest_draft(namespace_draft(
+                google_adapter.heartbeat(),
+                &source.config.id,
+            )) {
+                Ok(IngestResult::Ingested { .. }) => google_ingested += 1,
+                Ok(IngestResult::Duplicate { .. }) => duplicates += 1,
+                Ok(IngestResult::Quarantined { .. }) => quarantined += 1,
+                Ok(_) => {}
+                Err(error) => dead_letters.push(DeadLetter {
+                    source: source.config.id.clone(),
+                    reason: error.to_string(),
+                }),
             }
-
-            self.persistence_lock()?
-                .set_state(&cursor_key, &captured_revision.revision_id)?;
-        }
-
-        match self.ingest_draft(google_adapter.heartbeat())? {
-            IngestResult::Ingested { .. } => google_ingested += 1,
-            IngestResult::Duplicate { .. } => duplicates += 1,
-            _ => {}
         }
 
         let last_sync_at = Utc::now();
@@ -160,11 +291,19 @@ impl AppService {
                 else {
                     return acc;
                 };
+                let Some(source_instance) = obs
+                    .meta
+                    .get("source_instance")
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    return acc;
+                };
+                let key = format!("{source_instance}:{presentation_id}");
 
-                match acc.get(presentation_id) {
+                match acc.get(&key) {
                     Some(existing) if existing.published >= obs.published => {}
                     _ => {
-                        acc.insert(presentation_id.to_string(), obs.clone());
+                        acc.insert(key, obs.clone());
                     }
                 }
                 acc
@@ -181,29 +320,39 @@ impl AppService {
             self.slide_analyzer.model_name()
         );
         let mut needs_analysis = false;
-        for presentation_id in &self.config.google.presentation_ids {
-            let Some(_observation) = slide_obs_by_presentation.get(presentation_id) else {
-                continue;
-            };
-            let presentation = self.google_client.get_presentation(presentation_id)?;
+        for source in &self.google_sources {
+            for presentation_id in &source.config.presentation_ids {
+                let namespaced_id = format!("{}:{presentation_id}", source.config.id);
+                let Some(_observation) = slide_obs_by_presentation.get(&namespaced_id) else {
+                    continue;
+                };
+                let Ok(presentation) = self.resilient_executor.execute(
+                    &format!("gslides:{}:{presentation_id}", source.config.id),
+                    &google_policy.retry,
+                    &google_policy.rate_limit,
+                    || source.client.get_presentation(presentation_id),
+                ) else {
+                    continue;
+                };
 
-            if presentation
-                .slides
-                .iter()
-                .take(self.config.slide_analysis_limit)
-                .any(|slide| {
-                    match find_slide_analysis_record(
-                        &slide_analysis_records,
-                        presentation_id,
-                        &slide.object_id,
-                    ) {
-                        Some(record) => analysis_record_needs_refresh(record, &analysis_model),
-                        None => true,
-                    }
-                })
-            {
-                needs_analysis = true;
-                break;
+                if presentation
+                    .slides
+                    .iter()
+                    .take(self.config.slide_analysis_limit)
+                    .any(|slide| {
+                        match find_slide_analysis_record(
+                            &slide_analysis_records,
+                            &namespaced_id,
+                            &slide.object_id,
+                        ) {
+                            Some(record) => analysis_record_needs_refresh(record, &analysis_model),
+                            None => true,
+                        }
+                    })
+                {
+                    needs_analysis = true;
+                    break;
+                }
             }
         }
 
@@ -213,176 +362,257 @@ impl AppService {
         if google_ingested > 0 || slack_ingested > 0 || needs_analysis {
             let mut analysis_results = Vec::new();
 
-            for presentation_id in &self.config.google.presentation_ids {
-                let Some(observation) = slide_obs_by_presentation.get(presentation_id) else {
-                    continue;
-                };
-
-                let presentation = self.google_client.get_presentation(presentation_id)?;
-                let canonical_uri = observation
-                    .payload
-                    .pointer("/artifact/canonicalUri")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-
-                let candidate_slide_indices = ranked_self_intro_slide_indices(
-                    &presentation,
-                    self.config.slide_analysis_limit,
-                );
-                let mut consumed_slide_indices = HashSet::new();
-
-                for slide_index in candidate_slide_indices {
-                    if !consumed_slide_indices.insert(slide_index) {
-                        continue;
-                    }
-
-                    let slide = &presentation.slides[slide_index];
-                    if let Some(existing) = find_slide_analysis_record(
-                        &slide_analysis_records,
-                        presentation_id,
-                        &slide.object_id,
-                    ) && !analysis_record_needs_refresh(existing, &analysis_model)
-                    {
-                        continue;
-                    }
-
-                    let rendered = self.google_client.render_slide(
-                        presentation_id,
-                        &slide.object_id,
-                        "png",
-                    )?;
-                    let thumbnail_blob_ref = core.blobs.put(&rendered.data);
-                    self.persistence_lock()?.persist_blob(&rendered.data)?;
-                    let Some(mut profile) = self.extract_student_profile_from_png(
-                        &rendered.data,
-                        observation,
-                        &canonical_uri,
-                    )?
-                    else {
+            for source in &self.google_sources {
+                for presentation_id in &source.config.presentation_ids {
+                    let namespaced_id = format!("{}:{presentation_id}", source.config.id);
+                    let Some(observation) = slide_obs_by_presentation.get(&namespaced_id) else {
                         continue;
                     };
-                    profile.normalize_in_place();
 
-                    profile.source_slide_object_id = Some(slide.object_id.clone());
-                    profile.source_document_id = Some(format!(
-                        "document:gslides:{presentation_id}#slide:{}",
-                        slide.object_id
-                    ));
-                    profile.source_canonical_uri = Some(canonical_uri.clone());
-                    profile.thumbnail_blob_ref = Some(thumbnail_blob_ref.as_str().to_string());
-                    profile.thumbnail_url = rendered.content_url.clone();
-                    profile.companion_to_slide_object_id = None;
-                    resolve_slide_image_urls(&presentation, slide, &mut profile);
+                    let circuit = format!("gslides:{}:{presentation_id}", source.config.id);
+                    let presentation = match self.resilient_executor.execute(
+                        &circuit,
+                        &google_policy.retry,
+                        &google_policy.rate_limit,
+                        || source.client.get_presentation(presentation_id),
+                    ) {
+                        Ok(presentation) => presentation,
+                        Err(error) => {
+                            dead_letters.push(DeadLetter {
+                                source: source.config.id.clone(),
+                                reason: error.to_string(),
+                            });
+                            continue;
+                        }
+                    };
+                    let canonical_uri = observation
+                        .payload
+                        .pointer("/artifact/canonicalUri")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string();
 
-                    let mut consumed_companion = false;
-                    let mut companion_result = None;
+                    let candidate_slide_indices = ranked_self_intro_slide_indices(
+                        &presentation,
+                        self.config.slide_analysis_limit,
+                    );
+                    let mut consumed_slide_indices = HashSet::new();
 
-                    if let Some(next_slide) = presentation.slides.get(slide_index + 1) {
-                        let companion_rendered = self.google_client.render_slide(
-                            presentation_id,
-                            &next_slide.object_id,
-                            "png",
-                        )?;
-                        let Some(mut companion_profile) = self.extract_student_profile_from_png(
-                            &companion_rendered.data,
+                    for slide_index in candidate_slide_indices {
+                        if !consumed_slide_indices.insert(slide_index) {
+                            continue;
+                        }
+
+                        let slide = &presentation.slides[slide_index];
+                        if let Some(existing) = find_slide_analysis_record(
+                            &slide_analysis_records,
+                            &namespaced_id,
+                            &slide.object_id,
+                        ) && !analysis_record_needs_refresh(existing, &analysis_model)
+                        {
+                            continue;
+                        }
+
+                        let rendered = match self.resilient_executor.execute(
+                            &circuit,
+                            &google_policy.retry,
+                            &google_policy.rate_limit,
+                            || {
+                                source
+                                    .client
+                                    .render_slide(presentation_id, &slide.object_id, "png")
+                            },
+                        ) {
+                            Ok(rendered) => rendered,
+                            Err(error) => {
+                                dead_letters.push(DeadLetter {
+                                    source: source.config.id.clone(),
+                                    reason: error.to_string(),
+                                });
+                                continue;
+                            }
+                        };
+                        let thumbnail_blob_ref = self
+                            .persistence_lock()?
+                            .put_blob(&rendered.data, self.config.resource_limits.max_blob_bytes)?;
+                        core.blobs.put(&rendered.data);
+                        let Some(mut profile) = (match self.extract_student_profile_from_png(
+                            &rendered.data,
                             observation,
                             &canonical_uri,
-                        )?
-                        else {
+                        ) {
+                            Ok(profile) => profile,
+                            Err(error) => {
+                                dead_letters.push(DeadLetter {
+                                    source: source.config.id.clone(),
+                                    reason: error.to_string(),
+                                });
+                                continue;
+                            }
+                        }) else {
                             continue;
                         };
-                        companion_profile.normalize_in_place();
+                        profile.normalize_in_place();
 
-                        companion_profile.source_slide_object_id =
-                            Some(next_slide.object_id.clone());
-                        companion_profile.source_document_id = Some(format!(
-                            "document:gslides:{presentation_id}#slide:{}",
-                            next_slide.object_id
-                        ));
-                        companion_profile.source_canonical_uri = Some(canonical_uri.clone());
-                        companion_profile.thumbnail_url = companion_rendered.content_url.clone();
-                        companion_profile.companion_to_slide_object_id =
-                            Some(slide.object_id.clone());
-                        resolve_slide_image_urls(&presentation, next_slide, &mut companion_profile);
-
-                        if should_merge_companion_slide(&profile, &companion_profile, observation) {
-                            let companion_blob_ref = core.blobs.put(&companion_rendered.data);
-                            self.persistence_lock()?
-                                .persist_blob(&companion_rendered.data)?;
-                            companion_profile.thumbnail_blob_ref =
-                                Some(companion_blob_ref.as_str().to_string());
-                            merge_companion_profile(&mut profile, &companion_profile);
-                            consumed_companion = true;
-                            consumed_slide_indices.insert(slide_index + 1);
-                        }
-                    }
-
-                    ensure_profile_identifier(&mut profile, &slide.object_id);
-                    profile.normalize_in_place();
-
-                    let email = profile
-                        .email
-                        .as_deref()
-                        .or(profile.generated_email.as_deref())
-                        .map(ToOwned::to_owned)
-                        .or_else(|| profile.source_document_id.clone())
-                        .ok_or_else(|| {
-                            SelfHostError::Ingestion(format!(
-                                "slide analysis for {} produced no stable person identifier",
-                                slide.object_id
-                            ))
-                        })?;
-                    let person_entity = EntityRef::new(format!("person:{email}"));
-                    analysis_results.push(SlideAnalysisResult {
-                        source_observation_id: observation.id.clone(),
-                        presentation_id: presentation_id.clone(),
-                        profile: profile.clone(),
-                        person_entity: person_entity.clone(),
-                        supplemental_id: Some(lethe_core::domain::SupplementalId::new(format!(
-                            "sup:slide-analysis:{presentation_id}:{}",
+                        profile.source_slide_object_id = Some(slide.object_id.clone());
+                        profile.source_document_id = Some(format!(
+                            "document:gslides:{namespaced_id}#slide:{}",
                             slide.object_id
-                        ))),
-                        analyzed_at: observation.recorded_at,
-                        model_version: Some(analysis_model.clone()),
-                        slide_object_id: Some(slide.object_id.clone()),
-                        thumbnail_blob_ref: Some(thumbnail_blob_ref),
-                    });
-
-                    if consumed_companion
-                        && let Some(next_slide) = presentation.slides.get(slide_index + 1)
-                    {
-                        let mut companion_profile = profile.clone();
-                        companion_profile.source_slide_object_id =
-                            Some(next_slide.object_id.clone());
-                        companion_profile.source_document_id = Some(format!(
-                            "document:gslides:{presentation_id}#slide:{}",
-                            next_slide.object_id
                         ));
-                        companion_profile.companion_to_slide_object_id =
-                            Some(slide.object_id.clone());
-                        companion_profile.thumbnail_blob_ref = None;
-                        companion_profile.profile_pic = None;
-                        companion_result = Some(SlideAnalysisResult {
-                            source_observation_id: observation.id.clone(),
-                            presentation_id: presentation_id.clone(),
-                            profile: companion_profile,
-                            person_entity,
-                            supplemental_id: Some(lethe_core::domain::SupplementalId::new(
-                                format!(
-                                    "sup:slide-analysis:{presentation_id}:{}",
-                                    next_slide.object_id
+                        profile.source_canonical_uri = Some(canonical_uri.clone());
+                        profile.thumbnail_blob_ref = Some(thumbnail_blob_ref.as_str().to_string());
+                        profile.thumbnail_url = rendered.content_url.clone();
+                        profile.companion_to_slide_object_id = None;
+                        resolve_slide_image_urls(&presentation, slide, &mut profile);
+
+                        let mut consumed_companion = false;
+                        let mut companion_result = None;
+
+                        if let Some(next_slide) = presentation.slides.get(slide_index + 1) {
+                            let companion_rendered = match self.resilient_executor.execute(
+                                &circuit,
+                                &google_policy.retry,
+                                &google_policy.rate_limit,
+                                || {
+                                    source.client.render_slide(
+                                        presentation_id,
+                                        &next_slide.object_id,
+                                        "png",
+                                    )
+                                },
+                            ) {
+                                Ok(rendered) => rendered,
+                                Err(error) => {
+                                    dead_letters.push(DeadLetter {
+                                        source: source.config.id.clone(),
+                                        reason: error.to_string(),
+                                    });
+                                    continue;
+                                }
+                            };
+                            let Some(mut companion_profile) = (match self
+                                .extract_student_profile_from_png(
+                                    &companion_rendered.data,
+                                    observation,
+                                    &canonical_uri,
+                                ) {
+                                Ok(profile) => profile,
+                                Err(error) => {
+                                    dead_letters.push(DeadLetter {
+                                        source: source.config.id.clone(),
+                                        reason: error.to_string(),
+                                    });
+                                    continue;
+                                }
+                            }) else {
+                                continue;
+                            };
+                            companion_profile.normalize_in_place();
+
+                            companion_profile.source_slide_object_id =
+                                Some(next_slide.object_id.clone());
+                            companion_profile.source_document_id = Some(format!(
+                                "document:gslides:{namespaced_id}#slide:{}",
+                                next_slide.object_id
+                            ));
+                            companion_profile.source_canonical_uri = Some(canonical_uri.clone());
+                            companion_profile.thumbnail_url =
+                                companion_rendered.content_url.clone();
+                            companion_profile.companion_to_slide_object_id =
+                                Some(slide.object_id.clone());
+                            resolve_slide_image_urls(
+                                &presentation,
+                                next_slide,
+                                &mut companion_profile,
+                            );
+
+                            if should_merge_companion_slide(
+                                &profile,
+                                &companion_profile,
+                                observation,
+                            ) {
+                                let companion_blob_ref = self.persistence_lock()?.put_blob(
+                                    &companion_rendered.data,
+                                    self.config.resource_limits.max_blob_bytes,
+                                )?;
+                                core.blobs.put(&companion_rendered.data);
+                                companion_profile.thumbnail_blob_ref =
+                                    Some(companion_blob_ref.as_str().to_string());
+                                merge_companion_profile(&mut profile, &companion_profile);
+                                consumed_companion = true;
+                                consumed_slide_indices.insert(slide_index + 1);
+                            }
+                        }
+
+                        ensure_profile_identifier(&mut profile, &slide.object_id);
+                        profile.normalize_in_place();
+
+                        let Some(email) = profile
+                            .email
+                            .as_deref()
+                            .or(profile.generated_email.as_deref())
+                            .map(ToOwned::to_owned)
+                            .or_else(|| profile.source_document_id.clone())
+                        else {
+                            dead_letters.push(DeadLetter {
+                                source: source.config.id.clone(),
+                                reason: format!(
+                                    "slide analysis for {} produced no stable person identifier",
+                                    slide.object_id
                                 ),
+                            });
+                            continue;
+                        };
+                        let person_entity = EntityRef::new(format!("person:{email}"));
+                        analysis_results.push(SlideAnalysisResult {
+                            source_observation_id: observation.id.clone(),
+                            presentation_id: namespaced_id.clone(),
+                            profile: profile.clone(),
+                            person_entity: person_entity.clone(),
+                            supplemental_id: Some(lethe_core::domain::SupplementalId::new(
+                                format!("sup:slide-analysis:{namespaced_id}:{}", slide.object_id),
                             )),
                             analyzed_at: observation.recorded_at,
                             model_version: Some(analysis_model.clone()),
-                            slide_object_id: Some(next_slide.object_id.clone()),
-                            thumbnail_blob_ref: None,
+                            slide_object_id: Some(slide.object_id.clone()),
+                            thumbnail_blob_ref: Some(thumbnail_blob_ref),
                         });
-                    }
 
-                    if let Some(companion_result) = companion_result {
-                        analysis_results.push(companion_result);
+                        if consumed_companion
+                            && let Some(next_slide) = presentation.slides.get(slide_index + 1)
+                        {
+                            let mut companion_profile = profile.clone();
+                            companion_profile.source_slide_object_id =
+                                Some(next_slide.object_id.clone());
+                            companion_profile.source_document_id = Some(format!(
+                                "document:gslides:{namespaced_id}#slide:{}",
+                                next_slide.object_id
+                            ));
+                            companion_profile.companion_to_slide_object_id =
+                                Some(slide.object_id.clone());
+                            companion_profile.thumbnail_blob_ref = None;
+                            companion_profile.profile_pic = None;
+                            companion_result = Some(SlideAnalysisResult {
+                                source_observation_id: observation.id.clone(),
+                                presentation_id: namespaced_id.clone(),
+                                profile: companion_profile,
+                                person_entity,
+                                supplemental_id: Some(lethe_core::domain::SupplementalId::new(
+                                    format!(
+                                        "sup:slide-analysis:{namespaced_id}:{}",
+                                        next_slide.object_id
+                                    ),
+                                )),
+                                analyzed_at: observation.recorded_at,
+                                model_version: Some(analysis_model.clone()),
+                                slide_object_id: Some(next_slide.object_id.clone()),
+                                thumbnail_blob_ref: None,
+                            });
+                        }
+
+                        if let Some(companion_result) = companion_result {
+                            analysis_results.push(companion_result);
+                        }
                     }
                 }
             }
@@ -391,25 +621,30 @@ impl AppService {
 
             for result in &analysis_results {
                 let record = SlideAnalysisProjector::build_supplemental(result);
-                let rollback = core
-                    .upsert_supplemental(record)
-                    .map_err(|err| SelfHostError::Ingestion(err.to_string()))?;
-                let persisted_record =
-                    core.supplemental
-                        .get(&rollback.id)
-                        .cloned()
-                        .ok_or_else(|| {
-                            SelfHostError::Ingestion(format!(
-                                "supplemental {} missing after upsert",
-                                rollback.id
-                            ))
-                        })?;
-                if let Err(err) = self
-                    .persistence_lock()?
-                    .persist_supplemental(&persisted_record)
-                {
+                let rollback = match core.upsert_supplemental(record) {
+                    Ok(rollback) => rollback,
+                    Err(error) => {
+                        dead_letters.push(DeadLetter {
+                            source: result.presentation_id.clone(),
+                            reason: error.to_string(),
+                        });
+                        continue;
+                    }
+                };
+                let Some(persisted_record) = core.supplemental.get(&rollback.id).cloned() else {
+                    dead_letters.push(DeadLetter {
+                        source: result.presentation_id.clone(),
+                        reason: format!("supplemental {} missing after upsert", rollback.id),
+                    });
                     core.rollback_supplemental(rollback);
-                    return Err(SelfHostError::Persistence(err));
+                    continue;
+                };
+                if let Err(err) = self.persistence_lock()?.put_supplemental(&persisted_record) {
+                    core.rollback_supplemental(rollback);
+                    dead_letters.push(DeadLetter {
+                        source: result.presentation_id.clone(),
+                        reason: err.to_string(),
+                    });
                 }
             }
 
@@ -418,31 +653,87 @@ impl AppService {
                 let observation = match core.prepare_observation(draft) {
                     Ok(observation) => observation,
                     Err(IngestResult::Rejected { message, .. }) => {
-                        return Err(SelfHostError::Ingestion(message));
+                        dead_letters.push(DeadLetter {
+                            source: result.presentation_id.clone(),
+                            reason: message,
+                        });
+                        continue;
                     }
                     Err(IngestResult::Quarantined { ticket }) => {
-                        return Err(SelfHostError::Ingestion(ticket.reason));
+                        quarantined += 1;
+                        dead_letters.push(DeadLetter {
+                            source: result.presentation_id.clone(),
+                            reason: ticket.reason,
+                        });
+                        continue;
                     }
-                    Err(result) => {
-                        if let IngestResult::Duplicate { .. } = result {
+                    Err(other) => {
+                        if let IngestResult::Duplicate { .. } = other {
                             continue;
                         }
-                        return Err(SelfHostError::Ingestion(
-                            "unexpected non-terminal ingestion result during slide analysis"
-                                .to_owned(),
-                        ));
+                        dead_letters.push(DeadLetter {
+                            source: result.presentation_id.clone(),
+                            reason:
+                                "unexpected non-terminal ingestion result during slide analysis"
+                                    .to_owned(),
+                        });
+                        continue;
                     }
                 };
-                if let IngestResult::Ingested { .. } =
-                    self.append_prepared_observation(&mut core, observation)?
-                {
-                    // Count is derived from analysis_results; no per-row action needed here.
+                match self.append_prepared_observation(&mut core, observation) {
+                    Ok(IngestResult::Duplicate { .. }) => duplicates += 1,
+                    Ok(IngestResult::Quarantined { .. }) => quarantined += 1,
+                    Ok(_) => {}
+                    Err(error) => dead_letters.push(DeadLetter {
+                        source: result.presentation_id.clone(),
+                        reason: error.to_string(),
+                    }),
                 }
             }
         }
 
         if should_rebuild_snapshot || slide_analyses > 0 {
             core.rebuild_snapshot();
+            self.persistence_lock()?.materialize_projection(
+                &ProjectionRef::new("proj:person-page"),
+                &serde_json::to_value(&core.snapshot)?,
+            )?;
+        }
+
+        self.persistence_lock()?
+            .split_leaf_if_capacity(self.config.resource_limits.max_leaf_observations)?;
+
+        core.sync_metrics.fetched += fetched as u64;
+        core.sync_metrics.ingested += (slack_ingested + google_ingested + slide_analyses) as u64;
+        core.sync_metrics.skipped += duplicates as u64;
+        core.sync_metrics.failed += dead_letters.len() as u64;
+        core.sync_metrics.quarantined += quarantined as u64;
+        core.sync_metrics.latency_ms = started_at.elapsed().as_millis() as u64;
+        core.last_sync_error = if dead_letters.is_empty() {
+            None
+        } else {
+            Some(format!("{} item(s) failed", dead_letters.len()))
+        };
+        let latency_ms = core.sync_metrics.latency_ms;
+        drop(core);
+        {
+            let store = self.persistence_lock()?;
+            for dead_letter in &dead_letters {
+                store.record_dead_letter(&dead_letter.source, &dead_letter.reason)?;
+            }
+            store.record_sync_metrics(
+                "all",
+                &lethe_storage_api::SyncMetricRecord {
+                    fetched: fetched as u64,
+                    ingested: (slack_ingested + google_ingested + slide_analyses) as u64,
+                    skipped: duplicates as u64,
+                    failed: dead_letters.len() as u64,
+                    quarantined: quarantined as u64,
+                    latency_ms,
+                },
+            )?;
+            store.apply_retention(self.config.resource_limits.retention_days)?;
+            store.garbage_collect_orphan_blobs()?;
         }
 
         Ok(SyncReport {
@@ -450,8 +741,8 @@ impl AppService {
             google_ingested,
             slide_analyses,
             duplicates,
-            quarantined: 0,
-            dead_letters: Vec::new(),
+            quarantined,
+            dead_letters,
             last_sync_at,
         })
     }

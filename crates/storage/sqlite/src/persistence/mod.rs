@@ -3,6 +3,8 @@ mod schema;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
+use aes_gcm::{Aes256Gcm, Key};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::Digest;
 
@@ -10,9 +12,18 @@ use lethe_core::domain::{BlobRef, IdempotencyKey, Observation, ObservationId, Su
 use lethe_runtime::runtime::partition::{
     PARTITION_EVENT_FAILOVER, PARTITION_EVENT_INITIALIZE, PARTITION_EVENT_RECOVER,
     PARTITION_EVENT_SPLIT_COMMIT, PARTITION_EVENT_SPLIT_PREPARE, PARTITION_SPLIT_REASON_CAPACITY,
-    PartitionTree, failover_event_json, identity_keyspec_json, initialize_event_json,
-    parse_partition_event, recover_event_json, routing_keyspec_json, split_commit_event_json,
+    PartitionTree, RoutedObservation, failover_event_json, identity_keyspec_json,
+    initialize_event_json, parse_partition_event, plan_capacity_split, recover_event_json,
+    routing_key_from_observation, routing_keyspec_json, split_commit_event_json,
     split_prepare_event_json,
+};
+use lethe_storage_api::{
+    AppendOutcome as PortAppendOutcome, BlobStore as BlobStorePort, LeafPosition,
+    ObservationStore as ObservationStorePort, ProjectionLeafWatermark,
+    ProjectionMaterializer as ProjectionMaterializerPort,
+    ProjectionWatermarkStore as ProjectionWatermarkStorePort, RehomeMode as PortRehomeMode,
+    RuntimeStateStore as RuntimeStateStorePort, StorageError, StorageResult, StoredObservation,
+    SupplementalStore as SupplementalStorePort, SyncMetricRecord,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -30,9 +41,10 @@ pub enum PersistenceError {
 pub struct SqlitePersistence {
     conn: Connection,
     blob_dir: PathBuf,
+    secret_encryption_key: [u8; 32],
 }
 
-const CURRENT_SCHEMA_VERSION: i64 = 2;
+const CURRENT_SCHEMA_VERSION: i64 = 3;
 const CANONICAL_JSON_META_KEY: &str = "canonical_json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,8 +63,19 @@ pub enum RehomeMode {
     },
 }
 
+#[derive(Debug, Clone)]
+pub struct BlueGreenTransform {
+    pub identity_key: IdempotencyKey,
+    pub canonical_json: String,
+    pub routing_key: String,
+}
+
 impl SqlitePersistence {
-    pub fn open(database_path: &Path, blob_dir: &Path) -> Result<Self, PersistenceError> {
+    pub fn open(
+        database_path: &Path,
+        blob_dir: &Path,
+        secret_encryption_key: &[u8; 32],
+    ) -> Result<Self, PersistenceError> {
         if let Some(parent) = database_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -62,6 +85,7 @@ impl SqlitePersistence {
         let store = Self {
             conn,
             blob_dir: blob_dir.to_path_buf(),
+            secret_encryption_key: *secret_encryption_key,
         };
         store.init_schema()?;
         Ok(store)
@@ -113,6 +137,10 @@ impl SqlitePersistence {
         &self,
         observation: &Observation,
     ) -> Result<DurableAppendOutcome, PersistenceError> {
+        let tree = self.load_partition_tree()?;
+        let routing_key = routing_key_from_observation(observation)
+            .map_err(|err| PersistenceError::SchemaInvariant(err.to_string()))?;
+        let leaf_id = tree.route(&routing_key);
         let identity_key = &observation.idempotency_key;
         let canonical_json = observation
             .meta
@@ -127,13 +155,17 @@ impl SqlitePersistence {
         let inserted = self.conn.execute(
             "INSERT INTO observations (
                 id,
+                leaf_id,
+                routing_key,
                 identity_key,
                 canonical_json,
                 recorded_at,
                 observation_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 observation.id.as_str(),
+                leaf_id,
+                routing_key.encoded(),
                 identity_key.as_str(),
                 canonical_json,
                 observation.recorded_at.to_rfc3339(),
@@ -147,8 +179,9 @@ impl SqlitePersistence {
                 let existing = self
                     .conn
                     .query_row(
-                        "SELECT id, canonical_json FROM observations WHERE identity_key = ?1",
-                        [identity_key.as_str()],
+                        "SELECT id, canonical_json FROM observations
+                         WHERE leaf_id = ?1 AND identity_key = ?2",
+                        params![leaf_id, identity_key.as_str()],
                         |row| {
                             Ok((
                                 ObservationId::new(row.get::<_, String>(0)?),
@@ -263,6 +296,397 @@ impl SqlitePersistence {
             blobs.push(fs::read(row?)?);
         }
         Ok(blobs)
+    }
+
+    pub fn observation_page(
+        &self,
+        after_append_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredObservation>, PersistenceError> {
+        if limit == 0 {
+            return Err(PersistenceError::SchemaInvariant(
+                "observation page limit must be greater than zero".to_owned(),
+            ));
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT leaf_id, append_seq, observation_json
+             FROM observations
+             WHERE append_seq > ?1
+             ORDER BY append_seq
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![after_append_seq, limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (leaf_id, append_seq, json) = row?;
+            result.push(StoredObservation {
+                leaf_id,
+                append_seq,
+                observation: serde_json::from_str(&json)?,
+            });
+        }
+        Ok(result)
+    }
+
+    pub fn observations_for_leaf_after(
+        &self,
+        leaf_id: &str,
+        after_append_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredObservation>, PersistenceError> {
+        if limit == 0 {
+            return Err(PersistenceError::SchemaInvariant(
+                "leaf tail limit must be greater than zero".to_owned(),
+            ));
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT leaf_id, append_seq, observation_json
+             FROM observations
+             WHERE leaf_id = ?1 AND append_seq > ?2
+             ORDER BY append_seq
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![leaf_id, after_append_seq, limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (leaf_id, append_seq, json) = row?;
+            result.push(StoredObservation {
+                leaf_id,
+                append_seq,
+                observation: serde_json::from_str(&json)?,
+            });
+        }
+        Ok(result)
+    }
+
+    pub fn observation_by_id(
+        &self,
+        id: &ObservationId,
+    ) -> Result<Option<StoredObservation>, PersistenceError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT leaf_id, append_seq, observation_json
+                 FROM observations WHERE id = ?1",
+                [id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(leaf_id, append_seq, json)| {
+            Ok(StoredObservation {
+                leaf_id,
+                append_seq,
+                observation: serde_json::from_str(&json)?,
+            })
+        })
+        .transpose()
+    }
+
+    pub fn leaf_positions(&self) -> Result<Vec<LeafPosition>, PersistenceError> {
+        let tree = self.load_partition_tree()?;
+        let mut positions = Vec::new();
+        for leaf_id in tree.current_leaf_ids() {
+            let append_seq = self.conn.query_row(
+                "SELECT COALESCE(MAX(append_seq), 0) FROM observations WHERE leaf_id = ?1",
+                [&leaf_id],
+                |row| row.get::<_, u64>(0),
+            )?;
+            positions.push(LeafPosition {
+                leaf_id,
+                append_seq,
+            });
+        }
+        Ok(positions)
+    }
+
+    pub fn split_leaf_if_capacity(&self, capacity: usize) -> Result<bool, PersistenceError> {
+        if capacity == 0 {
+            return Err(PersistenceError::SchemaInvariant(
+                "leaf capacity must be greater than zero".to_owned(),
+            ));
+        }
+        let tree = self.load_partition_tree()?;
+        for parent_leaf_id in tree.current_leaf_ids() {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, observation_json FROM observations
+                 WHERE leaf_id = ?1 ORDER BY append_seq",
+            )?;
+            let rows = stmt.query_map([&parent_leaf_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut observations = Vec::new();
+            let mut routed = Vec::new();
+            for row in rows {
+                let (id, json) = row?;
+                let observation: Observation = serde_json::from_str(&json)?;
+                let routing_key = routing_key_from_observation(&observation)
+                    .map_err(|err| PersistenceError::SchemaInvariant(err.to_string()))?;
+                routed.push(RoutedObservation {
+                    observation_id: id,
+                    routing_key,
+                });
+                observations.push(observation);
+            }
+            if observations.len() < capacity {
+                continue;
+            }
+
+            let left = format!("lake:{}", uuid::Uuid::now_v7());
+            let right = format!("lake:{}", uuid::Uuid::now_v7());
+            let Some(plan) = plan_capacity_split(&parent_leaf_id, &routed, capacity, &left, &right)
+                .map_err(|err| PersistenceError::SchemaInvariant(err.to_string()))?
+            else {
+                continue;
+            };
+
+            let transaction = self.conn.unchecked_transaction()?;
+            let prepare_json = split_prepare_event_json(&parent_leaf_id, &left, &right)
+                .map_err(|err| PersistenceError::SchemaInvariant(err.to_string()))?;
+            transaction.execute(
+                "INSERT INTO partition_log (
+                    event_type, parent_leaf_id, left_child_leaf_id, right_child_leaf_id,
+                    reason, control_timestamp, event_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    PARTITION_EVENT_SPLIT_PREPARE,
+                    parent_leaf_id,
+                    left,
+                    right,
+                    PARTITION_SPLIT_REASON_CAPACITY,
+                    chrono::Utc::now().to_rfc3339(),
+                    prepare_json,
+                ],
+            )?;
+
+            for target in &plan.rehome_targets {
+                transaction.execute(
+                    "UPDATE observations SET leaf_id = ?1 WHERE id = ?2 AND leaf_id = ?3",
+                    params![
+                        target.target_leaf_id,
+                        target.observation_id,
+                        plan.parent_leaf_id
+                    ],
+                )?;
+            }
+
+            let commit_json = split_commit_event_json(
+                &plan.parent_leaf_id,
+                &plan.left_child_leaf_id,
+                &plan.right_child_leaf_id,
+                plan.bit_index,
+            )
+            .map_err(|err| PersistenceError::SchemaInvariant(err.to_string()))?;
+            transaction.execute(
+                "INSERT INTO partition_log (
+                    event_type, parent_leaf_id, left_child_leaf_id, right_child_leaf_id,
+                    bit_index, reason, control_timestamp, event_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    PARTITION_EVENT_SPLIT_COMMIT,
+                    plan.parent_leaf_id,
+                    plan.left_child_leaf_id,
+                    plan.right_child_leaf_id,
+                    i64::from(plan.bit_index),
+                    PARTITION_SPLIT_REASON_CAPACITY,
+                    chrono::Utc::now().to_rfc3339(),
+                    commit_json,
+                ],
+            )?;
+            transaction.commit()?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub fn blue_green_migrate<F>(
+        &self,
+        new_routing_keyspec_version: &str,
+        new_identity_keyspec_version: &str,
+        mut transform: F,
+    ) -> Result<(), PersistenceError>
+    where
+        F: FnMut(&Observation) -> Result<BlueGreenTransform, PersistenceError>,
+    {
+        if new_routing_keyspec_version == lethe_runtime::runtime::partition::ROUTING_KEYSPEC_VERSION
+            && new_identity_keyspec_version
+                == lethe_runtime::runtime::partition::IDENTITY_KEYSPEC_VERSION
+        {
+            return Err(PersistenceError::SchemaInvariant(
+                "blue/green migration requires a changed keyspec version".to_owned(),
+            ));
+        }
+
+        let old_partition_log = {
+            let mut stmt = self.conn.prepare(
+                "SELECT event_seq, event_type, event_json
+                 FROM partition_log ORDER BY event_seq",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(serde_json::json!({
+                    "event_seq": row.get::<_, i64>(0)?,
+                    "event_type": row.get::<_, String>(1)?,
+                    "event_json": row.get::<_, String>(2)?,
+                }))
+            })?;
+            let mut events = Vec::new();
+            for row in rows {
+                events.push(row?);
+            }
+            serde_json::to_string(&events)?
+        };
+
+        let mut observations = Vec::new();
+        let mut cursor = 0u64;
+        loop {
+            let page = self.observation_page(cursor, 512)?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map(|row| row.append_seq).unwrap_or(cursor);
+            observations.extend(page);
+        }
+
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute_batch(
+            "
+            DROP TABLE IF EXISTS observations_green;
+            DROP TABLE IF EXISTS partition_log_green;
+            CREATE TABLE observations_green (
+                append_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL UNIQUE,
+                leaf_id TEXT NOT NULL CHECK (leaf_id LIKE 'lake:%'),
+                routing_key TEXT NOT NULL,
+                identity_key TEXT NOT NULL,
+                canonical_json TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                observation_json TEXT NOT NULL,
+                UNIQUE (leaf_id, identity_key)
+            );
+            CREATE TABLE partition_log_green (
+                event_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                leaf_id TEXT,
+                parent_leaf_id TEXT,
+                left_child_leaf_id TEXT,
+                right_child_leaf_id TEXT,
+                bit_index INTEGER,
+                reason TEXT,
+                routing_keyspec_json TEXT,
+                identity_keyspec_json TEXT,
+                control_timestamp TEXT,
+                event_json TEXT NOT NULL
+            );
+            ",
+        )?;
+
+        let root_leaf_id = format!("lake:{}", uuid::Uuid::now_v7());
+        let initialize_json = serde_json::to_string(
+            &lethe_runtime::runtime::partition::InitializePartitionEvent {
+                root_leaf_id: root_leaf_id.clone(),
+                routing_keyspec_version: new_routing_keyspec_version.to_owned(),
+                identity_keyspec_version: new_identity_keyspec_version.to_owned(),
+            },
+        )?;
+        transaction.execute(
+            "INSERT INTO partition_log_green (
+                event_type, leaf_id, routing_keyspec_json, identity_keyspec_json,
+                control_timestamp, event_json
+             ) VALUES ('initialize', ?1, ?2, ?3, ?4, ?5)",
+            params![
+                root_leaf_id,
+                serde_json::json!({"version": new_routing_keyspec_version}).to_string(),
+                serde_json::json!({"version": new_identity_keyspec_version}).to_string(),
+                chrono::Utc::now().to_rfc3339(),
+                initialize_json,
+            ],
+        )?;
+
+        for stored in observations {
+            let transformed = transform(&stored.observation)?;
+            let mut observation = stored.observation;
+            observation.idempotency_key = transformed.identity_key.clone();
+            let mut meta = observation.meta.as_object().cloned().unwrap_or_default();
+            meta.insert(
+                CANONICAL_JSON_META_KEY.to_owned(),
+                serde_json::Value::String(transformed.canonical_json.clone()),
+            );
+            observation.meta = serde_json::Value::Object(meta);
+            transaction.execute(
+                "INSERT INTO observations_green (
+                    id, leaf_id, routing_key, identity_key, canonical_json,
+                    recorded_at, observation_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    observation.id.as_str(),
+                    root_leaf_id,
+                    transformed.routing_key,
+                    transformed.identity_key.as_str(),
+                    transformed.canonical_json,
+                    observation.recorded_at.to_rfc3339(),
+                    serde_json::to_string(&observation)?,
+                ],
+            )?;
+        }
+
+        transaction.execute(
+            "INSERT INTO keyspec_history (
+                migration_id, routing_keyspec_version, identity_keyspec_version,
+                partition_log_json, retired_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                format!("migration:{}", uuid::Uuid::now_v7()),
+                lethe_runtime::runtime::partition::ROUTING_KEYSPEC_VERSION,
+                lethe_runtime::runtime::partition::IDENTITY_KEYSPEC_VERSION,
+                old_partition_log,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+
+        transaction.execute_batch(
+            "
+            DROP TRIGGER partition_log_no_update;
+            DROP TRIGGER partition_log_no_delete;
+            DROP INDEX observations_leaf_append;
+            DROP INDEX partition_log_single_initialize;
+            DROP TABLE observations;
+            DROP TABLE partition_log;
+            ALTER TABLE observations_green RENAME TO observations;
+            ALTER TABLE partition_log_green RENAME TO partition_log;
+            CREATE INDEX observations_leaf_append ON observations(leaf_id, append_seq);
+            CREATE UNIQUE INDEX partition_log_single_initialize
+                ON partition_log(event_type) WHERE event_type = 'initialize';
+            CREATE TRIGGER partition_log_no_update
+            BEFORE UPDATE ON partition_log
+            BEGIN
+                SELECT RAISE(ABORT, 'partition_log is append-only');
+            END;
+            CREATE TRIGGER partition_log_no_delete
+            BEFORE DELETE ON partition_log
+            BEGIN
+                SELECT RAISE(ABORT, 'partition_log is append-only');
+            END;
+            ",
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn append_split_prepare(
@@ -428,6 +852,464 @@ impl SqlitePersistence {
             }
         }
         Ok(removed)
+    }
+
+    pub fn load_blob(&self, blob_ref: &BlobRef) -> Result<Option<Vec<u8>>, PersistenceError> {
+        let path = self
+            .conn
+            .query_row(
+                "SELECT file_path FROM blobs WHERE blob_ref = ?1",
+                [blob_ref.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        path.map(fs::read)
+            .transpose()
+            .map_err(PersistenceError::from)
+    }
+
+    pub fn supplemental_page(
+        &self,
+        after_created_at: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SupplementalRecord>, PersistenceError> {
+        if limit == 0 {
+            return Err(PersistenceError::SchemaInvariant(
+                "supplemental page limit must be greater than zero".to_owned(),
+            ));
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT supplemental_json FROM supplementals
+             WHERE (?1 IS NULL OR created_at > ?1)
+             ORDER BY created_at, id
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![after_created_at, limit], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(serde_json::from_str(&row?)?);
+        }
+        Ok(records)
+    }
+
+    pub fn materialize_projection(
+        &self,
+        projection: &lethe_core::domain::ProjectionRef,
+        records: &serde_json::Value,
+    ) -> Result<(), PersistenceError> {
+        self.conn.execute(
+            "INSERT INTO projection_materializations (
+                projection_id, records_json, materialized_at
+             ) VALUES (?1, ?2, ?3)
+             ON CONFLICT(projection_id) DO UPDATE SET
+                records_json = excluded.records_json,
+                materialized_at = excluded.materialized_at",
+            params![
+                projection.as_str(),
+                serde_json::to_string(records)?,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn projection_records(
+        &self,
+        projection: &lethe_core::domain::ProjectionRef,
+    ) -> Result<Option<serde_json::Value>, PersistenceError> {
+        let json = self
+            .conn
+            .query_row(
+                "SELECT records_json FROM projection_materializations WHERE projection_id = ?1",
+                [projection.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        json.map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(PersistenceError::from)
+    }
+
+    pub fn projection_leaf_watermark(
+        &self,
+        projection: &lethe_core::domain::ProjectionRef,
+        leaf_id: &str,
+    ) -> Result<ProjectionLeafWatermark, PersistenceError> {
+        let existing = self
+            .conn
+            .query_row(
+                "SELECT append_seq, status FROM projection_leaf_watermarks
+                 WHERE projection_id = ?1 AND leaf_id = ?2",
+                params![projection.as_str(), leaf_id],
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let (append_seq, status) = existing.unwrap_or((0, "success".to_owned()));
+        Ok(ProjectionLeafWatermark {
+            projection_id: projection.clone(),
+            leaf_id: leaf_id.to_owned(),
+            append_seq,
+            status,
+        })
+    }
+
+    pub fn commit_projection_leaf_watermark(
+        &self,
+        watermark: &ProjectionLeafWatermark,
+    ) -> Result<(), PersistenceError> {
+        let current =
+            self.projection_leaf_watermark(&watermark.projection_id, &watermark.leaf_id)?;
+        if watermark.append_seq < current.append_seq {
+            return Err(PersistenceError::SchemaInvariant(format!(
+                "projection leaf watermark cannot decrease: {} -> {}",
+                current.append_seq, watermark.append_seq
+            )));
+        }
+        self.conn.execute(
+            "INSERT INTO projection_leaf_watermarks (
+                projection_id, leaf_id, append_seq, status, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(projection_id, leaf_id) DO UPDATE SET
+                append_seq = excluded.append_seq,
+                status = excluded.status,
+                updated_at = excluded.updated_at",
+            params![
+                watermark.projection_id.as_str(),
+                watermark.leaf_id,
+                watermark.append_seq,
+                watermark.status,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn deep_check(&self) -> Result<(), PersistenceError> {
+        let integrity = self
+            .conn
+            .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))?;
+        if integrity != "ok" {
+            return Err(PersistenceError::SchemaInvariant(format!(
+                "SQLite quick_check failed: {integrity}"
+            )));
+        }
+        self.load_partition_tree()?;
+        Ok(())
+    }
+
+    pub fn put_encrypted_secret(
+        &self,
+        secret_ref: &str,
+        plaintext: &[u8],
+    ) -> Result<(), PersistenceError> {
+        if secret_ref.trim().is_empty() || plaintext.is_empty() {
+            return Err(PersistenceError::SchemaInvariant(
+                "secret_ref and plaintext must not be empty".to_owned(),
+            ));
+        }
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.secret_encryption_key));
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let ciphertext = cipher.encrypt(&nonce, plaintext).map_err(|_| {
+            PersistenceError::SchemaInvariant("secret encryption failed".to_owned())
+        })?;
+        self.conn.execute(
+            "INSERT INTO encrypted_secrets (secret_ref, nonce, ciphertext, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(secret_ref) DO UPDATE SET
+                nonce = excluded.nonce,
+                ciphertext = excluded.ciphertext,
+                updated_at = excluded.updated_at",
+            params![
+                secret_ref,
+                nonce.as_slice(),
+                ciphertext,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_encrypted_secret(
+        &self,
+        secret_ref: &str,
+    ) -> Result<Option<Vec<u8>>, PersistenceError> {
+        let encrypted = self
+            .conn
+            .query_row(
+                "SELECT nonce, ciphertext FROM encrypted_secrets WHERE secret_ref = ?1",
+                [secret_ref],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        let Some((nonce, ciphertext)) = encrypted else {
+            return Ok(None);
+        };
+        let nonce: [u8; 12] = nonce.try_into().map_err(|_| {
+            PersistenceError::SchemaInvariant("stored secret nonce has invalid length".to_owned())
+        })?;
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.secret_encryption_key));
+        cipher
+            .decrypt((&nonce).into(), ciphertext.as_ref())
+            .map(Some)
+            .map_err(|_| PersistenceError::SchemaInvariant("secret decryption failed".to_owned()))
+    }
+
+    pub fn record_dead_letter(&self, source: &str, reason: &str) -> Result<(), PersistenceError> {
+        self.conn.execute(
+            "INSERT INTO dead_letters (
+                source_instance, item_key, reason, payload_json, created_at
+             ) VALUES (?1, ?2, ?3, NULL, ?4)",
+            params![source, source, reason, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_audit_event(
+        &self,
+        id: &str,
+        timestamp: &str,
+        actor: &str,
+        event_json: &str,
+    ) -> Result<(), PersistenceError> {
+        self.conn.execute(
+            "INSERT INTO audit_events (id, timestamp, actor, event_json)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id, timestamp, actor, event_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_sync_metrics(
+        &self,
+        source: &str,
+        metrics: &SyncMetricRecord,
+    ) -> Result<(), PersistenceError> {
+        self.conn.execute(
+            "INSERT INTO sync_metrics (
+                source_instance, fetched, ingested, skipped, failed,
+                quarantined, latency_ms, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(source_instance) DO UPDATE SET
+                fetched = excluded.fetched,
+                ingested = excluded.ingested,
+                skipped = excluded.skipped,
+                failed = excluded.failed,
+                quarantined = excluded.quarantined,
+                latency_ms = excluded.latency_ms,
+                updated_at = excluded.updated_at",
+            params![
+                source,
+                metrics.fetched,
+                metrics.ingested,
+                metrics.skipped,
+                metrics.failed,
+                metrics.quarantined,
+                metrics.latency_ms,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn apply_retention(&self, retention_days: u32) -> Result<usize, PersistenceError> {
+        if retention_days == 0 {
+            return Err(PersistenceError::SchemaInvariant(
+                "retention_days must be positive".to_owned(),
+            ));
+        }
+        let modifier = format!("-{retention_days} days");
+        let dead_letters = self.conn.execute(
+            "DELETE FROM dead_letters
+             WHERE datetime(created_at) < datetime('now', ?1)",
+            [&modifier],
+        )?;
+        let audits = self.conn.execute(
+            "DELETE FROM audit_events
+             WHERE datetime(timestamp) < datetime('now', ?1)",
+            [&modifier],
+        )?;
+        Ok(dead_letters + audits)
+    }
+}
+
+fn storage_error(error: PersistenceError) -> StorageError {
+    match error {
+        PersistenceError::SchemaInvariant(message) => StorageError::Invariant(message),
+        other => StorageError::Backend(other.to_string()),
+    }
+}
+
+fn port_outcome(outcome: DurableAppendOutcome) -> PortAppendOutcome {
+    match outcome {
+        DurableAppendOutcome::Appended(id) => PortAppendOutcome::Appended(id),
+        DurableAppendOutcome::Duplicate(id) => PortAppendOutcome::Duplicate(id),
+        DurableAppendOutcome::CanonicalCollision(id) => PortAppendOutcome::CanonicalCollision(id),
+    }
+}
+
+impl ObservationStorePort for SqlitePersistence {
+    fn append_observation(&self, observation: &Observation) -> StorageResult<PortAppendOutcome> {
+        self.append_observation_idempotent(observation)
+            .map(port_outcome)
+            .map_err(storage_error)
+    }
+
+    fn rehome_observation(
+        &self,
+        observation: &Observation,
+        mode: PortRehomeMode,
+    ) -> StorageResult<PortAppendOutcome> {
+        let mode = match mode {
+            PortRehomeMode::StoredIdentity => RehomeMode::StoredIdentity,
+            PortRehomeMode::RecomputedIdentity {
+                identity_key,
+                canonical_json,
+            } => RehomeMode::RecomputedIdentity {
+                identity_key,
+                canonical_json,
+            },
+        };
+        SqlitePersistence::rehome_observation(self, observation, mode)
+            .map(port_outcome)
+            .map_err(storage_error)
+    }
+
+    fn observation_page(
+        &self,
+        after_append_seq: u64,
+        limit: usize,
+    ) -> StorageResult<Vec<StoredObservation>> {
+        SqlitePersistence::observation_page(self, after_append_seq, limit).map_err(storage_error)
+    }
+
+    fn observations_for_leaf_after(
+        &self,
+        leaf_id: &str,
+        after_append_seq: u64,
+        limit: usize,
+    ) -> StorageResult<Vec<StoredObservation>> {
+        SqlitePersistence::observations_for_leaf_after(self, leaf_id, after_append_seq, limit)
+            .map_err(storage_error)
+    }
+
+    fn observation_by_id(&self, id: &ObservationId) -> StorageResult<Option<StoredObservation>> {
+        SqlitePersistence::observation_by_id(self, id).map_err(storage_error)
+    }
+
+    fn leaf_positions(&self) -> StorageResult<Vec<LeafPosition>> {
+        SqlitePersistence::leaf_positions(self).map_err(storage_error)
+    }
+
+    fn split_leaf_if_capacity(&self, capacity: usize) -> StorageResult<bool> {
+        SqlitePersistence::split_leaf_if_capacity(self, capacity).map_err(storage_error)
+    }
+}
+
+impl BlobStorePort for SqlitePersistence {
+    fn put_blob(&self, data: &[u8], max_bytes: usize) -> StorageResult<BlobRef> {
+        if data.len() > max_bytes {
+            return Err(StorageError::Invariant(format!(
+                "blob size {} exceeds configured maximum {max_bytes}",
+                data.len()
+            )));
+        }
+        self.persist_blob(data).map_err(storage_error)
+    }
+
+    fn get_blob(&self, blob_ref: &BlobRef) -> StorageResult<Option<Vec<u8>>> {
+        self.load_blob(blob_ref).map_err(storage_error)
+    }
+}
+
+impl SupplementalStorePort for SqlitePersistence {
+    fn put_supplemental(&self, record: &SupplementalRecord) -> StorageResult<()> {
+        self.persist_supplemental(record).map_err(storage_error)
+    }
+
+    fn supplemental_page(
+        &self,
+        after_created_at: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<Vec<SupplementalRecord>> {
+        SqlitePersistence::supplemental_page(self, after_created_at, limit).map_err(storage_error)
+    }
+}
+
+impl ProjectionMaterializerPort for SqlitePersistence {
+    fn materialize_projection(
+        &self,
+        projection: &lethe_core::domain::ProjectionRef,
+        records: &serde_json::Value,
+    ) -> StorageResult<()> {
+        SqlitePersistence::materialize_projection(self, projection, records).map_err(storage_error)
+    }
+
+    fn projection_records(
+        &self,
+        projection: &lethe_core::domain::ProjectionRef,
+    ) -> StorageResult<Option<serde_json::Value>> {
+        SqlitePersistence::projection_records(self, projection).map_err(storage_error)
+    }
+}
+
+impl RuntimeStateStorePort for SqlitePersistence {
+    fn get_state(&self, key: &str) -> StorageResult<Option<String>> {
+        SqlitePersistence::get_state(self, key).map_err(storage_error)
+    }
+
+    fn set_state(&self, key: &str, value: &str) -> StorageResult<()> {
+        SqlitePersistence::set_state(self, key, value).map_err(storage_error)
+    }
+
+    fn record_dead_letter(&self, source: &str, reason: &str) -> StorageResult<()> {
+        SqlitePersistence::record_dead_letter(self, source, reason).map_err(storage_error)
+    }
+
+    fn record_audit_event(
+        &self,
+        id: &str,
+        timestamp: &str,
+        actor: &str,
+        event_json: &str,
+    ) -> StorageResult<()> {
+        SqlitePersistence::record_audit_event(self, id, timestamp, actor, event_json)
+            .map_err(storage_error)
+    }
+
+    fn record_sync_metrics(&self, source: &str, metrics: &SyncMetricRecord) -> StorageResult<()> {
+        SqlitePersistence::record_sync_metrics(self, source, metrics).map_err(storage_error)
+    }
+
+    fn apply_retention(&self, retention_days: u32) -> StorageResult<usize> {
+        SqlitePersistence::apply_retention(self, retention_days).map_err(storage_error)
+    }
+
+    fn garbage_collect_orphan_blobs(&self) -> StorageResult<usize> {
+        SqlitePersistence::garbage_collect_orphan_blobs(self).map_err(storage_error)
+    }
+
+    fn deep_check(&self) -> StorageResult<()> {
+        SqlitePersistence::deep_check(self).map_err(storage_error)
+    }
+}
+
+impl ProjectionWatermarkStorePort for SqlitePersistence {
+    fn projection_leaf_watermark(
+        &self,
+        projection: &lethe_core::domain::ProjectionRef,
+        leaf_id: &str,
+    ) -> StorageResult<ProjectionLeafWatermark> {
+        SqlitePersistence::projection_leaf_watermark(self, projection, leaf_id)
+            .map_err(storage_error)
+    }
+
+    fn commit_projection_leaf_watermark(
+        &self,
+        watermark: &ProjectionLeafWatermark,
+    ) -> StorageResult<()> {
+        SqlitePersistence::commit_projection_leaf_watermark(self, watermark).map_err(storage_error)
     }
 }
 

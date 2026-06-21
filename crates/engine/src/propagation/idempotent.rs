@@ -1,5 +1,6 @@
 //! Idempotent apply contract helpers for at-least-once propagation.
 
+use lethe_core::domain::Observation;
 use std::fmt::Debug;
 
 pub trait IdempotentFold<I> {
@@ -7,6 +8,12 @@ pub trait IdempotentFold<I> {
 
     fn apply(&mut self, input: &I);
     fn output(&self) -> Self::Output;
+}
+
+/// Marker contract for folds accepted by the persistent propagation runtime.
+/// Implementations must be both commutative and idempotent.
+pub trait CommutativeIdempotentObservationFold {
+    fn apply(&mut self, observation: &Observation) -> Result<(), String>;
 }
 
 pub fn assert_at_least_once_idempotent<F, I>(mut fold: F, inputs: &[I])

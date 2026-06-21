@@ -3,10 +3,42 @@ use super::*;
 impl AppService {
     pub fn health(&self) -> Result<HealthResponse, SelfHostError> {
         let core = self.core_lock()?;
-        Ok(HealthResponse::from_catalog(
-            &core.catalog,
-            env!("CARGO_PKG_VERSION"),
-        ))
+        Ok(
+            HealthResponse::from_catalog(&core.catalog, env!("CARGO_PKG_VERSION")).with_runtime(
+                Vec::new(),
+                LastSyncHealth {
+                    completed_at: core.last_sync_at,
+                    error: core.last_sync_error.clone(),
+                },
+                core.sync_metrics.clone(),
+            ),
+        )
+    }
+
+    pub fn deep_health(&self) -> Result<HealthResponse, SelfHostError> {
+        let dependency = match self.persistence_lock()?.deep_check() {
+            Ok(()) => DependencyHealthInfo {
+                name: "storage".to_owned(),
+                status: "ok".to_owned(),
+                detail: None,
+            },
+            Err(error) => DependencyHealthInfo {
+                name: "storage".to_owned(),
+                status: "failed".to_owned(),
+                detail: Some(error.to_string()),
+            },
+        };
+        let core = self.core_lock()?;
+        Ok(
+            HealthResponse::from_catalog(&core.catalog, env!("CARGO_PKG_VERSION")).with_runtime(
+                vec![dependency],
+                LastSyncHealth {
+                    completed_at: core.last_sync_at,
+                    error: core.last_sync_error.clone(),
+                },
+                core.sync_metrics.clone(),
+            ),
+        )
     }
 
     pub(super) fn authorize_read(
@@ -60,7 +92,16 @@ impl AppService {
     }
 
     pub(super) fn apply_filter(&self, payload: serde_json::Value) -> serde_json::Value {
-        FilteringGate::filter(&payload, AccessScope::Internal, &restricted_fields()).payload
+        let result = FilteringGate::filter(&payload, AccessScope::Internal, &restricted_fields());
+        self.emit_audit(
+            "actor:self-host",
+            AuditEventKind::ReadRestricted,
+            serde_json::json!({
+                "decision": "filtering-before-exposure",
+                "masked_fields": result.masked_fields,
+            }),
+        );
+        result.payload
     }
 
     pub(super) fn resolve_read_mode(
@@ -82,6 +123,13 @@ impl AppService {
         &self,
         draft: ObservationDraft,
     ) -> Result<IngestResult, SelfHostError> {
+        let payload_bytes = serde_json::to_vec(&draft.payload)?.len();
+        if payload_bytes > self.config.resource_limits.max_payload_bytes {
+            return Err(SelfHostError::Ingestion(format!(
+                "payload size {payload_bytes} exceeds configured maximum {}",
+                self.config.resource_limits.max_payload_bytes
+            )));
+        }
         let mut core = self.core_lock()?;
         let observation = match core.prepare_observation(draft) {
             Ok(observation) => observation,
@@ -114,13 +162,16 @@ impl AppService {
     ) -> Result<IngestResult, SelfHostError> {
         let recorded_at = observation.recorded_at;
 
-        let durable_outcome = self
-            .persistence_lock()?
-            .append_observation_idempotent(&observation)?;
+        let durable_outcome = self.persistence_lock()?.append_observation(&observation)?;
 
         let result = match durable_outcome {
             DurableAppendOutcome::Appended(id) => match core.lake.append_idempotent(observation) {
                 lethe_engine::lake::store::AppendOutcome::Appended(_) => {
+                    self.emit_audit(
+                        "actor:self-host",
+                        AuditEventKind::WriteExecution,
+                        serde_json::json!({"observation_id": id.as_str()}),
+                    );
                     IngestResult::Ingested { id, recorded_at }
                 }
                 lethe_engine::lake::store::AppendOutcome::Duplicate(existing_id)
@@ -145,8 +196,10 @@ impl AppService {
 
     pub(super) fn store_blob(&self, data: &[u8]) -> Result<BlobRef, SelfHostError> {
         let mut core = self.core_lock()?;
-        let blob_ref = core.blobs.put(data);
-        self.persistence_lock()?.persist_blob(data)?;
+        let blob_ref = self
+            .persistence_lock()?
+            .put_blob(data, self.config.resource_limits.max_blob_bytes)?;
+        core.blobs.put(data);
         Ok(blob_ref)
     }
 
@@ -160,13 +213,15 @@ impl AppService {
         if !json_contains_string(&filtered_projection, blob_ref.as_str()) {
             return Ok(None);
         }
-        Ok(core.blobs.get(blob_ref).map(|bytes| bytes.to_vec()))
+        drop(core);
+        Ok(self.persistence_lock()?.get_blob(blob_ref)?)
     }
 
     pub(super) fn ingest_slack_message(
         &self,
         slack_adapter: &SlackAdapter<HttpSlackClient>,
         file_client: &HttpSlackClient,
+        source_instance_id: &str,
         channel_id: &str,
         mut message: lethe_adapter_slack::slack::client::SlackMessage,
         latest_ts: &mut Option<String>,
@@ -174,7 +229,13 @@ impl AppService {
         message.channel_id = channel_id.to_string();
         for file in &mut message.files {
             if file.blob_ref.is_none() {
-                let data = file_client.file_download(file)?;
+                let policy = self.slack_adapter_config();
+                let data = self.resilient_executor.execute(
+                    &format!("slack:{source_instance_id}:file-download"),
+                    &policy.retry,
+                    &policy.rate_limit,
+                    || file_client.file_download(file),
+                )?;
                 let blob_ref = self.store_blob(&data)?;
                 file.blob_ref = Some(blob_ref.as_str().to_string());
             }
@@ -186,22 +247,38 @@ impl AppService {
         if is_latest {
             *latest_ts = Some(message.ts.clone());
         }
-        self.ingest_draft(slack_adapter.map_message(&message)?)
+        self.ingest_draft(namespace_draft(
+            slack_adapter.map_message(&message)?,
+            source_instance_id,
+        ))
     }
 
     pub(super) fn sync_thread_replies(
         &self,
         slack_adapter: &SlackAdapter<HttpSlackClient>,
+        source: &SlackSourceRuntime,
         channel_id: &str,
         thread_ts: &str,
     ) -> Result<(usize, usize), SelfHostError> {
-        let cursor_key = thread_cursor_key(channel_id, thread_ts);
+        let cursor_key = format!(
+            "{}:{}",
+            source.config.id,
+            thread_cursor_key(channel_id, thread_ts)
+        );
         let reply_oldest = non_empty_state(self.persistence_lock()?.get_state(&cursor_key)?)
             .unwrap_or_else(|| thread_ts.to_string());
-        let replies = self.slack_replies_client.conversations_replies(
-            channel_id,
-            thread_ts,
-            Some(reply_oldest.as_str()),
+        let policy = self.slack_adapter_config();
+        let replies = self.resilient_executor.execute(
+            &format!("slack:{}:{channel_id}:replies", source.config.id),
+            &policy.retry,
+            &policy.rate_limit,
+            || {
+                source.replies_client.conversations_replies(
+                    channel_id,
+                    thread_ts,
+                    Some(reply_oldest.as_str()),
+                )
+            },
         )?;
         let mut latest_reply_ts = Some(reply_oldest);
         let mut ingested = 0usize;
@@ -210,7 +287,8 @@ impl AppService {
         for reply in replies.into_iter().filter(|reply| reply.ts != thread_ts) {
             match self.ingest_slack_message(
                 slack_adapter,
-                &self.slack_replies_client,
+                &source.replies_client,
+                &source.config.id,
                 channel_id,
                 reply,
                 &mut latest_reply_ts,
@@ -233,17 +311,27 @@ impl AppService {
         &self,
         channel_id: &str,
     ) -> Result<BTreeSet<String>, SelfHostError> {
-        let core = self.core_lock()?;
-        let observations: Vec<Observation> = core
-            .lake
-            .by_schema(&SchemaRef::new("schema:slack-message"))
-            .into_iter()
-            .cloned()
-            .collect();
-        Ok(known_thread_roots_from_observations(
-            &observations,
-            channel_id,
-        ))
+        let mut roots = BTreeSet::new();
+        let mut cursor = 0u64;
+        loop {
+            let page = self.persistence_lock()?.observation_page(cursor, 512)?;
+            if page.is_empty() {
+                break;
+            }
+            let observations = page
+                .iter()
+                .map(|stored| stored.observation.clone())
+                .collect::<Vec<_>>();
+            roots.extend(known_thread_roots_from_observations(
+                &observations,
+                channel_id,
+            ));
+            cursor = page
+                .last()
+                .map(|stored| stored.append_seq)
+                .unwrap_or(cursor);
+        }
+        Ok(roots)
     }
 
     pub(super) fn extract_student_profile_from_png(
@@ -258,9 +346,16 @@ impl AppService {
             .and_then(|value| value.as_str())
             .unwrap_or("Unknown");
 
-        Ok(self
-            .slide_analyzer
-            .extract_profile_from_png(image, title, canonical_uri)?)
+        let policy = self.google_adapter_config();
+        Ok(self.resilient_executor.execute(
+            "derivation:gemini",
+            &policy.retry,
+            &policy.rate_limit,
+            || {
+                self.slide_analyzer
+                    .extract_profile_from_png(image, title, canonical_uri)
+            },
+        )?)
     }
 
     pub(super) fn core_lock(&self) -> Result<std::sync::MutexGuard<'_, AppCore>, SelfHostError> {
@@ -269,7 +364,7 @@ impl AppService {
 
     pub(super) fn persistence_lock(
         &self,
-    ) -> Result<std::sync::MutexGuard<'_, SqlitePersistence>, SelfHostError> {
+    ) -> Result<std::sync::MutexGuard<'_, Box<dyn StoragePorts>>, SelfHostError> {
         self.persistence
             .lock()
             .map_err(|_| SelfHostError::LockPoisoned)
@@ -335,6 +430,32 @@ impl AppService {
             credential_ref: "env:LETHE_GOOGLE_ACCESS_TOKEN".into(),
         }
     }
+}
+
+pub(super) fn namespace_draft(
+    mut draft: ObservationDraft,
+    source_instance_id: &str,
+) -> ObservationDraft {
+    draft.idempotency_key = lethe_core::domain::IdempotencyKey::new(format!(
+        "{source_instance_id}:{}",
+        draft.idempotency_key.as_str()
+    ));
+    let mut meta = draft.meta.as_object().cloned().unwrap_or_default();
+    let container = meta
+        .get("source_container")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("root")
+        .to_owned();
+    meta.insert(
+        "source_instance".to_owned(),
+        serde_json::Value::String(source_instance_id.to_owned()),
+    );
+    meta.insert(
+        "source_container".to_owned(),
+        serde_json::Value::String(format!("{source_instance_id}:{container}")),
+    );
+    draft.meta = serde_json::Value::Object(meta);
+    draft
 }
 
 pub(super) fn build_person_page_lineage(
