@@ -7,8 +7,8 @@ context: |
   Architecture: Functional Core / Imperative Shell
   Layers: Domain Kernel → Policy → Effect Ports → Adapters → Runtime
 
-  Tech stack (MVP): Python, FastAPI, DuckDB, Parquet, SQLite, MinIO/LocalFS
-  Testing: pytest, contract tests, replay tests
+  Tech stack: Rust workspace, Axum, SQLite, local content-addressed blob storage
+  Testing: cargo test, contract tests, replay tests, end-to-end tests
   Conventions: append-only Lake, academic-pinned reproducibility, filtering-before-exposure
 
   System Laws (MUST NOT violate):
@@ -20,7 +20,7 @@ context: |
   - Filtering-before-Exposure Law: Restricted data filtered before display/export
 
   Modular specs: See openspec/specs/_index.md for module map
-  Agent roles: spec-designer, implementer, reviewer (see agents/)
+  Agent roles: spec-designer, implementer, reviewer (see docs/development/agents/)
 
   MVP scope: Google Slides + Slack → 名寄せ → 個人ページ (vertical slice)
 

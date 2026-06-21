@@ -3,7 +3,7 @@
 **Module:** observation-lake
 **Scope:** Canonical capture layer / ingestion pipeline / storage architecture / ordering
 **Dependencies:** M01 Domain Kernel, M02 Registry, M08 Governance
-**Parent docs:** [plan.md](../../plan.md) §4, [domain_algebra.md](../../domain_algebra.md) §4
+**Parent docs:** [System overview](../../docs/architecture/system-overview.md) §4, [Domain algebra](../../docs/architecture/domain-algebra.md) §4
 **Agent:** Spec Designer (ingestion 契約) → Implementer (append + gate 実装) → Reviewer (append-only 検証)
 
 ---

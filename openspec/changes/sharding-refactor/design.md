@@ -4,14 +4,14 @@
 **Version:** 0.1 (draft)
 **Date:** 2026-06-17
 
-本書は `proposal.md`(WHY)と `specs/*/spec.md`(WHAT)を受けて、実装上の判断・前提・未確定事項(HOW / リスク)を記録する。normative な要件は spec 側にあり、本書はそれを覆さない。意味論の正典は [domain_algebra.md](../../../domain_algebra.md) / [plan.md](../../../plan.md) / [runtime_reference_architecture.md](../../../runtime_reference_architecture.md)、本 change の sharding 観点上の正典は [sharding_refactor.md](../../../sharding_refactor.md)。
+本書は `proposal.md`(WHY)と `specs/*/spec.md`(WHAT)を受けて、実装上の判断・前提・未確定事項(HOW / リスク)を記録する。normative な要件は spec 側にあり、本書はそれを覆さない。意味論の正典は [Domain algebra](../../../docs/architecture/domain-algebra.md) / [System overview](../../../docs/architecture/system-overview.md) / [Runtime reference](../../../docs/architecture/runtime-reference.md)、本 change の sharding 観点上の正典は [Sharding design](../../../docs/architecture/sharding.md)。
 
 ---
 
 ## Context
 
 - 本 change は **System Laws と既存モジュール契約(M01–M15)を変えず、Idempotency / Replay を強化** するアーキテクチャ refactor である。
-- 横断不変条件は [sharding_refactor.md §1](../../../sharding_refactor.md) に正典がある(不変条件1〜10)。各 D 決定の根拠とコード接地点(`file:line`)も同文書に記載。
+- 横断不変条件は [sharding_refactor.md §1](../../../docs/architecture/sharding.md) に正典がある(不変条件1〜10)。各 D 決定の根拠とコード接地点(`file:line`)も同文書に記載。
 - 旧記述(draft の確率的冪等性 / SimHash routing / 固定ビット trie / conversation-level idempotencyKey)は本 change で上書きされる(sharding_refactor.md §4)。
 
 ---
@@ -105,10 +105,10 @@
 
 ### U1. 現行コードとの差分マッピング(Phase 0 / Phase 1 の前提)
 
-`specs/observation-lake/spec.md` SHARD-04 の `IngestResult` 同型性主張は、現行 [src/lake/ingestion.rs:228](../../../src/lake/ingestion.rs) を実測して確認すること。差分があれば spec の Scenario を現コードに合わせて調整(意味論は変えない)。
+`specs/observation-lake/spec.md` SHARD-04 の `IngestResult` 同型性主張は、現行 [crates/engine/src/lake/ingestion.rs](../../../crates/engine/src/lake/ingestion.rs) を実測して確認すること。差分があれば spec の Scenario を現コードに合わせて調整(意味論は変えない)。
 
 1. `IngestResult` の variant 名 / payload を 1 対 1 で確認。
-2. `same_idempotent_observation` の比較範囲([src/lake/store.rs:151](../../../src/lake/store.rs))を実コードで確認。canonical 除外群(reactions / 編集 wrapper / ingestion meta)が現実装でも実際に差分を起こすか property test で確認。
+2. `same_idempotent_observation` の比較範囲([crates/engine/src/lake/store.rs](../../../crates/engine/src/lake/store.rs))を実コードで確認。canonical 除外群(reactions / 編集 wrapper / ingestion meta)が現実装でも実際に差分を起こすか property test で確認。
 3. SQLite schema migration の前後で既存 `idempotency_key` 列の denormalize 形式を確認(`observation_json.idempotency_key` との 1 対 1 関係)。
 
 `Gate P0`(partition log `initialize` の永続 + 両 keyspec の不変性 DB 強制)を満たすまで Phase 1 へ進まない。

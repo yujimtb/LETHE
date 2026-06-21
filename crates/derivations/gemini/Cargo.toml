@@ -1,0 +1,17 @@
+[package]
+name = "lethe-derivation-gemini"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+lethe-adapter-api = { path = "../../adapters/api" }
+lethe-adapter-gslides = { path = "../../adapters/gslides" }
+lethe-core = { path = "../../core" }
+lethe-engine = { path = "../../engine" }
+lethe-profile-model = { path = "../../profile-model" }
+regex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true

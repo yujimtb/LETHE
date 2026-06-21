@@ -3,7 +3,7 @@
 **Module:** google-slides-adapter
 **Scope:** Google Slides source adapter — revision snapshot / native structure / render の取り込み
 **Dependencies:** M01 Domain Kernel, M02 Registry, M03 Observation Lake, M04 Supplemental Store, M09 Adapter Policy
-**Parent docs:** [plan.md](../../plan.md) §4.5.1, [issues/R2-06](../../issues/R2-06_google_slides_adapter.md)
+**Parent docs:** [System overview](../../docs/architecture/system-overview.md) §4.5.1, [issues/R2-06](../../docs/archive/issues/round-2/R2-06_google_slides_adapter.md)
 **Agent:** Spec Designer (capture 仕様) → Implementer (API client + adapter) → Reviewer (snapshot 検証)
 **MVP:** ✓
 

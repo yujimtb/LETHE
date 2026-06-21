@@ -1,0 +1,8 @@
+[package]
+name = "lethe-storage-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lethe-core = { path = "../../core" }
+serde_json.workspace = true

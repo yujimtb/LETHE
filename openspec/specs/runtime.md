@@ -3,7 +3,7 @@
 **Module:** runtime
 **Scope:** Runtime topology, build isolation, sandbox, reference technology mapping, operational controls
 **Dependencies:** M01 Domain Kernel, M02 Registry, M03 Observation Lake, M05 Projection Engine
-**Parent docs:** [runtime_reference_architecture.md](../../runtime_reference_architecture.md)
+**Parent docs:** [Runtime reference](../../docs/architecture/runtime-reference.md)
 **Agent:** Spec Designer (topology 設計) → Implementer (infrastructure) → Reviewer (isolation 検証)
 **MVP:** △ (MVP は最小構成のみ)
 
@@ -15,7 +15,7 @@ LETHE を実際に稼働させるための runtime topology・build isolation・
 技術選定ガイドラインを定義する。
 
 > **Runtime Is Subordinate to Semantics:** 実装は交換可能であり、
-> 守るべき本質は `plan.md` と `domain_algebra.md` の意味論と law。
+> 守るべき本質は `docs/architecture/system-overview.md` と `docs/architecture/domain-algebra.md` の意味論と law。
 
 ---
 

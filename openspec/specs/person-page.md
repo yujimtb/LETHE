@@ -3,7 +3,7 @@
 **Module:** person-page
 **Scope:** 個人ページ Projection & API — MVP 最終成果物
 **Dependencies:** M01 Domain Kernel, M02 Registry, M03 Observation Lake, M05 Projection Engine, M12 Identity Resolution
-**Parent docs:** [issues/R2-04](../../issues/R2-04_person_page_api.md), [plan.md](../../plan.md) §11.4 Step 5
+**Parent docs:** [issues/R2-04](../../docs/archive/issues/round-2/R2-04_person_page_api.md), [System overview](../../docs/architecture/system-overview.md) §11.4 Step 5
 **Agent:** Spec Designer (API 契約) → Implementer (projector + API) → Reviewer (出力検証)
 **MVP:** ✓
 
@@ -61,7 +61,7 @@ spec:
   interface:
     primaryAccess:
       type: "http"
-      path: "/api/persons"
+      path: "/api/projections/proj:person-page/records"
     readModes:
       - name: "operational-latest"
         sourcePolicy: "source-native-preferred"
@@ -137,11 +137,11 @@ spec:
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/persons` | 名寄せ済み人物一覧 |
-| GET | `/api/persons/{person_id}` | 個人詳細ページ |
-| GET | `/api/persons/{person_id}/slides` | 関連 Slides 一覧 |
-| GET | `/api/persons/{person_id}/messages` | 関連メッセージ一覧 |
-| GET | `/api/persons/{person_id}/timeline` | Activity timeline |
+| GET | `/api/projections/proj:person-page/records` | 名寄せ済み人物一覧 |
+| GET | `/api/projections/proj:person-page/records/{person_id}` | 個人詳細ページ |
+| GET | `/api/projections/proj:person-page/records/{person_id}/slides` | 関連 Slides 一覧 |
+| GET | `/api/projections/proj:person-page/records/{person_id}/messages` | 関連メッセージ一覧 |
+| GET | `/api/projections/proj:person-page/records/{person_id}/timeline` | Activity timeline |
 
 ### 4.2 個人詳細レスポンス
 
@@ -305,14 +305,14 @@ SELECT * FROM person_activity WHERE person_id = :id;
 | # | Input | Expected | Notes |
 |---|---|---|---|
 | 1 | 名寄せ済み person (2 sources) | 個人詳細 JSON 返却 | identity, slides, messages |
-| 2 | `/api/persons` | 一覧返却 (paginated) | |
+| 2 | `/api/projections/proj:person-page/records` | 一覧返却 (paginated) | |
 | 3 | 自己紹介スライドあり person | self_introduction.text 含む | |
 | 4 | slides endpoint | 関連 slide 一覧 | |
 | 5 | messages endpoint | 関連メッセージ一覧 | |
 | 6 | timeline endpoint | 時系列イベント一覧 | |
 | 7 | restricted message | text masked or excluded | Filtering Law |
 | 8 | 存在しない person_id | 404 | |
-| 9 | pending medium candidate | `/api/persons` に出ない | |
+| 9 | pending medium candidate | projection recordsに出ない | |
 | 10 | incremental: 新 slide capture → rebuild | person_slides 更新 | |
 
 ---

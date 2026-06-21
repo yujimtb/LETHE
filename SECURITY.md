@@ -21,6 +21,6 @@
 
 ## Automated Audit
 
-- Run `./scripts/public-release-audit.ps1` before pushing changes to verify that newly tracked files do not contain secrets or local runtime data.
-- Run `./scripts/public-release-audit.ps1 -CheckHistory` before making the repository public. This stricter mode also fails when git history contains `.env`, `client_secret.json`, `data/` payloads, or `target/`.
+- Run `python ./scripts/public_release_audit.py` before pushing changes to verify that newly tracked files do not contain secrets or local runtime data.
+- Run `python ./scripts/public_release_audit.py --check-history` before making the repository public. This stricter mode also fails when git history contains `.env`, `client_secret.json`, `data/` payloads, or `target/`.
 - GitHub Actions runs the default audit in `.github/workflows/public-release-guard.yml`, so new leaks are blocked on every PR and on pushes to `main`.

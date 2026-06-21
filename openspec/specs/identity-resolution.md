@@ -3,7 +3,7 @@
 **Module:** identity-resolution
 **Scope:** 名寄せ Projection — Slack user / Google account / slide 登場人物の同一人物判定
 **Dependencies:** M01 Domain Kernel, M02 Registry, M03 Observation Lake, M04 Supplemental Store, M05 Projection Engine, M08 Governance
-**Parent docs:** [issues/R2-03](../../issues/R2-03_identity_resolution_projection.md), [plan.md](../../plan.md) §11.4 Step 4
+**Parent docs:** [issues/R2-03](../../docs/archive/issues/round-2/R2-03_identity_resolution_projection.md), [System overview](../../docs/architecture/system-overview.md) §11.4 Step 4
 **Agent:** Spec Designer (名寄せ spec) → Implementer (projector) → Reviewer (confidence / lineage 検証)
 **MVP:** ✓
 

@@ -1,41 +1,47 @@
-[package]
-name = "lethe"
+[workspace]
+resolver = "3"
+members = [
+    "apps/selfhost",
+    "apps/tools/attribute-inventory",
+    "crates/adapters/api",
+    "crates/adapters/claude",
+    "crates/adapters/gslides",
+    "crates/adapters/slack",
+    "crates/api",
+    "crates/core",
+    "crates/derivations/gemini",
+    "crates/engine",
+    "crates/policy",
+    "crates/profile-model",
+    "crates/projections/person",
+    "crates/registry",
+    "crates/runtime",
+    "crates/storage/api",
+    "crates/storage/sqlite",
+    "tests/e2e",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[workspace]
-members = [
-    ".",
-    "crates/lethe-core",
-    "crates/lethe-policy",
-    "crates/lethe-storage-api",
-    "crates/lethe-storage-sqlite",
-    "crates/lethe-adapter-slack",
-    "crates/lethe-adapter-gslides",
-    "crates/lethe-runtime",
-    "crates/lethe-selfhost",
-    "crates/lethe-projection-person",
-]
-
-[dependencies]
+[workspace.dependencies]
+axum = "0.8"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-uuid = { version = "1", features = ["v7", "serde"] }
-thiserror = "2"
-sha2 = "0.10"
+dotenvy = "0.15"
 hex = "0.4"
 jsonschema = "0.29"
-axum = "0.8"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+pretty_assertions = "1"
+regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
 rusqlite = { version = "0.34", features = ["bundled"] }
-dotenvy = "0.15"
-base64 = "0.22"
-zip = { version = "2", default-features = false, features = ["deflate"] }
-regex = "1"
-unicode-normalization = "0.1"
-
-[dev-dependencies]
-pretty_assertions = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
 tower = "0.5"
+unicode-normalization = "0.1"
+uuid = { version = "1", features = ["v7", "serde"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }

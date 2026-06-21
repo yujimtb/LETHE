@@ -3,7 +3,7 @@
 **Module:** domain-kernel
 **Scope:** 型定義・closed algebra・system laws・failure model・storage semantics boundary
 **Dependencies:** なし（全モジュールの基盤）
-**Parent docs:** [domain_algebra.md](../../domain_algebra.md), [plan.md](../../plan.md) §0.4
+**Parent docs:** [Domain algebra](../../docs/architecture/domain-algebra.md), [System overview](../../docs/architecture/system-overview.md) §0.4
 **Agent:** Spec Designer (定義) → Reviewer (law 整合性検証)
 
 ---

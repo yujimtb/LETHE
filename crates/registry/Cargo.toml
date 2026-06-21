@@ -1,0 +1,11 @@
+[package]
+name = "lethe-registry"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chrono.workspace = true
+jsonschema.workspace = true
+lethe-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true

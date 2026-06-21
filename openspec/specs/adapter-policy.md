@@ -3,7 +3,7 @@
 **Module:** adapter-policy
 **Scope:** Source adapter の共通パターン・契約・テスト要件
 **Dependencies:** M01 Domain Kernel, M02 Registry, M03 Observation Lake
-**Parent docs:** [plan.md](../../plan.md) §4.5, [issues/R2-02](../../issues/R2-02_slack_schema_adapter.md), [issues/R2-06](../../issues/R2-06_google_slides_adapter.md)
+**Parent docs:** [System overview](../../docs/architecture/system-overview.md) §4.5, [issues/R2-02](../../docs/archive/issues/round-2/R2-02_slack_schema_adapter.md), [issues/R2-06](../../docs/archive/issues/round-2/R2-06_google_slides_adapter.md)
 **Agent:** Spec Designer (共通契約) → Reviewer (contract 検証)
 
 ---

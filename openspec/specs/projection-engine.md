@@ -3,7 +3,7 @@
 **Module:** projection-engine
 **Scope:** Projection 意味論 / spec format / lifecycle / build / source 宣言
 **Dependencies:** M01 Domain Kernel, M02 Registry, M03 Observation Lake, M04 Supplemental Store
-**Parent docs:** [plan.md](../../plan.md) §5, [domain_algebra.md](../../domain_algebra.md) §3.3–3.4, §5
+**Parent docs:** [System overview](../../docs/architecture/system-overview.md) §5, [Domain algebra](../../docs/architecture/domain-algebra.md) §3.3–3.4, §5
 **Agent:** Spec Designer (spec format) → Implementer (runner 実装) → Reviewer (replay 検証)
 
 ---

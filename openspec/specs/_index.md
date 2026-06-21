@@ -208,7 +208,7 @@ M15 Runtime
 3. Failure model への参照は M01 Domain Kernel を正規参照先とする
 4. Governance policy への参照は M08 Governance を正規参照先とする
 5. runtime 詳細への参照は M15 Runtime を正規参照先とする
-6. 親仕様ファイル（plan.md, domain_algebra.md 等）は引き続き authoritative overview として保持する
+6. 親仕様文書（`docs/architecture/`）は authoritative overview として保持する
 
 ---
 
@@ -216,8 +216,8 @@ M15 Runtime
 
 | Parent Document | Extracted Modules | Status |
 |---|---|---|
-| plan.md | M02, M03, M05, M07, M09-M14 | 親仕様として保持。モジュール spec が詳細を持つ |
-| domain_algebra.md | M01, M04, M06, M07 | 意味論の正規参照。モジュール spec が実装寄り詳細を持つ |
-| governance_capability_model.md | M08 | policy の正規参照 |
-| runtime_reference_architecture.md | M15 | runtime の正規参照 |
-| issues/R2-*.md | M06, M10, M11, M12, M13 | Issue は対応モジュール spec を参照する |
+| `docs/architecture/system-overview.md` | M02, M03, M05, M07, M09-M14 | 親仕様として保持。モジュール spec が詳細を持つ |
+| `docs/architecture/domain-algebra.md` | M01, M04, M06, M07 | 意味論の正規参照。モジュール spec が実装寄り詳細を持つ |
+| `docs/architecture/governance-capability-model.md` | M08 | policy の正規参照 |
+| `docs/architecture/runtime-reference.md` | M15 | runtime の正規参照 |
+| `docs/archive/issues/round-2/R2-*.md` | M06, M10, M11, M12, M13 | 解決済みIssueの履歴 |

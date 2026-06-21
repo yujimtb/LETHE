@@ -3,7 +3,7 @@
 **Module:** registry
 **Scope:** EntityType / Schema / Observer / Source Contract / Projection Catalog のメタデータ管理
 **Dependencies:** M01 Domain Kernel
-**Parent docs:** [plan.md](../../plan.md) §3
+**Parent docs:** [System overview](../../docs/architecture/system-overview.md) §3
 **Agent:** Spec Designer (schema 設計) → Implementer (DB + API) → Reviewer (制約検証)
 
 ---

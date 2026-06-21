@@ -3,7 +3,7 @@
 **Module:** api-serving
 **Scope:** API レイヤー の read mode 制御、serving フロー、FastAPI 構成
 **Dependencies:** M01 Domain Kernel, M05 Projection Engine, M08 Governance
-**Parent docs:** [runtime_reference_architecture.md](../../runtime_reference_architecture.md) §3.5 / §4.4, [plan.md](../../plan.md) §5.6–5.7
+**Parent docs:** [Runtime reference](../../docs/architecture/runtime-reference.md) §3.5 / §4.4, [System overview](../../docs/architecture/system-overview.md) §5.6–5.7
 **Agent:** Spec Designer (read mode 契約) → Implementer (FastAPI, middleware) → Reviewer (access / filtering)
 **MVP:** ✓
 
@@ -119,44 +119,32 @@ restricted flag が付いた field は Projection API 経由で公開する前�
 
 ---
 
-## 6. FastAPI Structure
+## 6. Axum Structure
 
 ### 6.1 Application Layout
 
-```
-src/lethe/api/
-├── main.py                       # FastAPI app, middleware registration
-├── middleware/
-│   ├── auth.py                   # AuthenticationMiddleware
-│   ├── access.py                 # AccessPolicyMiddleware
-│   └── filtering.py              # FilteringMiddleware
-├── routers/
-│   ├── persons.py                # Person Page routes (M13)
-│   ├── projections.py            # Generic projection routes
-│   └── health.py                 # Health check
-├── deps.py                       # Dependencies (DB, config)
-├── schemas/
-│   ├── envelope.py               # Response envelope
-│   └── person.py                 # Person response models
-└── read_mode.py                  # Read mode resolver
+```text
+crates/api/src/api/
+├── envelope.rs
+├── health.rs
+├── pagination.rs
+└── read_mode.rs
+
+apps/selfhost/src/self_host/
+├── server.rs                     # Axum router / authentication boundary
+└── app/                          # Projection query service
 ```
 
 ### 6.2 Main App
 
-```python
-from fastapi import FastAPI
-
-app = FastAPI(title="LETHE API", version="0.1.0")
-
-# middleware (outer → inner order)
-app.add_middleware(FilteringMiddleware)
-app.add_middleware(AccessPolicyMiddleware)
-app.add_middleware(AuthenticationMiddleware)
-
-# routers
-app.include_router(persons_router, prefix="/api/persons", tags=["persons"])
-app.include_router(projections_router, prefix="/api/projections", tags=["projections"])
-app.include_router(health_router, prefix="/api/health", tags=["health"])
+```rust
+Router::new()
+    .route("/health", get(health))
+    .route("/admin/sync", post(sync_now))
+    .route(
+        "/api/projections/{projection_id}/records",
+        get(projection_records),
+    )
 ```
 
 ---
@@ -176,7 +164,7 @@ app.include_router(health_router, prefix="/api/health", tags=["health"])
 ## 8. Health Check
 
 ```json
-GET /api/health
+GET /health
 
 {
   "status": "ok",
@@ -232,7 +220,7 @@ Response:
 
 | # | Input | Expected | Notes |
 |---|---|---|---|
-| 1 | Valid GET /api/persons | 200 + person list + metadata | |
+| 1 | Valid GET /api/projections/proj:person-page/records | 200 + person list + metadata | |
 | 2 | Invalid auth token | 401 | |
 | 3 | Access denied (no capability) | 403 | |
 | 4 | ?mode=operational-latest | read_mode = operational-latest | |
