@@ -5,11 +5,11 @@
 
 実施順は `proposal.md` の Rollout に従う。各 Phase の完了が次 Phase の merge gate となる。要件 ID は `specs/*/spec.md` の SHARD-* / SHARD-PROP-* / SHARD-ADAPT-* / SHARD-RT-* を参照。各 Gate の受け入れ基準は対応する Scenario をテスト化したものとする。
 
-横断不変条件は [sharding_refactor.md §1](../../../sharding_refactor.md) を正典とし、本 change の全 Phase で破ってはならない(不変条件1〜10)。
+横断不変条件は [sharding_refactor.md §1](../../../docs/architecture/sharding.md) を正典とし、本 change の全 Phase で破ってはならない(不変条件1〜10)。
 
 ## Phase 0 — Keyspec Freeze (single leaf=root)
 
-> 前提: `design.md` U1「現行コードとの差分マッピング」を先に実施し、SHARD-04(exact dedup)と現行 [src/lake/ingestion.rs:228](../../../src/lake/ingestion.rs) の `IngestResult` 同型性を確認してから 0.1 に着手する。
+> 前提: `design.md` U1「現行コードとの差分マッピング」を先に実施し、SHARD-04(exact dedup)と現行 [crates/engine/src/lake/ingestion.rs](../../../crates/engine/src/lake/ingestion.rs) の `IngestResult` 同型性を確認してから 0.1 に着手する。
 
 - [x] 0.1 `routing_keyspec` と `identity_keyspec` の version pin スキーマを定義(SHARD-RT-01 / SHARD-01)
 - [x] 0.2 partition log の `initialize` event 形式を定義(両 keyspec を pin)、SQLite テーブル `partition_log` を追加(SHARD-RT-04)
@@ -27,7 +27,7 @@
       - `canonical_json TEXT NOT NULL`(衝突比較対象)
       - `recorded_at TEXT NOT NULL`(provenance、cursor には使わない)
       - `observation_json TEXT NOT NULL`
-- [x] 1.2 SQLite を per-leaf authoritative 化、in-memory `LakeStore` を非永続キャッシュへ降格(SHARD-05)
+- [ ] 1.2 SQLite を per-leaf authoritative 化、in-memory `LakeStore` を非永続キャッシュへ降格(SHARD-05)
 - [x] 1.3 dedup を SQLite UNIQUE 違反 → `Duplicate(existing_id)` に一本化(補償ロールバック除去)(SHARD-04)
 - [x] 1.4 衝突判定を `same_idempotent_observation`(full observation 比較) → stored `canonical_json` のみの exact compare に置換(SHARD-04 §canonical タプル衝突判定、R4)
 - [x] 1.5 Slack adapter を per-message 化(channel:ts ベース)、(object_id, canonical タプル) 宣言契約へ書き換え(SHARD-02 / SHARD-ADAPT-01)
@@ -58,8 +58,8 @@
 
 - [x] 3.1 Patricia trie の永続表現(`tree(L)` = `initialize` + `split_commit` の fold)(SHARD-RT-02)
 - [x] 3.2 `routing_key` 計算実装: `coarse(month) : coarse(year) : source : container : fine(published)`(SHARD-RT-01)
-- [x] 3.3 lazy split 実装(容量駆動、中身ごと全再配置 = rehome mode (a) を子 leaf へ)(SHARD-RT-02 §lazy split)
-- [x] 3.4 **split atomic cutover protocol**: `split_prepare`(子 build / 親へ route) → catch-up(差分 rehome) → write barrier(短い freeze) → `split_commit`(route 子へ原子的切替、`bit_index` 記録)(SHARD-RT-03、R9)
+- [ ] 3.3 lazy split 実装(容量駆動、中身ごと全再配置 = rehome mode (a) を子 leaf へ)(SHARD-RT-02 §lazy split)
+- [ ] 3.4 **split atomic cutover protocol**: `split_prepare`(子 build / 親へ route) → catch-up(差分 rehome) → write barrier(短い freeze) → `split_commit`(route 子へ原子的切替、`bit_index` 記録)(SHARD-RT-03、R9)
 - [x] 3.5 partition log events: `split_prepare` / `split_commit` を `event_seq` + optional control-plane timestamp で永続(SHARD-RT-04、R10)
 - [x] 3.6 split 中の crash: `prepare` だけで `commit` なしは `tree(L)` に影響しない(replay test)
 - [x] 3.7 leaf id = 不透明 `lake:<uuid>`、path / 責任ビット範囲は log から計算(SHARD-RT-04)
@@ -74,10 +74,10 @@
 - [x] 4.1 `candidate_leaves(filter, log)` 実装: routing 軸 prune + published time-window を `(month, year)` bucket 集合に展開して部分木 union(SHARD-RT-06、R3)
 - [x] 4.2 streaming k-way merge by `(published, recorded_at, id)` 実装(SHARD-RT-07)
 - [x] 4.3 resolver を Imperative Shell に配置、Kernel は論理 lake のみを見る(SHARD-RT-07 §Effect Isolation)
-- [x] 4.4 watermark を `projection_watermarks` テーブルから per-(projection × leaf) cursor table へ migrate(SHARD-PROP-01)
+- [ ] 4.4 watermark を `projection_watermarks` テーブルから per-(projection × leaf) cursor table へ migrate(SHARD-PROP-01)
 - [x] 4.5 cursor を `recorded_at` / `published` → leaf-local `append_seq` に置換(SHARD-PROP-02、R2)
-- [x] 4.6 propagation 検出: per-leaf `WHERE append_seq > ?` で tail を読む(SHARD-PROP-04)
-- [x] 4.7 propagation 適用: 可換 + 冪等 fold に限定(順序依存 fold は core サポート外)、at-least-once + 冪等 apply 契約(SHARD-PROP-03)
+- [ ] 4.6 propagation 検出: per-leaf `WHERE append_seq > ?` で tail を読む(SHARD-PROP-04)
+- [ ] 4.7 propagation 適用: 可換 + 冪等 fold に限定(順序依存 fold は core サポート外)、at-least-once + 冪等 apply 契約(SHARD-PROP-03)
 - [x] 4.8 split 後の全 Observation 再配送を baseline で許容(SHARD-PROP-05、R11)、profiling で β(frontier 子移管)を後付け可能に
 - [x] 4.9 supplemental index は明示宣言の read mode のみ(暗黙 full-scan fallback 禁止)(SHARD-RT-08、R6)
 - [x] 4.10 placement に解決済みエンティティ(person / subject / project)を入れない(SHARD-RT-08 §placement 原則)
@@ -102,11 +102,11 @@
 
 ## Phase 6 — Blue/Green Keyspec Migration
 
-- [x] 6.1 新 keyspec で新構造(新 partition log + 新 leaf 群)を立てる
-- [x] 6.2 全観測を rehome mode (b)(canonical タプル再計算、`identity_key` column + `canonical_json` column + `observation_json.idempotency_key` を新 keyspec で再シリアライズ)で新構造へ migrate(SHARD-07 §mode (b)、R14)
-- [x] 6.3 iterative catch-up(bulk → 差分反復 → 短い freeze → cutover)、または freeze。いずれも rehome primitive 上で(SHARD-07)
-- [x] 6.4 read を cutover、旧構造を retire(物理 leaf を削除)
-- [x] 6.5 旧 keyspec + 旧 partition log の version を metadata として履歴保持
+- [ ] 6.1 新 keyspec で新構造(新 partition log + 新 leaf 群)を立てる
+- [ ] 6.2 全観測を rehome mode (b)(canonical タプル再計算、`identity_key` column + `canonical_json` column + `observation_json.idempotency_key` を新 keyspec で再シリアライズ)で新構造へ migrate(SHARD-07 §mode (b)、R14)
+- [ ] 6.3 iterative catch-up(bulk → 差分反復 → 短い freeze → cutover)、または freeze。いずれも rehome primitive 上で(SHARD-07)
+- [ ] 6.4 read を cutover、旧構造を retire(物理 leaf を削除)
+- [ ] 6.5 旧 keyspec + 旧 partition log の version を metadata として履歴保持
 
 **Gate P6:**
 - 新構造の replay で migration 前後の現状態が決定的再現されること(Replay Law)
@@ -127,7 +127,7 @@
 | --- | ------------------------- | --------------------------------- | -------------------------------------------------------- | ---- |
 | —   | (既存 M03 / M06 / M09 / M15) | observation-lake.md / dag-propagation.md / adapter-policy.md / runtime.md | 本 change により sharding 関連要件(SHARD-*)を取り込み | ✓    |
 
-依存関係追記: SHARD-* は M03 / M06 / M09 / M15 を横断する。意味論の正典は依然として [domain_algebra.md](../../../domain_algebra.md) / [plan.md](../../../plan.md) / [runtime_reference_architecture.md](../../../runtime_reference_architecture.md) / [adr_backlog.md](../../../adr_backlog.md)、本 change の sharding 観点上の正典は [sharding_refactor.md](../../../sharding_refactor.md)。
+依存関係追記: SHARD-* は M03 / M06 / M09 / M15 を横断する。意味論の正典は依然として [Domain algebra](../../../docs/architecture/domain-algebra.md) / [System overview](../../../docs/architecture/system-overview.md) / [Runtime reference](../../../docs/architecture/runtime-reference.md) / [ADR backlog](../../../docs/decisions/adr-backlog.md)、本 change の sharding 観点上の正典は [Sharding design](../../../docs/architecture/sharding.md)。
 
 ## Frozen During This Change
 

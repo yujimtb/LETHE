@@ -1,7 +1,7 @@
 # Design: generalize-platform
 
 **Change:** generalize-platform
-**Version:** 0.1 (draft)
+**Version:** 0.2
 **Date:** 2026-06-13
 
 本書は `proposal.md`(WHY)と `specs/*/spec.md`(WHAT)を受けて、
@@ -53,14 +53,49 @@ normative な要件は spec 側にあり、本書はそれを覆さない。
 
 - 基盤 Entity Type(`et:person` 等)は **コード定数ではなくシードデータ**。
   `person_page` 相当は `lethe-projection-person` としてコア外に置き、
-  API は型非依存の `/api/projections/{id}/*` を正路とする(GEN-01)。
-  互換のため `/api/persons/*` を 1 リリースだけ deprecation alias で維持。
+  API は型非依存の `/api/projections/{id}/*` のみとする(GEN-01)。
 
 ### D6. 失敗は隔離し、sync は部分成功を返す
 
 - 外部 API 呼び出しは共通ミドルウェア(retry / backoff / rate limit /
   circuit breaker)を通す。単一失敗で全体停止させず、dead-letter +
   部分成功レポート + 永続 cursor で再開可能にする(ROB-03 / ROB-04)。
+
+### D7. crate はソースを物理所有し、ルート package を廃止
+
+- workspace root は `[workspace]` のみを持ち、Rust source を所有しない。
+- 各 crate は自身の `src/` 配下のコードだけをコンパイルする。
+- `#[path = "../../../src/..."]`、ルート package への逆依存、互換 re-export
+  で分割を装う構成は禁止する。
+- 確定した依存方向は次の通りとする。
+
+```text
+core
+├─ policy
+├─ registry
+├─ storage-api
+├─ engine ── policy, registry, storage-api
+├─ runtime
+├─ adapter-api
+└─ profile-model
+
+api ── core, engine
+projection-person ── core, policy, engine, profile-model
+adapter-* ── core, adapter-api, profile-model（必要なもののみ）
+derivation-gemini ── core, engine, adapter-api, profile-model
+storage-sqlite ── core, runtime
+selfhost ── 上記の配線
+tools ── selfhost
+```
+
+### D8. repository document taxonomy
+
+- 正典仕様は `openspec/`、説明文書は `docs/` に分離する。
+- `docs/architecture/` は現行アーキテクチャ、`docs/decisions/` は判断記録、
+  `docs/development/` は開発運用、`docs/audits/` は監査結果、
+  `docs/archive/` は歴史資料を保持する。
+- 外部で作成されたロードマップや監査の受け口として `docs/post/` を設ける。
+- ルートには入口となる `README.md`、`SECURITY.md`、ビルド設定だけを置く。
 
 ## 未確定事項 / 実装着手時に確定する前提
 

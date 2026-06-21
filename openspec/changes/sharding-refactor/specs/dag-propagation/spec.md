@@ -10,7 +10,7 @@
 - M03 Observation Lake — `append_seq` schema(本 change の `observation-lake` delta SHARD-06 で追加)
 - M05 Projection Engine — projection spec / lifecycle
 - M06 DAG Propagation — 既存 `openspec/specs/dag-propagation.md` の中核(watermark 概念 / incremental apply / retry semantics)は **不変**
-- 正典: [sharding_refactor.md](../../../../sharding_refactor.md) §2 D10
+- 正典: [Sharding design](../../../../../docs/architecture/sharding.md) §2 D10
 
 > 本 delta は M06 の incremental propagation 概念・watermark protocol(read → apply → commit、失敗時は据え置き)・retry 意味論を **変更しない**。watermark の「ひとつの cursor」を「per-(projection × leaf) cursor の集合」に分解し、cursor の物理表現を `append_seq` に変更し、適用契約(可換 + 冪等)を明文化する。
 

@@ -34,8 +34,7 @@
   を呼ぶ
 - **THEN** 任意の Projection の materialized view が Projection Catalog の
   出力契約に従って返る
-- **AND** `GET /api/persons/*` は deprecation header 付き alias として
-  1 リリースの間のみ応答する
+- **AND** `GET /api/persons/*` は存在しない
 
 ### Requirement: GEN-02 Layered Workspace Structure
 

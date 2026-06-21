@@ -1,0 +1,28 @@
+[package]
+name = "lethe-e2e"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+axum.workspace = true
+chrono.workspace = true
+lethe-adapter-api = { path = "../../crates/adapters/api" }
+lethe-adapter-claude = { path = "../../crates/adapters/claude" }
+lethe-adapter-gslides = { path = "../../crates/adapters/gslides" }
+lethe-adapter-slack = { path = "../../crates/adapters/slack" }
+lethe-api = { path = "../../crates/api" }
+lethe-core = { path = "../../crates/core" }
+lethe-engine = { path = "../../crates/engine" }
+lethe-policy = { path = "../../crates/policy" }
+lethe-projection-person = { path = "../../crates/projections/person" }
+lethe-registry = { path = "../../crates/registry" }
+lethe-selfhost = { path = "../../apps/selfhost" }
+lethe-storage-sqlite = { path = "../../crates/storage/sqlite" }
+serde_json.workspace = true
+tokio.workspace = true
+tower.workspace = true
+uuid.workspace = true
+
+[lib]
+path = "src/lib.rs"

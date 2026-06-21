@@ -3,7 +3,7 @@
 **Module:** write-back
 **Scope:** Command algebra / write paths / writable projections / concurrency control
 **Dependencies:** M01 Domain Kernel, M02 Registry, M03 Observation Lake, M05 Projection Engine, M08 Governance
-**Parent docs:** [plan.md](../../plan.md) §12–13, [domain_algebra.md](../../domain_algebra.md) §6
+**Parent docs:** [System overview](../../docs/architecture/system-overview.md) §12–13, [Domain algebra](../../docs/architecture/domain-algebra.md) §6
 **Agent:** Spec Designer (command algebra) → Implementer (adapter 実装) → Reviewer (authority 検証)
 **MVP:** — (MVP 外。MVP+2 で実装)
 

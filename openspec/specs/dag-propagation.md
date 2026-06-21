@@ -3,7 +3,7 @@
 **Module:** dag-propagation
 **Scope:** Incremental propagation / watermark 管理 / DAG scheduler / upstream breaking change
 **Dependencies:** M01 Domain Kernel, M03 Observation Lake, M04 Supplemental Store, M05 Projection Engine, M08 Governance
-**Parent docs:** [plan.md](../../plan.md) §5.2.1, [issues/R2-01](../../issues/R2-01_incremental_propagation_watermark.md)
+**Parent docs:** [System overview](../../docs/architecture/system-overview.md) §5.2.1, [issues/R2-01](../../docs/archive/issues/round-2/R2-01_incremental_propagation_watermark.md)
 **Agent:** Spec Designer (watermark 仕様) → Implementer (propagation 実装) → Reviewer (determinism 検証)
 
 ---

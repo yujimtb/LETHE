@@ -17,5 +17,14 @@ jobs:
           fetch-depth: 0
 
       - name: Run public release audit
+        run: python ./scripts/public_release_audit.py
+
+      - name: Check dependency layers
         shell: pwsh
-        run: ./scripts/public-release-audit.ps1
+        run: ./scripts/check_dependency_layers.ps1
+
+      - name: Check Markdown links
+        run: python ./scripts/check_markdown_links.py
+
+      - name: Test workspace
+        run: cargo test --workspace

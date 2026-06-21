@@ -10,7 +10,7 @@
 - M03 Observation Lake — 既存 `openspec/specs/observation-lake.md` の中核(append-only / ingestion pipeline / temporal validation / governance gate)は **不変**
 - M08 Governance — consent / restricted capture / review の正規参照
 - M09 Adapter Policy — adapter から identity_key 構成に必要な (object_id, canonical タプル) が宣言される(本 change の `adapter-policy` delta 参照)
-- 正典: [sharding_refactor.md](../../../../sharding_refactor.md) §2 D1〜D9 / D12
+- 正典: [Sharding design](../../../../../docs/architecture/sharding.md) §2 D1〜D9 / D12
 
 > 本 delta は M03 の append-only / replay / governance gate / `IngestResult` 同型を **変更しない**。identity 契約・dedup 判定経路・per-leaf 永続層・rehome primitive を ADDED として規定する。
 

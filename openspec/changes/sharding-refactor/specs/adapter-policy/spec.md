@@ -10,7 +10,7 @@
 - M02 Registry — Source Contract / Schema Registry
 - M03 Observation Lake — identity_key 構成(本 change の `observation-lake` delta SHARD-01 / SHARD-03)
 - M09 Adapter Policy — 既存 `openspec/specs/adapter-policy.md` の中核(adapter 責務分離 / configuration / heartbeat / retry)は **不変**
-- 正典: [sharding_refactor.md](../../../../sharding_refactor.md) §2 D1 / D3 / D3b / D12.4
+- 正典: [Sharding design](../../../../../docs/architecture/sharding.md) §2 D1 / D3 / D3b / D12.4
 
 > 本 delta は M09 の adapter 責務分離(OCR / 名寄せ / Projection materialization を adapter で行わない)を **変更しない**。`to_observations` の出力契約を「free-form `idempotencyKey` を直接返す」から「(object_id, canonical タプル) を宣言する」に置き換え、core が H して `identity_key` を組み立てる責務分担を明文化する。
 
@@ -25,7 +25,7 @@ adapter は、各 Observation について **`(object_id, canonical タプル)` 
 - **adapter の責務**: source 固有の `object_id` 抽出規則、および `canonical_content` を構成する固定 serialization(canonical タプル実体)の生成。
 - **core の責務**: 渡された canonical タプルに対し固定 serialization → sha256(H)で `identity_key` を組み立て、`canonical_json` column に stored canonical タプル実体を保存。
 
-adapter が直接 `idempotencyKey` 文字列を組み立てて返してはならない (SHALL NOT)(現行 `to_observations` 出力 [src/adapter/traits.rs](../../../../src/adapter/traits.rs)、[src/adapter/slack/mapper.rs:149](../../../../src/adapter/slack/mapper.rs) の content-hash 非含有契約は廃止される)。
+adapter が直接 `idempotencyKey` 文字列を組み立てて返してはならない (SHALL NOT)(現行 `to_observations` 出力 [crates/adapters/api/src/traits.rs](../../../../../crates/adapters/api/src/traits.rs)、[crates/adapters/slack/src/slack/mapper.rs](../../../../../crates/adapters/slack/src/slack/mapper.rs) の content-hash 非含有契約は廃止される)。
 
 #### canonical タプル境界(SHARD-03 と整合)
 

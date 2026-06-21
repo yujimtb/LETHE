@@ -3,7 +3,7 @@
 **Module:** supplemental-store
 **Scope:** 派生情報ストアの意味論・mutability policy・placement rules
 **Dependencies:** M01 Domain Kernel, M03 Observation Lake
-**Parent docs:** [domain_algebra.md](../../domain_algebra.md) §3.2, §4.3–4.4, [plan.md](../../plan.md) §6.3
+**Parent docs:** [Domain algebra](../../docs/architecture/domain-algebra.md) §3.2, §4.3–4.4, [System overview](../../docs/architecture/system-overview.md) §6.3
 **Agent:** Spec Designer (mutability policy) → Implementer (CRUD) → Reviewer (lineage 検証)
 
 ---

@@ -1184,29 +1184,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 
 [[package]]
-name = "lethe"
+name = "lethe-adapter-api"
 version = "0.1.0"
 dependencies = [
- "axum",
- "base64",
  "chrono",
- "dotenvy",
  "hex",
- "image",
- "jsonschema",
- "pretty_assertions",
- "regex",
- "reqwest",
- "roxmltree",
- "rusqlite",
+ "lethe-core",
  "serde",
  "serde_json",
  "sha2",
  "thiserror",
- "tokio",
- "tower",
  "unicode-normalization",
- "uuid",
+]
+
+[[package]]
+name = "lethe-adapter-claude"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "lethe-adapter-api",
+ "lethe-core",
+ "serde",
+ "serde_json",
  "zip",
 ]
 
@@ -1214,14 +1213,55 @@ dependencies = [
 name = "lethe-adapter-gslides"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "lethe-adapter-api",
  "lethe-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lethe-adapter-notion"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "image",
+ "lethe-adapter-api",
+ "lethe-profile-model",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]
 name = "lethe-adapter-slack"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "lethe-adapter-api",
  "lethe-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lethe-api"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "lethe-core",
+ "lethe-engine",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lethe-attribute-inventory"
+version = "0.1.0"
+dependencies = [
+ "lethe-selfhost",
 ]
 
 [[package]]
@@ -1236,6 +1276,71 @@ dependencies = [
 ]
 
 [[package]]
+name = "lethe-derivation-gemini"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chrono",
+ "lethe-adapter-api",
+ "lethe-adapter-gslides",
+ "lethe-core",
+ "lethe-engine",
+ "lethe-profile-model",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lethe-e2e"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "lethe-adapter-api",
+ "lethe-adapter-claude",
+ "lethe-adapter-gslides",
+ "lethe-adapter-slack",
+ "lethe-api",
+ "lethe-core",
+ "lethe-engine",
+ "lethe-policy",
+ "lethe-projection-person",
+ "lethe-registry",
+ "lethe-selfhost",
+ "lethe-storage-sqlite",
+ "serde_json",
+ "tokio",
+ "tower",
+ "uuid",
+]
+
+[[package]]
+name = "lethe-engine"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "jsonschema",
+ "lethe-core",
+ "lethe-policy",
+ "lethe-registry",
+ "lethe-storage-api",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
+name = "lethe-notion-review"
+version = "0.1.0"
+dependencies = [
+ "lethe-selfhost",
+]
+
+[[package]]
 name = "lethe-policy"
 version = "0.1.0"
 dependencies = [
@@ -1247,19 +1352,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "lethe-profile-model"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "lethe-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lethe-projection-person"
 version = "0.1.0"
 dependencies = [
- "lethe",
+ "chrono",
  "lethe-core",
+ "lethe-engine",
+ "lethe-policy",
+ "lethe-profile-model",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lethe-registry"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "jsonschema",
+ "lethe-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
 name = "lethe-runtime"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "lethe-core",
- "tokio",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "uuid",
 ]
 
 [[package]]
@@ -1267,12 +1403,36 @@ name = "lethe-selfhost"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
+ "chrono",
+ "dotenvy",
+ "image",
+ "lethe-adapter-api",
+ "lethe-adapter-gslides",
+ "lethe-adapter-notion",
+ "lethe-adapter-slack",
+ "lethe-api",
  "lethe-core",
+ "lethe-derivation-gemini",
+ "lethe-engine",
  "lethe-policy",
- "lethe-runtime",
- "lethe-storage-api",
+ "lethe-profile-model",
+ "lethe-projection-person",
+ "lethe-registry",
  "lethe-storage-sqlite",
+ "pretty_assertions",
+ "regex",
+ "reqwest",
+ "roxmltree",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror",
  "tokio",
+ "tower",
+ "unicode-normalization",
+ "uuid",
+ "zip",
 ]
 
 [[package]]
@@ -1287,8 +1447,15 @@ dependencies = [
 name = "lethe-storage-sqlite"
 version = "0.1.0"
 dependencies = [
- "lethe-storage-api",
+ "chrono",
+ "hex",
+ "lethe-core",
+ "lethe-runtime",
  "rusqlite",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "uuid",
 ]
 
 [[package]]

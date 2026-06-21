@@ -1,0 +1,7 @@
+[package]
+name = "lethe-notion-review"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lethe-selfhost = { path = "../../selfhost" }

@@ -3,7 +3,7 @@
 **Module:** governance
 **Scope:** Consent / access control / capability model / write review / retention / secret handling
 **Dependencies:** M01 Domain Kernel
-**Parent docs:** [governance_capability_model.md](../../governance_capability_model.md), [plan.md](../../plan.md) §7
+**Parent docs:** [Governance capability model](../../docs/architecture/governance-capability-model.md), [System overview](../../docs/architecture/system-overview.md) §7
 **Agent:** Spec Designer (policy 設計) → Implementer (policy engine) → Reviewer (exposure 検証)
 
 ---

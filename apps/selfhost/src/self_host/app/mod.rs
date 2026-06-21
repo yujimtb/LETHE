@@ -1,0 +1,477 @@
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::{Cursor, Read};
+use std::sync::{Arc, Mutex};
+
+use axum::http::HeaderMap;
+use chrono::{DateTime, Utc};
+
+use crate::attribute_inventory::{AttributeInventoryDocument, build_inventory_documents};
+use crate::self_host::config::SelfHostConfig;
+use crate::self_host::google::HttpGoogleSlidesClient;
+use crate::self_host::registry::{seed_projection_catalog, seed_registry};
+use crate::self_host::slack::HttpSlackClient;
+use lethe_adapter_api::config::{
+    AdapterConfig, BackoffStrategy, RateLimitConfig, RetryConfig, SchemaBinding,
+};
+use lethe_adapter_api::error::AdapterError;
+use lethe_adapter_api::traits::{ObservationDraft, SourceAdapter};
+use lethe_adapter_api::writeback::{SaaSWriteAdapter, WriteAction, WriteRecord};
+use lethe_adapter_gslides::gslides::client::GoogleSlidesClient;
+use lethe_adapter_gslides::gslides::mapper::GoogleSlidesAdapter;
+use lethe_adapter_notion::notion::client::{NotionClient, NotionConfig};
+use lethe_adapter_slack::slack::client::SlackClient;
+use lethe_adapter_slack::slack::mapper::SlackAdapter;
+use lethe_api::api::envelope::{ProjectionMetadata, ResponseEnvelope};
+use lethe_api::api::health::HealthResponse;
+use lethe_api::api::pagination::{PaginatedResponse, PaginationParams, paginate};
+use lethe_api::api::read_mode::{ReadModeError, ReadModeResolver};
+use lethe_core::domain::{
+    ActorRef, AuthorityModel, BlobRef, CaptureModel, EntityRef, IngestResult, Observation,
+    ObserverRef, ProjectionRef, ProjectionStatus, ReadMode, SchemaRef, SemVer, SourceSystemRef,
+};
+use lethe_derivation_gemini::{GeminiSlideAnalyzer, SlideAnalysisProjector};
+use lethe_engine::identity::projector::IdentityProjector;
+use lethe_engine::identity::types::IdentityResolutionOutput;
+use lethe_engine::lake::{BlobStore, IngestRequest, IngestionGate, LakeStore};
+use lethe_engine::projection::catalog::ProjectionCatalog;
+use lethe_engine::projection::runner::Projector;
+use lethe_engine::supplemental::SupplementalStore;
+use lethe_policy::governance::audit::{AuditLog, InMemoryAuditLog};
+use lethe_policy::governance::engine::PolicyEngine;
+use lethe_policy::governance::filter::FilteringGate;
+use lethe_policy::governance::types::{
+    AccessScope, AuditEvent, AuditEventKind, ConsentStatus, Environment, MaskStrategy, Operation,
+    PolicyOutcome, PolicyRequest, RestrictedFieldSpec, Role,
+};
+use lethe_profile_model::{
+    GalleryImage, ImageCoordinates, ProfilePic, SlideAnalysisResult, StudentProfile,
+};
+use lethe_projection_person::person_page::projector::PersonPageProjector;
+use lethe_projection_person::person_page::types::{
+    FrontendProfile, PersonDetailResponse, PersonListItem, PersonPageOutput, PersonProfile,
+    TimelineEvent,
+};
+use lethe_storage_sqlite::persistence::{
+    DurableAppendOutcome, PersistenceError, SqlitePersistence,
+};
+
+#[derive(Debug, thiserror::Error)]
+pub enum SelfHostError {
+    #[error(transparent)]
+    Config(#[from] crate::self_host::config::ConfigError),
+    #[error(transparent)]
+    Persistence(#[from] PersistenceError),
+    #[error(transparent)]
+    Adapter(#[from] AdapterError),
+    #[error("read mode error: {0}")]
+    ReadMode(String),
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("policy denied: {0}")]
+    Policy(String),
+    #[error("authentication failed: {0}")]
+    Auth(String),
+    #[error("internal state lock poisoned")]
+    LockPoisoned,
+    #[error("ingestion rejected: {0}")]
+    Ingestion(String),
+    #[error("serialization error: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SyncReport {
+    pub slack_ingested: usize,
+    pub google_ingested: usize,
+    pub slide_analyses: usize,
+    pub notion_synced: usize,
+    pub duplicates: usize,
+    pub quarantined: usize,
+    pub dead_letters: Vec<DeadLetter>,
+    pub last_sync_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeadLetter {
+    pub source: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NotionReviewCandidate {
+    pub rank: usize,
+    pub person_id: String,
+    pub display_name: String,
+    pub entity_id: String,
+    pub title: String,
+    pub last_activity: Option<DateTime<Utc>>,
+    pub source_document_id: String,
+    pub source_canonical_uri: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NotionReviewWrite {
+    pub rank: usize,
+    pub entity_id: String,
+    pub title: String,
+    pub external_id: String,
+    pub url: Option<String>,
+    pub action: WriteAction,
+    pub cleaned_existing_page: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NotionReviewSyncReport {
+    pub sync_report: SyncReport,
+    pub candidates: Vec<NotionReviewCandidate>,
+    pub writes: Vec<NotionReviewWrite>,
+    pub cleaned_up: usize,
+    pub notion_synced: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RankedNotionWriteCandidate {
+    preview: NotionReviewCandidate,
+    write_record: WriteRecord,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct NotionSourceImageCandidate {
+    object_id: String,
+    source_url: String,
+    blob_ref: String,
+    center_x_pct: f64,
+    center_y_pct: f64,
+}
+
+type NotionSourceImageIndex = HashMap<String, Vec<NotionSourceImageCandidate>>;
+
+#[derive(Debug, Clone)]
+struct SlideImageCandidate {
+    object_id: String,
+    content_url: String,
+    center_x: f64,
+    center_y: f64,
+    z_index: usize,
+    rotation_degrees: i32,
+}
+
+#[derive(Debug, Clone)]
+struct PptxSlideImageCandidate {
+    bytes: Vec<u8>,
+    center_x_pct: f64,
+    center_y_pct: f64,
+}
+
+const PERSON_PAGE_NOTION_PROJECTION_VERSION: &str =
+    concat!("proj:person-page@", env!("CARGO_PKG_VERSION"));
+
+#[derive(Debug, Clone)]
+pub struct ProjectionSnapshot {
+    pub identity: IdentityResolutionOutput,
+    pub person_page: PersonPageOutput,
+    pub built_at: DateTime<Utc>,
+}
+
+impl Default for ProjectionSnapshot {
+    fn default() -> Self {
+        Self {
+            identity: IdentityResolutionOutput::default(),
+            person_page: PersonPageOutput::default(),
+            built_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct AppCore {
+    pub registry: lethe_registry::registry::RegistryStore,
+    pub catalog: ProjectionCatalog,
+    pub lake: LakeStore,
+    pub blobs: BlobStore,
+    pub supplemental: SupplementalStore,
+    pub snapshot: ProjectionSnapshot,
+    pub last_sync_at: Option<DateTime<Utc>>,
+    pub last_sync_error: Option<String>,
+}
+
+impl AppCore {
+    fn new(
+        observations: Vec<Observation>,
+        persisted_blobs: Vec<Vec<u8>>,
+        persisted_supplementals: Vec<lethe_core::domain::SupplementalRecord>,
+    ) -> Result<Self, SelfHostError> {
+        let mut lake = LakeStore::new();
+        for observation in observations {
+            lake.append(observation).map_err(|existing_id| {
+                SelfHostError::Ingestion(format!(
+                    "duplicate persisted observation detected during bootstrap: {existing_id}"
+                ))
+            })?;
+        }
+
+        let mut blobs = BlobStore::new();
+        for blob in persisted_blobs {
+            blobs.put(&blob);
+        }
+
+        let mut supplemental = SupplementalStore::new();
+        for record in persisted_supplementals {
+            supplemental.upsert(record, &lake).map_err(|err| {
+                SelfHostError::Ingestion(format!(
+                    "invalid persisted supplemental detected during bootstrap: {err}"
+                ))
+            })?;
+        }
+
+        let mut core = Self {
+            registry: seed_registry(),
+            catalog: seed_projection_catalog(),
+            lake,
+            blobs,
+            supplemental,
+            snapshot: ProjectionSnapshot::default(),
+            last_sync_at: None,
+            last_sync_error: None,
+        };
+        core.rebuild_snapshot();
+        Ok(core)
+    }
+
+    fn rebuild_snapshot(&mut self) {
+        let identity = IdentityProjector::new("1.0.0")
+            .project(self.lake.list())
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        let supplemental_records = self.supplemental.by_kind("slide-analysis");
+        let person_page =
+            PersonPageProjector::project(&identity, self.lake.list(), &supplemental_records);
+        self.snapshot = ProjectionSnapshot {
+            identity,
+            person_page,
+            built_at: Utc::now(),
+        };
+        self.catalog.set_status(
+            &ProjectionRef::new("proj:identity-resolution"),
+            ProjectionStatus::Active,
+        );
+        self.catalog.set_status(
+            &ProjectionRef::new("proj:person-page"),
+            ProjectionStatus::Active,
+        );
+    }
+
+    fn prepare_observation(
+        &mut self,
+        draft: ObservationDraft,
+    ) -> Result<Observation, IngestResult> {
+        let request = IngestRequest {
+            schema: draft.schema,
+            schema_version: draft.schema_version,
+            observer: draft.observer,
+            source_system: draft.source_system,
+            authority_model: draft.authority_model,
+            capture_model: draft.capture_model,
+            subject: draft.subject,
+            target: draft.target,
+            payload: draft.payload,
+            attachments: draft.attachments,
+            published: draft.published,
+            idempotency_key: draft.idempotency_key,
+            meta: draft.meta,
+        };
+
+        let gate = IngestionGate {
+            registry: &self.registry,
+            lake: &mut self.lake,
+            blobs: &self.blobs,
+        };
+        gate.prepare_observation(request)
+    }
+
+    /// Upsert a supplemental record using this core's lake for validation.
+    fn upsert_supplemental(
+        &mut self,
+        record: lethe_core::domain::SupplementalRecord,
+    ) -> Result<lethe_engine::supplemental::store::UpsertRollback, lethe_core::domain::DomainError>
+    {
+        self.supplemental.upsert_with_rollback(record, &self.lake)
+    }
+
+    fn rollback_supplemental(
+        &mut self,
+        rollback: lethe_engine::supplemental::store::UpsertRollback,
+    ) {
+        self.supplemental.rollback_upsert(rollback);
+    }
+}
+
+#[derive(Clone)]
+pub struct AppService {
+    core: Arc<Mutex<AppCore>>,
+    persistence: Arc<Mutex<SqlitePersistence>>,
+    config: Arc<SelfHostConfig>,
+    slack_client: HttpSlackClient,
+    slack_replies_client: HttpSlackClient,
+    google_client: HttpGoogleSlidesClient,
+    slide_analyzer: Option<GeminiSlideAnalyzer>,
+    notion_client: Option<NotionClient>,
+    audit_log: Arc<InMemoryAuditLog>,
+}
+
+impl AppService {
+    pub fn bootstrap(config: SelfHostConfig) -> Result<Self, SelfHostError> {
+        let persistence = SqlitePersistence::open(&config.database_path, &config.blob_dir)?;
+        let observations = persistence.load_observations()?;
+        let blobs = persistence.load_blobs()?;
+        let supplementals = persistence.load_supplementals()?;
+        let slack_client = HttpSlackClient::new(config.slack.bot_token.clone())?;
+        let slack_replies_client = HttpSlackClient::new(
+            config
+                .slack
+                .thread_token
+                .clone()
+                .unwrap_or_else(|| config.slack.bot_token.clone()),
+        )?;
+        let google_client = HttpGoogleSlidesClient::new(&config.google)?;
+        let slide_analyzer = config
+            .slide_ai
+            .as_ref()
+            .map(|slide_ai| GeminiSlideAnalyzer::new(&slide_ai.api_key, &slide_ai.model))
+            .transpose()?;
+
+        let notion_client = config
+            .notion
+            .as_ref()
+            .map(|nc| {
+                NotionClient::new(
+                    NotionConfig::new(&nc.token, &nc.database_id)
+                        .with_blob_dir(config.blob_dir.clone())
+                        .with_public_base_url(config.public_base_url.clone()),
+                )
+            })
+            .transpose()?;
+
+        Ok(Self {
+            core: Arc::new(Mutex::new(AppCore::new(
+                observations,
+                blobs,
+                supplementals,
+            )?)),
+            persistence: Arc::new(Mutex::new(persistence)),
+            config: Arc::new(config),
+            slack_client,
+            slack_replies_client,
+            google_client,
+            slide_analyzer,
+            notion_client,
+            audit_log: Arc::new(InMemoryAuditLog::new()),
+        })
+    }
+
+    pub fn spawn_polling_task(&self) {
+        let service = self.clone();
+        let interval = self.config.poll_interval;
+        tokio::spawn(async move {
+            loop {
+                let cloned = service.clone();
+                let result = tokio::task::spawn_blocking(move || cloned.sync_all()).await;
+                if let Err(err) = result {
+                    eprintln!("poll task join error: {err}");
+                } else if let Ok(Err(err)) = result {
+                    eprintln!("poll sync error: {err}");
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
+    }
+
+    pub fn authorize_headers(
+        &self,
+        headers: &HeaderMap,
+        required_scope: &str,
+    ) -> Result<(), SelfHostError> {
+        self.authorize_headers_all(headers, &[required_scope])
+    }
+
+    pub fn authorize_headers_all(
+        &self,
+        headers: &HeaderMap,
+        required_scopes: &[&str],
+    ) -> Result<(), SelfHostError> {
+        if required_scopes.is_empty() {
+            return Err(SelfHostError::Policy(
+                "at least one required scope must be specified".to_string(),
+            ));
+        }
+        let Some(header) = headers.get(axum::http::header::AUTHORIZATION) else {
+            self.emit_audit(
+                "actor:anonymous",
+                AuditEventKind::PolicyDenial,
+                serde_json::json!({ "required_scopes": required_scopes, "reason": "missing bearer token" }),
+            );
+            return Err(SelfHostError::Auth("missing bearer token".to_string()));
+        };
+        let raw = header
+            .to_str()
+            .map_err(|_| SelfHostError::Auth("invalid authorization header".to_string()))?;
+        let token = raw.strip_prefix("Bearer ").ok_or_else(|| {
+            SelfHostError::Auth("authorization must use Bearer token".to_string())
+        })?;
+        let matched = self
+            .config
+            .api_tokens
+            .iter()
+            .find(|candidate| candidate.token.expose() == token)
+            .ok_or_else(|| SelfHostError::Auth("token rejected".to_string()))?;
+        if required_scopes.iter().all(|required_scope| {
+            matched
+                .scopes
+                .iter()
+                .any(|scope| scope == "*" || scope == required_scope)
+        }) {
+            self.emit_audit(
+                "actor:api-token",
+                audit_kind_for_scope(required_scopes[0]),
+                serde_json::json!({ "required_scopes": required_scopes }),
+            );
+            Ok(())
+        } else {
+            self.emit_audit(
+                "actor:api-token",
+                AuditEventKind::PolicyDenial,
+                serde_json::json!({ "required_scopes": required_scopes, "reason": "scope denied" }),
+            );
+            Err(SelfHostError::Policy(format!(
+                "token lacks required scopes {}",
+                required_scopes.join(",")
+            )))
+        }
+    }
+
+    fn emit_audit(&self, actor: &str, kind: AuditEventKind, detail: serde_json::Value) {
+        self.audit_log.emit(AuditEvent {
+            id: format!("audit:{}", uuid::Uuid::now_v7()),
+            timestamp: Utc::now(),
+            actor: ActorRef::new(actor),
+            kind,
+            detail,
+        });
+    }
+}
+
+mod media_support;
+mod notion_workflow;
+mod projection_api;
+mod service_support;
+mod slide_support;
+mod sync;
+mod sync_support;
+
+use media_support::*;
+use slide_support::*;
+use sync_support::*;
+
+#[cfg(test)]
+mod tests;

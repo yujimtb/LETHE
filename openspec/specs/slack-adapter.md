@@ -3,7 +3,7 @@
 **Module:** slack-adapter
 **Scope:** Slack source adapter — message / channel / thread / edit / delete の取り込み
 **Dependencies:** M01 Domain Kernel, M02 Registry, M03 Observation Lake, M09 Adapter Policy
-**Parent docs:** [issues/R2-02](../../issues/R2-02_slack_schema_adapter.md)
+**Parent docs:** [issues/R2-02](../../docs/archive/issues/round-2/R2-02_slack_schema_adapter.md)
 **Agent:** Spec Designer (schema + contract) → Implementer (API client + adapter) → Reviewer (idempotency / authority 検証)
 **MVP:** ✓
 
