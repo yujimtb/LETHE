@@ -16,4 +16,3 @@ pub mod projection;
 pub mod propagation;
 pub mod self_host;
 pub mod slide_analysis;
-pub mod qa;

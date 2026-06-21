@@ -91,7 +91,7 @@
 - `LETHE_SLACK_CHANNEL_IDS`
 - `LETHE_GOOGLE_PRESENTATION_IDS`
 - `LETHE_GOOGLE_ACCESS_TOKEN`
-- `LETHE_API_TOKENS` (`token:scope+scope` の comma 区切り。例: `qa-read-token:read:persons+read:timeline,sync-token:admin:sync`)
+- `LETHE_API_TOKENS` (`token:scope+scope` の comma 区切り。例: `read-token:read:persons+read:timeline,sync-token:admin:sync`)
 
 access token を毎回手で入れたくない場合は、代わりに以下を設定します。
 
@@ -167,16 +167,6 @@ cargo run --bin lethe-selfhost
 - Google Slides で未取得 revision が複数ある場合、self-host は取得可能な **最新 revision の正しい snapshot** だけを materialize し、古い revision に最新内容を誤って付与しません
 - Slack sync は thread parent を見つけたとき `conversations.replies` も辿り、thread reply を個別 observation として取り込みます
 - 秘密鍵・アクセストークンを一度でもローカルで使った場合は、公開前に新しい値へローテーションしてください
-
-### Phase 0 Q&A service
-
-`src/qa` は 6/24 チャットボット納品向けの薄い Q&A サービス境界です。
-
-- 保持 token は `read:persons` / `read:timeline` のみを許可し、`admin:sync` を含む token は拒否します
-- 質問文は `RetrievalQuery` として型付きで retriever へ渡し、URL・コマンド・SQLへ直接展開しません
-- 対象外カテゴリ、本人特定、低確信、日次コストキャップ超過は運営者誘導の定型文を返します
-- 回答末尾に人間可読の由来と observation ID を表示し、SQLiteログには provenance を observation ID で保存します
-- `tests/fixtures/phase0_golden_questions.json` は検収・回帰用のゴールデン質問セットです
 
 ### Token rotation
 
