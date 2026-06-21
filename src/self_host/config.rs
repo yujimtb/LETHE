@@ -235,6 +235,15 @@ fn parse_csv_env(name: &'static str) -> Result<Vec<String>, ConfigError> {
     Ok(values)
 }
 
+fn parse_usize_env(name: &'static str) -> Result<usize, ConfigError> {
+    required_env(name)?
+        .parse::<usize>()
+        .map_err(|err| ConfigError::InvalidEnv {
+            name,
+            message: err.to_string(),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,13 +264,4 @@ mod tests {
         assert!(!debug.contains("super-secret-token"));
         assert!(debug.contains("redacted"));
     }
-}
-
-fn parse_usize_env(name: &'static str) -> Result<usize, ConfigError> {
-    required_env(name)?
-        .parse::<usize>()
-        .map_err(|err| ConfigError::InvalidEnv {
-            name,
-            message: err.to_string(),
-        })
 }

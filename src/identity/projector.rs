@@ -114,37 +114,37 @@ impl IdentityProjector {
             .and_then(|v| v.as_array())
         {
             for editor in editors {
-                if let Some(email) = editor.as_str() {
-                    if seen_emails.insert(email.to_lowercase()) {
-                        candidates.push(PersonCandidate {
+                if let Some(email) = editor.as_str()
+                    && seen_emails.insert(email.to_lowercase())
+                {
+                    candidates.push(PersonCandidate {
+                        source: "google".into(),
+                        identifiers: vec![SourceIdentifier {
                             source: "google".into(),
-                            identifiers: vec![SourceIdentifier {
-                                source: "google".into(),
-                                identifier_type: IdentifierType::Email,
-                                value: email.to_string(),
-                            }],
-                            display_name: None,
-                            observed_at: obs.published,
-                        });
-                    }
+                            identifier_type: IdentifierType::Email,
+                            value: email.to_string(),
+                        }],
+                        display_name: None,
+                        observed_at: obs.published,
+                    });
                 }
             }
         }
 
         // Extract owner (skip if already seen as editor)
-        if let Some(owner) = payload.pointer("/relations/owner").and_then(|v| v.as_str()) {
-            if seen_emails.insert(owner.to_lowercase()) {
-                candidates.push(PersonCandidate {
+        if let Some(owner) = payload.pointer("/relations/owner").and_then(|v| v.as_str())
+            && seen_emails.insert(owner.to_lowercase())
+        {
+            candidates.push(PersonCandidate {
+                source: "google".into(),
+                identifiers: vec![SourceIdentifier {
                     source: "google".into(),
-                    identifiers: vec![SourceIdentifier {
-                        source: "google".into(),
-                        identifier_type: IdentifierType::Email,
-                        value: owner.to_string(),
-                    }],
-                    display_name: None,
-                    observed_at: obs.published,
-                });
-            }
+                    identifier_type: IdentifierType::Email,
+                    value: owner.to_string(),
+                }],
+                display_name: None,
+                observed_at: obs.published,
+            });
         }
 
         candidates
@@ -305,10 +305,11 @@ impl IdentityProjector {
             if should_merge {
                 let a = Self::parse_pc_index(&m.person_a_id);
                 let b = Self::parse_pc_index(&m.person_b_id);
-                if let (Some(a), Some(b)) = (a, b) {
-                    if a < n && b < n {
-                        union(&mut parent, a, b);
-                    }
+                if let (Some(a), Some(b)) = (a, b)
+                    && a < n
+                    && b < n
+                {
+                    union(&mut parent, a, b);
                 }
             }
         }
@@ -318,10 +319,11 @@ impl IdentityProjector {
             if ac.status == CandidateStatus::Accepted {
                 let a = Self::parse_pc_index(&ac.person_a_id);
                 let b = Self::parse_pc_index(&ac.person_b_id);
-                if let (Some(a), Some(b)) = (a, b) {
-                    if a < n && b < n {
-                        union(&mut parent, a, b);
-                    }
+                if let (Some(a), Some(b)) = (a, b)
+                    && a < n
+                    && b < n
+                {
+                    union(&mut parent, a, b);
                 }
             }
         }
@@ -360,10 +362,10 @@ impl IdentityProjector {
                 if canonical_name.is_none() {
                     canonical_name = candidate.display_name.clone();
                 }
-                if let Some(ref name) = candidate.display_name {
-                    if !all_aliases.contains(name) {
-                        all_aliases.push(name.clone());
-                    }
+                if let Some(ref name) = candidate.display_name
+                    && !all_aliases.contains(name)
+                {
+                    all_aliases.push(name.clone());
                 }
                 for ident in &candidate.identifiers {
                     if !all_identifiers.contains(ident) {

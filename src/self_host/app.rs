@@ -630,10 +630,9 @@ impl AppService {
                         &slide_analysis_records,
                         presentation_id,
                         &slide.object_id,
-                    ) {
-                        if !analysis_record_needs_refresh(existing, &analysis_model) {
-                            continue;
-                        }
+                    ) && !analysis_record_needs_refresh(existing, &analysis_model)
+                    {
+                        continue;
                     }
 
                     let rendered = self.google_client.render_slide(
@@ -738,37 +737,35 @@ impl AppService {
                         thumbnail_blob_ref: Some(thumbnail_blob_ref),
                     });
 
-                    if consumed_companion {
-                        if let Some(next_slide) = presentation.slides.get(slide_index + 1) {
-                            let mut companion_profile = profile.clone();
-                            companion_profile.source_slide_object_id =
-                                Some(next_slide.object_id.clone());
-                            companion_profile.source_document_id = Some(format!(
-                                "document:gslides:{presentation_id}#slide:{}",
-                                next_slide.object_id
-                            ));
-                            companion_profile.companion_to_slide_object_id =
-                                Some(slide.object_id.clone());
-                            companion_profile.thumbnail_blob_ref = None;
-                            companion_profile.profile_pic = None;
-                            companion_result =
-                                Some(crate::slide_analysis::types::SlideAnalysisResult {
-                                    source_observation_id: observation.id.clone(),
-                                    presentation_id: presentation_id.clone(),
-                                    profile: companion_profile,
-                                    person_entity,
-                                    supplemental_id: Some(crate::domain::SupplementalId::new(
-                                        format!(
-                                            "sup:slide-analysis:{presentation_id}:{}",
-                                            next_slide.object_id
-                                        ),
-                                    )),
-                                    analyzed_at: observation.recorded_at,
-                                    model_version: Some(analysis_model.clone()),
-                                    slide_object_id: Some(next_slide.object_id.clone()),
-                                    thumbnail_blob_ref: None,
-                                });
-                        }
+                    if consumed_companion
+                        && let Some(next_slide) = presentation.slides.get(slide_index + 1)
+                    {
+                        let mut companion_profile = profile.clone();
+                        companion_profile.source_slide_object_id =
+                            Some(next_slide.object_id.clone());
+                        companion_profile.source_document_id = Some(format!(
+                            "document:gslides:{presentation_id}#slide:{}",
+                            next_slide.object_id
+                        ));
+                        companion_profile.companion_to_slide_object_id =
+                            Some(slide.object_id.clone());
+                        companion_profile.thumbnail_blob_ref = None;
+                        companion_profile.profile_pic = None;
+                        companion_result =
+                            Some(crate::slide_analysis::types::SlideAnalysisResult {
+                                source_observation_id: observation.id.clone(),
+                                presentation_id: presentation_id.clone(),
+                                profile: companion_profile,
+                                person_entity,
+                                supplemental_id: Some(crate::domain::SupplementalId::new(format!(
+                                    "sup:slide-analysis:{presentation_id}:{}",
+                                    next_slide.object_id
+                                ))),
+                                analyzed_at: observation.recorded_at,
+                                model_version: Some(analysis_model.clone()),
+                                slide_object_id: Some(next_slide.object_id.clone()),
+                                thumbnail_blob_ref: None,
+                            });
                     }
 
                     if let Some(companion_result) = companion_result {
@@ -1904,19 +1901,13 @@ fn slide_image_candidate_from_element(
         .get("scaleY")
         .and_then(serde_json::Value::as_f64)
         .unwrap_or(1.0);
-    let rotation_degrees = image
-        .get("imageProperties")
-        .and_then(|value| value.get("cropProperties"))
-        .and_then(|_| Some(0))
-        .unwrap_or(0);
-
     Some(SlideImageCandidate {
         object_id,
         content_url,
         center_x: translate_x + (width * scale_x.abs() / 2.0),
         center_y: translate_y + (height * scale_y.abs() / 2.0),
         z_index,
-        rotation_degrees,
+        rotation_degrees: 0,
     })
 }
 

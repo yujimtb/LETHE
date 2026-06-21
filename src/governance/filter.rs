@@ -40,10 +40,10 @@ impl FilteringGate {
         }
 
         for spec in field_specs {
-            if Self::should_mask(spec.level, viewer_scope) {
-                if Self::apply_mask(&mut out, &spec.field_path, spec.mask_strategy) {
-                    masked.push(spec.field_path.clone());
-                }
+            if Self::should_mask(spec.level, viewer_scope)
+                && Self::apply_mask(&mut out, &spec.field_path, spec.mask_strategy)
+            {
+                masked.push(spec.field_path.clone());
             }
         }
 

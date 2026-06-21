@@ -406,7 +406,7 @@ mod tests {
     fn to_observations_from_revision_raw() {
         let adapter = GoogleSlidesAdapter::new(FixtureGoogleSlidesClient::new(), test_config());
         let raw = RawData {
-            data: serde_json::to_value(&sample_revision()).unwrap(),
+            data: serde_json::to_value(sample_revision()).unwrap(),
             blobs: vec![],
         };
         let drafts = adapter.to_observations(&raw).unwrap();

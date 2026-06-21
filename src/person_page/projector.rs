@@ -403,29 +403,23 @@ impl PersonPageProjector {
         identifier_map: &HashMap<String, EntityRef>,
     ) -> bool {
         // Check via user_id in payload.
-        if let Some(user_id) = obs.payload.get("user_id").and_then(|v| v.as_str()) {
-            if let Some(pid) = identifier_map.get(user_id) {
-                if *pid == person.person_id {
-                    return true;
-                }
-            }
+        if let Some(user_id) = obs.payload.get("user_id").and_then(|v| v.as_str())
+            && identifier_map.get(user_id) == Some(&person.person_id)
+        {
+            return true;
         }
 
         // Check via email in payload.
-        if let Some(email) = obs.payload.get("email").and_then(|v| v.as_str()) {
-            if let Some(pid) = identifier_map.get(email) {
-                if *pid == person.person_id {
-                    return true;
-                }
-            }
+        if let Some(email) = obs.payload.get("email").and_then(|v| v.as_str())
+            && identifier_map.get(email) == Some(&person.person_id)
+        {
+            return true;
         }
 
-        if let Some(email) = obs.payload.get("person_email").and_then(|v| v.as_str()) {
-            if let Some(pid) = identifier_map.get(email) {
-                if *pid == person.person_id {
-                    return true;
-                }
-            }
+        if let Some(email) = obs.payload.get("person_email").and_then(|v| v.as_str())
+            && identifier_map.get(email) == Some(&person.person_id)
+        {
+            return true;
         }
 
         // Check via editors in GSlides.
@@ -435,12 +429,10 @@ impl PersonPageProjector {
             .and_then(|v| v.as_array())
         {
             for editor in editors {
-                if let Some(email) = editor.as_str() {
-                    if let Some(pid) = identifier_map.get(email) {
-                        if *pid == person.person_id {
-                            return true;
-                        }
-                    }
+                if let Some(email) = editor.as_str()
+                    && identifier_map.get(email) == Some(&person.person_id)
+                {
+                    return true;
                 }
             }
         }
@@ -450,12 +442,9 @@ impl PersonPageProjector {
             .payload
             .pointer("/relations/owner")
             .and_then(|v| v.as_str())
+            && identifier_map.get(owner) == Some(&person.person_id)
         {
-            if let Some(pid) = identifier_map.get(owner) {
-                if *pid == person.person_id {
-                    return true;
-                }
-            }
+            return true;
         }
 
         false

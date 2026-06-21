@@ -185,23 +185,23 @@ impl GeminiSlideAnalyzer {
             })?;
 
         // Check finishReason before extracting text
-        if let Some(candidate) = parsed.candidates.first() {
-            if let Some(reason) = &candidate.finish_reason {
-                match reason.as_str() {
-                    "STOP" | "" => {} // normal completion
-                    "SAFETY" => {
-                        return Err(AdapterError::Other(
-                            "gemini blocked response due to safety filters".to_string(),
-                        ));
-                    }
-                    "RECITATION" => {
-                        return Err(AdapterError::Other(
-                            "gemini blocked response due to recitation policy".to_string(),
-                        ));
-                    }
-                    other => {
-                        eprintln!("gemini unexpected finishReason: {other}");
-                    }
+        if let Some(candidate) = parsed.candidates.first()
+            && let Some(reason) = &candidate.finish_reason
+        {
+            match reason.as_str() {
+                "STOP" | "" => {} // normal completion
+                "SAFETY" => {
+                    return Err(AdapterError::Other(
+                        "gemini blocked response due to safety filters".to_string(),
+                    ));
+                }
+                "RECITATION" => {
+                    return Err(AdapterError::Other(
+                        "gemini blocked response due to recitation policy".to_string(),
+                    ));
+                }
+                other => {
+                    eprintln!("gemini unexpected finishReason: {other}");
                 }
             }
         }

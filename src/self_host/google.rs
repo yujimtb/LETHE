@@ -51,11 +51,11 @@ impl HttpGoogleSlidesClient {
             let status = response.status();
 
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                if attempt == 0 {
-                    if let Some(refreshed) = self.auth.refresh_access_token(&self.http)? {
-                        token = refreshed;
-                        continue;
-                    }
+                if attempt == 0
+                    && let Some(refreshed) = self.auth.refresh_access_token(&self.http)?
+                {
+                    token = refreshed;
+                    continue;
                 }
 
                 return Err(AdapterError::AuthFailure {
@@ -100,11 +100,11 @@ impl HttpGoogleSlidesClient {
 
             let status = response.status();
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                if attempt == 0 {
-                    if let Some(refreshed) = self.auth.refresh_access_token(&self.http)? {
-                        token = refreshed;
-                        continue;
-                    }
+                if attempt == 0
+                    && let Some(refreshed) = self.auth.refresh_access_token(&self.http)?
+                {
+                    token = refreshed;
+                    continue;
                 }
 
                 return Err(AdapterError::AuthFailure {
@@ -154,11 +154,11 @@ impl HttpGoogleSlidesClient {
 
             let status = response.status();
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                if attempt == 0 {
-                    if let Some(refreshed) = self.auth.refresh_access_token(&self.http)? {
-                        token = refreshed;
-                        continue;
-                    }
+                if attempt == 0
+                    && let Some(refreshed) = self.auth.refresh_access_token(&self.http)?
+                {
+                    token = refreshed;
+                    continue;
                 }
                 return Err(AdapterError::AuthFailure {
                     message: "google oauth token rejected".to_string(),
@@ -200,11 +200,11 @@ impl HttpGoogleSlidesClient {
 
             let status = response.status();
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                if attempt == 0 {
-                    if let Some(refreshed) = self.auth.refresh_access_token(&self.http)? {
-                        token = refreshed;
-                        continue;
-                    }
+                if attempt == 0
+                    && let Some(refreshed) = self.auth.refresh_access_token(&self.http)?
+                {
+                    token = refreshed;
+                    continue;
                 }
                 return Err(AdapterError::AuthFailure {
                     message: "google oauth token rejected".to_string(),
@@ -312,10 +312,10 @@ impl GoogleSlidesClient for HttpGoogleSlidesClient {
             }
         }
 
-        if let Some(owner_email) = owner.clone() {
-            if !editors.contains(&owner_email) {
-                editors.push(owner_email);
-            }
+        if let Some(owner_email) = owner.clone()
+            && !editors.contains(&owner_email)
+        {
+            editors.push(owner_email);
         }
 
         Ok(PresentationMeta {
@@ -471,10 +471,9 @@ impl GoogleTokenSource {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+            && cached.expires_at > Instant::now()
         {
-            if cached.expires_at > Instant::now() {
-                return Ok(cached.access_token);
-            }
+            return Ok(cached.access_token);
         }
 
         if let Some(token) = self.config.access_token.clone() {
