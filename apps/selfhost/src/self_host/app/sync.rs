@@ -176,11 +176,10 @@ impl AppService {
             .into_iter()
             .cloned()
             .collect();
-        let analysis_model = self
-            .slide_analyzer
-            .as_ref()
-            .map(|analyzer| format!("{}+continuation-v2-image-url", analyzer.model_name()))
-            .unwrap_or_else(|| "heuristic-fallback+continuation-v2-image-url".to_string());
+        let analysis_model = format!(
+            "{}+continuation-v2-image-url",
+            self.slide_analyzer.model_name()
+        );
         let mut needs_analysis = false;
         for presentation_id in &self.config.google.presentation_ids {
             let Some(_observation) = slide_obs_by_presentation.get(presentation_id) else {
@@ -198,10 +197,7 @@ impl AppService {
                         presentation_id,
                         &slide.object_id,
                     ) {
-                        Some(record) if self.slide_analyzer.is_some() => {
-                            analysis_record_needs_refresh(record, &analysis_model)
-                        }
-                        Some(_) => false,
+                        Some(record) => analysis_record_needs_refresh(record, &analysis_model),
                         None => true,
                     }
                 })
@@ -211,9 +207,8 @@ impl AppService {
             }
         }
 
-        // --- Slide Analysis + Notion write-back ---
+        // --- Slide Analysis ---
         let mut slide_analyses = 0usize;
-        let mut notion_synced = 0usize;
 
         if google_ingested > 0 || slack_ingested > 0 || needs_analysis {
             let mut analysis_results = Vec::new();
@@ -247,12 +242,9 @@ impl AppService {
                         &slide_analysis_records,
                         presentation_id,
                         &slide.object_id,
-                    ) {
-                        if !self.slide_analyzer.is_some()
-                            || !analysis_record_needs_refresh(existing, &analysis_model)
-                        {
-                            continue;
-                        }
+                    ) && !analysis_record_needs_refresh(existing, &analysis_model)
+                    {
+                        continue;
                     }
 
                     let rendered = self.google_client.render_slide(
@@ -262,13 +254,11 @@ impl AppService {
                     )?;
                     let thumbnail_blob_ref = core.blobs.put(&rendered.data);
                     self.persistence_lock()?.persist_blob(&rendered.data)?;
-                    let Some(mut profile) = self
-                        .extract_student_profile_from_png(
-                            &rendered.data,
-                            observation,
-                            &canonical_uri,
-                        )
-                        .or_else(|| heuristic_profile_for_slide(observation, slide))
+                    let Some(mut profile) = self.extract_student_profile_from_png(
+                        &rendered.data,
+                        observation,
+                        &canonical_uri,
+                    )?
                     else {
                         continue;
                     };
@@ -294,13 +284,11 @@ impl AppService {
                             &next_slide.object_id,
                             "png",
                         )?;
-                        let Some(mut companion_profile) = self
-                            .extract_student_profile_from_png(
-                                &companion_rendered.data,
-                                observation,
-                                &canonical_uri,
-                            )
-                            .or_else(|| heuristic_profile_for_slide(observation, next_slide))
+                        let Some(mut companion_profile) = self.extract_student_profile_from_png(
+                            &companion_rendered.data,
+                            observation,
+                            &canonical_uri,
+                        )?
                         else {
                             continue;
                         };
@@ -339,7 +327,12 @@ impl AppService {
                         .or(profile.generated_email.as_deref())
                         .map(ToOwned::to_owned)
                         .or_else(|| profile.source_document_id.clone())
-                        .unwrap_or_else(|| "unknown".to_string());
+                        .ok_or_else(|| {
+                            SelfHostError::Ingestion(format!(
+                                "slide analysis for {} produced no stable person identifier",
+                                slide.object_id
+                            ))
+                        })?;
                     let person_entity = EntityRef::new(format!("person:{email}"));
                     analysis_results.push(SlideAnalysisResult {
                         source_observation_id: observation.id.clone(),
@@ -350,42 +343,42 @@ impl AppService {
                             "sup:slide-analysis:{presentation_id}:{}",
                             slide.object_id
                         ))),
-                        analyzed_at: Utc::now(),
+                        analyzed_at: observation.recorded_at,
                         model_version: Some(analysis_model.clone()),
                         slide_object_id: Some(slide.object_id.clone()),
                         thumbnail_blob_ref: Some(thumbnail_blob_ref),
                     });
 
-                    if consumed_companion {
-                        if let Some(next_slide) = presentation.slides.get(slide_index + 1) {
-                            let mut companion_profile = profile.clone();
-                            companion_profile.source_slide_object_id =
-                                Some(next_slide.object_id.clone());
-                            companion_profile.source_document_id = Some(format!(
-                                "document:gslides:{presentation_id}#slide:{}",
-                                next_slide.object_id
-                            ));
-                            companion_profile.companion_to_slide_object_id =
-                                Some(slide.object_id.clone());
-                            companion_profile.thumbnail_blob_ref = None;
-                            companion_profile.profile_pic = None;
-                            companion_result = Some(SlideAnalysisResult {
-                                source_observation_id: observation.id.clone(),
-                                presentation_id: presentation_id.clone(),
-                                profile: companion_profile,
-                                person_entity,
-                                supplemental_id: Some(lethe_core::domain::SupplementalId::new(
-                                    format!(
-                                        "sup:slide-analysis:{presentation_id}:{}",
-                                        next_slide.object_id
-                                    ),
-                                )),
-                                analyzed_at: Utc::now(),
-                                model_version: Some(analysis_model.clone()),
-                                slide_object_id: Some(next_slide.object_id.clone()),
-                                thumbnail_blob_ref: None,
-                            });
-                        }
+                    if consumed_companion
+                        && let Some(next_slide) = presentation.slides.get(slide_index + 1)
+                    {
+                        let mut companion_profile = profile.clone();
+                        companion_profile.source_slide_object_id =
+                            Some(next_slide.object_id.clone());
+                        companion_profile.source_document_id = Some(format!(
+                            "document:gslides:{presentation_id}#slide:{}",
+                            next_slide.object_id
+                        ));
+                        companion_profile.companion_to_slide_object_id =
+                            Some(slide.object_id.clone());
+                        companion_profile.thumbnail_blob_ref = None;
+                        companion_profile.profile_pic = None;
+                        companion_result = Some(SlideAnalysisResult {
+                            source_observation_id: observation.id.clone(),
+                            presentation_id: presentation_id.clone(),
+                            profile: companion_profile,
+                            person_entity,
+                            supplemental_id: Some(lethe_core::domain::SupplementalId::new(
+                                format!(
+                                    "sup:slide-analysis:{presentation_id}:{}",
+                                    next_slide.object_id
+                                ),
+                            )),
+                            analyzed_at: observation.recorded_at,
+                            model_version: Some(analysis_model.clone()),
+                            slide_object_id: Some(next_slide.object_id.clone()),
+                            thumbnail_blob_ref: None,
+                        });
                     }
 
                     if let Some(companion_result) = companion_result {
@@ -452,55 +445,10 @@ impl AppService {
             core.rebuild_snapshot();
         }
 
-        let observations = core.lake.list().to_vec();
-        let persistence = self.persistence_lock()?;
-        let source_image_index = build_notion_source_image_index(
-            &observations,
-            &mut core.blobs,
-            &self.google_client,
-            &persistence,
-        );
-        let notion_write_records = core
-            .snapshot
-            .person_page
-            .profiles
-            .iter()
-            .filter_map(|person| {
-                let frontend = person.frontend_profile.as_ref()?;
-                Some((person, frontend))
-            })
-            .collect::<Vec<_>>();
-        let notion_write_records = notion_write_records
-            .iter()
-            .filter_map(|(person, frontend)| {
-                let write_record = notion_write_record_for_person(
-                    person,
-                    frontend,
-                    core.snapshot.built_at,
-                    self.config.public_base_url.as_deref(),
-                    source_image_index.get(frontend.source_document_id.as_str()),
-                )?;
-                Some((write_record.entity_id.clone(), write_record))
-            })
-            .collect::<HashMap<_, _>>()
-            .into_values()
-            .collect::<Vec<_>>();
-
-        drop(core);
-
-        if let Some(notion) = &self.notion_client {
-            for mut write_record in notion_write_records {
-                write_record.external_id = notion.find_existing(&write_record.entity_id)?;
-                notion.write_record(&write_record)?;
-                notion_synced += 1;
-            }
-        }
-
         Ok(SyncReport {
             slack_ingested,
             google_ingested,
             slide_analyses,
-            notion_synced,
             duplicates,
             quarantined: 0,
             dead_letters: Vec::new(),

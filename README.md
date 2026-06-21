@@ -18,7 +18,7 @@ crates/
   api/                         API contract
   runtime/                     partition / resolver / runtime control
   storage/                     storage port と SQLite 実装
-  adapters/                    source / write-back adapter
+  adapters/                    read-side source adapter
   derivations/                 AI derivation provider
   projections/                 domain projection
 docs/                          説明文書、監査、外部投稿
@@ -27,8 +27,20 @@ resources/                     seedなどの静的資源
 tests/e2e/                     workspace横断テスト
 ```
 
-workspace root はvirtual manifestです。Rust実装を持つルート`src/`は存在せず、
-各crateが自身のsourceを所有します。
+workspace root は virtual manifest です。Rust 実装を持つルート `src/` は存在せず、
+各 crate が自身の source を所有します。
+
+## Current implementation
+
+- Slack / Google Slides の read-side adapter
+- append-only Observation Lake と SQLite 永続化
+- Gemini による slide-analysis derivation
+- identity resolution と Person Page Projection
+- scope 付き Bearer token、consent、Filtering-before-Exposure
+- Projection lineage と、Projection が参照する blob の限定配信
+
+M07 Write-Back は Post-MVP の仕様のみ存在し、write router や
+source-native write adapter は実装していません。
 
 ## Documentation
 
@@ -40,7 +52,7 @@ workspace root はvirtual manifestです。Rust実装を持つルート`src/`は
 - [OpenSpec module index](openspec/specs/_index.md)
 - [Security](SECURITY.md)
 
-外部で作成したロードマップや監査は[docs/post/](docs/post/README.md)へ配置します。
+外部で作成したロードマップや監査は [docs/post/](docs/post/README.md) へ配置します。
 
 ## Build and test
 
@@ -53,33 +65,60 @@ python ./scripts/public_release_audit.py
 python ./scripts/check_markdown_links.py
 ```
 
-## Self-host
+## Self-host quickstart
 
-`.env.example`を基に必要なcredentialとsource設定を定義して起動します。
+前提:
+
+- Rust stable toolchain
+- Slack Bot Token
+- Slack thread reply 読み取り用 token
+- Google Slides / Drive を読める OAuth access token、または
+  `client_id` / `client_secret` / `refresh_token`
+- Gemini API key
+
+`.env.example` を基に、credential、source ID、runtime path、resource limit を
+すべて明示して起動します。
 
 ```powershell
 cargo run -p lethe-selfhost
 ```
 
-主なendpoint:
+必須値が欠落・空欄・不正形式の場合は起動時にエラー終了します。暗黙の既定値、
+代替 credential、heuristic fallback は使用しません。
+
+主な endpoint:
 
 - `GET /health`
 - `GET /health/deep`
-- `POST /admin/sync`
-- `GET /public/blobs/{sha256}`
-- `GET /api/projections/{projection_id}/records`
+- `POST /admin/sync` (`admin:sync`)
+- `GET /api/projections/{projection_id}/records` (`read:persons`)
 - `GET /api/projections/{projection_id}/records/{record_id}`
+  (`read:persons` + `read:timeline`)
 - `GET /api/projections/{projection_id}/records/{record_id}/slides`
+  (`read:timeline`)
 - `GET /api/projections/{projection_id}/records/{record_id}/messages`
+  (`read:timeline`)
 - `GET /api/projections/{projection_id}/records/{record_id}/timeline`
+  (`read:timeline`)
+- `GET /api/projections/{projection_id}/blobs/{sha256}` (`read:persons`)
+- `GET /api/projections/{projection_id}/lineage` (`read:persons`)
 
-`/health`とblob配信以外はBearer tokenを必要とします。Person projection IDは
-`proj:person-page`です。旧`/api/persons/*`ルートは提供しません。
+`/health` 以外は `Authorization: Bearer <token>` が必要です。Person Projection ID
+は `proj:person-page` です。旧 `/api/persons/*` ルートや raw CAS 配信ルートは
+提供しません。
 
-## Local state
+## Runtime guarantees
 
-SQLite、blob、取得済み資料、credentialはGit管理対象外です。既定のローカル配置は
-`data/`ですが、公開用fixture以外のruntime payloadをcommitしてはいけません。
+- SQLite の UNIQUE 制約を ingest の正規重複判定に使用します。
+- consent decision がない人物は `restricted_capture` として扱い、最新 decision が
+  `opted_out` の人物は Projection から除外します。
+- blob は filter 済み Person Page が参照するものだけを認証付きで返します。
+- Projection response の `lineage_ref` は実在する lineage manifest を指します。
+- identity / person-page の時刻は入力から導出し、replay の決定性を保ちます。
+- Slack timestamp の形式不正、Gemini 解析失敗、必須設定欠落は即時エラーにします。
+
+SQLite、blob、取得済み資料、credential は Git 管理対象外です。公開用 fixture
+以外の runtime payload を commit してはいけません。
 
 公開前に次を実行してください。
 

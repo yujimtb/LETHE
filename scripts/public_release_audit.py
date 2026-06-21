@@ -21,9 +21,13 @@ SECRET_ENV_KEYS = {
     "LETHE_GOOGLE_CLIENT_SECRET",
     "LETHE_GOOGLE_REFRESH_TOKEN",
     "LETHE_GEMINI_API_KEY",
-    "LETHE_NOTION_TOKEN",
 }
-SAFE_SECRET_EXAMPLES = {"", "xoxb-your-slack-bot-token"}
+SAFE_SECRET_EXAMPLES = {
+    "",
+    "xoxb-your-slack-bot-token",
+    "xoxp-your-thread-read-token",
+    "your-gemini-api-key",
+}
 
 
 def git_lines(root: pathlib.Path, *args: str) -> list[str]:

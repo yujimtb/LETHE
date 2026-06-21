@@ -195,6 +195,7 @@ pub(super) fn find_first_email(fragments: &[String]) -> Option<String> {
     })
 }
 
+#[cfg(test)]
 pub(super) fn infer_profile_name_from_fragments(fragments: &[String]) -> Option<String> {
     fragments.iter().find_map(|fragment| {
         let trimmed = fragment.trim();

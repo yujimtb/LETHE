@@ -61,7 +61,7 @@
 
 ### Requirement: GEN-03 Pluggable Adapter Contract
 
-source adapter は M09 Adapter Policy を実装する trait 群(`SourceReader`, `Observer`, `WriteBackAdapter`)として提供 **しなければならない (SHALL)**。adapter は authority model / capture model / 対応 schema / credential 要求 / rate limit / cursor 形式を **宣言的メタデータ** として公開 **しなければならない (SHALL)**。新規 source の追加は「trait 実装 + Registry への Source Contract 登録」のみで完結 **しなければならない (SHALL)**。コアコードの変更を要してはならない。
+read-side source adapter は M09 Adapter Policy を実装する `SourceAdapter` trait として提供 **しなければならない (SHALL)**。adapter は authority model / capture model / 対応 schema / credential 要求 / rate limit / cursor 形式を **宣言的メタデータ** として公開 **しなければならない (SHALL)**。新規 source の追加は「trait 実装 + Registry への Source Contract 登録」のみで完結 **しなければならない (SHALL)**。コアコードの変更を要してはならない。M07 Write-Back は Post-MVP とし、この contract に含めない。
 
 #### Scenario: 新規 source の追加
 

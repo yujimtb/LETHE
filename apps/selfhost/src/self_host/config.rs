@@ -5,18 +5,15 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub struct SelfHostConfig {
     pub bind_addr: String,
-    pub public_base_url: Option<String>,
     pub database_path: PathBuf,
     pub blob_dir: PathBuf,
     pub poll_interval: Duration,
     pub api_tokens: Vec<ApiTokenConfig>,
     pub resource_limits: ResourceLimits,
-    pub sources: Vec<SourceInstanceConfig>,
     pub slack: SlackConfig,
     pub google: GoogleConfig,
     pub slide_analysis_limit: usize,
-    pub slide_ai: Option<SlideAiConfig>,
-    pub notion: Option<NotionWritebackConfig>,
+    pub slide_ai: SlideAiConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -60,18 +57,9 @@ pub struct ResourceLimits {
 }
 
 #[derive(Debug, Clone)]
-pub struct SourceInstanceConfig {
-    pub id: String,
-    pub adapter: String,
-    pub credential_ref: String,
-    pub cursor_key: String,
-    pub settings: serde_json::Value,
-}
-
-#[derive(Debug, Clone)]
 pub struct SlackConfig {
     pub bot_token: String,
-    pub thread_token: Option<String>,
+    pub thread_token: String,
     pub channel_ids: Vec<String>,
 }
 
@@ -90,17 +78,10 @@ pub struct SlideAiConfig {
     pub model: String,
 }
 
-/// Configuration for Notion write-back adapter.
-#[derive(Debug, Clone)]
-pub struct NotionWritebackConfig {
-    /// Notion integration token.
-    pub token: String,
-    /// Target Notion database ID.
-    pub database_id: String,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    #[error("dotenv error: {0}")]
+    Dotenv(#[from] dotenvy::Error),
     #[error("missing environment variable {0}")]
     MissingEnv(&'static str),
     #[error("invalid environment variable {name}: {message}")]
@@ -113,36 +94,24 @@ pub enum ConfigError {
 
 impl SelfHostConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let _ = dotenvy::dotenv();
+        dotenvy::dotenv()?;
 
-        let bind_addr =
-            env::var("LETHE_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
-        let public_base_url = env::var("LETHE_PUBLIC_BASE_URL")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .map(|value| normalize_public_base_url("LETHE_PUBLIC_BASE_URL", value))
-            .transpose()?;
-        let database_path = PathBuf::from(
-            env::var("LETHE_DATABASE_PATH").unwrap_or_else(|_| "./data/lethe.sqlite3".to_string()),
-        );
-        let blob_dir = PathBuf::from(
-            env::var("LETHE_BLOB_DIR").unwrap_or_else(|_| "./data/blobs".to_string()),
-        );
-        let poll_interval = Duration::from_secs(parse_u64_env("LETHE_POLL_SECONDS", 300)?);
+        let bind_addr = required_env("LETHE_BIND_ADDR")?;
+        let database_path = PathBuf::from(required_env("LETHE_DATABASE_PATH")?);
+        let blob_dir = PathBuf::from(required_env("LETHE_BLOB_DIR")?);
+        let poll_interval = Duration::from_secs(parse_u64_env("LETHE_POLL_SECONDS")?);
         let api_tokens = parse_api_tokens_env("LETHE_API_TOKENS")?;
         let resource_limits = ResourceLimits {
-            max_blob_bytes: parse_usize_env("LETHE_MAX_BLOB_BYTES", 10 * 1024 * 1024)?,
-            max_payload_bytes: parse_usize_env("LETHE_MAX_PAYLOAD_BYTES", 1024 * 1024)?,
-            max_sync_items: parse_usize_env("LETHE_MAX_SYNC_ITEMS", 10_000)?,
-            max_page_size: parse_usize_env("LETHE_MAX_PAGE_SIZE", 100)?,
+            max_blob_bytes: parse_usize_env("LETHE_MAX_BLOB_BYTES")?,
+            max_payload_bytes: parse_usize_env("LETHE_MAX_PAYLOAD_BYTES")?,
+            max_sync_items: parse_usize_env("LETHE_MAX_SYNC_ITEMS")?,
+            max_page_size: parse_usize_env("LETHE_MAX_PAGE_SIZE")?,
         };
 
         let slack = SlackConfig {
             bot_token: required_env("LETHE_SLACK_BOT_TOKEN")?,
-            thread_token: env::var("LETHE_SLACK_THREAD_TOKEN")
-                .ok()
-                .filter(|v| !v.trim().is_empty()),
-            channel_ids: parse_csv_env("LETHE_SLACK_CHANNEL_IDS", true)?,
+            thread_token: required_env("LETHE_SLACK_THREAD_TOKEN")?,
+            channel_ids: parse_csv_env("LETHE_SLACK_CHANNEL_IDS")?,
         };
 
         let google = GoogleConfig {
@@ -158,10 +127,9 @@ impl SelfHostConfig {
             refresh_token: env::var("LETHE_GOOGLE_REFRESH_TOKEN")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
-            presentation_ids: parse_csv_env("LETHE_GOOGLE_PRESENTATION_IDS", true)?,
+            presentation_ids: parse_csv_env("LETHE_GOOGLE_PRESENTATION_IDS")?,
         };
-        let slide_analysis_limit = parse_usize_env("LETHE_GOOGLE_SLIDE_ANALYSIS_LIMIT", 10)?;
-        let sources = source_instances_from_legacy_config(&slack, &google);
+        let slide_analysis_limit = parse_usize_env("LETHE_GOOGLE_SLIDE_ANALYSIS_LIMIT")?;
 
         if google.access_token.is_none()
             && (google.client_id.is_none()
@@ -171,43 +139,22 @@ impl SelfHostConfig {
             return Err(ConfigError::MissingGoogleCredentials);
         }
 
-        let notion = match (
-            env::var("LETHE_NOTION_TOKEN")
-                .ok()
-                .filter(|v| !v.trim().is_empty()),
-            env::var("LETHE_NOTION_DATABASE_ID")
-                .ok()
-                .filter(|v| !v.trim().is_empty()),
-        ) {
-            (Some(token), Some(database_id)) => Some(NotionWritebackConfig { token, database_id }),
-            _ => None,
+        let slide_ai = SlideAiConfig {
+            api_key: required_env("LETHE_GEMINI_API_KEY")?,
+            model: required_env("LETHE_GEMINI_MODEL")?,
         };
-
-        let slide_ai = env::var("LETHE_GEMINI_API_KEY")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .map(|api_key| SlideAiConfig {
-                api_key,
-                model: env::var("LETHE_GEMINI_MODEL")
-                    .ok()
-                    .filter(|v| !v.trim().is_empty())
-                    .unwrap_or_else(|| "gemini-3-flash-preview".to_string()),
-            });
 
         Ok(Self {
             bind_addr,
-            public_base_url,
             database_path,
             blob_dir,
             poll_interval,
             api_tokens,
             resource_limits,
-            sources,
             slack,
             google,
             slide_analysis_limit,
             slide_ai,
-            notion,
         })
     }
 }
@@ -252,78 +199,49 @@ fn parse_api_tokens_env(name: &'static str) -> Result<Vec<ApiTokenConfig>, Confi
     Ok(tokens)
 }
 
-fn source_instances_from_legacy_config(
-    slack: &SlackConfig,
-    google: &GoogleConfig,
-) -> Vec<SourceInstanceConfig> {
-    let mut sources = Vec::new();
-    for channel_id in &slack.channel_ids {
-        sources.push(SourceInstanceConfig {
-            id: format!("slack:{channel_id}"),
-            adapter: "slack".to_string(),
-            credential_ref: "env:LETHE_SLACK_BOT_TOKEN".to_string(),
-            cursor_key: format!("slack:{channel_id}:oldest_ts"),
-            settings: serde_json::json!({ "channel_id": channel_id }),
-        });
-    }
-    for presentation_id in &google.presentation_ids {
-        sources.push(SourceInstanceConfig {
-            id: format!("gslides:{presentation_id}"),
-            adapter: "gslides".to_string(),
-            credential_ref: "env:LETHE_GOOGLE_ACCESS_TOKEN".to_string(),
-            cursor_key: format!("gslides:{presentation_id}:revision"),
-            settings: serde_json::json!({ "presentation_id": presentation_id }),
-        });
-    }
-    sources
-}
-
 fn required_env(name: &'static str) -> Result<String, ConfigError> {
-    env::var(name).map_err(|_| ConfigError::MissingEnv(name))
+    let value = env::var(name).map_err(|_| ConfigError::MissingEnv(name))?;
+    if value.trim().is_empty() {
+        return Err(ConfigError::InvalidEnv {
+            name,
+            message: "must not be blank".to_string(),
+        });
+    }
+    Ok(value)
 }
 
-fn parse_u64_env(name: &'static str, default: u64) -> Result<u64, ConfigError> {
-    match env::var(name) {
-        Ok(raw) => raw.parse::<u64>().map_err(|err| ConfigError::InvalidEnv {
+fn parse_u64_env(name: &'static str) -> Result<u64, ConfigError> {
+    required_env(name)?
+        .parse::<u64>()
+        .map_err(|err| ConfigError::InvalidEnv {
             name,
             message: err.to_string(),
-        }),
-        Err(_) => Ok(default),
-    }
-}
-
-fn normalize_public_base_url(name: &'static str, raw: String) -> Result<String, ConfigError> {
-    let normalized = raw.trim().trim_end_matches('/').to_string();
-    if normalized.starts_with("http://") || normalized.starts_with("https://") {
-        Ok(normalized)
-    } else {
-        Err(ConfigError::InvalidEnv {
-            name,
-            message: "must start with http:// or https://".to_string(),
         })
-    }
 }
 
-fn parse_csv_env(name: &'static str, required: bool) -> Result<Vec<String>, ConfigError> {
-    match env::var(name) {
-        Ok(raw) => {
-            let values: Vec<String> = raw
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-                .collect();
-            if required && values.is_empty() {
-                return Err(ConfigError::InvalidEnv {
-                    name,
-                    message: "must contain at least one comma-separated value".to_string(),
-                });
-            }
-            Ok(values)
-        }
-        Err(_) if required => Err(ConfigError::MissingEnv(name)),
-        Err(_) => Ok(Vec::new()),
+fn parse_csv_env(name: &'static str) -> Result<Vec<String>, ConfigError> {
+    let values: Vec<String> = required_env(name)?
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    if values.is_empty() {
+        return Err(ConfigError::InvalidEnv {
+            name,
+            message: "must contain at least one comma-separated value".to_string(),
+        });
     }
+    Ok(values)
+}
+
+fn parse_usize_env(name: &'static str) -> Result<usize, ConfigError> {
+    required_env(name)?
+        .parse::<usize>()
+        .map_err(|err| ConfigError::InvalidEnv {
+            name,
+            message: err.to_string(),
+        })
 }
 
 #[cfg(test)]
@@ -335,23 +253,8 @@ mod tests {
         unsafe {
             env::set_var("LETHE_SLACK_CHANNEL_IDS", "C1, C2 ,,C3");
         }
-        let values = parse_csv_env("LETHE_SLACK_CHANNEL_IDS", true).unwrap();
+        let values = parse_csv_env("LETHE_SLACK_CHANNEL_IDS").unwrap();
         assert_eq!(values, vec!["C1", "C2", "C3"]);
-    }
-
-    #[test]
-    fn normalize_public_base_url_trims_trailing_slash() {
-        let normalized =
-            normalize_public_base_url("LETHE_PUBLIC_BASE_URL", "https://example.com/base/".into())
-                .unwrap();
-        assert_eq!(normalized, "https://example.com/base");
-    }
-
-    #[test]
-    fn normalize_public_base_url_rejects_non_http() {
-        let err = normalize_public_base_url("LETHE_PUBLIC_BASE_URL", "ftp://example.com".into())
-            .unwrap_err();
-        assert!(matches!(err, ConfigError::InvalidEnv { .. }));
     }
 
     #[test]
@@ -360,15 +263,5 @@ mod tests {
         let debug = format!("{secret:?}");
         assert!(!debug.contains("super-secret-token"));
         assert!(debug.contains("redacted"));
-    }
-}
-
-fn parse_usize_env(name: &'static str, default: usize) -> Result<usize, ConfigError> {
-    match env::var(name) {
-        Ok(raw) => raw.parse::<usize>().map_err(|err| ConfigError::InvalidEnv {
-            name,
-            message: err.to_string(),
-        }),
-        Err(_) => Ok(default),
     }
 }

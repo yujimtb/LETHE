@@ -251,6 +251,8 @@ Slack API は tier-based rate limiting:
 
 adapter は `Retry-After` header を尊重し、exponential backoff で対応。
 
+Slack timestamp は `seconds.microseconds` の形式を必須とする。不正形式を壁時計やゼロへ補完してはならず、`MalformedResponse` として ingestion を失敗させる。
+
 ---
 
 ## 8. Acceptance Tests
@@ -266,6 +268,7 @@ adapter は `Retry-After` header を尊重し、exponential backoff で対応。
 | 7 | rate limit (429) | retry + 成功 | |
 | 8 | channel snapshot | schema:slack-channel-snapshot Observation | |
 | 9 | heartbeat | schema:observer-heartbeat Observation | |
+| 10 | 不正な `ts` | `MalformedResponse` | 壁時計への代替禁止 |
 
 ---
 

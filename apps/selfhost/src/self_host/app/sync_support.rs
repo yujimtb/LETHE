@@ -116,6 +116,26 @@ pub(super) fn restricted_fields() -> Vec<RestrictedFieldSpec> {
     .collect()
 }
 
-pub(super) fn slack_ts_value(value: &str) -> f64 {
-    value.parse::<f64>().unwrap_or(0.0)
+pub(super) fn slack_ts_value(value: &str) -> Result<(i64, u32), SelfHostError> {
+    let (seconds, fractional) = value.split_once('.').ok_or_else(|| {
+        SelfHostError::Ingestion(format!(
+            "invalid Slack timestamp in persisted state: {value}"
+        ))
+    })?;
+    if fractional.len() != 6 || !fractional.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(SelfHostError::Ingestion(format!(
+            "invalid Slack timestamp in persisted state: {value}"
+        )));
+    }
+    let seconds = seconds.parse::<i64>().map_err(|_| {
+        SelfHostError::Ingestion(format!(
+            "invalid Slack timestamp in persisted state: {value}"
+        ))
+    })?;
+    let micros = fractional.parse::<u32>().map_err(|_| {
+        SelfHostError::Ingestion(format!(
+            "invalid Slack timestamp in persisted state: {value}"
+        ))
+    })?;
+    Ok((seconds, micros))
 }

@@ -46,13 +46,13 @@ impl RegistryStore {
             )));
         }
         // Validate parent exists if specified.
-        if let Some(ref parent) = et.parent {
-            if !self.entity_types.contains_key(&parent.0) {
-                return Err(DomainError::Validation(format!(
-                    "Parent EntityType {} does not exist",
-                    parent
-                )));
-            }
+        if let Some(ref parent) = et.parent
+            && !self.entity_types.contains_key(&parent.0)
+        {
+            return Err(DomainError::Validation(format!(
+                "Parent EntityType {} does not exist",
+                parent
+            )));
         }
         self.entity_types.insert(et.id.0.clone(), et);
         Ok(())

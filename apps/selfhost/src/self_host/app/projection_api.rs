@@ -9,7 +9,10 @@ impl AppService {
     ) -> Result<ResponseEnvelope<serde_json::Value>, SelfHostError> {
         let core = self.core_lock()?;
         let mode = self.resolve_read_mode(&core.catalog, "proj:person-page", read_mode, pin)?;
-        self.authorize_read(EntityRef::new("projection:person-page"))?;
+        self.authorize_read(
+            EntityRef::new("projection:person-page"),
+            ConsentStatus::RestrictedCapture,
+        )?;
 
         let mut list: Vec<PersonListItem> = core
             .snapshot
@@ -38,6 +41,7 @@ impl AppService {
                 "proj:person-page",
                 mode,
                 core.snapshot.built_at,
+                &core.snapshot.lineage,
             )?,
         })
     }
@@ -50,8 +54,6 @@ impl AppService {
     ) -> Result<ResponseEnvelope<serde_json::Value>, SelfHostError> {
         let core = self.core_lock()?;
         let mode = self.resolve_read_mode(&core.catalog, "proj:person-page", read_mode, pin)?;
-        self.authorize_read(EntityRef::new(person_id.to_string()))?;
-
         let profile = core
             .snapshot
             .person_page
@@ -59,6 +61,10 @@ impl AppService {
             .iter()
             .find(|profile| profile.person_id.as_str() == person_id)
             .ok_or_else(|| SelfHostError::NotFound(person_id.to_string()))?;
+        self.authorize_read(
+            EntityRef::new(person_id.to_string()),
+            consent_status_for_person_id(&core, person_id)?,
+        )?;
         let slides: Vec<_> = core
             .snapshot
             .person_page
@@ -92,6 +98,7 @@ impl AppService {
                 "proj:person-page",
                 mode,
                 core.snapshot.built_at,
+                &core.snapshot.lineage,
             )?,
         })
     }
@@ -104,7 +111,10 @@ impl AppService {
     ) -> Result<ResponseEnvelope<serde_json::Value>, SelfHostError> {
         let core = self.core_lock()?;
         let mode = self.resolve_read_mode(&core.catalog, "proj:person-page", read_mode, pin)?;
-        self.authorize_read(EntityRef::new(person_id.to_string()))?;
+        self.authorize_read(
+            EntityRef::new(person_id.to_string()),
+            consent_status_for_person_id(&core, person_id)?,
+        )?;
         let slides: Vec<_> = core
             .snapshot
             .person_page
@@ -121,6 +131,7 @@ impl AppService {
                 "proj:person-page",
                 mode,
                 core.snapshot.built_at,
+                &core.snapshot.lineage,
             )?,
         })
     }
@@ -133,7 +144,10 @@ impl AppService {
     ) -> Result<ResponseEnvelope<serde_json::Value>, SelfHostError> {
         let core = self.core_lock()?;
         let mode = self.resolve_read_mode(&core.catalog, "proj:person-page", read_mode, pin)?;
-        self.authorize_read(EntityRef::new(person_id.to_string()))?;
+        self.authorize_read(
+            EntityRef::new(person_id.to_string()),
+            consent_status_for_person_id(&core, person_id)?,
+        )?;
         let messages: Vec<_> = core
             .snapshot
             .person_page
@@ -150,6 +164,7 @@ impl AppService {
                 "proj:person-page",
                 mode,
                 core.snapshot.built_at,
+                &core.snapshot.lineage,
             )?,
         })
     }
@@ -162,7 +177,10 @@ impl AppService {
     ) -> Result<ResponseEnvelope<serde_json::Value>, SelfHostError> {
         let core = self.core_lock()?;
         let mode = self.resolve_read_mode(&core.catalog, "proj:person-page", read_mode, pin)?;
-        self.authorize_read(EntityRef::new(person_id.to_string()))?;
+        self.authorize_read(
+            EntityRef::new(person_id.to_string()),
+            consent_status_for_person_id(&core, person_id)?,
+        )?;
         let mut events = Vec::new();
 
         for slide in core
@@ -210,6 +228,7 @@ impl AppService {
                 "proj:person-page",
                 mode,
                 core.snapshot.built_at,
+                &core.snapshot.lineage,
             )?,
         })
     }

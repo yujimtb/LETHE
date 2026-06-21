@@ -413,14 +413,7 @@ fn normalize_string_list(values: &mut Vec<String>) {
 }
 
 fn split_list_value(value: &str) -> Vec<String> {
-    let normalized = value
-        .replace('\n', ",")
-        .replace('\r', ",")
-        .replace('・', ",")
-        .replace('•', ",")
-        .replace('，', ",")
-        .replace('、', ",")
-        .replace('/', ",");
+    let normalized = value.replace(['\n', '\r', '・', '•', '，', '、', '/'], ",");
 
     let mut results = Vec::new();
     for part in normalized.split(',') {

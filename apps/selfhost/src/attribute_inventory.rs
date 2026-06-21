@@ -787,6 +787,7 @@ mod tests {
                 ..PersonPageOutput::default()
             },
             built_at: Utc::now(),
+            lineage: ProjectionSnapshot::default().lineage,
         };
 
         let docs = build_inventory_documents(&snapshot);
@@ -925,7 +926,7 @@ mod tests {
 
     fn make_person(name: &str, bio: &str, props: StudentProperties) -> PersonProfile {
         PersonProfile {
-            person_id: EntityRef::new(&format!("person:{name}")),
+            person_id: EntityRef::new(format!("person:{name}")),
             display_name: name.into(),
             self_intro_text: None,
             self_intro_slide_id: None,

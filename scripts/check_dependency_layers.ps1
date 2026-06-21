@@ -29,7 +29,6 @@ $allowedLocalDependencies = @{
     "lethe-adapter-slack" = @("lethe-adapter-api", "lethe-core")
     "lethe-adapter-gslides" = @("lethe-adapter-api", "lethe-core")
     "lethe-adapter-claude" = @("lethe-adapter-api", "lethe-core")
-    "lethe-adapter-notion" = @("lethe-adapter-api", "lethe-profile-model")
     "lethe-derivation-gemini" = @(
         "lethe-adapter-api",
         "lethe-adapter-gslides",

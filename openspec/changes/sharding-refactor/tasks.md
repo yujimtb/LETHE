@@ -79,7 +79,7 @@
 - [ ] 4.6 propagation 検出: per-leaf `WHERE append_seq > ?` で tail を読む(SHARD-PROP-04)
 - [ ] 4.7 propagation 適用: 可換 + 冪等 fold に限定(順序依存 fold は core サポート外)、at-least-once + 冪等 apply 契約(SHARD-PROP-03)
 - [x] 4.8 split 後の全 Observation 再配送を baseline で許容(SHARD-PROP-05、R11)、profiling で β(frontier 子移管)を後付け可能に
-- [x] 4.9 supplemental index は明示宣言の read mode のみ(暗黙 full-scan fallback 禁止)(SHARD-RT-08、R6)
+- [x] 4.9 supplemental index が stale なら fail-fast(full-scan への切り替え禁止)(SHARD-RT-08、R6)
 - [x] 4.10 placement に解決済みエンティティ(person / subject / project)を入れない(SHARD-RT-08 §placement 原則)
 
 **Gate P4:**

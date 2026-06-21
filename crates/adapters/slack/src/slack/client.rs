@@ -191,7 +191,14 @@ impl SlackClient for FixtureSlackClient {
     ) -> Result<Vec<SlackMessage>, AdapterError> {
         let mut replies = self.replies.get(thread_ts).cloned().unwrap_or_default();
         if let Some(oldest) = oldest {
-            replies.retain(|reply| slack_ts_value(&reply.ts) > slack_ts_value(oldest));
+            let oldest = slack_ts_value(oldest)?;
+            let mut filtered = Vec::with_capacity(replies.len());
+            for reply in replies {
+                if slack_ts_value(&reply.ts)? > oldest {
+                    filtered.push(reply);
+                }
+            }
+            replies = filtered;
         }
         Ok(replies)
     }
@@ -211,6 +218,27 @@ impl SlackClient for FixtureSlackClient {
     }
 }
 
-fn slack_ts_value(value: &str) -> f64 {
-    value.parse::<f64>().unwrap_or(0.0)
+fn slack_ts_value(value: &str) -> Result<(i64, u32), AdapterError> {
+    let (seconds, fractional) =
+        value
+            .split_once('.')
+            .ok_or_else(|| AdapterError::MalformedResponse {
+                message: format!("invalid Slack timestamp: {value}"),
+            })?;
+    if fractional.len() != 6 || !fractional.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(AdapterError::MalformedResponse {
+            message: format!("invalid Slack timestamp: {value}"),
+        });
+    }
+    let seconds = seconds
+        .parse::<i64>()
+        .map_err(|_| AdapterError::MalformedResponse {
+            message: format!("invalid Slack timestamp: {value}"),
+        })?;
+    let micros = fractional
+        .parse::<u32>()
+        .map_err(|_| AdapterError::MalformedResponse {
+            message: format!("invalid Slack timestamp: {value}"),
+        })?;
+    Ok((seconds, micros))
 }

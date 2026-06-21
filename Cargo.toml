@@ -3,11 +3,9 @@ resolver = "3"
 members = [
     "apps/selfhost",
     "apps/tools/attribute-inventory",
-    "apps/tools/notion-review",
     "crates/adapters/api",
     "crates/adapters/claude",
     "crates/adapters/gslides",
-    "crates/adapters/notion",
     "crates/adapters/slack",
     "crates/api",
     "crates/core",
@@ -33,12 +31,10 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 hex = "0.4"
-image = "0.25"
 jsonschema = "0.29"
 pretty_assertions = "1"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
-roxmltree = "0.20"
 rusqlite = { version = "0.34", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

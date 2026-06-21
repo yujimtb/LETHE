@@ -291,7 +291,7 @@ fn slack_message_ingested_through_gate() {
     let blobs = BlobStore::new();
 
     let adapter = SlackAdapter::new(FixtureSlackClient::new(), slack_config());
-    let draft = adapter.map_message(&sample_slack_message());
+    let draft = adapter.map_message(&sample_slack_message()).unwrap();
     let req = draft_to_ingest(&draft);
 
     let mut gate = IngestionGate {
@@ -315,7 +315,7 @@ fn slack_duplicate_resend_deduplicated() {
     let blobs = BlobStore::new();
 
     let adapter = SlackAdapter::new(FixtureSlackClient::new(), slack_config());
-    let draft = adapter.map_message(&sample_slack_message());
+    let draft = adapter.map_message(&sample_slack_message()).unwrap();
 
     // First ingest
     let mut gate = IngestionGate {
@@ -352,7 +352,7 @@ fn slack_edit_and_delete_are_separate_observations() {
         lake: &mut lake,
         blobs: &blobs,
     };
-    gate.ingest(draft_to_ingest(&adapter.map_message(&msg)));
+    gate.ingest(draft_to_ingest(&adapter.map_message(&msg).unwrap()));
 
     // Edit
     let mut edit = msg.clone();
@@ -367,7 +367,7 @@ fn slack_edit_and_delete_are_separate_observations() {
         lake: &mut lake,
         blobs: &blobs,
     };
-    gate.ingest(draft_to_ingest(&adapter.map_message(&edit)));
+    gate.ingest(draft_to_ingest(&adapter.map_message(&edit).unwrap()));
 
     // Delete
     let mut del = msg.clone();
@@ -377,7 +377,7 @@ fn slack_edit_and_delete_are_separate_observations() {
         lake: &mut lake,
         blobs: &blobs,
     };
-    gate.ingest(draft_to_ingest(&adapter.map_message(&del)));
+    gate.ingest(draft_to_ingest(&adapter.map_message(&del).unwrap()));
 
     assert_eq!(lake.len(), 3);
 
@@ -410,7 +410,7 @@ fn slack_reaction_change_is_duplicate_not_conflict() {
         lake: &mut lake,
         blobs: &blobs,
     };
-    let r1 = gate.ingest(draft_to_ingest(&adapter.map_message(&msg)));
+    let r1 = gate.ingest(draft_to_ingest(&adapter.map_message(&msg).unwrap()));
     assert!(matches!(r1, IngestResult::Ingested { .. }));
 
     let mut gate = IngestionGate {
@@ -418,7 +418,7 @@ fn slack_reaction_change_is_duplicate_not_conflict() {
         lake: &mut lake,
         blobs: &blobs,
     };
-    let r2 = gate.ingest(draft_to_ingest(&adapter.map_message(&reacted)));
+    let r2 = gate.ingest(draft_to_ingest(&adapter.map_message(&reacted).unwrap()));
     assert!(matches!(r2, IngestResult::Duplicate { .. }));
     assert_eq!(lake.len(), 1);
 }
@@ -443,7 +443,7 @@ fn slack_file_share_with_blob() {
         blob_ref: Some(blob_ref.as_str().to_string()),
     }];
 
-    let draft = adapter.map_message(&msg);
+    let draft = adapter.map_message(&msg).unwrap();
     let mut gate = IngestionGate {
         registry: &reg,
         lake: &mut lake,
@@ -732,8 +732,8 @@ fn replay_same_input_same_output() {
     let adapter = SlackAdapter::new(FixtureSlackClient::new(), slack_config());
     let msg = sample_slack_message();
 
-    let d1 = adapter.map_message(&msg);
-    let d2 = adapter.map_message(&msg);
+    let d1 = adapter.map_message(&msg).unwrap();
+    let d2 = adapter.map_message(&msg).unwrap();
 
     assert_eq!(d1.idempotency_key, d2.idempotency_key);
     assert_eq!(d1.subject, d2.subject);
@@ -750,7 +750,7 @@ fn revision_snapshot_vs_event_capture_typed() {
     let gslides_adapter =
         GoogleSlidesAdapter::new(FixtureGoogleSlidesClient::new(), gslides_config());
 
-    let slack_draft = slack_adapter.map_message(&sample_slack_message());
+    let slack_draft = slack_adapter.map_message(&sample_slack_message()).unwrap();
     assert_eq!(slack_draft.capture_model, CaptureModel::Event);
     assert_eq!(
         slack_draft.authority_model,
@@ -796,7 +796,7 @@ fn watermark_tracks_adapter_ingestion() {
         lake: &mut lake,
         blobs: &blobs,
     };
-    gate.ingest(draft_to_ingest(&adapter.map_message(&msg1)));
+    gate.ingest(draft_to_ingest(&adapter.map_message(&msg1).unwrap()));
 
     let wm = lake.watermark().unwrap();
 
@@ -805,7 +805,7 @@ fn watermark_tracks_adapter_ingestion() {
         lake: &mut lake,
         blobs: &blobs,
     };
-    gate.ingest(draft_to_ingest(&adapter.map_message(&msg2)));
+    gate.ingest(draft_to_ingest(&adapter.map_message(&msg2).unwrap()));
 
     let delta = lake.since(wm.position);
     assert_eq!(delta.len(), 1);

@@ -32,9 +32,8 @@ tools / e2e ── public crate interfaces
 
 大きな実装は責務別submoduleへ分割します。
 
-- selfhost app: bootstrap/auth、sync workflow、Notion workflow、Projection API、
-  persistence/ingestion support、media/write-back support、slide scoring
-- Notion adapter: HTTP client、media mapping、page block construction
+- selfhost app: bootstrap/auth、sync workflow、Projection API、
+  persistence/ingestion support、media support、slide scoring
 - SQLite storage: persistence API、schema initialization、tests
 
 ## Runtime data

@@ -26,14 +26,13 @@ normative な要件は spec 側にあり、本書はそれを覆さない。
 - pure(`lethe-core` / `lethe-policy`)と effectful(storage / adapter /
   runtime / selfhost)を crate 境界で分離し、依存方向を CI で DAG として
   強制する(GEN-02)。
-- 強制手段は `cargo deny` を第一候補とし、表現力が不足する場合は custom
-  check(workspace metadata 走査)へフォールバックする。
+- 強制手段は workspace metadata を走査する dependency layer check に固定する。
 
 ### D2. すべての副作用を Effect Ports(trait)経由にする
 
 - `ObservationStore` / `BlobStore` / `SupplementalStore` /
-  `ProjectionMaterializer`(GEN-04)、および `SourceReader` / `Observer` /
-  `WriteBackAdapter`(GEN-03)、`DerivationProvider`(GEN-06)を trait 化。
+  `ProjectionMaterializer`(GEN-04)、および read-side `SourceAdapter`
+  (GEN-03)、`DerivationProvider`(GEN-06)を trait 化。
 - 各 port には **共通 conformance test suite** を用意し、具象実装は同一の
   受け入れテストに合格することを差し替え可能性の保証とする。
 - SQLite + ローカル blob は「参照実装の一つ」へ降格(既定のまま残す)。
@@ -120,7 +119,7 @@ Phase 0 着手時に以下を実施してから境界を確定すること:
 
 ### U2. trait 名・粒度
 
-`SourceReader` / `Observer` / `WriteBackAdapter` / `DerivationProvider` 等の
+`SourceAdapter` / `DerivationProvider` 等の
 名称と分割粒度は M09 Adapter Policy / 既存 `src/adapter/` の実コードに合わせて
 調整してよい。spec の Scenario(受け入れ基準)を満たす限り内部設計は自由。
 

@@ -261,10 +261,6 @@ OCR テキストから抽出する情報:
 
 抽出結果は Supplemental に `derivation: "profile-extraction"` として保存。
 
-### 5.3 既存プログラム参照
-
-既存の Slides→Notion 転記プログラムを参照・転用可能。
-
 ---
 
 ## 6. Query Patterns

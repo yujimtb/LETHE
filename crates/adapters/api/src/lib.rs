@@ -6,7 +6,6 @@ pub mod heartbeat;
 pub mod idempotency;
 pub mod retry;
 pub mod traits;
-pub mod writeback;
 
 pub use config::*;
 pub use conformance::*;

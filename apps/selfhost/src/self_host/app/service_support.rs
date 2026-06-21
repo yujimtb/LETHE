@@ -9,13 +9,17 @@ impl AppService {
         ))
     }
 
-    pub(super) fn authorize_read(&self, target: EntityRef) -> Result<(), SelfHostError> {
+    pub(super) fn authorize_read(
+        &self,
+        target: EntityRef,
+        consent_status: ConsentStatus,
+    ) -> Result<(), SelfHostError> {
         let outcome = PolicyEngine::evaluate(&PolicyRequest {
             actor: ActorRef::new("actor:self-host"),
             role: Role::Researcher,
             operation: Operation::Read { target },
-            data_scope: AccessScope::Internal,
-            consent_status: ConsentStatus::Unrestricted,
+            data_scope: AccessScope::Restricted,
+            consent_status,
             environment: Environment::Production,
         });
 
@@ -32,6 +36,7 @@ impl AppService {
         projection_id: &str,
         read_mode: ReadMode,
         built_at: DateTime<Utc>,
+        lineage: &LineageManifest,
     ) -> Result<ProjectionMetadata, SelfHostError> {
         let projection_id = ProjectionRef::new(projection_id);
         let entry = catalog
@@ -43,8 +48,15 @@ impl AppService {
             built_at,
             read_mode,
             stale: false,
-            lineage_ref: None,
+            lineage_ref: Some(lineage_ref(lineage)),
         })
+    }
+
+    pub fn lineage_manifest(&self, projection_id: &str) -> Result<LineageManifest, SelfHostError> {
+        if projection_id != "proj:person-page" {
+            return Err(SelfHostError::NotFound(projection_id.to_string()));
+        }
+        Ok(self.core_lock()?.snapshot.lineage.clone())
     }
 
     pub(super) fn apply_filter(&self, payload: serde_json::Value) -> serde_json::Value {
@@ -138,8 +150,16 @@ impl AppService {
         Ok(blob_ref)
     }
 
-    pub fn blob_bytes(&self, blob_ref: &BlobRef) -> Result<Option<Vec<u8>>, SelfHostError> {
+    pub fn projection_blob_bytes(
+        &self,
+        blob_ref: &BlobRef,
+    ) -> Result<Option<Vec<u8>>, SelfHostError> {
         let core = self.core_lock()?;
+        let filtered_projection =
+            self.apply_filter(serde_json::to_value(&core.snapshot.person_page)?);
+        if !json_contains_string(&filtered_projection, blob_ref.as_str()) {
+            return Ok(None);
+        }
         Ok(core.blobs.get(blob_ref).map(|bytes| bytes.to_vec()))
     }
 
@@ -159,14 +179,14 @@ impl AppService {
                 file.blob_ref = Some(blob_ref.as_str().to_string());
             }
         }
-        if latest_ts
-            .as_ref()
-            .map(|current| slack_ts_value(&message.ts) > slack_ts_value(current))
-            .unwrap_or(true)
-        {
+        let is_latest = match latest_ts.as_ref() {
+            Some(current) => slack_ts_value(&message.ts)? > slack_ts_value(current)?,
+            None => true,
+        };
+        if is_latest {
             *latest_ts = Some(message.ts.clone());
         }
-        self.ingest_draft(slack_adapter.map_message(&message))
+        self.ingest_draft(slack_adapter.map_message(&message)?)
     }
 
     pub(super) fn sync_thread_replies(
@@ -231,25 +251,16 @@ impl AppService {
         image: &[u8],
         observation: &Observation,
         canonical_uri: &str,
-    ) -> Option<StudentProfile> {
+    ) -> Result<Option<StudentProfile>, SelfHostError> {
         let title = observation
             .payload
             .get("title")
             .and_then(|value| value.as_str())
             .unwrap_or("Unknown");
 
-        if let Some(analyzer) = &self.slide_analyzer {
-            match analyzer.extract_profile_from_png(image, title, canonical_uri) {
-                Ok(Some(profile)) => return Some(profile),
-                Ok(None) => {}
-                Err(err) => eprintln!(
-                    "slide ai analysis failed for {}: {err}; falling back to heuristic profile",
-                    observation.id
-                ),
-            }
-        }
-
-        None
+        Ok(self
+            .slide_analyzer
+            .extract_profile_from_png(image, title, canonical_uri)?)
     }
 
     pub(super) fn core_lock(&self) -> Result<std::sync::MutexGuard<'_, AppCore>, SelfHostError> {
@@ -324,4 +335,90 @@ impl AppService {
             credential_ref: "env:LETHE_GOOGLE_ACCESS_TOKEN".into(),
         }
     }
+}
+
+pub(super) fn build_person_page_lineage(
+    observations: &[Observation],
+    supplementals: &[&lethe_core::domain::SupplementalRecord],
+    output_count: usize,
+    built_at: DateTime<Utc>,
+) -> LineageManifest {
+    let mut observation_refs = observations
+        .iter()
+        .map(|observation| format!("observation:{}", observation.id))
+        .collect::<Vec<_>>();
+    let mut supplemental_refs = supplementals
+        .iter()
+        .map(|record| format!("supplemental:{}", record.id))
+        .collect::<Vec<_>>();
+    observation_refs.sort();
+    supplemental_refs.sort();
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"proj:person-page@1.0.0\n");
+    for input_ref in observation_refs.iter().chain(&supplemental_refs) {
+        hasher.update(input_ref.as_bytes());
+        hasher.update(b"\n");
+    }
+    let build_id = format!("build-{}", hex::encode(hasher.finalize()));
+    let mut lineage = LineageManifest::new(
+        ProjectionRef::new("proj:person-page"),
+        SemVer::new("1.0.0"),
+        build_id,
+    );
+    lineage.built_at = built_at;
+    lineage.output_count = output_count;
+    lineage.deterministic = true;
+    lineage.add_source(SourceSnapshot {
+        source_ref: "lake".to_string(),
+        watermark_position: Some(observations.len()),
+        record_count: observations.len(),
+    });
+    lineage.add_source(SourceSnapshot {
+        source_ref: "supplemental:slide-analysis".to_string(),
+        watermark_position: None,
+        record_count: supplementals.len(),
+    });
+    for input_ref in observation_refs.into_iter().chain(supplemental_refs) {
+        lineage.add_input_ref(input_ref);
+    }
+    lineage
+}
+
+pub(super) fn consent_status_for_person_id(
+    core: &AppCore,
+    person_id: &str,
+) -> Result<ConsentStatus, SelfHostError> {
+    let person = core
+        .snapshot
+        .identity
+        .resolved_persons
+        .iter()
+        .find(|person| person.person_id.as_str() == person_id)
+        .ok_or_else(|| SelfHostError::NotFound(person_id.to_string()))?;
+    Ok(PersonPageProjector::consent_status_for_person(
+        person,
+        core.lake.list(),
+    ))
+}
+
+pub(super) fn json_contains_string(value: &serde_json::Value, needle: &str) -> bool {
+    match value {
+        serde_json::Value::String(value) => value == needle,
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| json_contains_string(value, needle)),
+        serde_json::Value::Object(values) => values
+            .values()
+            .any(|value| json_contains_string(value, needle)),
+        _ => false,
+    }
+}
+
+pub(super) fn lineage_ref(lineage: &LineageManifest) -> String {
+    format!(
+        "lineage:{}:{}",
+        lineage.projection_id.as_str().trim_start_matches("proj:"),
+        lineage.build_id
+    )
 }

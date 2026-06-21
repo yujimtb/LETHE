@@ -99,7 +99,7 @@ impl ProjectionCatalog {
 
     /// Return all registered projection ids.
     pub fn list_ids(&self) -> Vec<ProjectionRef> {
-        self.entries.keys().map(|k| ProjectionRef::new(k)).collect()
+        self.entries.keys().map(ProjectionRef::new).collect()
     }
 
     /// Get all entries.

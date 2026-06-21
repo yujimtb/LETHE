@@ -1,9 +1,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::io::{Cursor, Read};
 use std::sync::{Arc, Mutex};
 
 use axum::http::HeaderMap;
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 
 use crate::attribute_inventory::{AttributeInventoryDocument, build_inventory_documents};
 use crate::self_host::config::SelfHostConfig;
@@ -15,10 +15,8 @@ use lethe_adapter_api::config::{
 };
 use lethe_adapter_api::error::AdapterError;
 use lethe_adapter_api::traits::{ObservationDraft, SourceAdapter};
-use lethe_adapter_api::writeback::{SaaSWriteAdapter, WriteAction, WriteRecord};
 use lethe_adapter_gslides::gslides::client::GoogleSlidesClient;
 use lethe_adapter_gslides::gslides::mapper::GoogleSlidesAdapter;
-use lethe_adapter_notion::notion::client::{NotionClient, NotionConfig};
 use lethe_adapter_slack::slack::client::SlackClient;
 use lethe_adapter_slack::slack::mapper::SlackAdapter;
 use lethe_api::api::envelope::{ProjectionMetadata, ResponseEnvelope};
@@ -34,6 +32,7 @@ use lethe_engine::identity::projector::IdentityProjector;
 use lethe_engine::identity::types::IdentityResolutionOutput;
 use lethe_engine::lake::{BlobStore, IngestRequest, IngestionGate, LakeStore};
 use lethe_engine::projection::catalog::ProjectionCatalog;
+use lethe_engine::projection::lineage::{LineageManifest, SourceSnapshot};
 use lethe_engine::projection::runner::Projector;
 use lethe_engine::supplemental::SupplementalStore;
 use lethe_policy::governance::audit::{AuditLog, InMemoryAuditLog};
@@ -48,8 +47,7 @@ use lethe_profile_model::{
 };
 use lethe_projection_person::person_page::projector::PersonPageProjector;
 use lethe_projection_person::person_page::types::{
-    FrontendProfile, PersonDetailResponse, PersonListItem, PersonPageOutput, PersonProfile,
-    TimelineEvent,
+    PersonDetailResponse, PersonListItem, PersonPageOutput, TimelineEvent,
 };
 use lethe_storage_sqlite::persistence::{
     DurableAppendOutcome, PersistenceError, SqlitePersistence,
@@ -84,7 +82,6 @@ pub struct SyncReport {
     pub slack_ingested: usize,
     pub google_ingested: usize,
     pub slide_analyses: usize,
-    pub notion_synced: usize,
     pub duplicates: usize,
     pub quarantined: usize,
     pub dead_letters: Vec<DeadLetter>,
@@ -97,55 +94,6 @@ pub struct DeadLetter {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct NotionReviewCandidate {
-    pub rank: usize,
-    pub person_id: String,
-    pub display_name: String,
-    pub entity_id: String,
-    pub title: String,
-    pub last_activity: Option<DateTime<Utc>>,
-    pub source_document_id: String,
-    pub source_canonical_uri: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct NotionReviewWrite {
-    pub rank: usize,
-    pub entity_id: String,
-    pub title: String,
-    pub external_id: String,
-    pub url: Option<String>,
-    pub action: WriteAction,
-    pub cleaned_existing_page: bool,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct NotionReviewSyncReport {
-    pub sync_report: SyncReport,
-    pub candidates: Vec<NotionReviewCandidate>,
-    pub writes: Vec<NotionReviewWrite>,
-    pub cleaned_up: usize,
-    pub notion_synced: usize,
-}
-
-#[derive(Debug, Clone)]
-struct RankedNotionWriteCandidate {
-    preview: NotionReviewCandidate,
-    write_record: WriteRecord,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct NotionSourceImageCandidate {
-    object_id: String,
-    source_url: String,
-    blob_ref: String,
-    center_x_pct: f64,
-    center_y_pct: f64,
-}
-
-type NotionSourceImageIndex = HashMap<String, Vec<NotionSourceImageCandidate>>;
-
 #[derive(Debug, Clone)]
 struct SlideImageCandidate {
     object_id: String,
@@ -157,20 +105,11 @@ struct SlideImageCandidate {
 }
 
 #[derive(Debug, Clone)]
-struct PptxSlideImageCandidate {
-    bytes: Vec<u8>,
-    center_x_pct: f64,
-    center_y_pct: f64,
-}
-
-const PERSON_PAGE_NOTION_PROJECTION_VERSION: &str =
-    concat!("proj:person-page@", env!("CARGO_PKG_VERSION"));
-
-#[derive(Debug, Clone)]
 pub struct ProjectionSnapshot {
     pub identity: IdentityResolutionOutput,
     pub person_page: PersonPageOutput,
     pub built_at: DateTime<Utc>,
+    pub lineage: LineageManifest,
 }
 
 impl Default for ProjectionSnapshot {
@@ -179,6 +118,11 @@ impl Default for ProjectionSnapshot {
             identity: IdentityResolutionOutput::default(),
             person_page: PersonPageOutput::default(),
             built_at: Utc::now(),
+            lineage: LineageManifest::new(
+                ProjectionRef::new("proj:person-page"),
+                SemVer::new("1.0.0"),
+                "build-uninitialized".to_string(),
+            ),
         }
     }
 }
@@ -247,10 +191,21 @@ impl AppCore {
         let supplemental_records = self.supplemental.by_kind("slide-analysis");
         let person_page =
             PersonPageProjector::project(&identity, self.lake.list(), &supplemental_records);
+        let built_at = Utc::now();
+        let lineage = build_person_page_lineage(
+            self.lake.list(),
+            &supplemental_records,
+            person_page.profiles.len()
+                + person_page.slides.len()
+                + person_page.messages.len()
+                + person_page.activities.len(),
+            built_at,
+        );
         self.snapshot = ProjectionSnapshot {
             identity,
             person_page,
-            built_at: Utc::now(),
+            built_at,
+            lineage,
         };
         self.catalog.set_status(
             &ProjectionRef::new("proj:identity-resolution"),
@@ -315,8 +270,7 @@ pub struct AppService {
     slack_client: HttpSlackClient,
     slack_replies_client: HttpSlackClient,
     google_client: HttpGoogleSlidesClient,
-    slide_analyzer: Option<GeminiSlideAnalyzer>,
-    notion_client: Option<NotionClient>,
+    slide_analyzer: GeminiSlideAnalyzer,
     audit_log: Arc<InMemoryAuditLog>,
 }
 
@@ -327,31 +281,10 @@ impl AppService {
         let blobs = persistence.load_blobs()?;
         let supplementals = persistence.load_supplementals()?;
         let slack_client = HttpSlackClient::new(config.slack.bot_token.clone())?;
-        let slack_replies_client = HttpSlackClient::new(
-            config
-                .slack
-                .thread_token
-                .clone()
-                .unwrap_or_else(|| config.slack.bot_token.clone()),
-        )?;
+        let slack_replies_client = HttpSlackClient::new(config.slack.thread_token.clone())?;
         let google_client = HttpGoogleSlidesClient::new(&config.google)?;
-        let slide_analyzer = config
-            .slide_ai
-            .as_ref()
-            .map(|slide_ai| GeminiSlideAnalyzer::new(&slide_ai.api_key, &slide_ai.model))
-            .transpose()?;
-
-        let notion_client = config
-            .notion
-            .as_ref()
-            .map(|nc| {
-                NotionClient::new(
-                    NotionConfig::new(&nc.token, &nc.database_id)
-                        .with_blob_dir(config.blob_dir.clone())
-                        .with_public_base_url(config.public_base_url.clone()),
-                )
-            })
-            .transpose()?;
+        let slide_analyzer =
+            GeminiSlideAnalyzer::new(&config.slide_ai.api_key, &config.slide_ai.model)?;
 
         Ok(Self {
             core: Arc::new(Mutex::new(AppCore::new(
@@ -365,7 +298,6 @@ impl AppService {
             slack_replies_client,
             google_client,
             slide_analyzer,
-            notion_client,
             audit_log: Arc::new(InMemoryAuditLog::new()),
         })
     }
@@ -459,10 +391,16 @@ impl AppService {
             detail,
         });
     }
+
+    pub fn attribute_inventory_documents(
+        &self,
+    ) -> Result<Vec<AttributeInventoryDocument>, SelfHostError> {
+        let core = self.core_lock()?;
+        Ok(build_inventory_documents(&core.snapshot))
+    }
 }
 
 mod media_support;
-mod notion_workflow;
 mod projection_api;
 mod service_support;
 mod slide_support;
@@ -470,6 +408,7 @@ mod sync;
 mod sync_support;
 
 use media_support::*;
+use service_support::{build_person_page_lineage, consent_status_for_person_id};
 use slide_support::*;
 use sync_support::*;
 

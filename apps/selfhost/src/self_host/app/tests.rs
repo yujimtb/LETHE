@@ -8,14 +8,14 @@ use lethe_adapter_slack::slack::client::{SlackMessage, SlackMessageType};
 use lethe_core::domain::supplemental::InputAnchorSet;
 
 use super::{
-    AppCore, AppService, PERSON_PAGE_NOTION_PROJECTION_VERSION, ProjectionSnapshot, SelfHostError,
-    extract_slide_text_fragments, infer_profile_name_from_fragments,
-    known_thread_roots_from_observations, latest_revision_to_capture, non_empty_state,
-    ranked_notion_write_candidates_from_snapshot, ranked_self_intro_slide_indices,
+    AppCore, AppService, SelfHostError, extract_slide_text_fragments,
+    infer_profile_name_from_fragments, known_thread_roots_from_observations,
+    latest_revision_to_capture, non_empty_state, ranked_self_intro_slide_indices,
     thread_cursor_key, thread_root_ts,
 };
 use crate::self_host::config::{
     ApiTokenConfig, GoogleConfig, ResourceLimits, SecretString, SelfHostConfig, SlackConfig,
+    SlideAiConfig,
 };
 use crate::self_host::google::HttpGoogleSlidesClient;
 use crate::self_host::slack::HttpSlackClient;
@@ -24,11 +24,8 @@ use lethe_core::domain::{
     Observation, ObserverRef, SchemaRef, SemVer, SourceSystemRef, SupplementalId,
     SupplementalRecord,
 };
+use lethe_derivation_gemini::GeminiSlideAnalyzer;
 use lethe_policy::governance::audit::InMemoryAuditLog;
-use lethe_profile_model::StudentProfile;
-use lethe_projection_person::person_page::types::{
-    FrontendProfile, PersonActivity, PersonPageOutput, PersonProfile,
-};
 use lethe_storage_sqlite::persistence::SqlitePersistence;
 
 #[test]
@@ -108,7 +105,6 @@ fn latest_revision_to_capture_prefers_newest_revision() {
 fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
     SelfHostConfig {
         bind_addr: "127.0.0.1:0".into(),
-        public_base_url: None,
         database_path: db,
         blob_dir: blobs,
         poll_interval: std::time::Duration::from_secs(300),
@@ -122,10 +118,9 @@ fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
             max_sync_items: 10_000,
             max_page_size: 100,
         },
-        sources: vec![],
         slack: SlackConfig {
             bot_token: "xoxb-test-token".into(),
-            thread_token: None,
+            thread_token: "xoxp-test-thread-token".into(),
             channel_ids: vec!["C01ABC".into()],
         },
         google: GoogleConfig {
@@ -136,8 +131,10 @@ fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
             presentation_ids: vec!["pres123".into()],
         },
         slide_analysis_limit: 10,
-        slide_ai: None,
-        notion: None,
+        slide_ai: SlideAiConfig {
+            api_key: "test-gemini-key".into(),
+            model: "test-gemini-model".into(),
+        },
     }
 }
 
@@ -334,298 +331,6 @@ fn extract_slide_text_fragments_and_name_inference_use_text_runs() {
 }
 
 #[test]
-fn ranked_notion_write_candidates_follow_last_activity_order() {
-    let rich_profile = PersonProfile {
-        person_id: EntityRef::new("person:a"),
-        display_name: "A Person".into(),
-        self_intro_text: Some("A intro".into()),
-        self_intro_slide_id: Some("document:gslides:a#slide:1".into()),
-        self_intro_thumbnail: None,
-        identities: vec![],
-        source_count: 1,
-        last_activity: Some(
-            chrono::DateTime::parse_from_rfc3339("2026-03-28T10:00:00Z")
-                .unwrap()
-                .to_utc(),
-        ),
-        profile_updated_at: Utc::now(),
-        frontend_profile: Some(FrontendProfile {
-            source_document_id: "document:gslides:a#slide:1".into(),
-            source_canonical_uri: Some("https://example.com/a".into()),
-            thumbnail_ref: None,
-            thumbnail_url: None,
-            profile: StudentProfile {
-                email: Some("a@example.com".into()),
-                generated_email: None,
-                name: "A Person".into(),
-                bio_text: Some("bio".into()),
-                profile_pic: None,
-                gallery_images: vec![],
-                properties: Default::default(),
-                attributes: vec![],
-                source_slide_object_id: Some("1".into()),
-                source_document_id: Some("document:gslides:a#slide:1".into()),
-                source_canonical_uri: Some("https://example.com/a".into()),
-                thumbnail_blob_ref: None,
-                thumbnail_url: None,
-                companion_to_slide_object_id: None,
-            },
-        }),
-    };
-    let older_profile = PersonProfile {
-        person_id: EntityRef::new("person:b"),
-        display_name: "B Person".into(),
-        self_intro_text: Some("B intro".into()),
-        self_intro_slide_id: Some("document:gslides:b#slide:1".into()),
-        self_intro_thumbnail: None,
-        identities: vec![],
-        source_count: 1,
-        last_activity: Some(
-            chrono::DateTime::parse_from_rfc3339("2026-03-27T10:00:00Z")
-                .unwrap()
-                .to_utc(),
-        ),
-        profile_updated_at: Utc::now(),
-        frontend_profile: Some(FrontendProfile {
-            source_document_id: "document:gslides:b#slide:1".into(),
-            source_canonical_uri: Some("https://example.com/b".into()),
-            thumbnail_ref: None,
-            thumbnail_url: None,
-            profile: StudentProfile {
-                email: Some("b@example.com".into()),
-                generated_email: None,
-                name: "B Person".into(),
-                bio_text: Some("bio".into()),
-                profile_pic: None,
-                gallery_images: vec![],
-                properties: Default::default(),
-                attributes: vec![],
-                source_slide_object_id: Some("1".into()),
-                source_document_id: Some("document:gslides:b#slide:1".into()),
-                source_canonical_uri: Some("https://example.com/b".into()),
-                thumbnail_blob_ref: None,
-                thumbnail_url: None,
-                companion_to_slide_object_id: None,
-            },
-        }),
-    };
-
-    let snapshot = ProjectionSnapshot {
-        identity: Default::default(),
-        person_page: PersonPageOutput {
-            profiles: vec![older_profile, rich_profile],
-            slides: vec![],
-            messages: vec![],
-            activities: vec![
-                PersonActivity {
-                    person_id: EntityRef::new("person:a"),
-                    total_slides_related: 1,
-                    total_messages: 0,
-                    first_activity: None,
-                    last_activity: Some(
-                        chrono::DateTime::parse_from_rfc3339("2026-03-28T10:00:00Z")
-                            .unwrap()
-                            .to_utc(),
-                    ),
-                    active_channels: vec![],
-                },
-                PersonActivity {
-                    person_id: EntityRef::new("person:b"),
-                    total_slides_related: 1,
-                    total_messages: 0,
-                    first_activity: None,
-                    last_activity: Some(
-                        chrono::DateTime::parse_from_rfc3339("2026-03-27T10:00:00Z")
-                            .unwrap()
-                            .to_utc(),
-                    ),
-                    active_channels: vec![],
-                },
-            ],
-        },
-        built_at: Utc::now(),
-    };
-
-    let ranked = ranked_notion_write_candidates_from_snapshot(
-        &snapshot,
-        2,
-        None,
-        &std::collections::HashMap::new(),
-    );
-    assert_eq!(ranked.len(), 2);
-    assert_eq!(ranked[0].preview.entity_id, "a@example.com");
-    assert_eq!(ranked[1].preview.entity_id, "b@example.com");
-    assert_eq!(
-        ranked[0]
-            .write_record
-            .payload
-            .pointer("/_lethe/person_id")
-            .and_then(|value| value.as_str()),
-        Some("person:a")
-    );
-    assert_eq!(
-        ranked[0]
-            .write_record
-            .payload
-            .pointer("/_lethe/projection_version")
-            .and_then(|value| value.as_str()),
-        Some(PERSON_PAGE_NOTION_PROJECTION_VERSION)
-    );
-    assert_eq!(
-        ranked[0]
-            .write_record
-            .payload
-            .pointer("/_lethe/status")
-            .and_then(|value| value.as_str()),
-        Some("Done")
-    );
-}
-
-#[test]
-fn ranked_notion_candidates_prefer_google_export_thumbnail_url() {
-    let snapshot = ProjectionSnapshot {
-        identity: Default::default(),
-        person_page: PersonPageOutput {
-            profiles: vec![PersonProfile {
-                person_id: EntityRef::new("person:a"),
-                display_name: "A Person".into(),
-                self_intro_text: Some("A intro".into()),
-                self_intro_slide_id: Some("document:gslides:a#slide:1".into()),
-                self_intro_thumbnail: None,
-                identities: vec![],
-                source_count: 1,
-                last_activity: Some(Utc::now()),
-                profile_updated_at: Utc::now(),
-                frontend_profile: Some(FrontendProfile {
-                    source_document_id: "document:gslides:a#slide:1".into(),
-                    source_canonical_uri: Some("https://example.com/a".into()),
-                    thumbnail_ref: None,
-                    thumbnail_url: Some("https://googleusercontent.com/ephemeral".into()),
-                    profile: StudentProfile {
-                        email: Some("a@example.com".into()),
-                        generated_email: None,
-                        name: "A Person".into(),
-                        bio_text: Some("bio".into()),
-                        profile_pic: None,
-                        gallery_images: vec![],
-                        properties: Default::default(),
-                        attributes: vec![],
-                        source_slide_object_id: Some("1".into()),
-                        source_document_id: Some("document:gslides:a#slide:1".into()),
-                        source_canonical_uri: Some("https://example.com/a".into()),
-                        thumbnail_blob_ref: Some(format!("blob:sha256:{}", "a".repeat(64))),
-                        thumbnail_url: Some("https://googleusercontent.com/ephemeral".into()),
-                        companion_to_slide_object_id: None,
-                    },
-                }),
-            }],
-            slides: vec![],
-            messages: vec![],
-            activities: vec![PersonActivity {
-                person_id: EntityRef::new("person:a"),
-                total_slides_related: 1,
-                total_messages: 0,
-                first_activity: None,
-                last_activity: Some(Utc::now()),
-                active_channels: vec![],
-            }],
-        },
-        built_at: Utc::now(),
-    };
-
-    let ranked = ranked_notion_write_candidates_from_snapshot(
-        &snapshot,
-        1,
-        Some("https://public.example.com/root"),
-        &std::collections::HashMap::new(),
-    );
-    let expected_url = format!(
-        "https://docs.google.com/presentation/d/{}/export/png?id={}&pageid=1",
-        "a", "a"
-    );
-    assert_eq!(
-        ranked[0]
-            .write_record
-            .payload
-            .get("thumbnail_url")
-            .and_then(|value| value.as_str()),
-        Some(expected_url.as_str())
-    );
-}
-
-#[test]
-fn ranked_notion_candidates_fall_back_to_blob_backed_thumbnail_url_without_slide_identifier() {
-    let snapshot = ProjectionSnapshot {
-        identity: Default::default(),
-        person_page: PersonPageOutput {
-            profiles: vec![PersonProfile {
-                person_id: EntityRef::new("person:a"),
-                display_name: "A Person".into(),
-                self_intro_text: Some("A intro".into()),
-                self_intro_slide_id: Some("document:gslides:a#slide:1".into()),
-                self_intro_thumbnail: None,
-                identities: vec![],
-                source_count: 1,
-                last_activity: Some(Utc::now()),
-                profile_updated_at: Utc::now(),
-                frontend_profile: Some(FrontendProfile {
-                    source_document_id: "document:gslides:a#slide:1".into(),
-                    source_canonical_uri: Some("https://example.com/a".into()),
-                    thumbnail_ref: None,
-                    thumbnail_url: Some("https://googleusercontent.com/ephemeral".into()),
-                    profile: StudentProfile {
-                        email: Some("a@example.com".into()),
-                        generated_email: None,
-                        name: "A Person".into(),
-                        bio_text: Some("bio".into()),
-                        profile_pic: None,
-                        gallery_images: vec![],
-                        properties: Default::default(),
-                        attributes: vec![],
-                        source_slide_object_id: None,
-                        source_document_id: None,
-                        source_canonical_uri: Some("https://example.com/a".into()),
-                        thumbnail_blob_ref: Some(format!("blob:sha256:{}", "a".repeat(64))),
-                        thumbnail_url: Some("https://googleusercontent.com/ephemeral".into()),
-                        companion_to_slide_object_id: None,
-                    },
-                }),
-            }],
-            slides: vec![],
-            messages: vec![],
-            activities: vec![PersonActivity {
-                person_id: EntityRef::new("person:a"),
-                total_slides_related: 1,
-                total_messages: 0,
-                first_activity: None,
-                last_activity: Some(Utc::now()),
-                active_channels: vec![],
-            }],
-        },
-        built_at: Utc::now(),
-    };
-
-    let ranked = ranked_notion_write_candidates_from_snapshot(
-        &snapshot,
-        1,
-        Some("https://public.example.com/root"),
-        &std::collections::HashMap::new(),
-    );
-    let expected_url = format!(
-        "https://public.example.com/root/public/blobs/{}",
-        "a".repeat(64)
-    );
-    assert_eq!(
-        ranked[0]
-            .write_record
-            .payload
-            .get("thumbnail_url")
-            .and_then(|value| value.as_str()),
-        Some(expected_url.as_str())
-    );
-}
-
-#[test]
 fn ingest_draft_duplicate_is_decided_by_persistence_without_cache_append() {
     let root = std::env::temp_dir().join(format!("lethe-self-host-test-{}", uuid::Uuid::now_v7()));
     let db = root.join("lethe.sqlite3");
@@ -666,10 +371,10 @@ fn ingest_draft_duplicate_is_decided_by_persistence_without_cache_append() {
         persistence: Arc::new(Mutex::new(persistence)),
         config: Arc::new(config.clone()),
         slack_client: HttpSlackClient::new(config.slack.bot_token.clone()).unwrap(),
-        slack_replies_client: HttpSlackClient::new(config.slack.bot_token.clone()).unwrap(),
+        slack_replies_client: HttpSlackClient::new(config.slack.thread_token.clone()).unwrap(),
         google_client: HttpGoogleSlidesClient::new(&config.google).unwrap(),
-        slide_analyzer: None,
-        notion_client: None,
+        slide_analyzer: GeminiSlideAnalyzer::new(&config.slide_ai.api_key, &config.slide_ai.model)
+            .unwrap(),
         audit_log: Arc::new(InMemoryAuditLog::new()),
     };
 

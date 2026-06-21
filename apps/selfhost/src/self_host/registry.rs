@@ -44,6 +44,29 @@ pub fn seed_registry() -> RegistryStore {
         })
         .unwrap();
     registry
+        .register_source_system(SourceSystem {
+            id: SourceSystemRef::new("sys:lethe-governance"),
+            name: "LETHE Governance".into(),
+            provider: Some("LETHE".into()),
+            api_version: Some("v1".into()),
+            source_class: SourceClass::ImmutableText,
+        })
+        .unwrap();
+    registry
+        .register_observer(Observer {
+            id: ObserverRef::new("obs:consent-ledger"),
+            name: "Consent Ledger".into(),
+            observer_type: ObserverType::Human,
+            source_system: SourceSystemRef::new("sys:lethe-governance"),
+            adapter_version: SemVer::new("1.0.0"),
+            schemas: vec![SchemaRef::new("schema:consent-decision")],
+            authority_model: AuthorityModel::LakeAuthoritative,
+            capture_model: CaptureModel::Event,
+            owner: "lethe-governance".into(),
+            trust_level: TrustLevel::HumanVerified,
+        })
+        .unwrap();
+    registry
         .register_observer(Observer {
             id: ObserverRef::new("obs:gslides-crawler"),
             name: "Google Slides Crawler".into(),
@@ -174,6 +197,30 @@ fn base_schemas() -> Vec<ObservationSchema> {
             registered_by: None,
             registered_at: None,
         },
+        ObservationSchema {
+            id: SchemaRef::new("schema:consent-decision"),
+            name: "Consent Decision".into(),
+            version: SemVer::new("1.0.0"),
+            subject_type: EntityTypeRef::new("et:person"),
+            target_type: None,
+            payload_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["unrestricted", "restricted_capture", "opted_out"]
+                    },
+                    "identifier": { "type": "string" },
+                    "reason": { "type": "string" }
+                },
+                "required": ["status"],
+                "additionalProperties": false
+            }),
+            source_contracts: vec![],
+            attachment_config: None,
+            registered_by: None,
+            registered_at: None,
+        },
     ]
 }
 
@@ -291,13 +338,13 @@ fn slide_analysis_spec() -> ProjectionSpec {
         },
         outputs: vec![OutputSpec {
             format: "json".into(),
-            tables: vec!["slide_analysis_results".into(), "notion_pages".into()],
+            tables: vec!["slide_analysis_results".into()],
         }],
         reconciliation: Some(ReconciliationPolicy::LakeFirst),
         deterministic_in: vec![],
         gap_action: None,
-        tags: vec!["slide-analysis".into(), "notion".into()],
-        description: Some("Analyse Google Slides and sync to Notion".into()),
+        tags: vec!["slide-analysis".into()],
+        description: Some("Analyse Google Slides into supplemental records".into()),
         created_by: "self-host".into(),
     }
 }

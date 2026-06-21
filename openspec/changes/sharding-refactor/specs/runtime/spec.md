@@ -199,7 +199,7 @@ placement に **解決済みエンティティを使ってはならない (SHALL
 secondary index は **投入時ゼロ**、`supplemental-store` の supplemental record(`Mutability::ManagedCache`、`derived_from` は lake frontier)として **後付け可能** (MAY)。ただし:
 
 - index は **加速器** であり **正しさの依存先ではない** (SHALL)。正しさは base read(placement-prune + read 時 filter)が担保する。
-- index が stale な場合の挙動を **暗黙 full-scan fallback にしてはならない (SHALL NOT)**(R6)。呼び出し側が宣言する **明示 read mode**(base / full-scan を opt-in)または **stale-with-marker** または **fail-fast** に倒す。
+- index が stale な場合は **fail-fast** とし、full-scan や stale result へ切り替えてはならない (SHALL NOT)(R6)。
 - upstream 改訂時の rebuild は projection 作者の責務 (SHALL)。
 
 #### Scenario: 暗黙 full-scan が起きない

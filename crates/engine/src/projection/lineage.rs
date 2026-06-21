@@ -24,6 +24,8 @@ pub struct LineageManifest {
     pub input_count: usize,
     pub output_count: usize,
     pub deterministic: bool,
+    #[serde(default)]
+    pub input_refs: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
 }
@@ -40,6 +42,7 @@ impl LineageManifest {
             input_count: 0,
             output_count: 0,
             deterministic: true,
+            input_refs: Vec::new(),
             seed: None,
         }
     }
@@ -47,6 +50,10 @@ impl LineageManifest {
     pub fn add_source(&mut self, snapshot: SourceSnapshot) {
         self.input_count += snapshot.record_count;
         self.sources.push(snapshot);
+    }
+
+    pub fn add_input_ref(&mut self, input_ref: impl Into<String>) {
+        self.input_refs.push(input_ref.into());
     }
 }
 

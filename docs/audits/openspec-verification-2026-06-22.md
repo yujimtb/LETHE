@@ -14,7 +14,8 @@
 
 ### generalize-platform
 
-- `GET /public/blobs/{sha256}` は署名・scope 検証なしで公開されている。
+- raw CAS 配信は撤去済みで、Projection-scoped blob route は Bearer token、
+  scope、filter 済み Projection からの参照を検証する。
 - `SqlitePersistence` は storage port trait を実装しておらず、selfhost は具象型を
   直接使用している。
 - sync は外部API失敗を `?` で即時返却し、dead-letter と部分成功を構成しない。
@@ -40,7 +41,8 @@
 - virtual Cargo workspaceとcrate source ownership
 - root `src/`、`#[path]`、root package逆依存の撤去
 - dependency DAG check
-- `AppService`、Notion client、SQLite persistenceの責務分割
+- `AppService` と SQLite persistence の責務分割
+- 未実装の Write-Back / Notion adapter の撤去
 - `docs/` taxonomyと`docs/post/`
 - 単一のクロスプラットフォーム公開監査
 - `cargo fmt --check`、`cargo test --workspace`、Markdown link check、

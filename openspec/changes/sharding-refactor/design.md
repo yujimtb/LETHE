@@ -90,7 +90,7 @@
 - published time-window は `(month, year)` bucket 集合に展開して部分木 union(month:year 軸順では連続時間範囲は lexicographic range にならない、R3)。在籍 ≤2 年で year 次元 ≤ 2 値なので bucket 集合は bounded。
 - 読みは touch leaf 群の streaming k-way merge by `(published, recorded_at, id)`(Law S8、D11.2)。
 - **解決済みエンティティ(person / subject / project)は placement にも leaf-prune にも使わない**(D11.4)。それらを query する場合は対応 projection の出力ストアを読む。
-- secondary index は ManagedCache として後付け可能、ただし暗黙 full-scan fallback は禁止(明示 read mode / fail-fast、R6)。
+- secondary index は ManagedCache として後付け可能。ただし stale の場合は fail-fast とし、full-scan へ切り替えない(R6)。
 
 ### D12. 既存ストアは disposable → re-crawl
 

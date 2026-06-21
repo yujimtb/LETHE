@@ -1423,9 +1423,9 @@ Step 6: 検証
 
 ## 12. Write Paths: Lake-Mediated and Source-Native
 
-> **Implementation note:** Write-Back (M07) の共通 contract と Notion adapter は
-> `crates/adapters/api`、`crates/adapters/notion`、`apps/selfhost` に実装済みである。
-> 本章と §13 は、他 source adapter を含む一般 contract と target semantics を示す。
+> **Implementation note:** Write-Back (M07) は Post-MVP の仕様であり、現行コードに
+> write router や source-native write adapter は存在しない。本章と §13 は将来実装の
+> 一般 contract と target semantics を示す。
 
 Projection 上の UI やアプリケーションからの変更は、**Projection に直接書き込まない**。ただし、書き込み先は 1 つではなく、次の 2 系統を持つ。
 

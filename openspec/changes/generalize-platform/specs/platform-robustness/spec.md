@@ -18,18 +18,19 @@
 
 ### Requirement: ROB-01 API Authentication and Authorization
 
-すべての API endpoint(`/health` を除く)はリクエストを認証 **しなければならない (SHALL)**。認可は M08 の capability model に接続 **しなければならない (SHALL)**(最小実装: scope 付き token)。`GET /public/blobs/{sha256}` は無認可公開を廃止し、署名付き URL または scope 付き token に置き換え **なければならない (SHALL)**。blob 配信は Filtering-before-Exposure Law の適用対象で **なければならない (SHALL)**。
+すべての API endpoint(`/health` を除く)はリクエストを認証 **しなければならない (SHALL)**。認可は M08 の capability model に接続 **しなければならない (SHALL)**(最小実装: scope 付き token)。blob は Projection-scoped route でのみ配信し、filter 済み Projection 内に参照が存在することを確認 **しなければならない (SHALL)**。raw CAS を hash だけで取得可能にしてはならない。blob 配信は Filtering-before-Exposure Law の適用対象で **なければならない (SHALL)**。
 
 #### Scenario: 未認証アクセスの拒否
 
 - **WHEN** token なしで `GET /api/projections/{id}/records` を呼ぶ
 - **THEN** 401 が返り、AuditLog に拒否イベントが記録される
 
-#### Scenario: blob への期限付きアクセス
+#### Scenario: Projection-scoped blob access
 
-- **WHEN** クライアントが thumbnail blob の署名付き URL を取得し、
-  有効期限後に再アクセスする
-- **THEN** 期限内は 200、期限後は 403 が返る
+- **WHEN** 認証済みクライアントが filter 済み Projection から参照される thumbnail blob を取得する
+- **THEN** 200 が返る
+- **AND WHEN** 同じ token で Projection 未参照の raw CAS blob を取得する
+- **THEN** 404 が返る
 
 ### Requirement: ROB-02 Ingestion Gate Policy Enforcement
 
