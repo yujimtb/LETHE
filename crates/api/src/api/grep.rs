@@ -3,6 +3,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -142,7 +144,7 @@ pub struct PriorQaSearchResponse<T> {
 pub enum GrepError {
     #[error("invalid regex pattern: {0}")]
     InvalidPattern(String),
-    #[error("cursor must be a non-negative integer offset")]
+    #[error("cursor must be an encoded keyset cursor")]
     InvalidCursor,
     #[error("limit must be between 1 and {0}")]
     InvalidLimit(usize),
@@ -185,12 +187,7 @@ impl GrepEngine {
         if limit == 0 || limit > self.max_limit {
             return Err(GrepError::InvalidLimit(self.max_limit));
         }
-        let offset = match request.cursor.as_deref() {
-            Some(cursor) => cursor
-                .parse::<usize>()
-                .map_err(|_| GrepError::InvalidCursor)?,
-            None => 0,
-        };
+        let cursor = request.cursor.as_deref().map(decode_cursor).transpose()?;
         let pattern = match request.normalization {
             NormalizationMode::Nfkc => normalize(&request.pattern),
             NormalizationMode::None => request.pattern.clone(),
@@ -228,22 +225,71 @@ impl GrepEngine {
             if start.elapsed() > self.timeout {
                 return Err(GrepError::TimedOut(self.timeout.as_millis() as u64));
             }
+            if cursor
+                .as_ref()
+                .is_some_and(|cursor| !is_after_cursor(record, cursor, request.order))
+            {
+                continue;
+            }
             if let Some(matched) = match_record(record, &regex, request.normalization) {
                 matches.push(matched);
+                if matches.len() > limit {
+                    break;
+                }
             }
         }
-        let end = (offset + limit).min(matches.len());
-        let page = if offset >= matches.len() {
-            Vec::new()
+        let complete = matches.len() <= limit;
+        if !complete {
+            matches.truncate(limit);
+        }
+        let next_cursor = if complete {
+            None
         } else {
-            matches[offset..end].to_vec()
+            matches.last().map(encode_cursor).transpose()?
         };
         Ok(GrepResponse {
-            matches: page,
-            next_cursor: (end < matches.len()).then(|| end.to_string()),
-            complete: end >= matches.len(),
+            matches,
+            next_cursor,
+            complete,
             projection_watermark,
         })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GrepCursor {
+    timestamp: DateTime<Utc>,
+    record_id: String,
+}
+
+fn encode_cursor(record: &GrepMatch) -> Result<String, GrepError> {
+    let cursor = GrepCursor {
+        timestamp: record.timestamp,
+        record_id: record.record_id.clone(),
+    };
+    let bytes = serde_json::to_vec(&cursor).map_err(|_| GrepError::InvalidCursor)?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn decode_cursor(cursor: &str) -> Result<GrepCursor, GrepError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| GrepError::InvalidCursor)?;
+    serde_json::from_slice(&bytes).map_err(|_| GrepError::InvalidCursor)
+}
+
+fn is_after_cursor(record: &GrepRecord, cursor: &GrepCursor, order: GrepOrder) -> bool {
+    match order {
+        GrepOrder::DateDesc => {
+            record.timestamp < cursor.timestamp
+                || (record.timestamp == cursor.timestamp
+                    && record.record_id.as_str() > cursor.record_id.as_str())
+        }
+        GrepOrder::DateAsc => {
+            record.timestamp > cursor.timestamp
+                || (record.timestamp == cursor.timestamp
+                    && record.record_id.as_str() > cursor.record_id.as_str())
+        }
     }
 }
 
@@ -398,13 +444,19 @@ mod tests {
     use super::*;
 
     fn record(id: &str, text: &str) -> GrepRecord {
+        record_at(id, text, "2026-01-01T00:00:00Z")
+    }
+
+    fn record_at(id: &str, text: &str, timestamp: &str) -> GrepRecord {
         GrepRecord {
             record_id: id.into(),
             source_type: "docs".into(),
             anchor_url: "https://example.test".into(),
             source_title: "Doc".into(),
             source_location: None,
-            timestamp: Utc::now(),
+            timestamp: DateTime::parse_from_rfc3339(timestamp)
+                .unwrap()
+                .with_timezone(&Utc),
             text: text.into(),
             normalized_text: normalize(text),
             thread_ts: None,
@@ -463,5 +515,60 @@ mod tests {
             .search(&records, &request, "wm".into())
             .unwrap();
         assert_eq!(indexed.matches, full_scan.matches);
+    }
+
+    #[test]
+    fn keyset_cursor_does_not_duplicate_when_newer_record_is_inserted() {
+        let engine = GrepEngine::new(100);
+        let first_records = vec![
+            record_at("r3", "needle newest", "2026-01-03T00:00:00Z"),
+            record_at("r2", "needle middle", "2026-01-02T00:00:00Z"),
+            record_at("r1", "needle oldest", "2026-01-01T00:00:00Z"),
+        ];
+        let request = GrepRequest {
+            pattern: "needle".into(),
+            limit: Some(1),
+            ..GrepRequest::default()
+        };
+
+        let first_page = engine
+            .search(&first_records, &request, "wm".into())
+            .unwrap();
+        assert_eq!(first_page.matches[0].record_id, "r3");
+
+        let second_records = vec![
+            record_at("r4", "needle inserted", "2026-01-04T00:00:00Z"),
+            record_at("r3", "needle newest", "2026-01-03T00:00:00Z"),
+            record_at("r2", "needle middle", "2026-01-02T00:00:00Z"),
+            record_at("r1", "needle oldest", "2026-01-01T00:00:00Z"),
+        ];
+        let second_page = engine
+            .search(
+                &second_records,
+                &GrepRequest {
+                    cursor: first_page.next_cursor,
+                    ..request
+                },
+                "wm".into(),
+            )
+            .unwrap();
+
+        assert_eq!(second_page.matches[0].record_id, "r2");
+    }
+
+    #[test]
+    fn integer_offset_cursor_is_rejected() {
+        let engine = GrepEngine::new(100);
+        let result = engine.search(
+            &[record("r1", "needle")],
+            &GrepRequest {
+                pattern: "needle".into(),
+                cursor: Some("1".into()),
+                ..GrepRequest::default()
+            },
+            "wm".into(),
+        );
+
+        assert!(matches!(result, Err(GrepError::InvalidCursor)));
     }
 }

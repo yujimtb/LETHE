@@ -980,6 +980,7 @@ dependencies = [
 name = "lethe-api"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chrono",
  "lethe-core",
  "lethe-engine",
