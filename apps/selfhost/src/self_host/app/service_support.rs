@@ -85,10 +85,23 @@ impl AppService {
     }
 
     pub fn lineage_manifest(&self, projection_id: &str) -> Result<LineageManifest, SelfHostError> {
-        if projection_id != "proj:person-page" {
-            return Err(SelfHostError::NotFound(projection_id.to_string()));
+        let core = self.core_lock()?;
+        match projection_id {
+            "proj:person-page" => Ok(core.snapshot.lineage.clone()),
+            "proj:corpus" => Ok(build_projection_lineage(
+                "proj:corpus",
+                core.lake.list(),
+                core.snapshot.corpus.len(),
+                core.snapshot.built_at,
+            )),
+            "proj:answer-log" => Ok(build_projection_lineage(
+                "proj:answer-log",
+                core.lake.list(),
+                core.snapshot.answer_log.len(),
+                core.snapshot.built_at,
+            )),
+            _ => Err(SelfHostError::NotFound(projection_id.to_string())),
         }
-        Ok(self.core_lock()?.snapshot.lineage.clone())
     }
 
     pub(super) fn apply_filter(&self, payload: serde_json::Value) -> serde_json::Value {
@@ -501,6 +514,45 @@ pub(super) fn build_person_page_lineage(
         record_count: supplementals.len(),
     });
     for input_ref in observation_refs.into_iter().chain(supplemental_refs) {
+        lineage.add_input_ref(input_ref);
+    }
+    lineage
+}
+
+pub(super) fn build_projection_lineage(
+    projection_id: &str,
+    observations: &[Observation],
+    output_count: usize,
+    built_at: DateTime<Utc>,
+) -> LineageManifest {
+    let mut input_refs = observations
+        .iter()
+        .map(|observation| format!("observation:{}", observation.id))
+        .collect::<Vec<_>>();
+    input_refs.sort();
+
+    let mut hasher = Sha256::new();
+    hasher.update(projection_id.as_bytes());
+    hasher.update(b"@1.0.0\n");
+    for input_ref in &input_refs {
+        hasher.update(input_ref.as_bytes());
+        hasher.update(b"\n");
+    }
+    let build_id = format!("build-{}", hex::encode(hasher.finalize()));
+    let mut lineage = LineageManifest::new(
+        ProjectionRef::new(projection_id),
+        SemVer::new("1.0.0"),
+        build_id,
+    );
+    lineage.built_at = built_at;
+    lineage.output_count = output_count;
+    lineage.deterministic = true;
+    lineage.add_source(SourceSnapshot {
+        source_ref: "lake".to_string(),
+        watermark_position: Some(observations.len()),
+        record_count: observations.len(),
+    });
+    for input_ref in input_refs {
         lineage.add_input_ref(input_ref);
     }
     lineage

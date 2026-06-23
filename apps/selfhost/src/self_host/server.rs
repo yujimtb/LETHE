@@ -31,8 +31,24 @@ pub fn build_router(service: AppService) -> Router {
             get(projection_records),
         )
         .route(
+            "/api/projections/{projection_id}/grep",
+            post(projection_grep),
+        )
+        .route(
             "/api/projections/{projection_id}/records/{record_id}",
             get(projection_record_detail),
+        )
+        .route(
+            "/api/projections/{projection_id}/threads/{thread_ts}",
+            get(projection_thread),
+        )
+        .route(
+            "/api/projections/{projection_id}/resolve-link",
+            post(projection_resolve_link),
+        )
+        .route(
+            "/api/projections/{projection_id}/prior-qa-search",
+            post(projection_prior_qa_search),
         )
         .route(
             "/api/projections/{projection_id}/records/{record_id}/slides",
@@ -117,8 +133,8 @@ async fn projection_lineage(
     Path(projection_id): Path<String>,
 ) -> Result<Json<lethe_engine::projection::lineage::LineageManifest>, ApiError> {
     service.authorize_headers(&headers, "read:persons")?;
-    ensure_projection_person_page(&projection_id)?;
-    Ok(Json(service.lineage_manifest("proj:person-page")?))
+    ensure_known_projection(&projection_id)?;
+    Ok(Json(service.lineage_manifest(&projection_id)?))
 }
 async fn projection_records(
     State(service): State<AppService>,
@@ -126,13 +142,36 @@ async fn projection_records(
     Path(projection_id): Path<String>,
     Query(query): Query<PersonsQuery>,
 ) -> Result<Json<ResponseEnvelope<serde_json::Value>>, ApiError> {
-    service.authorize_headers(&headers, "read:persons")?;
-    ensure_projection_person_page(&projection_id)?;
-    Ok(Json(service.persons_response(
-        query.mode.as_deref(),
-        query.pin.as_deref(),
-        &query.pagination,
-    )?))
+    match projection_id.as_str() {
+        "proj:person-page" => {
+            service.authorize_headers(&headers, "read:persons")?;
+            Ok(Json(service.persons_response(
+                query.mode.as_deref(),
+                query.pin.as_deref(),
+                &query.pagination,
+            )?))
+        }
+        "proj:corpus" => {
+            service.authorize_headers(&headers, "read:corpus")?;
+            Ok(Json(service.corpus_records_response(
+                query.mode.as_deref(),
+                query.pin.as_deref(),
+                &query.pagination,
+            )?))
+        }
+        _ => Err(ApiError::not_found()),
+    }
+}
+
+async fn projection_grep(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Path(projection_id): Path<String>,
+    Json(request): Json<lethe_api::api::grep::GrepRequest>,
+) -> Result<Json<ResponseEnvelope<lethe_api::api::grep::GrepResponse>>, ApiError> {
+    service.authorize_headers(&headers, "read:corpus")?;
+    ensure_projection_corpus(&projection_id)?;
+    Ok(Json(service.corpus_grep_response(&request)?))
 }
 
 async fn projection_record_detail(
@@ -140,14 +179,65 @@ async fn projection_record_detail(
     headers: HeaderMap,
     Path((projection_id, record_id)): Path<(String, String)>,
     Query(query): Query<ReadQuery>,
-) -> Result<Json<ResponseEnvelope<serde_json::Value>>, ApiError> {
-    service.authorize_headers_all(&headers, &["read:persons", "read:timeline"])?;
-    ensure_projection_person_page(&projection_id)?;
-    Ok(Json(service.person_detail_response(
-        &record_id,
-        query.mode.as_deref(),
-        query.pin.as_deref(),
-    )?))
+) -> Result<Json<serde_json::Value>, ApiError> {
+    match projection_id.as_str() {
+        "proj:person-page" => {
+            service.authorize_headers_all(&headers, &["read:persons", "read:timeline"])?;
+            Ok(Json(serde_json::to_value(
+                service.person_detail_response(
+                    &record_id,
+                    query.mode.as_deref(),
+                    query.pin.as_deref(),
+                )?,
+            )?))
+        }
+        "proj:corpus" => {
+            service.authorize_headers(&headers, "read:corpus")?;
+            Ok(Json(serde_json::to_value(
+                service.corpus_record_response(&record_id)?,
+            )?))
+        }
+        _ => Err(ApiError::not_found()),
+    }
+}
+
+async fn projection_thread(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Path((projection_id, thread_ts)): Path<(String, String)>,
+) -> Result<Json<ResponseEnvelope<lethe_api::api::grep::ThreadResponse>>, ApiError> {
+    service.authorize_headers(&headers, "read:corpus")?;
+    ensure_projection_corpus(&projection_id)?;
+    Ok(Json(service.corpus_thread_response(&thread_ts)?))
+}
+
+async fn projection_resolve_link(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Path(projection_id): Path<String>,
+    Json(request): Json<lethe_api::api::grep::ResolveLinkRequest>,
+) -> Result<Json<ResponseEnvelope<lethe_api::api::grep::ResolveLinkResponse>>, ApiError> {
+    service.authorize_headers(&headers, "read:corpus")?;
+    ensure_projection_corpus(&projection_id)?;
+    Ok(Json(service.resolve_link_response(&request)?))
+}
+
+async fn projection_prior_qa_search(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Path(projection_id): Path<String>,
+    Json(request): Json<lethe_api::api::grep::PriorQaSearchRequest>,
+) -> Result<
+    Json<
+        ResponseEnvelope<
+            lethe_api::api::grep::PriorQaSearchResponse<lethe_projection_answer_log::PriorQaResult>,
+        >,
+    >,
+    ApiError,
+> {
+    service.authorize_headers(&headers, "read:answer-log")?;
+    ensure_projection_answer_log(&projection_id)?;
+    Ok(Json(service.prior_qa_search_response(&request)?))
 }
 
 async fn projection_record_slides(
@@ -247,6 +337,12 @@ impl From<SelfHostError> for ApiError {
     }
 }
 
+impl From<serde_json::Error> for ApiError {
+    fn from(value: serde_json::Error) -> Self {
+        Self::internal(value.to_string())
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.status, Json(self.body)).into_response()
@@ -266,5 +362,28 @@ fn ensure_projection_person_page(projection_id: &str) -> Result<(), ApiError> {
         Ok(())
     } else {
         Err(ApiError::not_found())
+    }
+}
+
+fn ensure_projection_corpus(projection_id: &str) -> Result<(), ApiError> {
+    if projection_id == "proj:corpus" {
+        Ok(())
+    } else {
+        Err(ApiError::not_found())
+    }
+}
+
+fn ensure_projection_answer_log(projection_id: &str) -> Result<(), ApiError> {
+    if projection_id == "proj:answer-log" {
+        Ok(())
+    } else {
+        Err(ApiError::not_found())
+    }
+}
+
+fn ensure_known_projection(projection_id: &str) -> Result<(), ApiError> {
+    match projection_id {
+        "proj:person-page" | "proj:corpus" | "proj:answer-log" => Ok(()),
+        _ => Err(ApiError::not_found()),
     }
 }

@@ -786,6 +786,8 @@ mod tests {
                 ],
                 ..PersonPageOutput::default()
             },
+            corpus: Vec::new(),
+            answer_log: Vec::new(),
             built_at: Utc::now(),
             lineage: ProjectionSnapshot::default().lineage,
         };

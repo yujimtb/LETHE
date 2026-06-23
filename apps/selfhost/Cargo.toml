@@ -17,6 +17,8 @@ lethe-derivation-gemini = { path = "../../crates/derivations/gemini" }
 lethe-engine = { path = "../../crates/engine" }
 lethe-policy = { path = "../../crates/policy" }
 lethe-profile-model = { path = "../../crates/profile-model" }
+lethe-projection-answer-log = { path = "../../crates/projections/answer-log" }
+lethe-projection-corpus = { path = "../../crates/projections/corpus" }
 lethe-projection-person = { path = "../../crates/projections/person" }
 lethe-registry = { path = "../../crates/registry" }
 lethe-storage-api = { path = "../../crates/storage/api" }
