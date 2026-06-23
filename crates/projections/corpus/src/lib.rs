@@ -210,17 +210,20 @@ impl CorpusProjector {
         if source_id.is_some_and(|id| self.config.excluded_file_ids.contains(id)) {
             return false;
         }
-        let parent_allowed = observation
+        if self.config.allowed_folder_ids.is_empty() {
+            return false;
+        }
+        let Some(parent_ids) = observation
             .payload
             .pointer("/metadata/parentIds")
             .and_then(serde_json::Value::as_array)
-            .unwrap_or(&Vec::new())
+        else {
+            return false;
+        };
+        let parent_allowed = parent_ids
             .iter()
             .filter_map(serde_json::Value::as_str)
-            .any(|parent| {
-                self.config.allowed_folder_ids.is_empty()
-                    || self.config.allowed_folder_ids.contains(parent)
-            });
+            .any(|parent| self.config.allowed_folder_ids.contains(parent));
         if !parent_allowed {
             return false;
         }
@@ -609,6 +612,247 @@ mod tests {
             }),
         );
         assert!(projector.project_observations(&[content]).is_empty());
+    }
+
+    fn drive_obs(file_id: &str, parent_id: &str, sharing_level: &str) -> Observation {
+        obs(
+            "schema:workspace-object-snapshot",
+            serde_json::json!({
+                "title": "Drive file",
+                "artifact": {
+                    "service": "drive",
+                    "objectType": "file",
+                    "sourceObjectId": file_id,
+                    "canonicalUri": "https://drive/file"
+                },
+                "metadata": {
+                    "parentIds": [parent_id],
+                    "sharingLevel": sharing_level
+                },
+                "native": {"text": "drive text"}
+            }),
+        )
+    }
+
+    fn corpus_with_allowed_folder() -> CorpusProjector {
+        CorpusProjector::new(CorpusConfig {
+            allowed_folder_ids: ["folder-allowed".to_owned()].into_iter().collect(),
+            ..CorpusConfig::default()
+        })
+    }
+
+    #[test]
+    fn drive_files_below_sharing_threshold_are_excluded() {
+        let projector = corpus_with_allowed_folder();
+        let private = drive_obs("file-private", "folder-allowed", "specific-users");
+        let domain = drive_obs("file-domain", "folder-allowed", "domain");
+
+        let records = projector.project_observations(&[private, domain]);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source_type, "drive");
+        assert_eq!(records[0].metadata["sharing_level"], "domain");
+    }
+
+    #[test]
+    fn drive_files_are_denied_when_allowed_folders_is_empty() {
+        let projector = CorpusProjector::default_config();
+        let file = drive_obs("file-domain", "folder-allowed", "domain");
+
+        assert!(projector.project_observations(&[file]).is_empty());
+    }
+
+    #[test]
+    fn drive_files_outside_allowed_folders_are_excluded() {
+        let projector = corpus_with_allowed_folder();
+        let file = drive_obs("file-domain", "folder-other", "domain");
+
+        assert!(projector.project_observations(&[file]).is_empty());
+    }
+
+    #[test]
+    fn excluded_drive_file_ids_are_excluded() {
+        let projector = CorpusProjector::new(CorpusConfig {
+            allowed_folder_ids: ["folder-allowed".to_owned()].into_iter().collect(),
+            excluded_file_ids: ["file-denied".to_owned()].into_iter().collect(),
+            ..CorpusConfig::default()
+        });
+        let file = drive_obs("file-denied", "folder-allowed", "domain");
+
+        assert!(projector.project_observations(&[file]).is_empty());
+    }
+
+    #[test]
+    fn linked_form_response_sheets_are_excluded() {
+        let projector = CorpusProjector::default_config();
+        let form = obs(
+            "schema:workspace-object-snapshot",
+            serde_json::json!({
+                "title": "Survey",
+                "artifact": {
+                    "service": "forms",
+                    "objectType": "form",
+                    "canonicalUri": "https://forms/form"
+                },
+                "metadata": {"linkedSheetId": "sheet-1"}
+            }),
+        );
+        let sheet = obs(
+            "schema:workspace-object-snapshot",
+            serde_json::json!({
+                "title": "Survey responses",
+                "artifact": {
+                    "service": "sheets",
+                    "objectType": "spreadsheet",
+                    "sourceObjectId": "sheet-1",
+                    "canonicalUri": "https://sheets/sheet-1"
+                },
+                "native": {
+                    "tabs": [{
+                        "name": "Responses",
+                        "rows": [{
+                            "rowNumber": 2,
+                            "cells": [{"header": "Email", "value": "a@example.test"}]
+                        }]
+                    }]
+                }
+            }),
+        );
+
+        let records = projector.project_observations(&[form, sheet]);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source_type, "forms");
+    }
+
+    #[test]
+    fn direct_form_response_sheet_metadata_is_excluded() {
+        let projector = CorpusProjector::default_config();
+        let sheet = obs(
+            "schema:workspace-object-snapshot",
+            serde_json::json!({
+                "title": "Survey responses",
+                "artifact": {
+                    "service": "sheets",
+                    "objectType": "spreadsheet",
+                    "canonicalUri": "https://sheets/sheet-1"
+                },
+                "metadata": {"formResponseSheet": true},
+                "native": {
+                    "tabs": [{
+                        "name": "Responses",
+                        "rows": [{
+                            "rowNumber": 2,
+                            "cells": [{"header": "Email", "value": "a@example.test"}]
+                        }]
+                    }]
+                }
+            }),
+        );
+
+        assert!(projector.project_observations(&[sheet]).is_empty());
+    }
+
+    #[test]
+    fn opted_out_drive_owner_is_excluded() {
+        let projector = CorpusProjector::new(CorpusConfig {
+            allowed_folder_ids: ["folder-allowed".to_owned()].into_iter().collect(),
+            opt_out_people: ["owner@example.test".to_owned()].into_iter().collect(),
+            ..CorpusConfig::default()
+        });
+        let mut file = drive_obs("file-domain", "folder-allowed", "domain");
+        file.payload["relations"] = serde_json::json!({"owner": "owner@example.test"});
+
+        assert!(projector.project_observations(&[file]).is_empty());
+    }
+
+    #[test]
+    fn docs_chunks_create_heading_records() {
+        let projector = CorpusProjector::default_config();
+        let doc = obs(
+            "schema:workspace-object-snapshot",
+            serde_json::json!({
+                "title": "Planning Doc",
+                "artifact": {
+                    "service": "docs",
+                    "objectType": "document",
+                    "canonicalUri": "https://docs/doc-1",
+                    "containerId": "folder-1"
+                },
+                "native": {
+                    "chunks": [
+                        {"heading": "Intro", "anchor": "h.intro", "text": "Alpha"},
+                        {"heading": "Plan", "text": "Beta"}
+                    ]
+                }
+            }),
+        );
+
+        let records = projector.project_observations(&[doc]);
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].source_location.as_deref(), Some("Intro"));
+        assert_eq!(records[0].anchor_url, "https://docs/doc-1#h.intro");
+        assert_eq!(records[1].source_location.as_deref(), Some("Plan"));
+        assert_eq!(records[1].text, "Beta");
+    }
+
+    #[test]
+    fn sheets_rows_create_row_records() {
+        let projector = CorpusProjector::default_config();
+        let sheet = obs(
+            "schema:workspace-object-snapshot",
+            serde_json::json!({
+                "title": "Inventory",
+                "artifact": {
+                    "service": "sheets",
+                    "objectType": "spreadsheet",
+                    "canonicalUri": "https://sheets/sheet-1"
+                },
+                "native": {
+                    "tabs": [{
+                        "name": "Items",
+                        "rows": [
+                            {
+                                "rowNumber": 2,
+                                "cells": [
+                                    {"header": "Name", "value": "Cable"},
+                                    {"header": "Count", "value": "3"}
+                                ]
+                            },
+                            {"rowNumber": 3, "cells": [{}]}
+                        ]
+                    }]
+                }
+            }),
+        );
+
+        let records = projector.project_observations(&[sheet]);
+
+        assert_eq!(records.len(), 1);
+        assert!(records[0].record_id.ends_with(":Items:2"));
+        assert_eq!(records[0].source_type, "sheets");
+        assert_eq!(records[0].source_location.as_deref(), Some("Items row 2"));
+        assert_eq!(records[0].text, "Name: Cable\nCount: 3");
+    }
+
+    #[test]
+    fn bot_answer_log_schema_never_enters_corpus() {
+        let projector = CorpusProjector::default_config();
+        let answer = obs(
+            "schema:bot-answer-log",
+            serde_json::json!({
+                "title": "Answer",
+                "artifact": {
+                    "service": "docs",
+                    "objectType": "document",
+                    "canonicalUri": "https://docs/answer"
+                },
+                "native": {"chunks": [{"text": "should stay out"}]}
+            }),
+        );
+
+        assert!(projector.project_observations(&[answer]).is_empty());
     }
 
     #[test]
