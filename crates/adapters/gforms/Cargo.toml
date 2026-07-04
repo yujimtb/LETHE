@@ -1,0 +1,11 @@
+[package]
+name = "lethe-adapter-gforms"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chrono.workspace = true
+lethe-adapter-api = { path = "../api" }
+lethe-core = { path = "../../core" }
+serde.workspace = true
+serde_json.workspace = true

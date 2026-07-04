@@ -911,7 +911,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "lethe-adapter-gdocs"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "lethe-adapter-api",
+ "lethe-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lethe-adapter-gdrive"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "lethe-adapter-api",
+ "lethe-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lethe-adapter-gforms"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "lethe-adapter-api",
+ "lethe-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lethe-adapter-github"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "lethe-adapter-api",
+ "lethe-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lethe-adapter-gsheets"
 version = "0.1.0"
 dependencies = [
  "chrono",
@@ -947,11 +991,15 @@ dependencies = [
 name = "lethe-api"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chrono",
  "lethe-core",
  "lethe-engine",
+ "regex",
  "serde",
  "serde_json",
+ "thiserror",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -1071,6 +1119,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "lethe-projection-answer-log"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "lethe-core",
+ "lethe-engine",
+ "serde",
+ "serde_json",
+ "sha2",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "lethe-projection-corpus"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "lethe-core",
+ "lethe-engine",
+ "regex",
+ "serde",
+ "serde_json",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "lethe-projection-person"
 version = "0.1.0"
 dependencies = [
@@ -1124,6 +1199,8 @@ dependencies = [
  "lethe-engine",
  "lethe-policy",
  "lethe-profile-model",
+ "lethe-projection-answer-log",
+ "lethe-projection-corpus",
  "lethe-projection-person",
  "lethe-registry",
  "lethe-runtime",

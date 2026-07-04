@@ -42,6 +42,30 @@ pub fn seed_registry() -> RegistryStore {
             source_class: SourceClass::ImmutableText,
         })
         .unwrap();
+    for (id, name, source_class) in [
+        ("sys:google-docs", "Google Docs", SourceClass::MutableText),
+        (
+            "sys:google-sheets",
+            "Google Sheets",
+            SourceClass::MutableText,
+        ),
+        ("sys:google-forms", "Google Forms", SourceClass::MutableText),
+        (
+            "sys:google-drive",
+            "Google Drive",
+            SourceClass::MutableMultimodal,
+        ),
+    ] {
+        registry
+            .register_source_system(SourceSystem {
+                id: SourceSystemRef::new(id),
+                name: name.into(),
+                provider: Some("Google".into()),
+                api_version: Some("v1".into()),
+                source_class,
+            })
+            .unwrap();
+    }
 
     registry
         .register_observer(Observer {
@@ -129,6 +153,46 @@ pub fn seed_registry() -> RegistryStore {
             trust_level: TrustLevel::Automated,
         })
         .unwrap();
+    for (observer_id, name, source_system) in [
+        (
+            "obs:gdocs-crawler",
+            "Google Docs Crawler",
+            "sys:google-docs",
+        ),
+        (
+            "obs:gsheets-crawler",
+            "Google Sheets Crawler",
+            "sys:google-sheets",
+        ),
+        (
+            "obs:gforms-crawler",
+            "Google Forms Crawler",
+            "sys:google-forms",
+        ),
+        (
+            "obs:gdrive-crawler",
+            "Google Drive Crawler",
+            "sys:google-drive",
+        ),
+    ] {
+        registry
+            .register_observer(Observer {
+                id: ObserverRef::new(observer_id),
+                name: name.into(),
+                observer_type: ObserverType::Crawler,
+                source_system: SourceSystemRef::new(source_system),
+                adapter_version: SemVer::new("1.0.0"),
+                schemas: vec![
+                    SchemaRef::new("schema:workspace-object-snapshot"),
+                    SchemaRef::new("schema:observer-heartbeat"),
+                ],
+                authority_model: AuthorityModel::SourceAuthoritative,
+                capture_model: CaptureModel::Snapshot,
+                owner: "lethe".into(),
+                trust_level: TrustLevel::Automated,
+            })
+            .unwrap();
+    }
 
     registry
         .register_source_system(SourceSystem {
@@ -153,6 +217,20 @@ pub fn seed_registry() -> RegistryStore {
             trust_level: TrustLevel::Automated,
         })
         .unwrap();
+    registry
+        .register_observer(Observer {
+            id: ObserverRef::new("obs:search-bot"),
+            name: "Workspace Search Bot".into(),
+            observer_type: ObserverType::Bot,
+            source_system: SourceSystemRef::new("sys:lethe-internal"),
+            adapter_version: SemVer::new("1.0.0"),
+            schemas: vec![SchemaRef::new("schema:bot-answer-log")],
+            authority_model: AuthorityModel::LakeAuthoritative,
+            capture_model: CaptureModel::Event,
+            owner: "lethe".into(),
+            trust_level: TrustLevel::Automated,
+        })
+        .unwrap();
 
     for schema in base_schemas() {
         registry.register_schema(schema).unwrap();
@@ -166,6 +244,8 @@ pub fn seed_projection_catalog() -> ProjectionCatalog {
     catalog.register(identity_spec()).unwrap();
     catalog.register(person_page_spec()).unwrap();
     catalog.register(slide_analysis_spec()).unwrap();
+    catalog.register(corpus_spec()).unwrap();
+    catalog.register(answer_log_spec()).unwrap();
     catalog.set_status(
         &ProjectionRef::new("proj:identity-resolution"),
         ProjectionStatus::Active,
@@ -176,6 +256,11 @@ pub fn seed_projection_catalog() -> ProjectionCatalog {
     );
     catalog.set_status(
         &ProjectionRef::new("proj:slide-analysis"),
+        ProjectionStatus::Active,
+    );
+    catalog.set_status(&ProjectionRef::new("proj:corpus"), ProjectionStatus::Active);
+    catalog.set_status(
+        &ProjectionRef::new("proj:answer-log"),
         ProjectionStatus::Active,
     );
     catalog
@@ -250,6 +335,33 @@ fn base_schemas() -> Vec<ObservationSchema> {
             subject_type: EntityTypeRef::new("et:observer"),
             target_type: None,
             payload_schema: serde_json::json!({"type": "object"}),
+            source_contracts: vec![],
+            attachment_config: None,
+            registered_by: None,
+            registered_at: None,
+        },
+        ObservationSchema {
+            id: SchemaRef::new("schema:bot-answer-log"),
+            name: "Bot Answer Log".into(),
+            version: SemVer::new("1.0.0"),
+            subject_type: EntityTypeRef::new("et:answer-log"),
+            target_type: None,
+            payload_schema: serde_json::json!({
+                "type": "object",
+                "required": ["question", "answer", "ts"],
+                "properties": {
+                    "question": {"type": "string"},
+                    "answer": {"type": "string"},
+                    "citations": {"type": "array"},
+                    "used_queries": {"type": "array"},
+                    "asker": {"type": "string"},
+                    "ts": {"type": "string"},
+                    "model": {"type": "string"},
+                    "usage": {"type": "object"},
+                    "confidence": {"type": "string"},
+                    "unknowns": {"type": "array"}
+                }
+            }),
             source_contracts: vec![],
             attachment_config: None,
             registered_by: None,
@@ -415,6 +527,75 @@ fn slide_analysis_spec() -> ProjectionSpec {
         gap_action: None,
         tags: vec!["slide-analysis".into()],
         description: Some("Analyse Google Slides into supplemental records".into()),
+        created_by: "self-host".into(),
+    }
+}
+
+fn corpus_spec() -> ProjectionSpec {
+    ProjectionSpec {
+        id: ProjectionRef::new("proj:corpus"),
+        name: "Access Controlled Corpus".into(),
+        version: SemVer::new("1.0.0"),
+        kind: ProjectionKind::CachedProjection,
+        sources: vec![SourceDecl {
+            source: SourceRef::Lake,
+            filter_schemas: vec![
+                SchemaRef::new("schema:slack-message"),
+                SchemaRef::new("schema:workspace-object-snapshot"),
+            ],
+            filter_derivations: vec![],
+        }],
+        read_modes: vec![ReadModePolicy {
+            mode: ReadMode::OperationalLatest,
+            source_policy: "lake-latest".into(),
+        }],
+        build: BuildSpec {
+            build_type: "rust".into(),
+            entrypoint: None,
+            projector: "corpus".into(),
+        },
+        outputs: vec![OutputSpec {
+            format: "json".into(),
+            tables: vec!["corpus_records".into()],
+        }],
+        reconciliation: None,
+        deterministic_in: vec![],
+        gap_action: None,
+        tags: vec!["workspace-search".into(), "corpus".into()],
+        description: Some("Bot-visible access-controlled workspace corpus".into()),
+        created_by: "self-host".into(),
+    }
+}
+
+fn answer_log_spec() -> ProjectionSpec {
+    ProjectionSpec {
+        id: ProjectionRef::new("proj:answer-log"),
+        name: "Answer Log".into(),
+        version: SemVer::new("1.0.0"),
+        kind: ProjectionKind::CachedProjection,
+        sources: vec![SourceDecl {
+            source: SourceRef::Lake,
+            filter_schemas: vec![SchemaRef::new("schema:bot-answer-log")],
+            filter_derivations: vec![],
+        }],
+        read_modes: vec![ReadModePolicy {
+            mode: ReadMode::OperationalLatest,
+            source_policy: "lake-latest".into(),
+        }],
+        build: BuildSpec {
+            build_type: "rust".into(),
+            entrypoint: None,
+            projector: "answer-log".into(),
+        },
+        outputs: vec![OutputSpec {
+            format: "json".into(),
+            tables: vec!["answer_log_records".into()],
+        }],
+        reconciliation: None,
+        deterministic_in: vec![],
+        gap_action: None,
+        tags: vec!["workspace-search".into(), "answer-log".into()],
+        description: Some("Search bot prior answer log projection".into()),
         created_by: "self-host".into(),
     }
 }

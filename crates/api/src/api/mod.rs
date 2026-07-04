@@ -4,11 +4,13 @@
 //! filtering-before-exposure middleware, pagination, health endpoint.
 
 pub mod envelope;
+pub mod grep;
 pub mod health;
 pub mod pagination;
 pub mod read_mode;
 
 pub use envelope::{ProjectionMetadata, ResponseEnvelope};
+pub use grep::*;
 pub use health::{HealthResponse, ProjectionHealthInfo};
 pub use pagination::{PaginatedResponse, PaginationParams};
 pub use read_mode::{ReadModeError, ReadModeResolver};

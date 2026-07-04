@@ -21,6 +21,7 @@ use lethe_adapter_gslides::gslides::mapper::GoogleSlidesAdapter;
 use lethe_adapter_slack::slack::client::SlackClient;
 use lethe_adapter_slack::slack::mapper::SlackAdapter;
 use lethe_api::api::envelope::{ProjectionMetadata, ResponseEnvelope};
+use lethe_api::api::grep::GrepRecord;
 use lethe_api::api::health::{DependencyHealthInfo, HealthResponse, LastSyncHealth, SyncMetrics};
 use lethe_api::api::pagination::{PaginatedResponse, PaginationParams, paginate};
 use lethe_api::api::read_mode::{ReadModeError, ReadModeResolver};
@@ -46,6 +47,8 @@ use lethe_policy::governance::types::{
 use lethe_profile_model::{
     GalleryImage, ImageCoordinates, ProfilePic, SlideAnalysisResult, StudentProfile,
 };
+use lethe_projection_answer_log::{AnswerLogProjector, AnswerLogRecord};
+use lethe_projection_corpus::{CorpusProjector, CorpusRecord};
 use lethe_projection_person::person_page::projector::PersonPageProjector;
 use lethe_projection_person::person_page::types::{
     PersonDetailResponse, PersonListItem, PersonPageOutput, TimelineEvent,
@@ -117,6 +120,10 @@ struct SlideImageCandidate {
 pub struct ProjectionSnapshot {
     pub identity: IdentityResolutionOutput,
     pub person_page: PersonPageOutput,
+    #[serde(default)]
+    pub corpus: Vec<CorpusRecord>,
+    #[serde(default)]
+    pub answer_log: Vec<AnswerLogRecord>,
     pub built_at: DateTime<Utc>,
     pub lineage: LineageManifest,
 }
@@ -126,6 +133,8 @@ impl Default for ProjectionSnapshot {
         Self {
             identity: IdentityResolutionOutput::default(),
             person_page: PersonPageOutput::default(),
+            corpus: Vec::new(),
+            answer_log: Vec::new(),
             built_at: Utc::now(),
             lineage: LineageManifest::new(
                 ProjectionRef::new("proj:person-page"),
@@ -203,6 +212,8 @@ impl AppCore {
         let supplemental_records = self.supplemental.by_kind("slide-analysis");
         let person_page =
             PersonPageProjector::project(&identity, self.lake.list(), &supplemental_records);
+        let corpus = CorpusProjector::default_config().project_observations(self.lake.list());
+        let answer_log = AnswerLogProjector.project_observations(self.lake.list());
         let built_at = Utc::now();
         let lineage = build_person_page_lineage(
             self.lake.list(),
@@ -216,6 +227,8 @@ impl AppCore {
         self.snapshot = ProjectionSnapshot {
             identity,
             person_page,
+            corpus,
+            answer_log,
             built_at,
             lineage,
         };
@@ -225,6 +238,12 @@ impl AppCore {
         );
         self.catalog.set_status(
             &ProjectionRef::new("proj:person-page"),
+            ProjectionStatus::Active,
+        );
+        self.catalog
+            .set_status(&ProjectionRef::new("proj:corpus"), ProjectionStatus::Active);
+        self.catalog.set_status(
+            &ProjectionRef::new("proj:answer-log"),
             ProjectionStatus::Active,
         );
     }
@@ -247,6 +266,12 @@ impl AppCore {
         );
         core.catalog.set_status(
             &ProjectionRef::new("proj:person-page"),
+            ProjectionStatus::Active,
+        );
+        core.catalog
+            .set_status(&ProjectionRef::new("proj:corpus"), ProjectionStatus::Active);
+        core.catalog.set_status(
+            &ProjectionRef::new("proj:answer-log"),
             ProjectionStatus::Active,
         );
         core
@@ -338,6 +363,8 @@ impl ProjectionSnapshot {
         let supplemental_records = supplemental.by_kind("slide-analysis");
         let person_page =
             PersonPageProjector::project(&identity, lake.list(), &supplemental_records);
+        let corpus = CorpusProjector::default_config().project_observations(lake.list());
+        let answer_log = AnswerLogProjector.project_observations(lake.list());
         let built_at = Utc::now();
         let lineage = build_person_page_lineage(
             lake.list(),
@@ -351,6 +378,8 @@ impl ProjectionSnapshot {
         Ok(Self {
             identity,
             person_page,
+            corpus,
+            answer_log,
             built_at,
             lineage,
         })
@@ -600,7 +629,10 @@ mod sync;
 mod sync_support;
 
 use media_support::*;
-use service_support::{build_person_page_lineage, consent_status_for_person_id, namespace_draft};
+use service_support::{
+    build_person_page_lineage, build_projection_lineage, consent_status_for_person_id,
+    namespace_draft,
+};
 use slide_support::*;
 use sync_support::*;
 

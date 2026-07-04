@@ -28,5 +28,10 @@
     "id": "et:observer",
     "name": "Observer",
     "description": "Observers themselves"
+  },
+  {
+    "id": "et:answer-log",
+    "name": "Answer Log",
+    "description": "Structured bot answer log records"
   }
 ]
