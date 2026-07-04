@@ -944,6 +944,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lethe-adapter-github"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "lethe-adapter-api",
+ "lethe-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lethe-adapter-gsheets"
 version = "0.1.0"
 dependencies = [
@@ -1042,6 +1053,7 @@ dependencies = [
  "lethe-policy",
  "lethe-projection-person",
  "lethe-registry",
+ "lethe-runtime",
  "lethe-selfhost",
  "lethe-storage-sqlite",
  "serde_json",
@@ -1065,6 +1077,24 @@ dependencies = [
  "serde_json",
  "sha2",
  "uuid",
+]
+
+[[package]]
+name = "lethe-import-claude"
+version = "0.1.0"
+dependencies = [
+ "lethe-adapter-claude",
+ "lethe-core",
+ "lethe-selfhost",
+]
+
+[[package]]
+name = "lethe-import-github"
+version = "0.1.0"
+dependencies = [
+ "lethe-adapter-github",
+ "lethe-core",
+ "lethe-selfhost",
 ]
 
 [[package]]
@@ -1173,6 +1203,7 @@ dependencies = [
  "lethe-projection-corpus",
  "lethe-projection-person",
  "lethe-registry",
+ "lethe-runtime",
  "lethe-storage-api",
  "lethe-storage-sqlite",
  "pretty_assertions",

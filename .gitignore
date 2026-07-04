@@ -11,3 +11,4 @@ client_secret.json
 data/*
 !data/.gitkeep
 !data/README.md
+deploy/personal-lake/data/

@@ -6,6 +6,7 @@ use lethe_core::domain::{
     ObserverRef, SchemaRef, SemVer, SourceSystemRef, SupplementalId, SupplementalRecord,
     supplemental::InputAnchorSet,
 };
+use lethe_runtime::runtime::partition::{RoutingKeyOrder, routing_keyspec_json_for_order};
 
 fn sample_observation() -> Observation {
     let canonical_json = serde_json::json!({
@@ -324,6 +325,64 @@ fn open_records_partition_initialize_with_pinned_keyspecs() {
         identity,
         lethe_runtime::runtime::partition::identity_keyspec_json().unwrap()
     );
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn open_with_personal_routing_records_year_month_keyspec() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let store = SqlitePersistence::open_with_routing_key_order(
+        &db,
+        &blob_dir,
+        &[7; 32],
+        RoutingKeyOrder::YearMonthSourceContainerPublished,
+    )
+    .unwrap();
+
+    let routing: String = store
+        .conn
+        .query_row(
+            "SELECT routing_keyspec_json FROM partition_log WHERE event_type = 'initialize'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(
+        routing,
+        routing_keyspec_json_for_order(RoutingKeyOrder::YearMonthSourceContainerPublished).unwrap()
+    );
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn opening_existing_db_with_different_routing_keyspec_fails_fast() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    SqlitePersistence::open_with_routing_key_order(
+        &db,
+        &blob_dir,
+        &[7; 32],
+        RoutingKeyOrder::MonthYearSourceContainerPublished,
+    )
+    .unwrap();
+
+    let err = match SqlitePersistence::open_with_routing_key_order(
+        &db,
+        &blob_dir,
+        &[7; 32],
+        RoutingKeyOrder::YearMonthSourceContainerPublished,
+    ) {
+        Ok(_) => panic!("expected keyspec mismatch"),
+        Err(err) => err,
+    };
+
+    assert!(matches!(err, PersistenceError::SchemaInvariant(_)));
 
     let _ = fs::remove_dir_all(tmp);
 }

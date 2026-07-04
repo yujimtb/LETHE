@@ -360,15 +360,21 @@ impl AppService {
             .unwrap_or("Unknown");
 
         let policy = self.google_adapter_config();
+        let analyzer = self.slide_analyzer()?;
         Ok(self.resilient_executor.execute(
             "derivation:gemini",
             &policy.retry,
             &policy.rate_limit,
-            || {
-                self.slide_analyzer
-                    .extract_profile_from_png(image, title, canonical_uri)
-            },
+            || analyzer.extract_profile_from_png(image, title, canonical_uri),
         )?)
+    }
+
+    pub(super) fn slide_analyzer(&self) -> Result<&GeminiSlideAnalyzer, SelfHostError> {
+        self.slide_analyzer.as_ref().ok_or_else(|| {
+            SelfHostError::Config(crate::self_host::config::ConfigError::Invalid(
+                "slide analyzer is not configured".to_owned(),
+            ))
+        })
     }
 
     pub(super) fn core_lock(&self) -> Result<std::sync::MutexGuard<'_, AppCore>, SelfHostError> {

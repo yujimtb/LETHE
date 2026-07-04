@@ -53,6 +53,7 @@ source-native write adapter は実装していません。
 - [Domain algebra](docs/architecture/domain-algebra.md)
 - [Runtime reference](docs/architecture/runtime-reference.md)
 - [Repository layout](docs/development/repository-layout.md)
+- [Personal lake ingestion](docs/development/personal-lake-ingestion.md)
 - [OpenSpec module index](openspec/specs/_index.md)
 - [Security](SECURITY.md)
 
@@ -85,6 +86,8 @@ python ./scripts/check_markdown_links.py
 `LETHE_CONFIG_PATH` のみです。TOML には secret 値を書かず、`*_env` で環境変数名を
 参照します。Slack / Google Slides source は配列で複数 instance を定義でき、
 instance ごとに独立 cursor と failure isolation を持ちます。
+GitHub/Claude の one-shot import 専用 instance では `sources` を空配列にできます。
+その場合も API token と routing key order は TOML で明示します。
 
 ```powershell
 cargo run -p lethe-selfhost

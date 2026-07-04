@@ -6,6 +6,9 @@ database_path = "./data/lethe.sqlite3"
 blob_dir = "./data/blobs"
 encryption_key_env = "LETHE_STORAGE_ENCRYPTION_KEY"
 
+[routing]
+key_order = "month_year_source_container_published"
+
 [runtime]
 poll_seconds = 300
 

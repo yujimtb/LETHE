@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use lethe_runtime::runtime::partition::RoutingKeyOrder;
 use serde::Deserialize;
 
 #[derive(Debug, Clone)]
@@ -13,12 +14,13 @@ pub struct SelfHostConfig {
     pub blob_dir: PathBuf,
     pub secret_encryption_key: [u8; 32],
     pub poll_interval: Duration,
+    pub routing_key_order: RoutingKeyOrder,
     pub api_tokens: Vec<ApiTokenConfig>,
     pub resource_limits: ResourceLimits,
     pub slack_sources: Vec<SlackConfig>,
     pub google_sources: Vec<GoogleConfig>,
-    pub slide_analysis_limit: usize,
-    pub slide_ai: SlideAiConfig,
+    pub slide_analysis_limit: Option<usize>,
+    pub slide_ai: Option<SlideAiConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,11 +106,13 @@ pub enum ConfigError {
 struct FileConfig {
     server: ServerFileConfig,
     storage: StorageFileConfig,
+    routing: RoutingFileConfig,
     runtime: RuntimeFileConfig,
     limits: LimitsFileConfig,
     api_tokens: Vec<ApiTokenFileConfig>,
     sources: SourcesFileConfig,
-    derivation: DerivationFileConfig,
+    #[serde(default)]
+    derivation: Option<DerivationFileConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,6 +127,12 @@ struct StorageFileConfig {
     database_path: PathBuf,
     blob_dir: PathBuf,
     encryption_key_env: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutingFileConfig {
+    key_order: RoutingKeyOrder,
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,6 +261,17 @@ impl SelfHostConfig {
             })
             .collect::<Result<Vec<_>, ConfigError>>()?;
 
+        let (slide_analysis_limit, slide_ai) = match raw.derivation {
+            Some(derivation) => (
+                Some(derivation.slide_analysis_limit),
+                Some(SlideAiConfig {
+                    api_key: SecretString::new(required_env(&derivation.gemini_api_key_env)?)?,
+                    model: derivation.gemini_model,
+                }),
+            ),
+            None => (None, None),
+        };
+
         Ok(Self {
             bind_addr: raw.server.bind_addr,
             database_path: raw.storage.database_path,
@@ -259,6 +280,7 @@ impl SelfHostConfig {
                 &raw.storage.encryption_key_env,
             )?)?,
             poll_interval: Duration::from_secs(raw.runtime.poll_seconds),
+            routing_key_order: raw.routing.key_order,
             api_tokens,
             resource_limits: ResourceLimits {
                 max_blob_bytes: raw.limits.max_blob_bytes,
@@ -270,11 +292,8 @@ impl SelfHostConfig {
             },
             slack_sources,
             google_sources,
-            slide_analysis_limit: raw.derivation.slide_analysis_limit,
-            slide_ai: SlideAiConfig {
-                api_key: SecretString::new(required_env(&raw.derivation.gemini_api_key_env)?)?,
-                model: raw.derivation.gemini_model,
-            },
+            slide_analysis_limit,
+            slide_ai,
         })
     }
 }
@@ -292,19 +311,26 @@ impl FileConfig {
             self.limits.max_leaf_observations,
         )?;
         require_positive("limits.retention_days", self.limits.retention_days as usize)?;
-        require_positive(
-            "derivation.slide_analysis_limit",
-            self.derivation.slide_analysis_limit,
-        )?;
         if self.api_tokens.is_empty() {
             return Err(ConfigError::Invalid(
                 "api_tokens must contain at least one entry".to_owned(),
             ));
         }
-        if self.sources.slack.is_empty() && self.sources.google_slides.is_empty() {
+        if !self.sources.google_slides.is_empty() && self.derivation.is_none() {
             return Err(ConfigError::Invalid(
-                "at least one source instance is required".to_owned(),
+                "derivation is required when google_slides sources are configured".to_owned(),
             ));
+        }
+        if let Some(derivation) = &self.derivation {
+            require_non_empty(
+                "derivation.gemini_api_key_env",
+                &derivation.gemini_api_key_env,
+            )?;
+            require_non_empty("derivation.gemini_model", &derivation.gemini_model)?;
+            require_positive(
+                "derivation.slide_analysis_limit",
+                derivation.slide_analysis_limit,
+            )?;
         }
         let mut ids = HashSet::new();
         for id in self
@@ -406,6 +432,8 @@ mod tests {
             database_path = "data/lethe.sqlite3"
             blob_dir = "data/blobs"
             encryption_key_env = "ENCRYPTION_KEY"
+            [routing]
+            key_order = "month_year_source_container_published"
             [runtime]
             poll_seconds = 60
             [limits]
@@ -432,6 +460,77 @@ mod tests {
             gemini_api_key_env = "GEMINI"
             gemini_model = "model"
             slide_analysis_limit = 1
+            "#,
+        )
+        .unwrap();
+
+        assert!(raw.validate().is_err());
+    }
+
+    #[test]
+    fn empty_sources_are_allowed_for_import_only_instance() {
+        let raw: FileConfig = toml::from_str(
+            r#"
+            [server]
+            bind_addr = "127.0.0.1:8080"
+            [storage]
+            database_path = "data/lethe.sqlite3"
+            blob_dir = "data/blobs"
+            encryption_key_env = "ENCRYPTION_KEY"
+            [routing]
+            key_order = "year_month_source_container_published"
+            [runtime]
+            poll_seconds = 60
+            [limits]
+            max_blob_bytes = 1
+            max_payload_bytes = 1
+            max_sync_items = 1
+            max_page_size = 1
+            max_leaf_observations = 1
+            retention_days = 3650
+            [[api_tokens]]
+            token_env = "TOKEN"
+            scopes = ["admin:health"]
+            [sources]
+            slack = []
+            google_slides = []
+            "#,
+        )
+        .unwrap();
+
+        assert!(raw.validate().is_ok());
+    }
+
+    #[test]
+    fn google_sources_require_derivation_config() {
+        let raw: FileConfig = toml::from_str(
+            r#"
+            [server]
+            bind_addr = "127.0.0.1:8080"
+            [storage]
+            database_path = "data/lethe.sqlite3"
+            blob_dir = "data/blobs"
+            encryption_key_env = "ENCRYPTION_KEY"
+            [routing]
+            key_order = "month_year_source_container_published"
+            [runtime]
+            poll_seconds = 60
+            [limits]
+            max_blob_bytes = 1
+            max_payload_bytes = 1
+            max_sync_items = 1
+            max_page_size = 1
+            max_leaf_observations = 1
+            retention_days = 30
+            [[api_tokens]]
+            token_env = "TOKEN"
+            scopes = ["read"]
+            [sources]
+            slack = []
+            [[sources.google_slides]]
+            id = "gslides"
+            access_token_env = "GOOGLE"
+            presentation_ids = ["P1"]
             "#,
         )
         .unwrap();

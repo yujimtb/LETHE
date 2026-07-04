@@ -169,7 +169,7 @@ impl SqlitePersistence {
     }
 
     pub(super) fn ensure_partition_initialize(&self) -> Result<(), PersistenceError> {
-        let expected_routing = routing_keyspec_json()?;
+        let expected_routing = routing_keyspec_json_for_order(self.routing_key_order)?;
         let expected_identity = identity_keyspec_json()?;
 
         let existing = self

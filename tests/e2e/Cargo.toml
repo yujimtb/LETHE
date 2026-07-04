@@ -17,6 +17,7 @@ lethe-engine = { path = "../../crates/engine" }
 lethe-policy = { path = "../../crates/policy" }
 lethe-projection-person = { path = "../../crates/projections/person" }
 lethe-registry = { path = "../../crates/registry" }
+lethe-runtime = { path = "../../crates/runtime" }
 lethe-selfhost = { path = "../../apps/selfhost" }
 lethe-storage-sqlite = { path = "../../crates/storage/sqlite" }
 serde_json.workspace = true

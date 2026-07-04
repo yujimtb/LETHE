@@ -19,6 +19,13 @@ pub const ROUTING_KEYSPEC_VERSION: &str = "routing-keyspec/v1";
 pub const IDENTITY_KEYSPEC_VERSION: &str = "identity-keyspec/v1";
 const ROUTING_AXIS_SEPARATOR: char = '\u{1f}';
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingKeyOrder {
+    MonthYearSourceContainerPublished,
+    YearMonthSourceContainerPublished,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PartitionError {
     #[error("invalid leaf id: {0}")]
@@ -235,9 +242,12 @@ enum PartitionNode {
 }
 
 pub fn routing_keyspec() -> RoutingKeySpec {
-    RoutingKeySpec {
-        version: ROUTING_KEYSPEC_VERSION,
-        axes: vec![
+    routing_keyspec_for_order(RoutingKeyOrder::MonthYearSourceContainerPublished)
+}
+
+pub fn routing_keyspec_for_order(order: RoutingKeyOrder) -> RoutingKeySpec {
+    let time_axes = match order {
+        RoutingKeyOrder::MonthYearSourceContainerPublished => vec![
             RoutingAxisSpec {
                 name: "coarse_month",
                 source_field: "published",
@@ -248,22 +258,42 @@ pub fn routing_keyspec() -> RoutingKeySpec {
                 source_field: "published",
                 encoding: "utc_year_4digit",
             },
+        ],
+        RoutingKeyOrder::YearMonthSourceContainerPublished => vec![
             RoutingAxisSpec {
-                name: "source",
-                source_field: "source_system",
-                encoding: "stable_source_ref",
-            },
-            RoutingAxisSpec {
-                name: "container",
-                source_field: "source_container",
-                encoding: "adapter_declared_workspace_or_channel",
-            },
-            RoutingAxisSpec {
-                name: "fine_published",
+                name: "coarse_year",
                 source_field: "published",
-                encoding: "utc_rfc3339_nanos",
+                encoding: "utc_year_4digit",
+            },
+            RoutingAxisSpec {
+                name: "coarse_month",
+                source_field: "published",
+                encoding: "utc_month_2digit",
             },
         ],
+    };
+    let mut axes = time_axes;
+    axes.extend([
+        RoutingAxisSpec {
+            name: "source",
+            source_field: "source_system",
+            encoding: "stable_source_ref",
+        },
+        RoutingAxisSpec {
+            name: "container",
+            source_field: "source_container",
+            encoding: "adapter_declared_workspace_or_channel",
+        },
+        RoutingAxisSpec {
+            name: "fine_published",
+            source_field: "published",
+            encoding: "utc_rfc3339_nanos",
+        },
+    ]);
+
+    RoutingKeySpec {
+        version: ROUTING_KEYSPEC_VERSION,
+        axes,
     }
 }
 
@@ -287,7 +317,11 @@ pub fn identity_keyspec() -> IdentityKeySpec {
 }
 
 pub fn routing_keyspec_json() -> Result<String, serde_json::Error> {
-    serde_json::to_string(&routing_keyspec())
+    routing_keyspec_json_for_order(RoutingKeyOrder::MonthYearSourceContainerPublished)
+}
+
+pub fn routing_keyspec_json_for_order(order: RoutingKeyOrder) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&routing_keyspec_for_order(order))
 }
 
 pub fn identity_keyspec_json() -> Result<String, serde_json::Error> {
@@ -406,16 +440,46 @@ pub fn routing_key(
     source: &str,
     container: &str,
 ) -> Result<RoutingKey, PartitionError> {
-    RoutingKey::from_axes(vec![
-        format!("{:02}", published.month()),
-        format!("{:04}", published.year()),
+    routing_key_for_order(
+        RoutingKeyOrder::MonthYearSourceContainerPublished,
+        published,
+        source,
+        container,
+    )
+}
+
+pub fn routing_key_for_order(
+    order: RoutingKeyOrder,
+    published: DateTime<Utc>,
+    source: &str,
+    container: &str,
+) -> Result<RoutingKey, PartitionError> {
+    let month = format!("{:02}", published.month());
+    let year = format!("{:04}", published.year());
+    let time_axes = match order {
+        RoutingKeyOrder::MonthYearSourceContainerPublished => vec![month, year],
+        RoutingKeyOrder::YearMonthSourceContainerPublished => vec![year, month],
+    };
+    let mut axes = time_axes;
+    axes.extend([
         source.to_owned(),
         container.to_owned(),
         published.to_rfc3339_opts(SecondsFormat::Nanos, true),
-    ])
+    ]);
+    RoutingKey::from_axes(axes)
 }
 
 pub fn routing_key_from_observation(
+    observation: &Observation,
+) -> Result<RoutingKey, PartitionError> {
+    routing_key_from_observation_for_order(
+        RoutingKeyOrder::MonthYearSourceContainerPublished,
+        observation,
+    )
+}
+
+pub fn routing_key_from_observation_for_order(
+    order: RoutingKeyOrder,
     observation: &Observation,
 ) -> Result<RoutingKey, PartitionError> {
     let source = observation
@@ -429,7 +493,7 @@ pub fn routing_key_from_observation(
         .and_then(serde_json::Value::as_str)
         .ok_or(PartitionError::EmptyRoutingAxis { axis: "container" })?;
 
-    routing_key(observation.published, source, container)
+    routing_key_for_order(order, observation.published, source, container)
 }
 
 pub fn plan_capacity_split(
@@ -884,6 +948,31 @@ mod tests {
                 "2026".to_owned(),
                 "sys:slack".to_owned(),
                 "channel:C01".to_owned(),
+                "2026-04-03T01:02:03.123456789Z".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn routing_key_can_use_year_month_for_personal_lake() {
+        let published = chrono::DateTime::parse_from_rfc3339("2026-04-03T01:02:03.123456789Z")
+            .unwrap()
+            .to_utc();
+        let key = routing_key_for_order(
+            RoutingKeyOrder::YearMonthSourceContainerPublished,
+            published,
+            "sys:github",
+            "owner/repo",
+        )
+        .unwrap();
+
+        assert_eq!(
+            key.axes(),
+            &[
+                "2026".to_owned(),
+                "04".to_owned(),
+                "sys:github".to_owned(),
+                "owner/repo".to_owned(),
                 "2026-04-03T01:02:03.123456789Z".to_owned()
             ]
         );

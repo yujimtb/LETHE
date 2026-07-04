@@ -121,6 +121,8 @@
 
 `specs/adapter-policy/spec.md` SHARD-ADAPT-02 の「`conversation_uuid` + `parent_message_uuid` チェーン上の位置から決定的に導出」は、Phase 2 で claude.ai zip importer 着手時に具体アルゴリズムを固定する(チェーン位置のエンコード方法、roots が複数ある場合の扱い、欠落と存在の混在をどう扱うか)。同じ zip を再 import して同じ derived id が再現できることを property test で保証。
 
+**Resolved 2026-07-05:** `crates/adapters/claude/src/claude/importer.rs` now derives missing message ids from a deterministic sibling path under `conversation:{conversation_uuid}:path:{path}`. Root siblings, mixed present/missing UUID branches, and missing-parent orphan branches use the same stable sort by `created_at`, `sender`, `text`, and original index. Missing-parent branches are assigned under deterministic `orphan:{n}` roots sorted by missing parent UUID, avoiding panic and preserving exact re-import idempotency. Regression coverage: `derives_missing_uuid_from_conversation_path`, `derives_missing_uuid_for_orphaned_parent_branch`, `same_json_import_produces_same_identity_keys`, and real export shape coverage in `zip_import_skips_known_metadata_and_accepts_actual_export_shapes`.
+
 ### U4. β(watermark frontier 子移管)の発動条件
 
 SHARD-PROP-05 / R11 で baseline は全量再配送を許容する。β(frontier 子移管)を発動するかは Phase 4 完了後の profiling で決める。Open Question 1 を参照。

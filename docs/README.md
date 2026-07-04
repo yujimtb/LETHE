@@ -18,3 +18,6 @@
 最新の実装整合性監査は
 [`audits/openspec-verification-2026-06-22.md`](audits/openspec-verification-2026-06-22.md)
 です。
+
+個人 lake の Claude/GitHub ingestion 手順は
+[`development/personal-lake-ingestion.md`](development/personal-lake-ingestion.md) にあります。

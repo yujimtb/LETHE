@@ -1,0 +1,9 @@
+[package]
+name = "lethe-import-github"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lethe-adapter-github = { path = "../../../crates/adapters/github" }
+lethe-core = { path = "../../../crates/core" }
+lethe-selfhost = { path = "../../selfhost" }

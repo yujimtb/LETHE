@@ -1,0 +1,9 @@
+[package]
+name = "lethe-import-claude"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lethe-adapter-claude = { path = "../../../crates/adapters/claude" }
+lethe-core = { path = "../../../crates/core" }
+lethe-selfhost = { path = "../../selfhost" }
