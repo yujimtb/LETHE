@@ -3,8 +3,11 @@ resolver = "3"
 members = [
     "apps/selfhost",
     "apps/tools/attribute-inventory",
+    "apps/tools/lethe-import-claude",
+    "apps/tools/lethe-import-github",
     "crates/adapters/api",
     "crates/adapters/claude",
+    "crates/adapters/github",
     "crates/adapters/gslides",
     "crates/adapters/slack",
     "crates/api",

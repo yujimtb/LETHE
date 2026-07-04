@@ -91,6 +91,13 @@ pub struct SyncReport {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+pub struct ImportReport {
+    pub ingested: usize,
+    pub duplicates: usize,
+    pub quarantined: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct DeadLetter {
     pub source: String,
     pub reason: String,
@@ -297,7 +304,7 @@ pub struct AppService {
     config: Arc<SelfHostConfig>,
     slack_sources: Vec<SlackSourceRuntime>,
     google_sources: Vec<GoogleSourceRuntime>,
-    slide_analyzer: GeminiSlideAnalyzer,
+    slide_analyzer: Option<GeminiSlideAnalyzer>,
     resilient_executor: Arc<ResilientExecutor>,
     audit_log: Arc<InMemoryAuditLog>,
 }
@@ -365,10 +372,11 @@ struct GoogleSourceRuntime {
 
 impl AppService {
     pub fn bootstrap(config: SelfHostConfig) -> Result<Self, SelfHostError> {
-        let persistence = SqlitePersistence::open(
+        let persistence = SqlitePersistence::open_with_routing_key_order(
             &config.database_path,
             &config.blob_dir,
             &config.secret_encryption_key,
+            config.routing_key_order,
         )?;
         let persisted_snapshot = lethe_storage_api::ProjectionMaterializer::projection_records(
             &persistence,
@@ -409,8 +417,11 @@ impl AppService {
                 })
             })
             .collect::<Result<Vec<_>, AdapterError>>()?;
-        let slide_analyzer =
-            GeminiSlideAnalyzer::new(config.slide_ai.api_key.expose(), &config.slide_ai.model)?;
+        let slide_analyzer = config
+            .slide_ai
+            .as_ref()
+            .map(|slide_ai| GeminiSlideAnalyzer::new(slide_ai.api_key.expose(), &slide_ai.model))
+            .transpose()?;
 
         Ok(Self {
             core: Arc::new(Mutex::new(AppCore::empty_with_snapshot(persisted_snapshot))),
@@ -539,6 +550,46 @@ impl AppService {
         let core = self.core_lock()?;
         Ok(build_inventory_documents(&core.snapshot))
     }
+
+    pub fn ingest_observation_drafts(
+        &self,
+        drafts: Vec<ObservationDraft>,
+        source_instance_id: &str,
+    ) -> Result<ImportReport, SelfHostError> {
+        if source_instance_id.trim().is_empty() {
+            return Err(SelfHostError::Ingestion(
+                "source_instance_id must not be blank".to_owned(),
+            ));
+        }
+
+        let mut report = ImportReport {
+            ingested: 0,
+            duplicates: 0,
+            quarantined: 0,
+        };
+
+        for draft in drafts {
+            match self.ingest_draft(namespace_draft(draft, source_instance_id))? {
+                IngestResult::Ingested { .. } => report.ingested += 1,
+                IngestResult::Duplicate { .. } => report.duplicates += 1,
+                IngestResult::Quarantined { .. } => report.quarantined += 1,
+                IngestResult::Rejected { message, .. } => {
+                    return Err(SelfHostError::Ingestion(message));
+                }
+            }
+        }
+
+        if report.ingested > 0 {
+            let mut core = self.core_lock()?;
+            core.rebuild_snapshot();
+            self.persistence_lock()?.materialize_projection(
+                &ProjectionRef::new("proj:person-page"),
+                &serde_json::to_value(&core.snapshot)?,
+            )?;
+        }
+
+        Ok(report)
+    }
 }
 
 mod media_support;
@@ -549,9 +600,7 @@ mod sync;
 mod sync_support;
 
 use media_support::*;
-#[cfg(test)]
-use service_support::namespace_draft;
-use service_support::{build_person_page_lineage, consent_status_for_person_id};
+use service_support::{build_person_page_lineage, consent_status_for_person_id, namespace_draft};
 use slide_support::*;
 use sync_support::*;
 

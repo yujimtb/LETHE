@@ -315,43 +315,49 @@ impl AppService {
             .into_iter()
             .cloned()
             .collect();
-        let analysis_model = format!(
-            "{}+continuation-v2-image-url",
-            self.slide_analyzer.model_name()
-        );
+        let analysis_model = self
+            .slide_analyzer
+            .as_ref()
+            .map(|analyzer| format!("{}+continuation-v2-image-url", analyzer.model_name()));
         let mut needs_analysis = false;
-        for source in &self.google_sources {
-            for presentation_id in &source.config.presentation_ids {
-                let namespaced_id = format!("{}:{presentation_id}", source.config.id);
-                let Some(_observation) = slide_obs_by_presentation.get(&namespaced_id) else {
-                    continue;
-                };
-                let Ok(presentation) = self.resilient_executor.execute(
-                    &format!("gslides:{}:{presentation_id}", source.config.id),
-                    &google_policy.retry,
-                    &google_policy.rate_limit,
-                    || source.client.get_presentation(presentation_id),
-                ) else {
-                    continue;
-                };
+        if let (Some(analysis_model), Some(slide_analysis_limit)) =
+            (analysis_model.as_ref(), self.config.slide_analysis_limit)
+        {
+            for source in &self.google_sources {
+                for presentation_id in &source.config.presentation_ids {
+                    let namespaced_id = format!("{}:{presentation_id}", source.config.id);
+                    let Some(_observation) = slide_obs_by_presentation.get(&namespaced_id) else {
+                        continue;
+                    };
+                    let Ok(presentation) = self.resilient_executor.execute(
+                        &format!("gslides:{}:{presentation_id}", source.config.id),
+                        &google_policy.retry,
+                        &google_policy.rate_limit,
+                        || source.client.get_presentation(presentation_id),
+                    ) else {
+                        continue;
+                    };
 
-                if presentation
-                    .slides
-                    .iter()
-                    .take(self.config.slide_analysis_limit)
-                    .any(|slide| {
-                        match find_slide_analysis_record(
-                            &slide_analysis_records,
-                            &namespaced_id,
-                            &slide.object_id,
-                        ) {
-                            Some(record) => analysis_record_needs_refresh(record, &analysis_model),
-                            None => true,
-                        }
-                    })
-                {
-                    needs_analysis = true;
-                    break;
+                    if presentation
+                        .slides
+                        .iter()
+                        .take(slide_analysis_limit)
+                        .any(|slide| {
+                            match find_slide_analysis_record(
+                                &slide_analysis_records,
+                                &namespaced_id,
+                                &slide.object_id,
+                            ) {
+                                Some(record) => {
+                                    analysis_record_needs_refresh(record, analysis_model)
+                                }
+                                None => true,
+                            }
+                        })
+                    {
+                        needs_analysis = true;
+                        break;
+                    }
                 }
             }
         }
@@ -359,7 +365,23 @@ impl AppService {
         // --- Slide Analysis ---
         let mut slide_analyses = 0usize;
 
-        if google_ingested > 0 || slack_ingested > 0 || needs_analysis {
+        if (google_ingested > 0 || slack_ingested > 0 || needs_analysis)
+            && !self.google_sources.is_empty()
+        {
+            let Some(analysis_model) = analysis_model.clone() else {
+                return Err(SelfHostError::Config(
+                    crate::self_host::config::ConfigError::Invalid(
+                        "slide analyzer is required for Google Slides analysis".to_owned(),
+                    ),
+                ));
+            };
+            let Some(slide_analysis_limit) = self.config.slide_analysis_limit else {
+                return Err(SelfHostError::Config(
+                    crate::self_host::config::ConfigError::Invalid(
+                        "slide_analysis_limit is required for Google Slides analysis".to_owned(),
+                    ),
+                ));
+            };
             let mut analysis_results = Vec::new();
 
             for source in &self.google_sources {
@@ -392,10 +414,8 @@ impl AppService {
                         .unwrap_or_default()
                         .to_string();
 
-                    let candidate_slide_indices = ranked_self_intro_slide_indices(
-                        &presentation,
-                        self.config.slide_analysis_limit,
-                    );
+                    let candidate_slide_indices =
+                        ranked_self_intro_slide_indices(&presentation, slide_analysis_limit);
                     let mut consumed_slide_indices = HashSet::new();
 
                     for slide_index in candidate_slide_indices {

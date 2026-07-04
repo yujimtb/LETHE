@@ -1,0 +1,11 @@
+[package]
+name = "lethe-adapter-github"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chrono.workspace = true
+lethe-adapter-api = { path = "../api" }
+lethe-core = { path = "../../core" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true

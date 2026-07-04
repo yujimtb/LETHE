@@ -12,10 +12,10 @@ use lethe_core::domain::{BlobRef, IdempotencyKey, Observation, ObservationId, Su
 use lethe_runtime::runtime::partition::{
     PARTITION_EVENT_FAILOVER, PARTITION_EVENT_INITIALIZE, PARTITION_EVENT_RECOVER,
     PARTITION_EVENT_SPLIT_COMMIT, PARTITION_EVENT_SPLIT_PREPARE, PARTITION_SPLIT_REASON_CAPACITY,
-    PartitionTree, RoutedObservation, failover_event_json, identity_keyspec_json,
+    PartitionTree, RoutedObservation, RoutingKeyOrder, failover_event_json, identity_keyspec_json,
     initialize_event_json, parse_partition_event, plan_capacity_split, recover_event_json,
-    routing_key_from_observation, routing_keyspec_json, split_commit_event_json,
-    split_prepare_event_json,
+    routing_key_from_observation_for_order, routing_keyspec_json_for_order,
+    split_commit_event_json, split_prepare_event_json,
 };
 use lethe_storage_api::{
     AppendOutcome as PortAppendOutcome, BlobStore as BlobStorePort, LeafPosition,
@@ -42,6 +42,7 @@ pub struct SqlitePersistence {
     conn: Connection,
     blob_dir: PathBuf,
     secret_encryption_key: [u8; 32],
+    routing_key_order: RoutingKeyOrder,
 }
 
 const CURRENT_SCHEMA_VERSION: i64 = 3;
@@ -76,6 +77,20 @@ impl SqlitePersistence {
         blob_dir: &Path,
         secret_encryption_key: &[u8; 32],
     ) -> Result<Self, PersistenceError> {
+        Self::open_with_routing_key_order(
+            database_path,
+            blob_dir,
+            secret_encryption_key,
+            RoutingKeyOrder::MonthYearSourceContainerPublished,
+        )
+    }
+
+    pub fn open_with_routing_key_order(
+        database_path: &Path,
+        blob_dir: &Path,
+        secret_encryption_key: &[u8; 32],
+        routing_key_order: RoutingKeyOrder,
+    ) -> Result<Self, PersistenceError> {
         if let Some(parent) = database_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -86,6 +101,7 @@ impl SqlitePersistence {
             conn,
             blob_dir: blob_dir.to_path_buf(),
             secret_encryption_key: *secret_encryption_key,
+            routing_key_order,
         };
         store.init_schema()?;
         Ok(store)
@@ -138,8 +154,9 @@ impl SqlitePersistence {
         observation: &Observation,
     ) -> Result<DurableAppendOutcome, PersistenceError> {
         let tree = self.load_partition_tree()?;
-        let routing_key = routing_key_from_observation(observation)
-            .map_err(|err| PersistenceError::SchemaInvariant(err.to_string()))?;
+        let routing_key =
+            routing_key_from_observation_for_order(self.routing_key_order, observation)
+                .map_err(|err| PersistenceError::SchemaInvariant(err.to_string()))?;
         let leaf_id = tree.route(&routing_key);
         let identity_key = &observation.idempotency_key;
         let canonical_json = observation
@@ -437,8 +454,9 @@ impl SqlitePersistence {
             for row in rows {
                 let (id, json) = row?;
                 let observation: Observation = serde_json::from_str(&json)?;
-                let routing_key = routing_key_from_observation(&observation)
-                    .map_err(|err| PersistenceError::SchemaInvariant(err.to_string()))?;
+                let routing_key =
+                    routing_key_from_observation_for_order(self.routing_key_order, &observation)
+                        .map_err(|err| PersistenceError::SchemaInvariant(err.to_string()))?;
                 routed.push(RoutedObservation {
                     observation_id: id,
                     routing_key,

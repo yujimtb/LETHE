@@ -1,0 +1,16 @@
+services:
+  lethe-selfhost:
+    build:
+      context: ../..
+      dockerfile: apps/selfhost/Dockerfile
+    environment:
+      LETHE_CONFIG_PATH: /etc/lethe/config.toml
+      LETHE_STORAGE_ENCRYPTION_KEY: ${LETHE_STORAGE_ENCRYPTION_KEY:?}
+      LETHE_API_READ_TOKEN: ${LETHE_API_READ_TOKEN:?}
+      LETHE_API_SYNC_TOKEN: ${LETHE_API_SYNC_TOKEN:?}
+    ports:
+      - "127.0.0.1:${LETHE_HTTP_HOST_PORT:?}:8080"
+    volumes:
+      - ./config.toml:/etc/lethe/config.toml:ro
+      - ./data:/var/lib/lethe
+    restart: unless-stopped

@@ -1,0 +1,33 @@
+[server]
+bind_addr = "0.0.0.0:8080"
+
+[storage]
+database_path = "/var/lib/lethe/lethe.sqlite3"
+blob_dir = "/var/lib/lethe/blobs"
+encryption_key_env = "LETHE_STORAGE_ENCRYPTION_KEY"
+
+[routing]
+key_order = "year_month_source_container_published"
+
+[runtime]
+poll_seconds = 300
+
+[limits]
+max_blob_bytes = 10485760
+max_payload_bytes = 1048576
+max_sync_items = 10000
+max_page_size = 100
+max_leaf_observations = 100000
+retention_days = 3650
+
+[[api_tokens]]
+token_env = "LETHE_API_READ_TOKEN"
+scopes = ["read:persons", "read:timeline"]
+
+[[api_tokens]]
+token_env = "LETHE_API_SYNC_TOKEN"
+scopes = ["admin:sync", "admin:health"]
+
+[sources]
+slack = []
+google_slides = []

@@ -7,6 +7,7 @@ use lethe_core::domain::{
     ActorRef, AuthorityModel, CaptureModel, EntityRef, IdempotencyKey, Mutability, Observation,
     ObserverRef, SchemaRef, SemVer, SourceSystemRef, SupplementalId, SupplementalRecord,
 };
+use lethe_runtime::runtime::partition::RoutingKeyOrder;
 use lethe_selfhost::self_host::app::{AppService, ProjectionSnapshot};
 use lethe_selfhost::self_host::config::{
     ApiTokenConfig, GoogleConfig, ResourceLimits, SecretString, SelfHostConfig, SlackConfig,
@@ -127,6 +128,7 @@ fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
         blob_dir: blobs,
         secret_encryption_key: [7; 32],
         poll_interval: std::time::Duration::from_secs(300),
+        routing_key_order: RoutingKeyOrder::MonthYearSourceContainerPublished,
         api_tokens: vec![ApiTokenConfig {
             token: SecretString::new("test-api-token").unwrap(),
             scopes: vec!["read:persons".into(), "read:timeline".into()],
@@ -153,11 +155,11 @@ fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
             refresh_token: None,
             presentation_ids: vec!["pres123".into()],
         }],
-        slide_analysis_limit: 10,
-        slide_ai: SlideAiConfig {
+        slide_analysis_limit: Some(10),
+        slide_ai: Some(SlideAiConfig {
             api_key: SecretString::new("test-gemini-key").unwrap(),
             model: "test-gemini-model".into(),
-        },
+        }),
     }
 }
 

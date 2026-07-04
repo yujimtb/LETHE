@@ -19,6 +19,7 @@ lethe-policy = { path = "../../crates/policy" }
 lethe-profile-model = { path = "../../crates/profile-model" }
 lethe-projection-person = { path = "../../crates/projections/person" }
 lethe-registry = { path = "../../crates/registry" }
+lethe-runtime = { path = "../../crates/runtime" }
 lethe-storage-api = { path = "../../crates/storage/api" }
 lethe-storage-sqlite = { path = "../../crates/storage/sqlite" }
 regex.workspace = true

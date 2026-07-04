@@ -27,6 +27,7 @@ use lethe_core::domain::{
 };
 use lethe_derivation_gemini::GeminiSlideAnalyzer;
 use lethe_policy::governance::audit::InMemoryAuditLog;
+use lethe_runtime::runtime::partition::RoutingKeyOrder;
 use lethe_storage_sqlite::persistence::SqlitePersistence;
 
 #[test]
@@ -144,6 +145,7 @@ fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
         blob_dir: blobs,
         secret_encryption_key: [7; 32],
         poll_interval: std::time::Duration::from_secs(300),
+        routing_key_order: RoutingKeyOrder::MonthYearSourceContainerPublished,
         api_tokens: vec![ApiTokenConfig {
             token: SecretString::new("test-api-token").unwrap(),
             scopes: vec!["*".into()],
@@ -170,11 +172,11 @@ fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
             refresh_token: None,
             presentation_ids: vec!["pres123".into()],
         }],
-        slide_analysis_limit: 10,
-        slide_ai: SlideAiConfig {
+        slide_analysis_limit: Some(10),
+        slide_ai: Some(SlideAiConfig {
             api_key: SecretString::new("test-gemini-key").unwrap(),
             model: "test-gemini-model".into(),
-        },
+        }),
     }
 }
 
@@ -424,11 +426,12 @@ fn ingest_draft_duplicate_is_decided_by_persistence_without_cache_append() {
             config: config.google_sources[0].clone(),
             client: HttpGoogleSlidesClient::new(&config.google_sources[0]).unwrap(),
         }],
-        slide_analyzer: GeminiSlideAnalyzer::new(
-            config.slide_ai.api_key.expose(),
-            &config.slide_ai.model,
-        )
-        .unwrap(),
+        slide_analyzer: config
+            .slide_ai
+            .as_ref()
+            .map(|slide_ai| GeminiSlideAnalyzer::new(slide_ai.api_key.expose(), &slide_ai.model))
+            .transpose()
+            .unwrap(),
         resilient_executor: Arc::new(ResilientExecutor::new(
             3,
             std::time::Duration::from_secs(60),

@@ -24,6 +24,24 @@ pub fn seed_registry() -> RegistryStore {
             source_class: SourceClass::MutableMultimodal,
         })
         .unwrap();
+    registry
+        .register_source_system(SourceSystem {
+            id: SourceSystemRef::new("sys:claude-ai"),
+            name: "claude.ai".into(),
+            provider: Some("Anthropic".into()),
+            api_version: None,
+            source_class: SourceClass::ImmutableText,
+        })
+        .unwrap();
+    registry
+        .register_source_system(SourceSystem {
+            id: SourceSystemRef::new("sys:github"),
+            name: "GitHub".into(),
+            provider: Some("GitHub".into()),
+            api_version: Some("v3".into()),
+            source_class: SourceClass::ImmutableText,
+        })
+        .unwrap();
 
     registry
         .register_observer(Observer {
@@ -37,6 +55,34 @@ pub fn seed_registry() -> RegistryStore {
                 SchemaRef::new("schema:slack-channel-snapshot"),
                 SchemaRef::new("schema:observer-heartbeat"),
             ],
+            authority_model: AuthorityModel::LakeAuthoritative,
+            capture_model: CaptureModel::Event,
+            owner: "lethe".into(),
+            trust_level: TrustLevel::Automated,
+        })
+        .unwrap();
+    registry
+        .register_observer(Observer {
+            id: ObserverRef::new("obs:claude-ai-importer"),
+            name: "claude.ai Importer".into(),
+            observer_type: ObserverType::Crawler,
+            source_system: SourceSystemRef::new("sys:claude-ai"),
+            adapter_version: SemVer::new("1.0.0"),
+            schemas: vec![SchemaRef::new("schema:claude-message")],
+            authority_model: AuthorityModel::LakeAuthoritative,
+            capture_model: CaptureModel::Event,
+            owner: "lethe".into(),
+            trust_level: TrustLevel::Automated,
+        })
+        .unwrap();
+    registry
+        .register_observer(Observer {
+            id: ObserverRef::new("obs:github-importer"),
+            name: "GitHub Importer".into(),
+            observer_type: ObserverType::Crawler,
+            source_system: SourceSystemRef::new("sys:github"),
+            adapter_version: SemVer::new("1.0.0"),
+            schemas: vec![SchemaRef::new("schema:github-event")],
             authority_model: AuthorityModel::LakeAuthoritative,
             capture_model: CaptureModel::Event,
             owner: "lethe".into(),
@@ -137,6 +183,30 @@ pub fn seed_projection_catalog() -> ProjectionCatalog {
 
 fn base_schemas() -> Vec<ObservationSchema> {
     vec![
+        ObservationSchema {
+            id: SchemaRef::new("schema:claude-message"),
+            name: "claude.ai Message".into(),
+            version: SemVer::new("1.0.0"),
+            subject_type: EntityTypeRef::new("et:message"),
+            target_type: None,
+            payload_schema: serde_json::json!({"type": "object"}),
+            source_contracts: vec![],
+            attachment_config: None,
+            registered_by: None,
+            registered_at: None,
+        },
+        ObservationSchema {
+            id: SchemaRef::new("schema:github-event"),
+            name: "GitHub Event".into(),
+            version: SemVer::new("1.0.0"),
+            subject_type: EntityTypeRef::new("et:*"),
+            target_type: None,
+            payload_schema: serde_json::json!({"type": "object"}),
+            source_contracts: vec![],
+            attachment_config: None,
+            registered_by: None,
+            registered_at: None,
+        },
         ObservationSchema {
             id: SchemaRef::new("schema:slack-message"),
             name: "Slack Message".into(),
