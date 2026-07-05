@@ -54,6 +54,17 @@ git -C "D:\userdata\docs\private\claude-source-archive" log -1 --oneline
 - 実会話 JSONL の手動削除テストは実施していない。ユーザーの実データを削除する操作になるため。
 - 代替 evidence として、削除伝播しない同期オプション、archive 側の実ファイル存在、手動同期成功、日次タスク成功を確認済み。
 
+## 追加確認 2026-07-06
+
+- source 側の Codex sessions が archive 側より 7 件多い状態を検出した。
+  - source `~/.codex/sessions`: 210 files
+  - archive `codex/sessions`: 203 files
+- `sync-agent-sessions.ps1` を手動実行し、差分 7 件を archive に追加した。
+  - Commit: `5e38c8f Archive agent sessions 2026-07-06 00:05:38 +09:00`
+  - Result: `codex/sessions` 203 -> 210 files
+- 同期後、source `~/.codex/sessions` と archive `codex/sessions` は 210 files で一致している。
+- archive repository working tree は clean。
+
 ## SHALL evidence
 
 | Requirement | Judgement | Evidence |
