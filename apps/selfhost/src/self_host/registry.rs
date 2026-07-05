@@ -1,7 +1,9 @@
 use lethe_core::domain::*;
 use lethe_engine::projection::catalog::ProjectionCatalog;
 use lethe_engine::projection::spec::*;
-use lethe_registry::registry::{ObservationSchema, Observer, RegistryStore, SourceSystem};
+use lethe_registry::registry::{
+    ObservationSchema, Observer, RegistryStore, SourceSystem, base_supplemental_kind_schemas,
+};
 
 pub fn seed_registry() -> RegistryStore {
     let mut registry = RegistryStore::new();
@@ -35,10 +37,28 @@ pub fn seed_registry() -> RegistryStore {
         .unwrap();
     registry
         .register_source_system(SourceSystem {
+            id: SourceSystemRef::new("sys:claude-code"),
+            name: "Claude Code".into(),
+            provider: Some("Anthropic".into()),
+            api_version: None,
+            source_class: SourceClass::ImmutableText,
+        })
+        .unwrap();
+    registry
+        .register_source_system(SourceSystem {
             id: SourceSystemRef::new("sys:github"),
             name: "GitHub".into(),
             provider: Some("GitHub".into()),
             api_version: Some("v3".into()),
+            source_class: SourceClass::ImmutableText,
+        })
+        .unwrap();
+    registry
+        .register_source_system(SourceSystem {
+            id: SourceSystemRef::new("sys:codex"),
+            name: "Codex".into(),
+            provider: Some("OpenAI".into()),
+            api_version: None,
             source_class: SourceClass::ImmutableText,
         })
         .unwrap();
@@ -107,6 +127,34 @@ pub fn seed_registry() -> RegistryStore {
             source_system: SourceSystemRef::new("sys:github"),
             adapter_version: SemVer::new("1.0.0"),
             schemas: vec![SchemaRef::new("schema:github-event")],
+            authority_model: AuthorityModel::LakeAuthoritative,
+            capture_model: CaptureModel::Event,
+            owner: "lethe".into(),
+            trust_level: TrustLevel::Automated,
+        })
+        .unwrap();
+    registry
+        .register_observer(Observer {
+            id: ObserverRef::new("obs:claude-code-importer"),
+            name: "Claude Code Importer".into(),
+            observer_type: ObserverType::Crawler,
+            source_system: SourceSystemRef::new("sys:claude-code"),
+            adapter_version: SemVer::new("1.0.0"),
+            schemas: vec![SchemaRef::new("schema:coding-agent-message")],
+            authority_model: AuthorityModel::LakeAuthoritative,
+            capture_model: CaptureModel::Event,
+            owner: "lethe".into(),
+            trust_level: TrustLevel::Automated,
+        })
+        .unwrap();
+    registry
+        .register_observer(Observer {
+            id: ObserverRef::new("obs:codex-importer"),
+            name: "Codex Importer".into(),
+            observer_type: ObserverType::Crawler,
+            source_system: SourceSystemRef::new("sys:codex"),
+            adapter_version: SemVer::new("1.0.0"),
+            schemas: vec![SchemaRef::new("schema:coding-agent-message")],
             authority_model: AuthorityModel::LakeAuthoritative,
             capture_model: CaptureModel::Event,
             owner: "lethe".into(),
@@ -235,6 +283,9 @@ pub fn seed_registry() -> RegistryStore {
     for schema in base_schemas() {
         registry.register_schema(schema).unwrap();
     }
+    for schema in base_supplemental_kind_schemas() {
+        registry.register_supplemental_kind_schema(schema).unwrap();
+    }
 
     registry
 }
@@ -245,6 +296,7 @@ pub fn seed_projection_catalog() -> ProjectionCatalog {
     catalog.register(person_page_spec()).unwrap();
     catalog.register(slide_analysis_spec()).unwrap();
     catalog.register(corpus_spec()).unwrap();
+    catalog.register(claim_queue_spec()).unwrap();
     catalog.register(answer_log_spec()).unwrap();
     catalog.set_status(
         &ProjectionRef::new("proj:identity-resolution"),
@@ -259,6 +311,10 @@ pub fn seed_projection_catalog() -> ProjectionCatalog {
         ProjectionStatus::Active,
     );
     catalog.set_status(&ProjectionRef::new("proj:corpus"), ProjectionStatus::Active);
+    catalog.set_status(
+        &ProjectionRef::new("proj:claim-queue"),
+        ProjectionStatus::Active,
+    );
     catalog.set_status(
         &ProjectionRef::new("proj:answer-log"),
         ProjectionStatus::Active,
@@ -285,6 +341,18 @@ fn base_schemas() -> Vec<ObservationSchema> {
             name: "GitHub Event".into(),
             version: SemVer::new("1.0.0"),
             subject_type: EntityTypeRef::new("et:*"),
+            target_type: None,
+            payload_schema: serde_json::json!({"type": "object"}),
+            source_contracts: vec![],
+            attachment_config: None,
+            registered_by: None,
+            registered_at: None,
+        },
+        ObservationSchema {
+            id: SchemaRef::new("schema:coding-agent-message"),
+            name: "Coding Agent Message".into(),
+            version: SemVer::new("1.0.0"),
+            subject_type: EntityTypeRef::new("et:message"),
             target_type: None,
             payload_schema: serde_json::json!({"type": "object"}),
             source_contracts: vec![],
@@ -539,10 +607,7 @@ fn corpus_spec() -> ProjectionSpec {
         kind: ProjectionKind::CachedProjection,
         sources: vec![SourceDecl {
             source: SourceRef::Lake,
-            filter_schemas: vec![
-                SchemaRef::new("schema:slack-message"),
-                SchemaRef::new("schema:workspace-object-snapshot"),
-            ],
+            filter_schemas: vec![],
             filter_derivations: vec![],
         }],
         read_modes: vec![ReadModePolicy {
@@ -596,6 +661,49 @@ fn answer_log_spec() -> ProjectionSpec {
         gap_action: None,
         tags: vec!["workspace-search".into(), "answer-log".into()],
         description: Some("Search bot prior answer log projection".into()),
+        created_by: "self-host".into(),
+    }
+}
+
+fn claim_queue_spec() -> ProjectionSpec {
+    ProjectionSpec {
+        id: ProjectionRef::new("proj:claim-queue"),
+        name: "Claim Queue".into(),
+        version: SemVer::new("1.0.0"),
+        kind: ProjectionKind::CachedProjection,
+        sources: vec![SourceDecl {
+            source: SourceRef::Supplemental,
+            filter_schemas: vec![],
+            filter_derivations: vec![
+                "claim@1".into(),
+                "claim-transition@1".into(),
+                "verification-result@1".into(),
+                "decision@1".into(),
+            ],
+        }],
+        read_modes: vec![ReadModePolicy {
+            mode: ReadMode::OperationalLatest,
+            source_policy: "supplemental-latest".into(),
+        }],
+        build: BuildSpec {
+            build_type: "rust".into(),
+            entrypoint: None,
+            projector: "claim-queue".into(),
+        },
+        outputs: vec![OutputSpec {
+            format: "json".into(),
+            tables: vec![
+                "claim_queue_claims".into(),
+                "claim_queue_groups".into(),
+                "decision_views".into(),
+                "claim_queue_audit_log".into(),
+            ],
+        }],
+        reconciliation: None,
+        deterministic_in: vec![],
+        gap_action: None,
+        tags: vec!["claim-queue".into(), "decisions".into()],
+        description: Some("Deduplicated claim queue and decision ledger projection".into()),
         created_by: "self-host".into(),
     }
 }

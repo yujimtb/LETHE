@@ -15,8 +15,9 @@ use super::{
     non_empty_state, ranked_self_intro_slide_indices, thread_cursor_key, thread_root_ts,
 };
 use crate::self_host::config::{
-    ApiTokenConfig, GoogleConfig, ResourceLimits, SecretString, SelfHostConfig, SlackConfig,
-    SlideAiConfig,
+    ApiTokenConfig, CorpusProjectionConfig, GoogleConfig, JsonWebKey, JsonWebKeySet,
+    McpOAuthConfig, ResourceLimits, SecretString, SelfHostConfig, SlackConfig, SlideAiConfig,
+    SupplementalConfig,
 };
 use crate::self_host::google::HttpGoogleSlidesClient;
 use crate::self_host::slack::HttpSlackClient;
@@ -141,6 +142,8 @@ fn latest_revision_to_capture_prefers_newest_revision() {
 fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
     SelfHostConfig {
         bind_addr: "127.0.0.1:0".into(),
+        mcp_bind_addr: "127.0.0.1:0".into(),
+        mcp_oauth: test_mcp_oauth(),
         database_path: db,
         blob_dir: blobs,
         secret_encryption_key: [7; 32],
@@ -157,6 +160,9 @@ fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
             max_page_size: 100,
             max_leaf_observations: 100_000,
             retention_days: 30,
+        },
+        corpus: CorpusProjectionConfig {
+            mode: lethe_projection_corpus::CorpusMode::WorkspaceFiltered,
         },
         slack_sources: vec![SlackConfig {
             id: "slack-test".into(),
@@ -177,6 +183,32 @@ fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
             api_key: SecretString::new("test-gemini-key").unwrap(),
             model: "test-gemini-model".into(),
         }),
+        supplemental: SupplementalConfig {
+            reject_unregistered_kinds: true,
+        },
+    }
+}
+
+fn test_mcp_oauth() -> McpOAuthConfig {
+    McpOAuthConfig {
+        resource_url: "https://mcp.example.test".into(),
+        protected_resource_metadata_url:
+            "https://mcp.example.test/.well-known/oauth-protected-resource".into(),
+        issuer: "https://issuer.example.test/".into(),
+        audience: "lethe-test".into(),
+        jwks_path: PathBuf::from("test-jwks.json"),
+        jwks: JsonWebKeySet {
+            keys: vec![JsonWebKey {
+                kty: "EC".into(),
+                kid: "test-key".into(),
+                alg: Some("ES256".into()),
+                crv: Some("P-256".into()),
+                x: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()),
+                y: Some("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into()),
+                n: None,
+                e: None,
+            }],
+        },
     }
 }
 

@@ -27,7 +27,8 @@ use lethe_api::api::pagination::{PaginatedResponse, PaginationParams, paginate};
 use lethe_api::api::read_mode::{ReadModeError, ReadModeResolver};
 use lethe_core::domain::{
     ActorRef, AuthorityModel, BlobRef, CaptureModel, EntityRef, IngestResult, Observation,
-    ObserverRef, ProjectionRef, ProjectionStatus, ReadMode, SchemaRef, SemVer, SourceSystemRef,
+    ObserverRef, ProjectionHealth, ProjectionRef, ProjectionStatus, ReadMode, SchemaRef, SemVer,
+    SourceSystemRef,
 };
 use lethe_derivation_gemini::{GeminiSlideAnalyzer, SlideAnalysisProjector};
 use lethe_engine::identity::projector::IdentityProjector;
@@ -48,7 +49,8 @@ use lethe_profile_model::{
     GalleryImage, ImageCoordinates, ProfilePic, SlideAnalysisResult, StudentProfile,
 };
 use lethe_projection_answer_log::{AnswerLogProjector, AnswerLogRecord};
-use lethe_projection_corpus::{CorpusProjector, CorpusRecord};
+use lethe_projection_claim_queue::{ClaimQueueProjection, ClaimQueueProjector};
+use lethe_projection_corpus::{CorpusConfig, CorpusProjector, CorpusRecord};
 use lethe_projection_person::person_page::projector::PersonPageProjector;
 use lethe_projection_person::person_page::types::{
     PersonDetailResponse, PersonListItem, PersonPageOutput, TimelineEvent,
@@ -74,6 +76,18 @@ pub enum SelfHostError {
     Policy(String),
     #[error("authentication failed: {0}")]
     Auth(String),
+    #[error("projection stale: {0}")]
+    ProjectionStale(String),
+    #[error("supplemental validation failed: {code}")]
+    SupplementalValidation {
+        code: &'static str,
+        detail: serde_json::Value,
+    },
+    #[error("supplemental conflict: {code}")]
+    SupplementalConflict {
+        code: &'static str,
+        detail: serde_json::Value,
+    },
     #[error("internal state lock poisoned")]
     LockPoisoned,
     #[error("ingestion rejected: {0}")]
@@ -124,6 +138,8 @@ pub struct ProjectionSnapshot {
     pub corpus: Vec<CorpusRecord>,
     #[serde(default)]
     pub answer_log: Vec<AnswerLogRecord>,
+    #[serde(default)]
+    pub claim_queue: ClaimQueueProjection,
     pub built_at: DateTime<Utc>,
     pub lineage: LineageManifest,
 }
@@ -135,6 +151,7 @@ impl Default for ProjectionSnapshot {
             person_page: PersonPageOutput::default(),
             corpus: Vec::new(),
             answer_log: Vec::new(),
+            claim_queue: ClaimQueueProjection::default(),
             built_at: Utc::now(),
             lineage: LineageManifest::new(
                 ProjectionRef::new("proj:person-page"),
@@ -152,6 +169,7 @@ pub struct AppCore {
     pub lake: LakeStore,
     pub blobs: BlobStore,
     pub supplemental: SupplementalStore,
+    corpus_config: CorpusConfig,
     pub snapshot: ProjectionSnapshot,
     pub last_sync_at: Option<DateTime<Utc>>,
     pub last_sync_error: Option<String>,
@@ -194,6 +212,7 @@ impl AppCore {
             lake,
             blobs,
             supplemental,
+            corpus_config: CorpusConfig::default(),
             snapshot: ProjectionSnapshot::default(),
             last_sync_at: None,
             last_sync_error: None,
@@ -210,10 +229,18 @@ impl AppCore {
             .next()
             .unwrap_or_default();
         let supplemental_records = self.supplemental.by_kind("slide-analysis");
+        let all_supplemental_records = self
+            .supplemental
+            .list()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
         let person_page =
             PersonPageProjector::project(&identity, self.lake.list(), &supplemental_records);
-        let corpus = CorpusProjector::default_config().project_observations(self.lake.list());
+        let corpus =
+            CorpusProjector::new(self.corpus_config.clone()).project_observations(self.lake.list());
         let answer_log = AnswerLogProjector.project_observations(self.lake.list());
+        let claim_queue = ClaimQueueProjector.project_records(&all_supplemental_records);
         let built_at = Utc::now();
         let lineage = build_person_page_lineage(
             self.lake.list(),
@@ -229,6 +256,7 @@ impl AppCore {
             person_page,
             corpus,
             answer_log,
+            claim_queue,
             built_at,
             lineage,
         };
@@ -243,18 +271,30 @@ impl AppCore {
         self.catalog
             .set_status(&ProjectionRef::new("proj:corpus"), ProjectionStatus::Active);
         self.catalog.set_status(
+            &ProjectionRef::new("proj:claim-queue"),
+            ProjectionStatus::Active,
+        );
+        self.catalog.set_status(
             &ProjectionRef::new("proj:answer-log"),
+            ProjectionStatus::Active,
+        );
+        self.catalog.set_status(
+            &ProjectionRef::new("proj:claim-queue"),
             ProjectionStatus::Active,
         );
     }
 
-    fn empty_with_snapshot(snapshot: Option<ProjectionSnapshot>) -> Self {
+    fn empty_with_snapshot(
+        snapshot: Option<ProjectionSnapshot>,
+        corpus_config: CorpusConfig,
+    ) -> Self {
         let mut core = Self {
             registry: seed_registry(),
             catalog: seed_projection_catalog(),
             lake: LakeStore::new(),
             blobs: BlobStore::new(),
             supplemental: SupplementalStore::new(),
+            corpus_config,
             snapshot: snapshot.unwrap_or_default(),
             last_sync_at: None,
             last_sync_error: None,
@@ -271,7 +311,15 @@ impl AppCore {
         core.catalog
             .set_status(&ProjectionRef::new("proj:corpus"), ProjectionStatus::Active);
         core.catalog.set_status(
+            &ProjectionRef::new("proj:claim-queue"),
+            ProjectionStatus::Active,
+        );
+        core.catalog.set_status(
             &ProjectionRef::new("proj:answer-log"),
+            ProjectionStatus::Active,
+        );
+        core.catalog.set_status(
+            &ProjectionRef::new("proj:claim-queue"),
             ProjectionStatus::Active,
         );
         core
@@ -314,6 +362,23 @@ impl AppCore {
         self.supplemental.upsert_with_rollback(record, &self.lake)
     }
 
+    fn upsert_supplemental_checked<ObservationExists, SupplementalExists>(
+        &mut self,
+        record: lethe_core::domain::SupplementalRecord,
+        observation_exists: ObservationExists,
+        supplemental_exists: SupplementalExists,
+    ) -> Result<lethe_engine::supplemental::store::UpsertRollback, lethe_core::domain::DomainError>
+    where
+        ObservationExists: Fn(&lethe_core::domain::ObservationId) -> bool,
+        SupplementalExists: Fn(&lethe_core::domain::SupplementalId) -> bool,
+    {
+        self.supplemental.upsert_with_rollback_checked(
+            record,
+            observation_exists,
+            supplemental_exists,
+        )
+    }
+
     fn rollback_supplemental(
         &mut self,
         rollback: lethe_engine::supplemental::store::UpsertRollback,
@@ -338,6 +403,7 @@ impl ProjectionSnapshot {
     pub fn build(
         observations: Vec<Observation>,
         persisted_supplementals: Vec<lethe_core::domain::SupplementalRecord>,
+        corpus_config: CorpusConfig,
     ) -> Result<Self, SelfHostError> {
         let mut lake = LakeStore::new();
         for observation in observations {
@@ -361,10 +427,12 @@ impl ProjectionSnapshot {
             .next()
             .unwrap_or_default();
         let supplemental_records = supplemental.by_kind("slide-analysis");
+        let all_supplemental_records = supplemental.list().into_iter().cloned().collect::<Vec<_>>();
         let person_page =
             PersonPageProjector::project(&identity, lake.list(), &supplemental_records);
-        let corpus = CorpusProjector::default_config().project_observations(lake.list());
+        let corpus = CorpusProjector::new(corpus_config).project_observations(lake.list());
         let answer_log = AnswerLogProjector.project_observations(lake.list());
+        let claim_queue = ClaimQueueProjector.project_records(&all_supplemental_records);
         let built_at = Utc::now();
         let lineage = build_person_page_lineage(
             lake.list(),
@@ -380,6 +448,7 @@ impl ProjectionSnapshot {
             person_page,
             corpus,
             answer_log,
+            claim_queue,
             built_at,
             lineage,
         })
@@ -453,7 +522,10 @@ impl AppService {
             .transpose()?;
 
         Ok(Self {
-            core: Arc::new(Mutex::new(AppCore::empty_with_snapshot(persisted_snapshot))),
+            core: Arc::new(Mutex::new(AppCore::empty_with_snapshot(
+                persisted_snapshot,
+                config.corpus.projector_config(),
+            ))),
             persistence: Arc::new(Mutex::new(Box::new(persistence))),
             config: Arc::new(config),
             slack_sources,
@@ -622,18 +694,20 @@ impl AppService {
 }
 
 mod media_support;
-mod projection_api;
+pub(crate) mod projection_api;
 mod service_support;
 mod slide_support;
+mod supplemental_write;
 mod sync;
 mod sync_support;
 
 use media_support::*;
 use service_support::{
-    build_person_page_lineage, build_projection_lineage, consent_status_for_person_id,
-    namespace_draft,
+    build_person_page_lineage, build_projection_lineage, build_supplemental_projection_lineage,
+    consent_status_for_person_id, namespace_draft,
 };
 use slide_support::*;
+pub use supplemental_write::{SupplementalWriteRequest, WriteEnvelope};
 use sync_support::*;
 
 #[cfg(test)]

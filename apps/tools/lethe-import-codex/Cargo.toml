@@ -1,0 +1,9 @@
+[package]
+name = "lethe-import-codex"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lethe-adapter-coding-agent = { path = "../../../crates/adapters/coding-agent" }
+lethe-core = { path = "../../../crates/core" }
+lethe-selfhost = { path = "../../selfhost" }

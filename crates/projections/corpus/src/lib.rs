@@ -13,6 +13,7 @@ pub const CORPUS_PROJECTION_ID: &str = "proj:corpus";
 
 #[derive(Debug, Clone)]
 pub struct CorpusConfig {
+    pub mode: CorpusMode,
     pub channel_allow_regex: Regex,
     pub channel_opt_in: HashSet<String>,
     pub exclude_bot_authors: bool,
@@ -23,9 +24,17 @@ pub struct CorpusConfig {
     pub exclude_form_response_sheets: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CorpusMode {
+    WorkspaceFiltered,
+    PersonalAllText,
+}
+
 impl Default for CorpusConfig {
     fn default() -> Self {
         Self {
+            mode: CorpusMode::WorkspaceFiltered,
             channel_allow_regex: Regex::new(r"^\d{3}_").expect("valid default channel regex"),
             channel_opt_in: HashSet::new(),
             exclude_bot_authors: true,
@@ -78,7 +87,21 @@ impl CorpusProjector {
         Self::new(CorpusConfig::default())
     }
 
+    pub fn personal_all_text_config() -> Self {
+        Self::new(CorpusConfig {
+            mode: CorpusMode::PersonalAllText,
+            ..CorpusConfig::default()
+        })
+    }
+
     pub fn project_observations(&self, observations: &[Observation]) -> Vec<CorpusRecord> {
+        match self.config.mode {
+            CorpusMode::WorkspaceFiltered => self.project_workspace_filtered(observations),
+            CorpusMode::PersonalAllText => self.project_personal_all_text(observations),
+        }
+    }
+
+    fn project_workspace_filtered(&self, observations: &[Observation]) -> Vec<CorpusRecord> {
         let form_response_sheet_ids = observations
             .iter()
             .filter_map(linked_form_sheet_id)
@@ -101,6 +124,20 @@ impl CorpusProjector {
                 _ => {}
             }
         }
+        records.sort_by(|left, right| {
+            right
+                .timestamp
+                .cmp(&left.timestamp)
+                .then_with(|| left.record_id.cmp(&right.record_id))
+        });
+        records
+    }
+
+    fn project_personal_all_text(&self, observations: &[Observation]) -> Vec<CorpusRecord> {
+        let mut records = observations
+            .iter()
+            .filter_map(personal_record)
+            .collect::<Vec<_>>();
         records.sort_by(|left, right| {
             right
                 .timestamp
@@ -451,6 +488,394 @@ fn record(
     }
 }
 
+fn personal_record(observation: &Observation) -> Option<CorpusRecord> {
+    let source_type = personal_source_type(observation);
+    let text = personal_text(observation, &source_type)?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    let thread_key = personal_thread_key(observation, &source_type);
+    let metadata = personal_metadata(observation, &source_type, thread_key.as_deref());
+
+    Some(record(
+        format!("corpus:{source_type}:{}", observation.id.as_str()),
+        &source_type,
+        personal_anchor_url(observation, &source_type),
+        personal_title(observation, &source_type),
+        personal_location(observation, &source_type),
+        observation.published,
+        text,
+        thread_key,
+        personal_container(observation, &source_type),
+        metadata,
+    ))
+}
+
+fn personal_source_type(observation: &Observation) -> String {
+    let source_system = observation
+        .source_system
+        .as_ref()
+        .map(|source| source.as_str());
+    let schema = observation.schema.as_str();
+
+    if matches!(source_system, Some("sys:claude-ai")) || schema == "schema:claude-message" {
+        return "claude-ai".to_owned();
+    }
+    if matches!(source_system, Some("sys:github")) || schema == "schema:github-event" {
+        return github_source_type(&observation.payload).to_owned();
+    }
+    if matches!(source_system, Some("sys:claude-code")) || schema.contains("claude-code") {
+        return "claude-code".to_owned();
+    }
+    if matches!(source_system, Some("sys:codex")) || schema.contains("codex") {
+        return "codex".to_owned();
+    }
+
+    source_system
+        .and_then(|source| source.strip_prefix("sys:"))
+        .map(str::to_owned)
+        .unwrap_or_else(|| schema.strip_prefix("schema:").unwrap_or(schema).to_owned())
+}
+
+fn github_source_type(payload: &serde_json::Value) -> &'static str {
+    match string_at(payload, &["object_type"]).unwrap_or("") {
+        "issue" => "github-issue",
+        "pull_request" => "github-pr",
+        "issue_comment" | "pull_request_review" | "pull_request_review_comment" => "github-comment",
+        "commit" => "github-commit",
+        _ => "github-event",
+    }
+}
+
+fn personal_text(observation: &Observation, source_type: &str) -> Option<String> {
+    match source_type {
+        "claude-ai" => string_at(&observation.payload, &["text"]).map(str::to_owned),
+        "github-issue" | "github-pr" | "github-comment" | "github-commit" | "github-event" => {
+            github_text(&observation.payload)
+        }
+        "claude-code" | "codex" => coding_agent_text(&observation.payload),
+        _ => {
+            let text = value_text(&observation.payload);
+            (!text.trim().is_empty()).then_some(text)
+        }
+    }
+}
+
+fn github_text(payload: &serde_json::Value) -> Option<String> {
+    let parts = match string_at(payload, &["object_type"]).unwrap_or("") {
+        "issue" | "pull_request" => vec![
+            string_at(payload, &["title"]).unwrap_or(""),
+            string_at(payload, &["body"]).unwrap_or(""),
+        ],
+        "issue_comment" | "pull_request_review_comment" => {
+            vec![string_at(payload, &["body"]).unwrap_or("")]
+        }
+        "pull_request_review" => vec![
+            string_at(payload, &["state"]).unwrap_or(""),
+            string_at(payload, &["body"]).unwrap_or(""),
+        ],
+        "commit" => vec![string_at(payload, &["message"]).unwrap_or("")],
+        _ => return Some(value_text(payload)),
+    };
+    let text = parts
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn coding_agent_text(payload: &serde_json::Value) -> Option<String> {
+    let mut parts = Vec::new();
+    for path in [
+        &["text"][..],
+        &["content"][..],
+        &["message"][..],
+        &["tool", "name"][..],
+        &["tool_name"][..],
+        &["target"][..],
+        &["target_ref"][..],
+        &["path"][..],
+        &["pattern"][..],
+    ] {
+        if let Some(value) = string_at(payload, path)
+            && !value.trim().is_empty()
+        {
+            parts.push(value.to_owned());
+        }
+    }
+    if let Some(values) = payload
+        .pointer("/target_refs")
+        .and_then(serde_json::Value::as_array)
+    {
+        parts.extend(
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(ToOwned::to_owned),
+        );
+    }
+    let text = parts.join("\n");
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn personal_anchor_url(observation: &Observation, source_type: &str) -> String {
+    if let Some(url) = string_at(&observation.payload, &["html_url"])
+        .or_else(|| string_at(&observation.payload, &["url"]))
+        .or_else(|| string_at(&observation.payload, &["permalink"]))
+        .or_else(|| string_at(&observation.payload, &["artifact", "canonicalUri"]))
+    {
+        return url.to_owned();
+    }
+
+    match source_type {
+        "claude-ai" => {
+            let conversation = string_at(&observation.payload, &["conversation_uuid"])
+                .unwrap_or(observation.id.as_str());
+            let message = string_at(&observation.payload, &["message_uuid"]).unwrap_or("");
+            format!("claude-ai://conversation/{conversation}/message/{message}")
+        }
+        "github-issue" | "github-pr" | "github-comment" | "github-commit" | "github-event" => {
+            let repo = string_at(&observation.payload, &["repo"]).unwrap_or("unknown");
+            let object_type = string_at(&observation.payload, &["object_type"]).unwrap_or("event");
+            let object_id = string_at(&observation.payload, &["sha"])
+                .map(str::to_owned)
+                .or_else(|| number_like(&observation.payload, "number"))
+                .or_else(|| number_like(&observation.payload, "id"))
+                .or_else(|| string_at(&observation.payload, &["event_key"]).map(str::to_owned))
+                .unwrap_or_else(|| observation.id.as_str().to_owned());
+            format!("github://{repo}/{object_type}/{object_id}")
+        }
+        "claude-code" | "codex" => {
+            let session = coding_session_id(&observation.payload, &observation.meta)
+                .unwrap_or_else(|| observation.id.as_str().to_owned());
+            let message = coding_message_id(&observation.payload, &observation.meta)
+                .unwrap_or_else(|| observation.id.as_str().to_owned());
+            format!("{source_type}://session/{session}/message/{message}")
+        }
+        _ => format!("observation://{}", observation.id.as_str()),
+    }
+}
+
+fn personal_title(observation: &Observation, source_type: &str) -> String {
+    match source_type {
+        "claude-ai" => format!(
+            "claude.ai conversation {}",
+            string_at(&observation.payload, &["conversation_uuid"]).unwrap_or("unknown")
+        ),
+        "github-issue" | "github-pr" => string_at(&observation.payload, &["title"])
+            .unwrap_or("GitHub item")
+            .to_owned(),
+        "github-comment" => format!(
+            "GitHub comment in {}",
+            string_at(&observation.payload, &["repo"]).unwrap_or("unknown")
+        ),
+        "github-commit" => format!(
+            "GitHub commit {}",
+            string_at(&observation.payload, &["sha"]).unwrap_or("unknown")
+        ),
+        "claude-code" | "codex" => format!(
+            "{source_type} session {}",
+            coding_session_id(&observation.payload, &observation.meta)
+                .unwrap_or_else(|| "unknown".to_owned())
+        ),
+        _ => title(observation),
+    }
+}
+
+fn personal_location(observation: &Observation, source_type: &str) -> Option<String> {
+    match source_type {
+        "claude-ai" => string_at(&observation.payload, &["sender"]).map(str::to_owned),
+        "github-issue" | "github-pr" | "github-comment" | "github-commit" | "github-event" => {
+            string_at(&observation.payload, &["object_type"]).map(str::to_owned)
+        }
+        "claude-code" | "codex" => string_at(&observation.payload, &["role"])
+            .or_else(|| string_at(&observation.payload, &["sender"]))
+            .map(str::to_owned),
+        _ => None,
+    }
+}
+
+fn personal_container(observation: &Observation, source_type: &str) -> Option<String> {
+    match source_type {
+        "github-issue" | "github-pr" | "github-comment" | "github-commit" | "github-event" => {
+            string_at(&observation.payload, &["repo"]).map(str::to_owned)
+        }
+        "claude-ai" => string_at(&observation.payload, &["conversation_uuid"]).map(str::to_owned),
+        "claude-code" | "codex" => coding_session_id(&observation.payload, &observation.meta),
+        _ => string_at(&observation.payload, &["artifact", "containerId"]).map(str::to_owned),
+    }
+}
+
+fn personal_thread_key(observation: &Observation, source_type: &str) -> Option<String> {
+    match source_type {
+        "claude-ai" => string_at(&observation.payload, &["conversation_uuid"])
+            .map(|conversation| format!("claude-ai:conversation:{conversation}")),
+        "claude-code" | "codex" => {
+            let session = coding_session_id(&observation.payload, &observation.meta)?;
+            let root = coding_parent_session_id(&observation.payload, &observation.meta)
+                .unwrap_or_else(|| session.clone());
+            Some(format!("{source_type}:session:{root}"))
+        }
+        _ => None,
+    }
+}
+
+fn personal_metadata(
+    observation: &Observation,
+    source_type: &str,
+    thread_key: Option<&str>,
+) -> serde_json::Value {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "observation_id".to_owned(),
+        serde_json::Value::String(observation.id.as_str().to_owned()),
+    );
+    metadata.insert(
+        "schema".to_owned(),
+        serde_json::Value::String(observation.schema.as_str().to_owned()),
+    );
+    metadata.insert(
+        "source_type".to_owned(),
+        serde_json::Value::String(source_type.to_owned()),
+    );
+    if let Some(source_system) = &observation.source_system {
+        metadata.insert(
+            "source_system".to_owned(),
+            serde_json::Value::String(source_system.as_str().to_owned()),
+        );
+    }
+    if let Some(thread_key) = thread_key {
+        metadata.insert(
+            "thread_key".to_owned(),
+            serde_json::Value::String(thread_key.to_owned()),
+        );
+    }
+    if let Some(object_type) = string_at(&observation.payload, &["object_type"]) {
+        metadata.insert(
+            "object_type".to_owned(),
+            serde_json::Value::String(object_type.to_owned()),
+        );
+    }
+    if let Some(repo) = string_at(&observation.payload, &["repo"]) {
+        metadata.insert(
+            "repo".to_owned(),
+            serde_json::Value::String(repo.to_owned()),
+        );
+    }
+    if matches!(source_type, "claude-code" | "codex") {
+        if let Some(session_id) = coding_session_id(&observation.payload, &observation.meta) {
+            metadata.insert(
+                "session_id".to_owned(),
+                serde_json::Value::String(session_id),
+            );
+        }
+        if let Some(parent_session_id) =
+            coding_parent_session_id(&observation.payload, &observation.meta)
+        {
+            metadata.insert(
+                "parent_session_id".to_owned(),
+                serde_json::Value::String(parent_session_id),
+            );
+        }
+        metadata.insert(
+            "is_sidechain".to_owned(),
+            serde_json::Value::Bool(coding_is_sidechain(&observation.payload, &observation.meta)),
+        );
+        if let Some(message_id) = coding_message_id(&observation.payload, &observation.meta) {
+            metadata.insert(
+                "message_id".to_owned(),
+                serde_json::Value::String(message_id),
+            );
+        }
+        if let Some(parent_message_id) =
+            string_owned_at(&observation.payload, &["parent_message_uuid"])
+                .or_else(|| string_owned_at(&observation.payload, &["parent_message_id"]))
+        {
+            metadata.insert(
+                "parent_message_id".to_owned(),
+                serde_json::Value::String(parent_message_id),
+            );
+        }
+    }
+    serde_json::Value::Object(metadata)
+}
+
+fn number_like(payload: &serde_json::Value, field: &str) -> Option<String> {
+    payload.get(field).and_then(|value| {
+        value
+            .as_i64()
+            .map(|value| value.to_string())
+            .or_else(|| value.as_str().map(str::to_owned))
+    })
+}
+
+fn coding_session_id(payload: &serde_json::Value, meta: &serde_json::Value) -> Option<String> {
+    first_string_owned(
+        payload,
+        meta,
+        &[
+            &["session_id"][..],
+            &["sessionId"][..],
+            &["session", "id"][..],
+            &["session", "session_id"][..],
+        ],
+    )
+}
+
+fn coding_parent_session_id(
+    payload: &serde_json::Value,
+    meta: &serde_json::Value,
+) -> Option<String> {
+    first_string_owned(
+        payload,
+        meta,
+        &[
+            &["parent_session_id"][..],
+            &["parentSessionId"][..],
+            &["parent_session"][..],
+            &["session", "parent_session_id"][..],
+            &["sidechain", "parent_session_id"][..],
+        ],
+    )
+}
+
+fn coding_message_id(payload: &serde_json::Value, meta: &serde_json::Value) -> Option<String> {
+    first_string_owned(
+        payload,
+        meta,
+        &[
+            &["message_uuid"][..],
+            &["message_id"][..],
+            &["messageId"][..],
+            &["uuid"][..],
+        ],
+    )
+}
+
+fn coding_is_sidechain(payload: &serde_json::Value, meta: &serde_json::Value) -> bool {
+    bool_at(payload, &["is_sidechain"])
+        .or_else(|| bool_at(payload, &["sidechain"]))
+        .or_else(|| bool_at(meta, &["is_sidechain"]))
+        .unwrap_or_else(|| coding_parent_session_id(payload, meta).is_some())
+}
+
+fn first_string_owned(
+    payload: &serde_json::Value,
+    meta: &serde_json::Value,
+    paths: &[&[&str]],
+) -> Option<String> {
+    paths
+        .iter()
+        .find_map(|path| string_owned_at(payload, path))
+        .or_else(|| paths.iter().find_map(|path| string_owned_at(meta, path)))
+}
+
+fn string_owned_at(value: &serde_json::Value, path: &[&str]) -> Option<String> {
+    string_at(value, path).map(str::to_owned)
+}
+
 fn title(observation: &Observation) -> String {
     string_at(&observation.payload, &["title"])
         .unwrap_or("Untitled")
@@ -547,12 +972,20 @@ mod tests {
     use lethe_core::domain::*;
 
     fn obs(schema: &str, payload: serde_json::Value) -> Observation {
+        obs_with_source(schema, None, payload)
+    }
+
+    fn obs_with_source(
+        schema: &str,
+        source_system: Option<&str>,
+        payload: serde_json::Value,
+    ) -> Observation {
         Observation {
             id: Observation::new_id(),
             schema: SchemaRef::new(schema),
             schema_version: SemVer::new("1.0.0"),
             observer: ObserverRef::new("obs:test"),
-            source_system: None,
+            source_system: source_system.map(SourceSystemRef::new),
             actor: None,
             authority_model: AuthorityModel::LakeAuthoritative,
             capture_model: CaptureModel::Event,
@@ -853,6 +1286,129 @@ mod tests {
         );
 
         assert!(projector.project_observations(&[answer]).is_empty());
+    }
+
+    #[test]
+    fn personal_all_text_indexes_personal_lake_source_types() {
+        let projector = CorpusProjector::personal_all_text_config();
+        let records = projector.project_observations(&[
+            obs_with_source(
+                "schema:claude-message",
+                Some("sys:claude-ai"),
+                serde_json::json!({
+                    "conversation_uuid": "conv-1",
+                    "message_uuid": "msg-1",
+                    "sender": "human",
+                    "text": "needle claude ai"
+                }),
+            ),
+            obs_with_source(
+                "schema:github-event",
+                Some("sys:github"),
+                serde_json::json!({
+                    "object_type": "issue",
+                    "repo": "owner/repo",
+                    "number": 1,
+                    "title": "needle issue",
+                    "body": "body"
+                }),
+            ),
+            obs_with_source(
+                "schema:github-event",
+                Some("sys:github"),
+                serde_json::json!({
+                    "object_type": "pull_request",
+                    "repo": "owner/repo",
+                    "number": 2,
+                    "title": "needle pr",
+                    "body": "body"
+                }),
+            ),
+            obs_with_source(
+                "schema:github-event",
+                Some("sys:github"),
+                serde_json::json!({
+                    "object_type": "issue_comment",
+                    "repo": "owner/repo",
+                    "id": 3,
+                    "body": "needle comment"
+                }),
+            ),
+            obs_with_source(
+                "schema:github-event",
+                Some("sys:github"),
+                serde_json::json!({
+                    "object_type": "commit",
+                    "repo": "owner/repo",
+                    "sha": "abc",
+                    "message": "needle commit"
+                }),
+            ),
+            obs_with_source(
+                "schema:claude-code-message",
+                Some("sys:claude-code"),
+                serde_json::json!({
+                    "session_id": "main-session",
+                    "message_uuid": "cc-1",
+                    "role": "assistant",
+                    "text": "needle claude code"
+                }),
+            ),
+            obs_with_source(
+                "schema:codex-message",
+                Some("sys:codex"),
+                serde_json::json!({
+                    "session_id": "codex-session",
+                    "message_uuid": "codex-1",
+                    "role": "assistant",
+                    "text": "needle codex"
+                }),
+            ),
+        ]);
+
+        let source_types = records
+            .iter()
+            .map(|record| record.source_type.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            source_types,
+            std::collections::BTreeSet::from([
+                "claude-ai",
+                "github-issue",
+                "github-pr",
+                "github-comment",
+                "github-commit",
+                "claude-code",
+                "codex",
+            ])
+        );
+    }
+
+    #[test]
+    fn personal_all_text_preserves_coding_agent_sidechain_metadata() {
+        let projector = CorpusProjector::personal_all_text_config();
+        let records = projector.project_observations(&[obs_with_source(
+            "schema:claude-code-message",
+            Some("sys:claude-code"),
+            serde_json::json!({
+                "session_id": "child-session",
+                "parent_session_id": "main-session",
+                "is_sidechain": true,
+                "message_uuid": "child-message",
+                "role": "assistant",
+                "text": "sidechain finding"
+            }),
+        )]);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source_type, "claude-code");
+        assert_eq!(
+            records[0].metadata["thread_key"],
+            "claude-code:session:main-session"
+        );
+        assert_eq!(records[0].metadata["session_id"], "child-session");
+        assert_eq!(records[0].metadata["parent_session_id"], "main-session");
+        assert_eq!(records[0].metadata["is_sidechain"], true);
     }
 
     #[test]

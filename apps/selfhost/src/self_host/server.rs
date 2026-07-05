@@ -7,17 +7,21 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 
-use crate::self_host::app::{AppService, SelfHostError};
+use crate::self_host::app::{AppService, SelfHostError, SupplementalWriteRequest, WriteEnvelope};
 use lethe_api::api::envelope::{ErrorResponse, ResponseEnvelope};
 use lethe_api::api::health::HealthResponse;
 use lethe_api::api::pagination::PaginationParams;
 use lethe_core::domain::BlobRef;
+use lethe_projection_claim_queue::ClaimState;
 
 pub fn build_router(service: AppService) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/health/deep", get(deep_health))
         .route("/admin/sync", post(sync_now))
+        .route("/projections/claim-queue", get(claim_queue))
+        .route("/projections/decisions", get(decisions))
+        .route("/supplementals", post(create_supplemental))
         .route(
             "/api/projections/{projection_id}/blobs/{blob_hash}",
             get(projection_blob),
@@ -79,6 +83,19 @@ struct PersonsQuery {
     pagination: PaginationParams,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct ClaimQueueQuery {
+    state: Option<ClaimState>,
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct DecisionsQuery {
+    q: Option<String>,
+    limit: Option<usize>,
+}
+
 async fn health(State(service): State<AppService>) -> Result<Json<HealthResponse>, ApiError> {
     Ok(Json(service.health()?))
 }
@@ -100,6 +117,51 @@ async fn sync_now(
         .await
         .map_err(|err| ApiError::internal(err.to_string()))??;
     Ok(Json(report))
+}
+
+async fn claim_queue(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Query(query): Query<ClaimQueueQuery>,
+) -> Result<Json<ResponseEnvelope<crate::self_host::app::projection_api::ClaimQueuePage>>, ApiError>
+{
+    service.authorize_headers(&headers, "read:corpus")?;
+    Ok(Json(service.claim_queue_response(
+        query.state,
+        query.limit.unwrap_or(20),
+        query.cursor.as_deref(),
+    )?))
+}
+
+async fn decisions(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Query(query): Query<DecisionsQuery>,
+) -> Result<
+    Json<ResponseEnvelope<crate::self_host::app::projection_api::DecisionSearchPage>>,
+    ApiError,
+> {
+    service.authorize_headers(&headers, "read:corpus")?;
+    Ok(Json(service.decision_search_response(
+        query.q.as_deref(),
+        query.limit.unwrap_or(20),
+    )?))
+}
+
+async fn create_supplemental(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Json(request): Json<SupplementalWriteRequest>,
+) -> Result<
+    (
+        StatusCode,
+        Json<WriteEnvelope<lethe_core::domain::SupplementalRecord>>,
+    ),
+    ApiError,
+> {
+    service.authorize_headers(&headers, "write:supplemental")?;
+    let record = service.write_supplemental(request)?;
+    Ok((StatusCode::CREATED, Json(WriteEnvelope { data: record })))
 }
 
 async fn projection_blob(
@@ -304,6 +366,20 @@ impl ApiError {
             body: ErrorResponse::internal_server_error(&detail),
         }
     }
+
+    fn unprocessable_entity(code: &'static str, detail: serde_json::Value) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            body: ErrorResponse::unprocessable_entity(code, detail),
+        }
+    }
+
+    fn conflict(code: &'static str, detail: serde_json::Value) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            body: ErrorResponse::conflict(code, detail),
+        }
+    }
 }
 
 impl From<SelfHostError> for ApiError {
@@ -329,6 +405,14 @@ impl From<SelfHostError> for ApiError {
                     body
                 },
             },
+            SelfHostError::ProjectionStale(detail) => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                body: ErrorResponse::projection_stale(&detail, 30),
+            },
+            SelfHostError::SupplementalValidation { code, detail } => {
+                Self::unprocessable_entity(code, detail)
+            }
+            SelfHostError::SupplementalConflict { code, detail } => Self::conflict(code, detail),
             other => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 body: ErrorResponse::internal_server_error(&other.to_string()),
@@ -383,7 +467,7 @@ fn ensure_projection_answer_log(projection_id: &str) -> Result<(), ApiError> {
 
 fn ensure_known_projection(projection_id: &str) -> Result<(), ApiError> {
     match projection_id {
-        "proj:person-page" | "proj:corpus" | "proj:answer-log" => Ok(()),
+        "proj:person-page" | "proj:corpus" | "proj:answer-log" | "proj:claim-queue" => Ok(()),
         _ => Err(ApiError::not_found()),
     }
 }

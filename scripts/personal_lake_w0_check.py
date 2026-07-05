@@ -29,6 +29,7 @@ EXPECTED_ROUTING_AXES = [
 ]
 EXPECTED_ROUTING_VERSION = "routing-keyspec/v1"
 EXPECTED_IDENTITY_VERSION = "identity-keyspec/v1"
+EXPECTED_CORPUS_MODE = "personal_all_text"
 
 
 def main() -> int:
@@ -100,6 +101,24 @@ def verify_config(config: dict[str, Any], config_path: Path) -> None:
         value = required_value(sources, source_key, config_path)
         if value != []:
             fail(f"{config_path}: sources.{source_key} must be an empty array")
+
+    corpus = required_table(config, "corpus", config_path)
+    mode = required_value(corpus, "mode", config_path)
+    if mode != EXPECTED_CORPUS_MODE:
+        fail(
+            f"{config_path}: corpus.mode is {mode!r}; "
+            f"expected {EXPECTED_CORPUS_MODE!r}"
+        )
+
+    tokens = required_value(config, "api_tokens", config_path)
+    if not isinstance(tokens, list):
+        fail(f"{config_path}: api_tokens must be a list")
+    if not any(
+        isinstance(token, dict)
+        and "read:corpus" in token.get("scopes", [])
+        for token in tokens
+    ):
+        fail(f"{config_path}: at least one api token must include read:corpus")
 
 
 def verify_deep_health(

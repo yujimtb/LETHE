@@ -1,4 +1,25 @@
 use super::*;
+use lethe_projection_claim_queue::{ClaimGroup, ClaimState, DecisionView, ProjectionAuditEvent};
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClaimQueuePage {
+    pub groups: Vec<ClaimGroup>,
+    pub total: usize,
+    pub limit: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub audit_log: Vec<ProjectionAuditEvent>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DecisionSearchPage {
+    pub query: String,
+    pub matches: Vec<DecisionView>,
+    pub total: usize,
+    pub limit: usize,
+    pub audit_log: Vec<ProjectionAuditEvent>,
+}
 
 impl AppService {
     pub fn persons_response(
@@ -346,18 +367,10 @@ impl AppService {
 
     pub fn corpus_thread_response(
         &self,
-        thread_ts: &str,
+        thread_ref: &str,
     ) -> Result<ResponseEnvelope<lethe_api::api::grep::ThreadResponse>, SelfHostError> {
         let core = self.core_lock()?;
-        let records = core
-            .snapshot
-            .corpus
-            .iter()
-            .filter(|record| record.source_type == "slack")
-            .filter(|record| record.thread_ts.as_deref() == Some(thread_ts))
-            .cloned()
-            .map(grep_record_from_corpus)
-            .collect::<Vec<_>>();
+        let response = build_corpus_thread_response(&core.snapshot.corpus, thread_ref)?;
         let lineage = build_projection_lineage(
             "proj:corpus",
             core.lake.list(),
@@ -365,10 +378,7 @@ impl AppService {
             core.snapshot.built_at,
         );
         Ok(ResponseEnvelope {
-            data: lethe_api::api::grep::ThreadResponse {
-                thread_ts: thread_ts.to_owned(),
-                records,
-            },
+            data: response,
             projection_metadata: self.projection_metadata(
                 &core.catalog,
                 "proj:corpus",
@@ -450,6 +460,143 @@ impl AppService {
             )?,
         })
     }
+
+    pub fn claim_queue_response(
+        &self,
+        state: Option<ClaimState>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ResponseEnvelope<ClaimQueuePage>, SelfHostError> {
+        self.claim_queue_response_filtered(state, None, limit, cursor)
+    }
+
+    pub fn claim_queue_response_filtered(
+        &self,
+        state: Option<ClaimState>,
+        verification_mode: Option<&str>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ResponseEnvelope<ClaimQueuePage>, SelfHostError> {
+        if limit == 0 || limit > self.config.resource_limits.max_page_size {
+            return Err(SelfHostError::ReadMode(format!(
+                "page limit must be between 1 and {}",
+                self.config.resource_limits.max_page_size
+            )));
+        }
+        validate_verification_mode_filter(verification_mode)?;
+        let offset = parse_cursor(cursor)?;
+        let core = self.core_lock()?;
+        self.ensure_projection_fresh(&core.catalog, "proj:claim-queue")?;
+        let mode = self.resolve_read_mode(&core.catalog, "proj:claim-queue", None, None)?;
+        let mut groups = core.snapshot.claim_queue.groups_matching_state(state);
+        if let Some(verification_mode) = verification_mode {
+            for group in &mut groups {
+                group
+                    .members
+                    .retain(|claim| claim.verification_mode == verification_mode);
+            }
+            groups.retain(|group| !group.members.is_empty());
+        }
+        let total = groups.len();
+        let start = offset.min(total);
+        let end = (start + limit).min(total);
+        let next_cursor = if end < total {
+            Some(end.to_string())
+        } else {
+            None
+        };
+        let page = groups[start..end].to_vec();
+        let lineage = build_supplemental_projection_lineage(
+            "proj:claim-queue",
+            &core.supplemental.list(),
+            core.snapshot.claim_queue.claims.len() + core.snapshot.claim_queue.decisions.len(),
+            core.snapshot.built_at,
+        );
+
+        Ok(ResponseEnvelope {
+            data: ClaimQueuePage {
+                groups: page,
+                total,
+                limit,
+                next_cursor,
+                audit_log: core.snapshot.claim_queue.audit_log.clone(),
+            },
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:claim-queue",
+                mode,
+                core.snapshot.built_at,
+                &lineage,
+            )?,
+        })
+    }
+
+    pub fn decision_search_response(
+        &self,
+        query: Option<&str>,
+        limit: usize,
+    ) -> Result<ResponseEnvelope<DecisionSearchPage>, SelfHostError> {
+        if limit == 0 || limit > self.config.resource_limits.max_page_size {
+            return Err(SelfHostError::ReadMode(format!(
+                "page limit must be between 1 and {}",
+                self.config.resource_limits.max_page_size
+            )));
+        }
+        let query = query
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .ok_or_else(|| SelfHostError::ReadMode("q must not be blank".to_owned()))?;
+        let core = self.core_lock()?;
+        self.ensure_projection_fresh(&core.catalog, "proj:claim-queue")?;
+        let mode = self.resolve_read_mode(&core.catalog, "proj:claim-queue", None, None)?;
+        let all_matches = core
+            .snapshot
+            .claim_queue
+            .search_decisions(query, usize::MAX);
+        let total = all_matches.len();
+        let matches = all_matches.into_iter().take(limit).collect::<Vec<_>>();
+        let lineage = build_supplemental_projection_lineage(
+            "proj:claim-queue",
+            &core.supplemental.list(),
+            core.snapshot.claim_queue.claims.len() + core.snapshot.claim_queue.decisions.len(),
+            core.snapshot.built_at,
+        );
+
+        Ok(ResponseEnvelope {
+            data: DecisionSearchPage {
+                query: query.to_owned(),
+                matches,
+                total,
+                limit,
+                audit_log: core.snapshot.claim_queue.audit_log.clone(),
+            },
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:claim-queue",
+                mode,
+                core.snapshot.built_at,
+                &lineage,
+            )?,
+        })
+    }
+}
+
+fn validate_verification_mode_filter(value: Option<&str>) -> Result<(), SelfHostError> {
+    match value {
+        None | Some("check") | Some("generate") => Ok(()),
+        Some(other) => Err(SelfHostError::ReadMode(format!(
+            "invalid verification_mode filter: {other}"
+        ))),
+    }
+}
+
+fn parse_cursor(cursor: Option<&str>) -> Result<usize, SelfHostError> {
+    match cursor {
+        Some(raw) if !raw.trim().is_empty() => raw
+            .parse::<usize>()
+            .map_err(|_| SelfHostError::ReadMode("cursor must be a numeric offset".to_owned())),
+        _ => Ok(0),
+    }
 }
 
 fn grep_record_from_corpus(record: CorpusRecord) -> GrepRecord {
@@ -466,4 +613,226 @@ fn grep_record_from_corpus(record: CorpusRecord) -> GrepRecord {
         container: record.container,
         metadata: record.metadata,
     }
+}
+
+fn build_corpus_thread_response(
+    corpus: &[CorpusRecord],
+    thread_ref: &str,
+) -> Result<lethe_api::api::grep::ThreadResponse, SelfHostError> {
+    if let Some(record) = corpus.iter().find(|record| record.record_id == thread_ref) {
+        if is_coding_agent_record(record) {
+            return coding_agent_thread_response(corpus, record);
+        }
+        if let Some(thread_ts) = record.thread_ts.as_deref() {
+            return slack_thread_response(corpus, thread_ts);
+        }
+        return Ok(lethe_api::api::grep::ThreadResponse {
+            thread_ts: record.record_id.clone(),
+            records: vec![grep_record_from_corpus(record.clone())],
+            structure: None,
+        });
+    }
+    if let Some(record) = corpus.iter().find(|record| {
+        is_coding_agent_record(record) && metadata_str(record, "thread_key") == Some(thread_ref)
+    }) {
+        return coding_agent_thread_response(corpus, record);
+    }
+    if let Some(record) = corpus.iter().find(|record| {
+        is_coding_agent_record(record) && metadata_str(record, "session_id") == Some(thread_ref)
+    }) {
+        return coding_agent_thread_response(corpus, record);
+    }
+
+    slack_thread_response(corpus, thread_ref)
+}
+
+fn slack_thread_response(
+    corpus: &[CorpusRecord],
+    thread_ref: &str,
+) -> Result<lethe_api::api::grep::ThreadResponse, SelfHostError> {
+    let records = corpus
+        .iter()
+        .filter(|record| record.source_type == "slack")
+        .filter(|record| record.thread_ts.as_deref() == Some(thread_ref))
+        .cloned()
+        .map(grep_record_from_corpus)
+        .collect::<Vec<_>>();
+    if records.is_empty() {
+        return Err(SelfHostError::NotFound(thread_ref.to_owned()));
+    }
+    Ok(lethe_api::api::grep::ThreadResponse {
+        thread_ts: thread_ref.to_owned(),
+        records,
+        structure: None,
+    })
+}
+
+fn coding_agent_thread_response(
+    corpus: &[CorpusRecord],
+    seed: &CorpusRecord,
+) -> Result<lethe_api::api::grep::ThreadResponse, SelfHostError> {
+    let source_type = seed.source_type.clone();
+    let seed_session = metadata_owned(seed, "session_id").ok_or_else(|| {
+        SelfHostError::ReadMode(format!(
+            "coding-agent corpus record {} has no session_id metadata",
+            seed.record_id
+        ))
+    })?;
+    let records = corpus
+        .iter()
+        .filter(|record| record.source_type == source_type)
+        .filter(|record| metadata_str(record, "session_id").is_some())
+        .collect::<Vec<_>>();
+    let parent_by_session = parent_session_map(&records)?;
+    let root_session = root_session_for(&seed_session, &parent_by_session)?;
+    let included_sessions = descendant_sessions(&root_session, &parent_by_session);
+
+    let mut thread_records = records
+        .into_iter()
+        .filter(|record| {
+            metadata_str(record, "session_id")
+                .is_some_and(|session_id| included_sessions.contains(session_id))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    thread_records.sort_by(|left, right| {
+        left.timestamp
+            .cmp(&right.timestamp)
+            .then_with(|| left.record_id.cmp(&right.record_id))
+    });
+
+    let mut sessions: BTreeMap<String, lethe_api::api::grep::ThreadSession> = BTreeMap::new();
+    for record in &thread_records {
+        let session_id = metadata_owned(record, "session_id").ok_or_else(|| {
+            SelfHostError::ReadMode(format!(
+                "coding-agent corpus record {} has no session_id metadata",
+                record.record_id
+            ))
+        })?;
+        let parent_session_id = parent_by_session.get(&session_id).cloned().flatten();
+        let is_sidechain = session_id != root_session
+            || metadata_bool(record, "is_sidechain")
+            || parent_session_id.is_some();
+        sessions
+            .entry(session_id.clone())
+            .or_insert_with(|| lethe_api::api::grep::ThreadSession {
+                session_id,
+                parent_session_id,
+                is_sidechain,
+                record_ids: Vec::new(),
+            })
+            .record_ids
+            .push(record.record_id.clone());
+    }
+    if !sessions.contains_key(&root_session) {
+        sessions.insert(
+            root_session.clone(),
+            lethe_api::api::grep::ThreadSession {
+                session_id: root_session.clone(),
+                parent_session_id: parent_by_session.get(&root_session).cloned().flatten(),
+                is_sidechain: false,
+                record_ids: Vec::new(),
+            },
+        );
+    }
+    let root = sessions.remove(&root_session);
+    let sidechains = sessions.into_values().collect::<Vec<_>>();
+    let thread_key = format!("{source_type}:session:{root_session}");
+
+    Ok(lethe_api::api::grep::ThreadResponse {
+        thread_ts: thread_key.clone(),
+        records: thread_records
+            .into_iter()
+            .map(grep_record_from_corpus)
+            .collect(),
+        structure: Some(lethe_api::api::grep::ThreadStructure {
+            thread_key,
+            source_type,
+            root_session: root,
+            sidechains,
+        }),
+    })
+}
+
+fn parent_session_map(
+    records: &[&CorpusRecord],
+) -> Result<BTreeMap<String, Option<String>>, SelfHostError> {
+    let mut parent_by_session = BTreeMap::new();
+    for record in records {
+        let Some(session_id) = metadata_owned(record, "session_id") else {
+            continue;
+        };
+        let parent_session_id = metadata_owned(record, "parent_session_id");
+        match parent_by_session.get(&session_id) {
+            Some(existing) if existing != &parent_session_id => {
+                return Err(SelfHostError::ReadMode(format!(
+                    "conflicting parent_session_id metadata for coding-agent session {session_id}"
+                )));
+            }
+            Some(_) => {}
+            None => {
+                parent_by_session.insert(session_id, parent_session_id);
+            }
+        }
+    }
+    Ok(parent_by_session)
+}
+
+fn root_session_for(
+    seed_session: &str,
+    parent_by_session: &BTreeMap<String, Option<String>>,
+) -> Result<String, SelfHostError> {
+    let mut current = seed_session.to_owned();
+    let mut seen = BTreeSet::new();
+    while let Some(Some(parent)) = parent_by_session.get(&current) {
+        if !seen.insert(current.clone()) {
+            return Err(SelfHostError::ReadMode(format!(
+                "cycle in coding-agent parent_session_id metadata at {current}"
+            )));
+        }
+        current = parent.clone();
+    }
+    Ok(current)
+}
+
+fn descendant_sessions(
+    root_session: &str,
+    parent_by_session: &BTreeMap<String, Option<String>>,
+) -> BTreeSet<String> {
+    let mut included = BTreeSet::from([root_session.to_owned()]);
+    loop {
+        let before = included.len();
+        for (session_id, parent) in parent_by_session {
+            if parent
+                .as_ref()
+                .is_some_and(|parent| included.contains(parent))
+            {
+                included.insert(session_id.clone());
+            }
+        }
+        if included.len() == before {
+            break;
+        }
+    }
+    included
+}
+
+fn is_coding_agent_record(record: &CorpusRecord) -> bool {
+    matches!(record.source_type.as_str(), "claude-code" | "codex")
+}
+
+fn metadata_str<'a>(record: &'a CorpusRecord, key: &str) -> Option<&'a str> {
+    record.metadata.get(key).and_then(serde_json::Value::as_str)
+}
+
+fn metadata_owned(record: &CorpusRecord, key: &str) -> Option<String> {
+    metadata_str(record, key).map(str::to_owned)
+}
+
+fn metadata_bool(record: &CorpusRecord, key: &str) -> bool {
+    record
+        .metadata
+        .get(key)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }

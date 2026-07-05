@@ -12,7 +12,7 @@
 
 ### Requirement: SKIND-01 Supplemental Kind Schema の登録
 
-Registry は ObservationSchema と並行な `SupplementalKindSchema` を保持 SHALL する。各エントリは kind 名、セマンティックバージョン、JSON Schema(payload の必須・任意フィールド定義)を持つ。バージョン規則は既存 Schema Registry と同一(任意フィールド追加 = minor、必須フィールド追加・削除 = major)。
+Registry は ObservationSchema と並行な `SupplementalKindSchema` を保持 SHALL する。各エントリは kind 名、セマンティックバージョン、JSON Schema(payload の必須・任意フィールド定義)を持つ。バージョン規則は既存 Schema Registry と同一(任意フィールド追加 = minor、必須フィールド追加・削除 = major)。record-level 検証では `SupplementalRecord.kind` を `kind@major` 形式(例: `claim@1`)として解釈し、Registry 内では kind 名と major version に分解して取得する。
 
 #### Scenario: kind スキーマの登録と参照
 - **WHEN** `claim@1` の kind スキーマが Registry に登録されている

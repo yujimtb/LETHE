@@ -788,6 +788,7 @@ mod tests {
             },
             corpus: Vec::new(),
             answer_log: Vec::new(),
+            claim_queue: Default::default(),
             built_at: Utc::now(),
             lineage: ProjectionSnapshot::default().lineage,
         };

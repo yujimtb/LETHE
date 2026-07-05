@@ -911,6 +911,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "lethe-adapter-coding-agent"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "lethe-adapter-api",
+ "lethe-core",
+ "lethe-engine",
+ "lethe-registry",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lethe-adapter-gdocs"
 version = "0.1.0"
 dependencies = [
@@ -1042,20 +1055,25 @@ name = "lethe-e2e"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "chrono",
  "lethe-adapter-api",
  "lethe-adapter-claude",
+ "lethe-adapter-coding-agent",
  "lethe-adapter-gslides",
  "lethe-adapter-slack",
  "lethe-api",
  "lethe-core",
  "lethe-engine",
  "lethe-policy",
+ "lethe-projection-claim-queue",
+ "lethe-projection-corpus",
  "lethe-projection-person",
  "lethe-registry",
  "lethe-runtime",
  "lethe-selfhost",
  "lethe-storage-sqlite",
+ "ring",
  "serde_json",
  "tokio",
  "tower",
@@ -1084,6 +1102,24 @@ name = "lethe-import-claude"
 version = "0.1.0"
 dependencies = [
  "lethe-adapter-claude",
+ "lethe-core",
+ "lethe-selfhost",
+]
+
+[[package]]
+name = "lethe-import-claude-code"
+version = "0.1.0"
+dependencies = [
+ "lethe-adapter-coding-agent",
+ "lethe-core",
+ "lethe-selfhost",
+]
+
+[[package]]
+name = "lethe-import-codex"
+version = "0.1.0"
+dependencies = [
+ "lethe-adapter-coding-agent",
  "lethe-core",
  "lethe-selfhost",
 ]
@@ -1120,6 +1156,20 @@ dependencies = [
 
 [[package]]
 name = "lethe-projection-answer-log"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "lethe-core",
+ "lethe-engine",
+ "serde",
+ "serde_json",
+ "sha2",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "lethe-projection-claim-queue"
 version = "0.1.0"
 dependencies = [
  "chrono",
@@ -1200,6 +1250,7 @@ dependencies = [
  "lethe-policy",
  "lethe-profile-model",
  "lethe-projection-answer-log",
+ "lethe-projection-claim-queue",
  "lethe-projection-corpus",
  "lethe-projection-person",
  "lethe-registry",
@@ -1209,6 +1260,7 @@ dependencies = [
  "pretty_assertions",
  "regex",
  "reqwest",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

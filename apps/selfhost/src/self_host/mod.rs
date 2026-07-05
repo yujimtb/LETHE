@@ -2,6 +2,8 @@ pub mod app;
 pub mod config;
 pub mod failover_spool;
 pub mod google;
+pub mod mcp;
+pub mod mcp_contract;
 pub mod registry;
 pub mod server;
 pub mod slack;

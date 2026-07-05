@@ -4,9 +4,12 @@ members = [
     "apps/selfhost",
     "apps/tools/attribute-inventory",
     "apps/tools/lethe-import-claude",
+    "apps/tools/lethe-import-claude-code",
+    "apps/tools/lethe-import-codex",
     "apps/tools/lethe-import-github",
     "crates/adapters/api",
     "crates/adapters/claude",
+    "crates/adapters/coding-agent",
     "crates/adapters/github",
     "crates/adapters/gdocs",
     "crates/adapters/gdrive",
@@ -21,6 +24,7 @@ members = [
     "crates/policy",
     "crates/profile-model",
     "crates/projections/answer-log",
+    "crates/projections/claim-queue",
     "crates/projections/corpus",
     "crates/projections/person",
     "crates/registry",
@@ -44,6 +48,7 @@ jsonschema = "0.29"
 pretty_assertions = "1"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
+ring = "0.17.14"
 rusqlite = { version = "0.34", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

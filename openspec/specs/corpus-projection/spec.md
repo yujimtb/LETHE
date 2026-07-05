@@ -111,3 +111,13 @@ Corpus Projection は M08 Governance の Filtering-before-Exposure Law に準拠
 - **THEN** CORPUS-02〜04 で除外されたレコードは結果に含まれない
 - **AND** Bot は除外されたレコードの存在を知ることができない
 
+### Requirement: CORPUS-07 個人 lake all-text mode
+個人 lake の Corpus Projection は `corpus.mode = "personal_all_text"` で構成 SHALL し、テキストを持つ Observation を source 種別で一部に限定して SHALL NOT ならない。対象には claude.ai 会話、GitHub issue / PR / コメント / commit メッセージ、Claude Code 会話、Codex 会話を含む。
+
+#### Scenario: 個人 lake 横断検索
+- **WHEN** 個人 lake に claude.ai、GitHub issue、GitHub PR、GitHub コメント、GitHub commit、Claude Code、Codex の各 text-bearing Observation が存在する
+- **THEN** Corpus Projection は各 source type の record を生成し、Grep API は同一 query で横断検索できる
+
+#### Scenario: coding-agent sidechain thread
+- **WHEN** coding-agent Observation が `session_id`、`parent_session_id`、`is_sidechain` を持つ
+- **THEN** Corpus Projection record はそれらを metadata に保持し、thread API は root session と sidechain session の構造を返せる

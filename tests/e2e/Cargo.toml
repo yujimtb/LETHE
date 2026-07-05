@@ -6,20 +6,25 @@ publish = false
 
 [dependencies]
 axum.workspace = true
+base64.workspace = true
 chrono.workspace = true
 lethe-adapter-api = { path = "../../crates/adapters/api" }
 lethe-adapter-claude = { path = "../../crates/adapters/claude" }
+lethe-adapter-coding-agent = { path = "../../crates/adapters/coding-agent" }
 lethe-adapter-gslides = { path = "../../crates/adapters/gslides" }
 lethe-adapter-slack = { path = "../../crates/adapters/slack" }
 lethe-api = { path = "../../crates/api" }
 lethe-core = { path = "../../crates/core" }
 lethe-engine = { path = "../../crates/engine" }
 lethe-policy = { path = "../../crates/policy" }
+lethe-projection-claim-queue = { path = "../../crates/projections/claim-queue" }
+lethe-projection-corpus = { path = "../../crates/projections/corpus" }
 lethe-projection-person = { path = "../../crates/projections/person" }
 lethe-registry = { path = "../../crates/registry" }
 lethe-runtime = { path = "../../crates/runtime" }
 lethe-selfhost = { path = "../../apps/selfhost" }
 lethe-storage-sqlite = { path = "../../crates/storage/sqlite" }
+ring.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tower.workspace = true

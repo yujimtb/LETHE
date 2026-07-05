@@ -1,5 +1,6 @@
 use lethe_core::domain::{
-    BlobRef, IdempotencyKey, Observation, ObservationId, ProjectionRef, SupplementalRecord,
+    BlobRef, IdempotencyKey, Observation, ObservationId, ProjectionRef, SupplementalId,
+    SupplementalRecord,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -61,6 +62,7 @@ pub struct SyncMetricRecord {
 
 pub trait ObservationStore: Send {
     fn append_observation(&self, observation: &Observation) -> StorageResult<AppendOutcome>;
+    fn load_observations(&self) -> StorageResult<Vec<Observation>>;
     fn rehome_observation(
         &self,
         observation: &Observation,
@@ -89,6 +91,8 @@ pub trait BlobStore: Send {
 
 pub trait SupplementalStore: Send {
     fn put_supplemental(&self, record: &SupplementalRecord) -> StorageResult<()>;
+    fn load_supplementals(&self) -> StorageResult<Vec<SupplementalRecord>>;
+    fn supplemental_by_id(&self, id: &SupplementalId) -> StorageResult<Option<SupplementalRecord>>;
     fn supplemental_page(
         &self,
         after_created_at: Option<&str>,

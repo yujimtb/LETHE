@@ -8,7 +8,9 @@ use aes_gcm::{Aes256Gcm, Key};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::Digest;
 
-use lethe_core::domain::{BlobRef, IdempotencyKey, Observation, ObservationId, SupplementalRecord};
+use lethe_core::domain::{
+    BlobRef, IdempotencyKey, Observation, ObservationId, SupplementalId, SupplementalRecord,
+};
 use lethe_runtime::runtime::partition::{
     PARTITION_EVENT_FAILOVER, PARTITION_EVENT_INITIALIZE, PARTITION_EVENT_RECOVER,
     PARTITION_EVENT_SPLIT_COMMIT, PARTITION_EVENT_SPLIT_PREPARE, PARTITION_SPLIT_REASON_CAPACITY,
@@ -912,6 +914,23 @@ impl SqlitePersistence {
         Ok(records)
     }
 
+    pub fn supplemental_by_id(
+        &self,
+        id: &SupplementalId,
+    ) -> Result<Option<SupplementalRecord>, PersistenceError> {
+        let json = self
+            .conn
+            .query_row(
+                "SELECT supplemental_json FROM supplementals WHERE id = ?1",
+                [id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        json.map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(PersistenceError::from)
+    }
+
     pub fn materialize_projection(
         &self,
         projection: &lethe_core::domain::ProjectionRef,
@@ -1174,6 +1193,10 @@ impl ObservationStorePort for SqlitePersistence {
             .map_err(storage_error)
     }
 
+    fn load_observations(&self) -> StorageResult<Vec<Observation>> {
+        SqlitePersistence::load_observations(self).map_err(storage_error)
+    }
+
     fn rehome_observation(
         &self,
         observation: &Observation,
@@ -1244,6 +1267,14 @@ impl BlobStorePort for SqlitePersistence {
 impl SupplementalStorePort for SqlitePersistence {
     fn put_supplemental(&self, record: &SupplementalRecord) -> StorageResult<()> {
         self.persist_supplemental(record).map_err(storage_error)
+    }
+
+    fn load_supplementals(&self) -> StorageResult<Vec<SupplementalRecord>> {
+        SqlitePersistence::load_supplementals(self).map_err(storage_error)
+    }
+
+    fn supplemental_by_id(&self, id: &SupplementalId) -> StorageResult<Option<SupplementalRecord>> {
+        SqlitePersistence::supplemental_by_id(self, id).map_err(storage_error)
     }
 
     fn supplemental_page(

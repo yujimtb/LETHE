@@ -1,0 +1,12 @@
+{
+  "keys": [
+    {
+      "kty": "EC",
+      "kid": "replace-with-managed-idp-key-id",
+      "alg": "ES256",
+      "crv": "P-256",
+      "x": "replace-with-base64url-x-coordinate",
+      "y": "replace-with-base64url-y-coordinate"
+    }
+  ]
+}

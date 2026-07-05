@@ -1,15 +1,21 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use lethe_projection_corpus::{CorpusConfig, CorpusMode};
 use lethe_runtime::runtime::partition::RoutingKeyOrder;
 use serde::Deserialize;
 
 #[derive(Debug, Clone)]
 pub struct SelfHostConfig {
     pub bind_addr: String,
+    pub mcp_bind_addr: String,
+    pub mcp_oauth: McpOAuthConfig,
     pub database_path: PathBuf,
     pub blob_dir: PathBuf,
     pub secret_encryption_key: [u8; 32],
@@ -17,16 +23,51 @@ pub struct SelfHostConfig {
     pub routing_key_order: RoutingKeyOrder,
     pub api_tokens: Vec<ApiTokenConfig>,
     pub resource_limits: ResourceLimits,
+    pub corpus: CorpusProjectionConfig,
     pub slack_sources: Vec<SlackConfig>,
     pub google_sources: Vec<GoogleConfig>,
     pub slide_analysis_limit: Option<usize>,
     pub slide_ai: Option<SlideAiConfig>,
+    pub supplemental: SupplementalConfig,
 }
 
 #[derive(Debug, Clone)]
 pub struct ApiTokenConfig {
     pub token: SecretString,
     pub scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpOAuthConfig {
+    pub resource_url: String,
+    pub protected_resource_metadata_url: String,
+    pub issuer: String,
+    pub audience: String,
+    pub jwks_path: PathBuf,
+    pub jwks: JsonWebKeySet,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct JsonWebKeySet {
+    pub keys: Vec<JsonWebKey>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct JsonWebKey {
+    pub kty: String,
+    pub kid: String,
+    #[serde(default)]
+    pub alg: Option<String>,
+    #[serde(default)]
+    pub crv: Option<String>,
+    #[serde(default)]
+    pub x: Option<String>,
+    #[serde(default)]
+    pub y: Option<String>,
+    #[serde(default)]
+    pub n: Option<String>,
+    #[serde(default)]
+    pub e: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -63,6 +104,20 @@ pub struct ResourceLimits {
 }
 
 #[derive(Debug, Clone)]
+pub struct CorpusProjectionConfig {
+    pub mode: CorpusMode,
+}
+
+impl CorpusProjectionConfig {
+    pub fn projector_config(&self) -> CorpusConfig {
+        CorpusConfig {
+            mode: self.mode,
+            ..CorpusConfig::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct SlackConfig {
     pub id: String,
     pub bot_token: SecretString,
@@ -86,6 +141,11 @@ pub struct SlideAiConfig {
     pub model: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct SupplementalConfig {
+    pub reject_unregistered_kinds: bool,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("missing environment variable {0}")]
@@ -105,12 +165,15 @@ pub enum ConfigError {
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     server: ServerFileConfig,
+    mcp: McpFileConfig,
     storage: StorageFileConfig,
     routing: RoutingFileConfig,
     runtime: RuntimeFileConfig,
     limits: LimitsFileConfig,
+    corpus: CorpusFileConfig,
     api_tokens: Vec<ApiTokenFileConfig>,
     sources: SourcesFileConfig,
+    supplemental: SupplementalFileConfig,
     #[serde(default)]
     derivation: Option<DerivationFileConfig>,
 }
@@ -119,6 +182,17 @@ struct FileConfig {
 #[serde(deny_unknown_fields)]
 struct ServerFileConfig {
     bind_addr: String,
+    mcp_bind_addr: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpFileConfig {
+    resource_url: String,
+    protected_resource_metadata_url: String,
+    oauth_issuer: String,
+    oauth_audience: String,
+    oauth_jwks_path: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,6 +224,12 @@ struct LimitsFileConfig {
     max_page_size: usize,
     max_leaf_observations: usize,
     retention_days: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CorpusFileConfig {
+    mode: CorpusMode,
 }
 
 #[derive(Debug, Deserialize)]
@@ -194,6 +274,12 @@ struct DerivationFileConfig {
     slide_analysis_limit: usize,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SupplementalFileConfig {
+    reject_unregistered_kinds: bool,
+}
+
 impl SelfHostConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
         let path = required_env("LETHE_CONFIG_PATH")?;
@@ -207,6 +293,14 @@ impl SelfHostConfig {
         })?;
         let raw: FileConfig = toml::from_str(&source)?;
         raw.validate()?;
+        let jwks_source =
+            fs::read_to_string(&raw.mcp.oauth_jwks_path).map_err(|source| ConfigError::Read {
+                path: raw.mcp.oauth_jwks_path.clone(),
+                source,
+            })?;
+        let jwks: JsonWebKeySet = serde_json::from_str(&jwks_source)
+            .map_err(|error| ConfigError::Invalid(format!("invalid MCP OAuth JWKS: {error}")))?;
+        validate_jwks(&jwks)?;
 
         let api_tokens = raw
             .api_tokens
@@ -274,6 +368,15 @@ impl SelfHostConfig {
 
         Ok(Self {
             bind_addr: raw.server.bind_addr,
+            mcp_bind_addr: raw.server.mcp_bind_addr,
+            mcp_oauth: McpOAuthConfig {
+                resource_url: raw.mcp.resource_url,
+                protected_resource_metadata_url: raw.mcp.protected_resource_metadata_url,
+                issuer: raw.mcp.oauth_issuer,
+                audience: raw.mcp.oauth_audience,
+                jwks_path: raw.mcp.oauth_jwks_path,
+                jwks,
+            },
             database_path: raw.storage.database_path,
             blob_dir: raw.storage.blob_dir,
             secret_encryption_key: parse_encryption_key(&required_env(
@@ -290,10 +393,16 @@ impl SelfHostConfig {
                 max_leaf_observations: raw.limits.max_leaf_observations,
                 retention_days: raw.limits.retention_days,
             },
+            corpus: CorpusProjectionConfig {
+                mode: raw.corpus.mode,
+            },
             slack_sources,
             google_sources,
             slide_analysis_limit,
             slide_ai,
+            supplemental: SupplementalConfig {
+                reject_unregistered_kinds: raw.supplemental.reject_unregistered_kinds,
+            },
         })
     }
 }
@@ -301,6 +410,30 @@ impl SelfHostConfig {
 impl FileConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         require_non_empty("server.bind_addr", &self.server.bind_addr)?;
+        require_non_empty("server.mcp_bind_addr", &self.server.mcp_bind_addr)?;
+        let bind_addr = parse_socket_addr("server.bind_addr", &self.server.bind_addr)?;
+        let mcp_bind_addr = parse_socket_addr("server.mcp_bind_addr", &self.server.mcp_bind_addr)?;
+        if bind_addr.port() == mcp_bind_addr.port() {
+            return Err(ConfigError::Invalid(
+                "server.bind_addr and server.mcp_bind_addr must use different ports".to_owned(),
+            ));
+        }
+        require_non_empty("mcp.resource_url", &self.mcp.resource_url)?;
+        require_non_empty(
+            "mcp.protected_resource_metadata_url",
+            &self.mcp.protected_resource_metadata_url,
+        )?;
+        require_non_empty("mcp.oauth_issuer", &self.mcp.oauth_issuer)?;
+        require_non_empty("mcp.oauth_audience", &self.mcp.oauth_audience)?;
+        if self.mcp.oauth_jwks_path.as_os_str().is_empty() {
+            return Err(ConfigError::Invalid(
+                "mcp.oauth_jwks_path must not be blank".to_owned(),
+            ));
+        }
+        reject_header_control_chars(
+            "mcp.protected_resource_metadata_url",
+            &self.mcp.protected_resource_metadata_url,
+        )?;
         require_positive("runtime.poll_seconds", self.runtime.poll_seconds as usize)?;
         require_positive("limits.max_blob_bytes", self.limits.max_blob_bytes)?;
         require_positive("limits.max_payload_bytes", self.limits.max_payload_bytes)?;
@@ -311,6 +444,20 @@ impl FileConfig {
             self.limits.max_leaf_observations,
         )?;
         require_positive("limits.retention_days", self.limits.retention_days as usize)?;
+        if matches!(self.corpus.mode, CorpusMode::PersonalAllText) {
+            let has_corpus_reader = self.api_tokens.iter().any(|token| {
+                token
+                    .scopes
+                    .iter()
+                    .any(|scope| scope == "*" || scope == "read:corpus")
+            });
+            if !has_corpus_reader {
+                return Err(ConfigError::Invalid(
+                    "corpus.mode = personal_all_text requires an api token with read:corpus scope"
+                        .to_owned(),
+                ));
+            }
+        }
         if self.api_tokens.is_empty() {
             return Err(ConfigError::Invalid(
                 "api_tokens must contain at least one entry".to_owned(),
@@ -402,6 +549,85 @@ fn require_positive(name: &str, value: usize) -> Result<(), ConfigError> {
     }
 }
 
+fn parse_socket_addr(name: &str, value: &str) -> Result<SocketAddr, ConfigError> {
+    value
+        .parse::<SocketAddr>()
+        .map_err(|error| ConfigError::Invalid(format!("{name} must be a socket address: {error}")))
+}
+
+fn reject_header_control_chars(name: &str, value: &str) -> Result<(), ConfigError> {
+    if value.chars().any(|ch| ch == '\r' || ch == '\n') {
+        Err(ConfigError::Invalid(format!(
+            "{name} must not contain CR/LF characters"
+        )))
+    } else if !value.is_ascii() {
+        Err(ConfigError::Invalid(format!("{name} must be ASCII")))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_jwks(jwks: &JsonWebKeySet) -> Result<(), ConfigError> {
+    if jwks.keys.is_empty() {
+        return Err(ConfigError::Invalid(
+            "MCP OAuth JWKS must contain at least one key".to_owned(),
+        ));
+    }
+    let mut kids = HashSet::new();
+    for key in &jwks.keys {
+        require_non_empty("mcp JWKS key.kid", &key.kid)?;
+        if !kids.insert(key.kid.as_str()) {
+            return Err(ConfigError::Invalid(format!(
+                "duplicate MCP OAuth JWKS kid: {}",
+                key.kid
+            )));
+        }
+        match key.kty.as_str() {
+            "EC" => {
+                if key.crv.as_deref() != Some("P-256")
+                    || key.x.as_deref().is_none()
+                    || key.y.as_deref().is_none()
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "MCP OAuth JWKS EC key {} must be P-256 with x and y",
+                        key.kid
+                    )));
+                }
+                let x = validate_base64url_part("mcp JWKS key.x", key.x.as_deref().unwrap())?;
+                let y = validate_base64url_part("mcp JWKS key.y", key.y.as_deref().unwrap())?;
+                if x.len() != 32 || y.len() != 32 {
+                    return Err(ConfigError::Invalid(format!(
+                        "MCP OAuth JWKS EC key {} x and y must be 32 bytes",
+                        key.kid
+                    )));
+                }
+            }
+            "RSA" => {
+                if key.n.as_deref().is_none() || key.e.as_deref().is_none() {
+                    return Err(ConfigError::Invalid(format!(
+                        "MCP OAuth JWKS RSA key {} must contain n and e",
+                        key.kid
+                    )));
+                }
+                validate_base64url_part("mcp JWKS key.n", key.n.as_deref().unwrap())?;
+                validate_base64url_part("mcp JWKS key.e", key.e.as_deref().unwrap())?;
+            }
+            other => {
+                return Err(ConfigError::Invalid(format!(
+                    "unsupported MCP OAuth JWKS key type: {other}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_base64url_part(name: &str, value: &str) -> Result<Vec<u8>, ConfigError> {
+    URL_SAFE_NO_PAD
+        .decode(value.as_bytes())
+        .map_err(|error| ConfigError::Invalid(format!("{name} is not valid base64url: {error}")))
+}
+
 fn parse_encryption_key(value: &str) -> Result<[u8; 32], ConfigError> {
     let decoded = hex::decode(value)
         .map_err(|error| ConfigError::Invalid(format!("invalid encryption key hex: {error}")))?;
@@ -428,6 +654,13 @@ mod tests {
             r#"
             [server]
             bind_addr = "127.0.0.1:8080"
+            mcp_bind_addr = "127.0.0.1:8090"
+            [mcp]
+            resource_url = "https://mcp.example.test/mcp"
+            protected_resource_metadata_url = "https://mcp.example.test/.well-known/oauth-protected-resource"
+            oauth_issuer = "https://issuer.example.test/"
+            oauth_audience = "lethe-mcp"
+            oauth_jwks_path = "mcp-jwks.json"
             [storage]
             database_path = "data/lethe.sqlite3"
             blob_dir = "data/blobs"
@@ -443,6 +676,10 @@ mod tests {
             max_page_size = 1
             max_leaf_observations = 1
             retention_days = 30
+            [corpus]
+            mode = "workspace_filtered"
+            [supplemental]
+            reject_unregistered_kinds = true
             [[api_tokens]]
             token_env = "TOKEN"
             scopes = ["read"]
@@ -473,6 +710,13 @@ mod tests {
             r#"
             [server]
             bind_addr = "127.0.0.1:8080"
+            mcp_bind_addr = "127.0.0.1:8090"
+            [mcp]
+            resource_url = "https://mcp.example.test/mcp"
+            protected_resource_metadata_url = "https://mcp.example.test/.well-known/oauth-protected-resource"
+            oauth_issuer = "https://issuer.example.test/"
+            oauth_audience = "lethe-mcp"
+            oauth_jwks_path = "mcp-jwks.json"
             [storage]
             database_path = "data/lethe.sqlite3"
             blob_dir = "data/blobs"
@@ -488,9 +732,13 @@ mod tests {
             max_page_size = 1
             max_leaf_observations = 1
             retention_days = 3650
+            [corpus]
+            mode = "personal_all_text"
+            [supplemental]
+            reject_unregistered_kinds = true
             [[api_tokens]]
             token_env = "TOKEN"
-            scopes = ["admin:health"]
+            scopes = ["admin:health", "read:corpus"]
             [sources]
             slack = []
             google_slides = []
@@ -502,11 +750,64 @@ mod tests {
     }
 
     #[test]
+    fn mcp_listener_must_not_share_internal_api_port() {
+        let raw: FileConfig = toml::from_str(
+            r#"
+            [server]
+            bind_addr = "127.0.0.1:8080"
+            mcp_bind_addr = "127.0.0.1:8080"
+            [mcp]
+            resource_url = "https://mcp.example.test/mcp"
+            protected_resource_metadata_url = "https://mcp.example.test/.well-known/oauth-protected-resource"
+            oauth_issuer = "https://issuer.example.test/"
+            oauth_audience = "lethe-mcp"
+            oauth_jwks_path = "mcp-jwks.json"
+            [storage]
+            database_path = "data/lethe.sqlite3"
+            blob_dir = "data/blobs"
+            encryption_key_env = "ENCRYPTION_KEY"
+            [routing]
+            key_order = "year_month_source_container_published"
+            [runtime]
+            poll_seconds = 60
+            [limits]
+            max_blob_bytes = 1
+            max_payload_bytes = 1
+            max_sync_items = 1
+            max_page_size = 1
+            max_leaf_observations = 1
+            retention_days = 3650
+            [corpus]
+            mode = "personal_all_text"
+            [supplemental]
+            reject_unregistered_kinds = true
+            [[api_tokens]]
+            token_env = "TOKEN"
+            scopes = ["read:corpus"]
+            [sources]
+            slack = []
+            google_slides = []
+            "#,
+        )
+        .unwrap();
+
+        let error = raw.validate().unwrap_err().to_string();
+        assert!(error.contains("different ports"));
+    }
+
+    #[test]
     fn google_sources_require_derivation_config() {
         let raw: FileConfig = toml::from_str(
             r#"
             [server]
             bind_addr = "127.0.0.1:8080"
+            mcp_bind_addr = "127.0.0.1:8090"
+            [mcp]
+            resource_url = "https://mcp.example.test/mcp"
+            protected_resource_metadata_url = "https://mcp.example.test/.well-known/oauth-protected-resource"
+            oauth_issuer = "https://issuer.example.test/"
+            oauth_audience = "lethe-mcp"
+            oauth_jwks_path = "mcp-jwks.json"
             [storage]
             database_path = "data/lethe.sqlite3"
             blob_dir = "data/blobs"
@@ -522,6 +823,10 @@ mod tests {
             max_page_size = 1
             max_leaf_observations = 1
             retention_days = 30
+            [corpus]
+            mode = "workspace_filtered"
+            [supplemental]
+            reject_unregistered_kinds = true
             [[api_tokens]]
             token_env = "TOKEN"
             scopes = ["read"]

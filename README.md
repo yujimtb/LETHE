@@ -38,6 +38,7 @@ workspace root は virtual manifest です。Rust 実装を持つルート `src/
 - identity resolution と Person Page Projection
 - scope 付き Bearer token、consent、Filtering-before-Exposure
 - Projection lineage と、Projection が参照する blob の限定配信
+- Supplemental Kind Registry と初期 kind schema (`claim@1` など)
 - storage Effect Ports と per-leaf SQLite authoritative store
 - 容量駆動 split、永続 per-leaf watermark、blue/green keyspec migration
 - retry / rate limit / circuit breaker、dead-letter、部分成功 sync
@@ -87,7 +88,13 @@ python ./scripts/check_markdown_links.py
 参照します。Slack / Google Slides source は配列で複数 instance を定義でき、
 instance ごとに独立 cursor と failure isolation を持ちます。
 GitHub/Claude の one-shot import 専用 instance では `sources` を空配列にできます。
-その場合も API token と routing key order は TOML で明示します。
+その場合も API token、routing key order、`supplemental.reject_unregistered_kinds`
+は TOML で明示します。
+MCP read port を使う場合も設定は必須です。`server.mcp_bind_addr` は内部 API と
+別ポートにし、`[mcp]` には公開 resource URL、protected resource metadata URL、
+managed ID provider の issuer、audience、JWKS path を明示します。MCP は固定
+Bearer token / API key を受け付けず、JWKS で署名検証できる OAuth JWT だけを
+受け付けます。
 
 ```powershell
 cargo run -p lethe-selfhost
@@ -112,10 +119,37 @@ cargo run -p lethe-selfhost
   (`read:timeline`)
 - `GET /api/projections/{projection_id}/blobs/{sha256}` (`read:persons`)
 - `GET /api/projections/{projection_id}/lineage` (`read:persons`)
+- `GET /api/projections/proj:corpus/records` (`read:corpus`)
+- `POST /api/projections/proj:corpus/grep` (`read:corpus`)
+- `GET /api/projections/proj:corpus/records/{record_id}` (`read:corpus`)
+- `GET /api/projections/proj:corpus/threads/{record_id}` (`read:corpus`)
+- `POST /supplementals` (`write:supplemental`)
 
 `/health` 以外は `Authorization: Bearer <token>` が必要です。Person Projection ID
 は `proj:person-page` です。旧 `/api/persons/*` ルートや raw CAS 配信ルートは
 提供しません。
+
+`POST /supplementals` は supplemental record を作成します。ID はクライアント採番の
+`sup:{uuid}`、`kind` は登録済みの `claim@1` などの形式です。body は
+`id`, `kind`, `derived_from`, `payload`, `created_by`, `mutability`,
+`model_version`, `consent_metadata`, `lineage` を受け付け、`created_at` は
+selfhost が設定します。`derived_from` は空にできず、未解決の observation /
+supplemental 参照は 422 と詳細で拒否されます。同一 ID の再 POST は 409 です。
+内容ベースの重複排除は書き込み側では行いません。
+
+`created_by` には `actor:codex-import` のような安定した pipeline/client actor を
+入れ、使用モデル名は `model_version` に記録します。モデル名を `created_by` に
+混ぜないでください。
+
+MCP read port は別 listener で提供します。
+
+- `GET /.well-known/oauth-protected-resource`
+- `POST /mcp` (Streamable HTTP / JSON-RPC)
+
+公開する場合は Tailscale Funnel の対象を MCP host port のみに限定してください。
+内部 API port、`/admin/*`、管理面を Funnel に晒してはいけません。この self-host
+構成の MCP endpoint は本 PC が起動し、selfhost プロセスと Funnel が稼働している
+間だけ到達可能です。常時稼働 SLA は提供しません。
 
 ## Runtime guarantees
 

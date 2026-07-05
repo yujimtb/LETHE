@@ -165,10 +165,37 @@ def prepare_work_dir(path: Path) -> Path:
 
 
 def write_config(config_path: Path, db_path: Path, blob_dir: Path) -> None:
+    jwks_path = config_path.with_name("mcp-jwks.json")
+    jwks_path.write_text(
+        json.dumps(
+            {
+                "keys": [
+                    {
+                        "kty": "EC",
+                        "kid": "smoke-key",
+                        "alg": "ES256",
+                        "crv": "P-256",
+                        "x": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                        "y": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+                    }
+                ]
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     config_path.write_text(
         f"""
 [server]
 bind_addr = "127.0.0.1:0"
+mcp_bind_addr = "127.0.0.1:1"
+
+[mcp]
+resource_url = "https://mcp.example.test/mcp"
+protected_resource_metadata_url = "https://mcp.example.test/.well-known/oauth-protected-resource"
+oauth_issuer = "https://issuer.example.test/"
+oauth_audience = "lethe-mcp"
+oauth_jwks_path = "{toml_path(jwks_path)}"
 
 [storage]
 database_path = "{toml_path(db_path)}"
@@ -189,9 +216,15 @@ max_page_size = 100
 max_leaf_observations = 100000
 retention_days = 3650
 
+[corpus]
+mode = "personal_all_text"
+
+[supplemental]
+reject_unregistered_kinds = true
+
 [[api_tokens]]
 token_env = "LETHE_API_READ_TOKEN"
-scopes = ["read:persons", "read:timeline"]
+scopes = ["read:persons", "read:timeline", "read:corpus"]
 
 [[api_tokens]]
 token_env = "LETHE_API_SYNC_TOKEN"

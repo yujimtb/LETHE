@@ -31,6 +31,8 @@ pub struct ErrorResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_after: Option<u32>,
 }
 
@@ -39,6 +41,7 @@ impl ErrorResponse {
         Self {
             error: "bad_request".into(),
             detail: Some(detail.into()),
+            details: None,
             retry_after: None,
         }
     }
@@ -47,6 +50,7 @@ impl ErrorResponse {
         Self {
             error: "internal_server_error".into(),
             detail: Some(detail.into()),
+            details: None,
             retry_after: None,
         }
     }
@@ -55,6 +59,7 @@ impl ErrorResponse {
         Self {
             error: "unauthorized".into(),
             detail: None,
+            details: None,
             retry_after: None,
         }
     }
@@ -63,6 +68,7 @@ impl ErrorResponse {
         Self {
             error: "forbidden".into(),
             detail: Some(detail.into()),
+            details: None,
             retry_after: None,
         }
     }
@@ -71,6 +77,7 @@ impl ErrorResponse {
         Self {
             error: "not_found".into(),
             detail: None,
+            details: None,
             retry_after: None,
         }
     }
@@ -79,7 +86,35 @@ impl ErrorResponse {
         Self {
             error: "service_unavailable".into(),
             detail: None,
+            details: None,
             retry_after: Some(retry_after),
+        }
+    }
+
+    pub fn projection_stale(detail: &str, retry_after: u32) -> Self {
+        Self {
+            error: "projection_stale".into(),
+            detail: Some(detail.into()),
+            details: None,
+            retry_after: Some(retry_after),
+        }
+    }
+
+    pub fn unprocessable_entity(error: impl Into<String>, details: serde_json::Value) -> Self {
+        Self {
+            error: error.into(),
+            detail: Some("request body violates supplemental write contract".into()),
+            details: Some(details),
+            retry_after: None,
+        }
+    }
+
+    pub fn conflict(error: impl Into<String>, details: serde_json::Value) -> Self {
+        Self {
+            error: error.into(),
+            detail: Some("supplemental write conflicts with existing state".into()),
+            details: Some(details),
+            retry_after: None,
         }
     }
 }

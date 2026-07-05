@@ -1,6 +1,10 @@
 use super::*;
 
 impl AppService {
+    pub fn mcp_oauth_config(&self) -> crate::self_host::config::McpOAuthConfig {
+        self.config.mcp_oauth.clone()
+    }
+
     pub fn health(&self) -> Result<HealthResponse, SelfHostError> {
         let core = self.core_lock()?;
         Ok(
@@ -100,6 +104,12 @@ impl AppService {
                 core.snapshot.answer_log.len(),
                 core.snapshot.built_at,
             )),
+            "proj:claim-queue" => Ok(build_supplemental_projection_lineage(
+                "proj:claim-queue",
+                &core.supplemental.list(),
+                core.snapshot.claim_queue.claims.len() + core.snapshot.claim_queue.decisions.len(),
+                core.snapshot.built_at,
+            )),
             _ => Err(SelfHostError::NotFound(projection_id.to_string())),
         }
     }
@@ -130,6 +140,41 @@ impl AppService {
             .spec;
         ReadModeResolver::resolve(spec, read_mode, pin)
             .map_err(|err: ReadModeError| SelfHostError::ReadMode(err.to_string()))
+    }
+
+    pub(super) fn ensure_projection_fresh(
+        &self,
+        catalog: &ProjectionCatalog,
+        projection_id: &str,
+    ) -> Result<(), SelfHostError> {
+        let projection_ref = ProjectionRef::new(projection_id);
+        let entry = catalog
+            .get(&projection_ref)
+            .ok_or_else(|| SelfHostError::NotFound(projection_id.to_owned()))?;
+        if entry.status == ProjectionStatus::Stale || entry.health == ProjectionHealth::Stale {
+            Err(SelfHostError::ProjectionStale(format!(
+                "{projection_id} is stale"
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn refresh_materialized_snapshot(
+        &self,
+        core: &mut AppCore,
+    ) -> Result<(), SelfHostError> {
+        let (observations, supplementals) = {
+            let store = self.persistence_lock()?;
+            (store.load_observations()?, store.load_supplementals()?)
+        };
+        let snapshot =
+            ProjectionSnapshot::build(observations, supplementals, core.corpus_config.clone())?;
+        let snapshot_value = serde_json::to_value(&snapshot)?;
+        self.persistence_lock()?
+            .materialize_projection(&ProjectionRef::new("proj:person-page"), &snapshot_value)?;
+        core.snapshot = snapshot;
+        Ok(())
     }
 
     pub(super) fn ingest_draft(
@@ -557,6 +602,45 @@ pub(super) fn build_projection_lineage(
         source_ref: "lake".to_string(),
         watermark_position: Some(observations.len()),
         record_count: observations.len(),
+    });
+    for input_ref in input_refs {
+        lineage.add_input_ref(input_ref);
+    }
+    lineage
+}
+
+pub(super) fn build_supplemental_projection_lineage(
+    projection_id: &str,
+    supplementals: &[&lethe_core::domain::SupplementalRecord],
+    output_count: usize,
+    built_at: DateTime<Utc>,
+) -> LineageManifest {
+    let mut input_refs = supplementals
+        .iter()
+        .map(|record| format!("supplemental:{}", record.id))
+        .collect::<Vec<_>>();
+    input_refs.sort();
+
+    let mut hasher = Sha256::new();
+    hasher.update(projection_id.as_bytes());
+    hasher.update(b"@1.0.0\n");
+    for input_ref in &input_refs {
+        hasher.update(input_ref.as_bytes());
+        hasher.update(b"\n");
+    }
+    let build_id = format!("build-{}", hex::encode(hasher.finalize()));
+    let mut lineage = LineageManifest::new(
+        ProjectionRef::new(projection_id),
+        SemVer::new("1.0.0"),
+        build_id,
+    );
+    lineage.built_at = built_at;
+    lineage.output_count = output_count;
+    lineage.deterministic = true;
+    lineage.add_source(SourceSnapshot {
+        source_ref: "supplemental".to_string(),
+        watermark_position: None,
+        record_count: supplementals.len(),
     });
     for input_ref in input_refs {
         lineage.add_input_ref(input_ref);

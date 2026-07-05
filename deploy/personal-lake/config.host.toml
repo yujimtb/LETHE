@@ -1,5 +1,13 @@
 [server]
 bind_addr = "127.0.0.1:8080"
+mcp_bind_addr = "127.0.0.1:8090"
+
+[mcp]
+resource_url = "https://replace-with-tailnet-name.ts.net/mcp"
+protected_resource_metadata_url = "https://replace-with-tailnet-name.ts.net/.well-known/oauth-protected-resource"
+oauth_issuer = "https://replace-with-managed-idp.example/"
+oauth_audience = "lethe-mcp"
+oauth_jwks_path = "deploy/personal-lake/mcp-jwks.json"
 
 [storage]
 database_path = "deploy/personal-lake/data/lethe.sqlite3"
@@ -20,9 +28,19 @@ max_page_size = 100
 max_leaf_observations = 100000
 retention_days = 3650
 
+[corpus]
+mode = "personal_all_text"
+
+[supplemental]
+reject_unregistered_kinds = true
+
 [[api_tokens]]
 token_env = "LETHE_API_READ_TOKEN"
-scopes = ["read:persons", "read:timeline"]
+scopes = ["read:persons", "read:timeline", "read:corpus"]
+
+[[api_tokens]]
+token_env = "LETHE_API_WRITE_TOKEN"
+scopes = ["write:supplemental"]
 
 [[api_tokens]]
 token_env = "LETHE_API_SYNC_TOKEN"

@@ -113,6 +113,27 @@ pub struct RecordDetailResponse {
 pub struct ThreadResponse {
     pub thread_ts: String,
     pub records: Vec<GrepRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structure: Option<ThreadStructure>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadStructure {
+    pub thread_key: String,
+    pub source_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_session: Option<ThreadSession>,
+    #[serde(default)]
+    pub sidechains: Vec<ThreadSession>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadSession {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    pub is_sidechain: bool,
+    pub record_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

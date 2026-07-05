@@ -47,7 +47,11 @@ impl SupplementalStore {
         record: SupplementalRecord,
         lake: &LakeStore,
     ) -> Result<SupplementalId, DomainError> {
-        self.validate_record(&record, lake)?;
+        self.validate_record_with(
+            &record,
+            |obs_id| lake.get(obs_id).is_some(),
+            |sup_id| self.get(sup_id).is_some(),
+        )?;
 
         if self.records.contains_key(&record.id.0) {
             return Err(DomainError::Conflict(format!(
@@ -68,7 +72,11 @@ impl SupplementalStore {
         mut record: SupplementalRecord,
         lake: &LakeStore,
     ) -> Result<SupplementalId, DomainError> {
-        self.validate_record(&record, lake)?;
+        self.validate_record_with(
+            &record,
+            |obs_id| lake.get(obs_id).is_some(),
+            |sup_id| self.get(sup_id).is_some(),
+        )?;
 
         if let Some(entry) = self.records.get_mut(&record.id.0) {
             if entry.record.mutability == Mutability::AppendOnly {
@@ -107,6 +115,63 @@ impl SupplementalStore {
         Ok(rollback)
     }
 
+    pub fn upsert_with_rollback_checked<ObservationExists, SupplementalExists>(
+        &mut self,
+        record: SupplementalRecord,
+        observation_exists: ObservationExists,
+        supplemental_exists: SupplementalExists,
+    ) -> Result<UpsertRollback, DomainError>
+    where
+        ObservationExists: Fn(&ObservationId) -> bool,
+        SupplementalExists: Fn(&SupplementalId) -> bool,
+    {
+        let rollback = UpsertRollback {
+            id: record.id.clone(),
+            previous: self.records.get(&record.id.0).cloned(),
+            history_len: self.history.len(),
+        };
+        self.upsert_checked(record, observation_exists, supplemental_exists)?;
+        Ok(rollback)
+    }
+
+    pub fn upsert_checked<ObservationExists, SupplementalExists>(
+        &mut self,
+        mut record: SupplementalRecord,
+        observation_exists: ObservationExists,
+        supplemental_exists: SupplementalExists,
+    ) -> Result<SupplementalId, DomainError>
+    where
+        ObservationExists: Fn(&ObservationId) -> bool,
+        SupplementalExists: Fn(&SupplementalId) -> bool,
+    {
+        self.validate_record_with(&record, observation_exists, supplemental_exists)?;
+
+        if let Some(entry) = self.records.get_mut(&record.id.0) {
+            if entry.record.mutability == Mutability::AppendOnly {
+                return Err(DomainError::Policy(lethe_core::domain::PolicyError {
+                    code: "APPEND_ONLY".into(),
+                    message: format!(
+                        "Record {} is AppendOnly and cannot be overwritten",
+                        record.id
+                    ),
+                }));
+            }
+
+            let new_version = entry.version + 1;
+            record.record_version = Some(new_version.to_string());
+            entry.version = new_version;
+            entry.record = record.clone();
+            self.history.push(entry.clone());
+            return Ok(record.id);
+        }
+
+        let id = record.id.clone();
+        let ver = VersionedRecord { version: 1, record };
+        self.history.push(ver.clone());
+        self.records.insert(id.0.clone(), ver);
+        Ok(id)
+    }
+
     /// Restore the store state captured before `upsert_with_rollback`.
     pub fn rollback_upsert(&mut self, rollback: UpsertRollback) {
         self.history.truncate(rollback.history_len);
@@ -120,11 +185,16 @@ impl SupplementalStore {
         }
     }
 
-    fn validate_record(
+    fn validate_record_with<ObservationExists, SupplementalExists>(
         &self,
         record: &SupplementalRecord,
-        lake: &LakeStore,
-    ) -> Result<(), DomainError> {
+        observation_exists: ObservationExists,
+        supplemental_exists: SupplementalExists,
+    ) -> Result<(), DomainError>
+    where
+        ObservationExists: Fn(&ObservationId) -> bool,
+        SupplementalExists: Fn(&SupplementalId) -> bool,
+    {
         // Invariant 2: derivedFrom must have at least one anchor.
         if record.derived_from.observations.is_empty()
             && record.derived_from.blobs.is_empty()
@@ -137,10 +207,19 @@ impl SupplementalStore {
 
         // Invariant 4: referenced observations must exist.
         for obs_id in &record.derived_from.observations {
-            if lake.get(obs_id).is_none() {
+            if !observation_exists(obs_id) {
                 return Err(DomainError::Validation(format!(
                     "Referenced observation {} does not exist",
                     obs_id
+                )));
+            }
+        }
+
+        for supplemental_id in &record.derived_from.supplementals {
+            if !supplemental_exists(supplemental_id) {
+                return Err(DomainError::Validation(format!(
+                    "Referenced supplemental {} does not exist",
+                    supplemental_id
                 )));
             }
         }
@@ -212,6 +291,21 @@ impl SupplementalStore {
             .filter(|v| v.record.kind == kind)
             .map(|v| &v.record)
             .collect()
+    }
+
+    /// List current records in deterministic replay order.
+    pub fn list(&self) -> Vec<&SupplementalRecord> {
+        let mut records = self
+            .records
+            .values()
+            .map(|versioned| &versioned.record)
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+        });
+        records
     }
 
     /// Update consent metadata (Invariant 6: record is preserved, metadata changes).

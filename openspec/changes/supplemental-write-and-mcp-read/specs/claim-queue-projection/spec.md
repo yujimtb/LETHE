@@ -66,6 +66,14 @@ selfhost に以下を追加 SHALL する(いずれも既存 read 系スコープ
 - **WHEN** open / parked / verified の claim が混在する Projection に `GET /projections/claim-queue?state=open&limit=2` を呼ぶ
 - **THEN** 応答は open claim の同源グループのみを最大 2 件返し、次ページがある場合は cursor を含む
 
+#### API Contract
+
+- `GET /projections/claim-queue?state=<state>&limit=<n>&cursor=<offset>` は `read:corpus` スコープで認可する。`state` は省略可で、指定時は `open` / `dispatched` / `verified` / `refuted` / `inconclusive` / `terminated` / `parked` のいずれかである。`limit` は 1 以上かつ selfhost の `resource_limits.max_page_size` 以下で、`cursor` は数値 offset 文字列である。
+- 成功時の `data` は `{ "groups": [...], "total": <filtered_group_count>, "limit": <n>, "next_cursor": "<offset>", "audit_log": [...] }` を返す。`groups[].members[]` は `representative_id`, `absorbed_ids`, `state`, `verification_mode`, `derived_from`, `source_refs`, `payload_hash`, `state_history` を含み、同源グループ内でも状態管理は member 単位で表す。
+- `GET /projections/decisions?q=<query>&limit=<n>` は `read:corpus` スコープで認可する。`q` は必須かつ non-blank、`limit` は同じ上限規則に従う。
+- 成功時の `data` は `{ "query": "<query>", "matches": [...], "total": <match_count>, "limit": <n>, "audit_log": [...] }` を返す。`matches[]` は `id`, `statement`, `rationale`, `supersedes`, `superseded_by`, `derived_from`, `created_by`, `created_at` を含む。
+- いずれの成功応答も `projection_metadata.projection_id = "proj:claim-queue"` の ResponseEnvelope で返す。Projection が stale の場合は空結果にせず HTTP 503 と `{ "error": "projection_stale", "detail": "...", "retry_after": 30 }` を返す。
+
 ## Invariants(継承)
 
 - No Direct Mutation Law: materialization を ground truth として更新しない(常に supplemental からの再計算で復元可能)
