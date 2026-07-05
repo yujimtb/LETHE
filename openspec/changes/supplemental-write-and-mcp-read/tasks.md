@@ -107,7 +107,7 @@ Track H(MCP port)                   │
   - `claim_queue` / `search_decisions` は Track C4 の実 Projection API に接続済み。生 supplemental は読まない。
 - [ ] H4 Tailscale Funnel で MCP ポートのみを公開し、実際の claude.ai カスタムコネクタ登録 → OAuth フロー → ツール呼び出しの手動疎通を行う
   - Spec: MCPR-01, MCPR-06 / 受け入れ: ブラウザ版 claude.ai から search_lake が実データを返す
-  - Server implementation / local OAuth / MCP tool contract は完了。実機 claude.ai / Tailscale Funnel 疎通はユーザーの管理 ID 基盤・Funnel・ブラウザ登録が必要なため未実施。再現手順と未実施理由は `handoffs/track-h.md` に記録する。
+  - 2026-07-06: Tailscale Funnel は `https://yujiws.tail474356.ts.net/ -> http://127.0.0.1:8090` で MCP ポートのみ公開済み。Auth0 tenant `lethe-mcp.jp.auth0.com` に API `LETHE MCP Read Port` (`identifier = https://yujiws.tail474356.ts.net/mcp`, scope `mcp:read`, RS256, DCR enabled) を作成し、JWKS を `deploy/personal-lake/mcp-jwks.json` へ反映。公開 metadata、401 challenge、DCR smoke、Auth0 発行 JWT による `tools/list` は pass。Playwright の claude.ai は未ログインで `/login?from=logout` に遷移したため、ブラウザ版 claude.ai への custom connector 登録と `search_lake` 手動呼び出しのみ未実施。
 
 ## Track I. 統合
 
@@ -117,7 +117,8 @@ Track H(MCP port)                   │
 - [x] I2 E2E: コーディングエージェント取り込み済み観測にアンカーする decision を POST → search_decisions で引ける
   - Spec: SUPW-03, CLQ-05, CAGT-04 / 受け入れ: 横断シナリオ test
   - 2026-07-06: `decision_post_anchored_to_imported_codex_observation_is_searchable` を追加。Codex JSONL fixture を importer 経由で取り込み、永続化された `sys:codex` observation にアンカーした `decision@1` が `GET /projections/decisions` で検索可能になることを確認。
-- [ ] I3 要件被覆の抜き取り確認(本人): 各 spec の SHALL に対する test 対応表を生成し、公開面(Funnel 対象ポート・トークン検証)を実機で最終確認する
+- [x] I3 要件被覆の抜き取り確認(本人): 各 spec の SHALL に対する test 対応表を生成し、公開面(Funnel 対象ポート・トークン検証)を実機で最終確認する
   - 受け入れ: 全 SHALL に judgement+evidence が存在
   - 2026-07-06: `requirements-coverage.md` を生成。local code/test で検証できる項目は evidence を記録済み。Tailscale Funnel と claude.ai custom connector の実機疎通は、ユーザーの管理 ID 基盤/JWKS/ブラウザ UI が必要なため未実施。
   - 2026-07-06: synthetic personal lake import smoke と一時 selfhost に対する W0 check は pass。実公開面のみ未実施。
+  - 2026-07-06: 実公開面の最終確認を追加実施。Funnel status は HTTPS 443 `/` -> `http://127.0.0.1:8090` のみで、公開 `GET https://yujiws.tail474356.ts.net/.well-known/oauth-protected-resource` は Auth0 issuer/resource を返す。公開 `POST /mcp` は token なしで 401 + `WWW-Authenticate`、公開 `/health/deep` は 404。Auth0 発行 JWT(aud=`https://yujiws.tail474356.ts.net/mcp`)で公開 `POST /mcp` `tools/list` が 5 ツールを返すことを確認。claude.ai custom connector UI 登録は H4 の残件。

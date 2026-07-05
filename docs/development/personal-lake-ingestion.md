@@ -97,10 +97,43 @@ starting the Docker stack. `deploy/personal-lake/mcp-jwks.example.json` shows
 the expected file shape. `oauth_issuer` and `oauth_audience` must match the
 managed provider configuration.
 
+Current production values for this personal lake:
+
+- MCP URL: `https://yujiws.tail474356.ts.net/mcp`
+- protected resource metadata: `https://yujiws.tail474356.ts.net/.well-known/oauth-protected-resource`
+- Auth0 issuer: `https://lethe-mcp.jp.auth0.com/`
+- Auth0 API identifier / LETHE `oauth_audience`: `https://yujiws.tail474356.ts.net/mcp`
+- scope: `mcp:read`
+
+`deploy/personal-lake/mcp-jwks.json` is generated local configuration and is
+gitignored. Refresh it from
+`https://lethe-mcp.jp.auth0.com/.well-known/jwks.json` whenever Auth0 rotates
+signing keys, then restart selfhost so the in-process verifier reloads the
+JWKS.
+
 Tailscale Funnel must target only `LETHE_MCP_HOST_PORT`; do not funnel
 `LETHE_HTTP_HOST_PORT` or any admin/internal API port. This endpoint is reachable
 only while this PC is on, Tailscale Funnel is active, and the selfhost process is
 running. It is not a 24/7 service.
+
+The current Funnel command/state is:
+
+```powershell
+tailscale funnel --bg --yes 8090
+tailscale funnel status --json
+```
+
+The expected public proxy is `https://yujiws.tail474356.ts.net/` to
+`http://127.0.0.1:8090`. Public `/health/deep` should return 404 because the
+internal API router is not exposed on the MCP listener.
+
+Claude custom connector setup:
+
+1. Log in to claude.ai.
+2. Add a custom connector with URL `https://yujiws.tail474356.ts.net/mcp`.
+3. Leave OAuth Client ID/Secret blank so Claude uses Auth0 DCR.
+4. Complete the Auth0 OAuth flow.
+5. In a Claude conversation, enable the connector and call `search_lake`.
 
 ## Claude.ai
 

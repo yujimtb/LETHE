@@ -6,6 +6,7 @@
 .env.*
 !.env.example
 client_secret.json
+deploy/personal-lake/mcp-jwks.json
 
 # Local runtime state
 data/*

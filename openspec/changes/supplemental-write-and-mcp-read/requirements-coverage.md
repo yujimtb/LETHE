@@ -10,7 +10,7 @@
 | Supplemental write + kind registry | Pass | Unit and E2E tests cover registration, schema validation, authz, store invariants, conflicts, and HTTP write path. |
 | Claim queue + decision projection | Pass | Unit tests cover fold semantics; E2E covers read API plus POST-to-projection integration. |
 | Coding-agent archive/import/corpus | Pass for local implementation | Archive sync and importer tests cover append-only preservation, backbone-only mapping, idempotency, Codex measured schema, and corpus thread restoration. |
-| MCP read port | Pass for local server contract; Manual pending for live connector | E2E covers listener separation, OAuth JWT validation, metadata, tools, and projection-only reads. Live Tailscale Funnel + claude.ai custom connector flow still requires the user's managed ID provider/JWKS/browser session. |
+| MCP read port | Pass for server, Auth0, and Funnel public surface; Claude UI pending | E2E covers listener separation, OAuth JWT validation, metadata, tools, and projection-only reads. Live Tailscale Funnel exposes only the MCP port, Auth0 DCR/JWT smoke passed, and claude.ai custom connector registration remains pending because the Playwright browser is not logged in to Claude. |
 
 ## SHALL Matrix
 
@@ -37,9 +37,9 @@
 | CAGT-03: sidechain/subagent transcripts preserve parent metadata for thread restoration. | Pass | importer metadata plus corpus `ThreadResponse.structure`; tests `codex_subagent_metadata_is_preserved`, `coding_agent_get_thread_preserves_parent_child_sessions`. |
 | CAGT-04: per-message identity and event timestamps are deterministic and idempotent. | Pass | importer identity tests, real archive subset evidence in tasks, and I2 decision-on-imported-observation E2E. |
 | CAGT-05: Codex path/schema/sidechain measurements are recorded. | Pass | `specs/coding-agent-adapters/spec.md` Codex measurement section. |
-| MCPR-01: MCP uses a dedicated listener; Funnel must expose only MCP port. | Local pass; live Funnel pending | `main.rs`, `config.rs`, `compose.yaml`, README; test `mcp_and_internal_api_routes_are_separate`. User must run final Tailscale Funnel exposure. |
-| MCPR-02: Streamable HTTP transport is implemented. | Local pass; live connector pending | `apps/selfhost/src/self_host/mcp.rs`; test `five_mcp_tools_have_contracts_and_read_via_projection`. |
-| MCPR-03: OAuth resource-server metadata and JWT validation; no token issuance/API key auth. | Pass locally; managed provider wiring pending | `mcp.rs`, `mcp_contract.rs`; tests `protected_resource_metadata_contract_is_public`, `mcp_jwt_validation_rejects_expired_and_wrong_audience_and_accepts_valid`. User must provide real issuer/audience/JWKS. |
+| MCPR-01: MCP uses a dedicated listener; Funnel must expose only MCP port. | Pass | `main.rs`, `config.rs`, `compose.yaml`, README; test `mcp_and_internal_api_routes_are_separate`; live `tailscale funnel status --json` showed HTTPS 443 `/` proxying only to `http://127.0.0.1:8090`, and public `/health/deep` returned 404. |
+| MCPR-02: Streamable HTTP transport is implemented. | Pass for live public endpoint | `apps/selfhost/src/self_host/mcp.rs`; test `five_mcp_tools_have_contracts_and_read_via_projection`; live public `POST https://yujiws.tail474356.ts.net/mcp` returned a valid JSON-RPC `tools/list` result with an Auth0-issued JWT. |
+| MCPR-03: OAuth resource-server metadata and JWT validation; no token issuance/API key auth. | Pass | `mcp.rs`, `mcp_contract.rs`; tests `protected_resource_metadata_contract_is_public`, `mcp_jwt_validation_rejects_expired_and_wrong_audience_and_accepts_valid`; Auth0 tenant `lethe-mcp.jp.auth0.com` has API `LETHE MCP Read Port` with identifier/audience `https://yujiws.tail474356.ts.net/mcp`, DCR enabled, public JWKS loaded locally, tokenless public `/mcp` returned 401 + `WWW-Authenticate`, and Auth0-issued JWT returned 5 tools. |
 | MCPR-04: exactly five read-only tools and all read projections only. | Pass | `mcp_contract.rs`; test `five_mcp_tools_have_contracts_and_read_via_projection`. |
 | MCPR-05: personal lake corpus indexes all text-bearing personal observations. | Pass | `CorpusMode::PersonalAllText`; tests `personal_all_text_indexes_personal_lake_source_types`, `personal_corpus_grep_hits_all_text_source_types`. |
 | MCPR-06: README/ops docs state PC/selfhost/Funnel uptime constraint. | Pass | `README.md`, `docs/development/personal-lake-ingestion.md`, `handoffs/track-h.md`. |
@@ -48,14 +48,13 @@
 
 - `supplemental_post_updates_claim_queue_projection_state`: claim POST appears as `open`, then `claim-transition@1` POST changes it to `parked`.
 - `decision_post_anchored_to_imported_codex_observation_is_searchable`: Codex JSONL is imported through `CodexImporter`; a decision anchored to the persisted `sys:codex` observation is returned by `/projections/decisions`.
+- Public Funnel/Auth0 evidence: `tailscale funnel status --json` exposed only `yujiws.tail474356.ts.net:443` -> `http://127.0.0.1:8090`; public metadata returned `authorization_servers = ["https://lethe-mcp.jp.auth0.com/"]` and `resource = "https://yujiws.tail474356.ts.net/mcp"`; public `/mcp` without token returned 401 + `WWW-Authenticate`; Auth0 DCR smoke client creation/deletion passed; Auth0-issued JWT for audience `https://yujiws.tail474356.ts.net/mcp` returned the five MCP tools.
 - `cargo test -p lethe-e2e --test self_host_api -- --nocapture`: pass, 18 tests.
 - `python scripts/personal_lake_pipeline_smoke.py --work-dir <temp>`: pass; synthetic claude/github imports produced 9 observations and duplicate re-runs were idempotent.
 - `python scripts/personal_lake_w0_check.py --config <temp>/config.toml --db <temp>/lethe.sqlite3 --base-url http://127.0.0.1:18080 --api-token-env LETHE_API_SYNC_TOKEN`: pass against a locally started selfhost using the smoke DB.
 
-## Manual Pending Before Production Exposure
+## Manual Pending Before Claude Connector Use
 
-- Create real `deploy/personal-lake/mcp-jwks.json` from the managed OAuth/OIDC provider.
-- Replace placeholder MCP config values with real `resource_url`, `protected_resource_metadata_url`, `oauth_issuer`, and `oauth_audience`.
-- Start selfhost with separate internal and MCP ports.
-- Enable Tailscale Funnel for the MCP host port only.
-- Register the claude.ai custom connector, complete OAuth, and call `search_lake`.
+- Log in to claude.ai in a browser session.
+- Add custom connector URL `https://yujiws.tail474356.ts.net/mcp`.
+- Complete the Auth0 OAuth flow and call `search_lake`.
