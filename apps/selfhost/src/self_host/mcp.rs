@@ -231,6 +231,12 @@ fn tool_definition(name: &str, description: &str, input_schema: Value) -> Value 
         "name": name,
         "description": description,
         "inputSchema": input_schema,
+        "annotations": {
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
+        }
     })
 }
 

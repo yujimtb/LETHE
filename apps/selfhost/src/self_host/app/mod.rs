@@ -177,11 +177,11 @@ pub struct AppCore {
 }
 
 impl AppCore {
-    #[cfg(test)]
-    fn new(
+    fn from_persisted(
         observations: Vec<Observation>,
         persisted_blobs: Vec<Vec<u8>>,
         persisted_supplementals: Vec<lethe_core::domain::SupplementalRecord>,
+        corpus_config: CorpusConfig,
     ) -> Result<Self, SelfHostError> {
         let mut lake = LakeStore::new();
         for observation in observations {
@@ -212,7 +212,7 @@ impl AppCore {
             lake,
             blobs,
             supplemental,
-            corpus_config: CorpusConfig::default(),
+            corpus_config,
             snapshot: ProjectionSnapshot::default(),
             last_sync_at: None,
             last_sync_error: None,
@@ -220,6 +220,20 @@ impl AppCore {
         };
         core.rebuild_snapshot();
         Ok(core)
+    }
+
+    #[cfg(test)]
+    fn new(
+        observations: Vec<Observation>,
+        persisted_blobs: Vec<Vec<u8>>,
+        persisted_supplementals: Vec<lethe_core::domain::SupplementalRecord>,
+    ) -> Result<Self, SelfHostError> {
+        Self::from_persisted(
+            observations,
+            persisted_blobs,
+            persisted_supplementals,
+            CorpusConfig::default(),
+        )
     }
 
     fn rebuild_snapshot(&mut self) {
@@ -282,47 +296,6 @@ impl AppCore {
             &ProjectionRef::new("proj:claim-queue"),
             ProjectionStatus::Active,
         );
-    }
-
-    fn empty_with_snapshot(
-        snapshot: Option<ProjectionSnapshot>,
-        corpus_config: CorpusConfig,
-    ) -> Self {
-        let mut core = Self {
-            registry: seed_registry(),
-            catalog: seed_projection_catalog(),
-            lake: LakeStore::new(),
-            blobs: BlobStore::new(),
-            supplemental: SupplementalStore::new(),
-            corpus_config,
-            snapshot: snapshot.unwrap_or_default(),
-            last_sync_at: None,
-            last_sync_error: None,
-            sync_metrics: SyncMetrics::default(),
-        };
-        core.catalog.set_status(
-            &ProjectionRef::new("proj:identity-resolution"),
-            ProjectionStatus::Active,
-        );
-        core.catalog.set_status(
-            &ProjectionRef::new("proj:person-page"),
-            ProjectionStatus::Active,
-        );
-        core.catalog
-            .set_status(&ProjectionRef::new("proj:corpus"), ProjectionStatus::Active);
-        core.catalog.set_status(
-            &ProjectionRef::new("proj:claim-queue"),
-            ProjectionStatus::Active,
-        );
-        core.catalog.set_status(
-            &ProjectionRef::new("proj:answer-log"),
-            ProjectionStatus::Active,
-        );
-        core.catalog.set_status(
-            &ProjectionRef::new("proj:claim-queue"),
-            ProjectionStatus::Active,
-        );
-        core
     }
 
     fn prepare_observation(
@@ -476,22 +449,18 @@ impl AppService {
             &config.secret_encryption_key,
             config.routing_key_order,
         )?;
-        let persisted_snapshot = lethe_storage_api::ProjectionMaterializer::projection_records(
-            &persistence,
+        let observations = persistence.load_observations()?;
+        let supplementals = persistence.load_supplementals()?;
+        let core = AppCore::from_persisted(
+            observations,
+            Vec::new(),
+            supplementals,
+            config.corpus.projector_config(),
+        )?;
+        persistence.materialize_projection(
             &ProjectionRef::new("proj:person-page"),
-        )?
-        .map(serde_json::from_value)
-        .transpose()?;
-        if persisted_snapshot.is_none()
-            && lethe_storage_api::ObservationStore::leaf_positions(&persistence)?
-                .iter()
-                .any(|position| position.append_seq > 0)
-        {
-            return Err(SelfHostError::Storage(StorageError::Invariant(
-                "observations exist but proj:person-page materialization is missing; run an explicit rebuild"
-                    .to_owned(),
-            )));
-        }
+            &serde_json::to_value(&core.snapshot)?,
+        )?;
         let slack_sources = config
             .slack_sources
             .iter()
@@ -522,10 +491,7 @@ impl AppService {
             .transpose()?;
 
         Ok(Self {
-            core: Arc::new(Mutex::new(AppCore::empty_with_snapshot(
-                persisted_snapshot,
-                config.corpus.projector_config(),
-            ))),
+            core: Arc::new(Mutex::new(core)),
             persistence: Arc::new(Mutex::new(Box::new(persistence))),
             config: Arc::new(config),
             slack_sources,

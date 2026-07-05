@@ -61,6 +61,23 @@ another WSL Docker container already owned `127.0.0.1:8080`.
 The same stack was also verified through Docker Desktop 4.80.0 on Windows with
 `LETHE_HTTP_HOST_PORT=18081`.
 
+For the standing local service, use the checked-in launcher instead of starting
+Compose by hand:
+
+```powershell
+./scripts/start_personal_lake_services.cmd
+```
+
+The launcher requires `deploy/personal-lake/.env`, reads the required
+`LETHE_MCP_HOST_PORT` from that file, starts the Docker Compose service detached
+with build, and then starts Tailscale Funnel against that port. On this host a
+Windows Startup shortcut script is installed at
+`C:\Users\mitob\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\LETHEPersonalLakeServices.vbs`;
+it runs `scripts\start_personal_lake_services.cmd` hidden after user login.
+This keeps the personal lake and Funnel up across normal Windows logins, but it
+still depends on Windows, Docker Desktop, and Tailscale being signed in and able
+to start.
+
 Deep health:
 
 ```powershell
@@ -127,13 +144,38 @@ The expected public proxy is `https://yujiws.tail474356.ts.net/` to
 `http://127.0.0.1:8090`. Public `/health/deep` should return 404 because the
 internal API router is not exposed on the MCP listener.
 
-Claude custom connector setup:
+Live client setup and verification:
 
-1. Log in to claude.ai.
-2. Add a custom connector with URL `https://yujiws.tail474356.ts.net/mcp`.
-3. Leave OAuth Client ID/Secret blank so Claude uses Auth0 DCR.
-4. Complete the Auth0 OAuth flow.
-5. In a Claude conversation, enable the connector and call `search_lake`.
+- claude.ai: add custom connector `LETHE Personal Lake` with URL
+  `https://yujiws.tail474356.ts.net/mcp`, leave OAuth Client ID/Secret blank so
+  Claude uses Auth0 DCR, complete the Auth0 OAuth flow, then enable the
+  connector in a conversation.
+- ChatGPT: enable Developer mode, create custom app `LETHE Personal Lake` with
+  MCP URL `https://yujiws.tail474356.ts.net/mcp`, select OAuth, acknowledge the
+  custom-action risk prompt, and complete the Auth0 OAuth flow.
+- Codex: configure MCP server `lethe-personal-lake` with URL
+  `https://yujiws.tail474356.ts.net/mcp` and complete the OAuth flow.
+- Claude Code: use the claude.ai-scoped connector `LETHE Personal Lake`. The
+  installed CLI currently has no `claude mcp login` command, so a separate
+  user-scope Claude Code MCP entry may still show `Needs authentication`.
+
+The 2026-07-06 live verification query for all four clients was:
+
+```text
+search_lake(query="aquisition", source_types=["github-commit"], limit=3)
+```
+
+Each client returned `result_count=1` and
+`first_record_id=corpus:github-commit:019f2dea-4cf8-7e53-9f1c-863986634345`.
+Claude Code was tested with `--model opus`; Fable was not used.
+
+All five MCP tools advertise read-only annotations:
+`readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`, and
+`openWorldHint=false`.
+
+Operational note: Auth0 currently warns when a tenant uses Auth0-provided Google
+development keys. Configure a tenant-owned Google OAuth client before treating
+the identity setup as production-grade.
 
 ## Claude.ai
 
@@ -315,3 +357,13 @@ Current corpus source types for personal search are:
 records. The response includes the flat `records` list plus `structure` with
 `root_session` and `sidechains`, so callers must preserve the parent/child
 relationship instead of flattening sidechains into a single anonymous thread.
+
+Selfhost startup rebuilds the projection snapshot from persisted observations
+and supplementals before materializing it. Importing new observations with
+host-run one-shot CLIs and then restarting the service is therefore sufficient
+for MCP corpus reads to see the durable data.
+
+Filtered corpus grep applies source-type filters before building the trigram
+index. Keep that order intact: broad personal-lake text can exceed the request
+timeout if the engine indexes every record before applying a narrow MCP
+`source_types` filter.

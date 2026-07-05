@@ -216,16 +216,21 @@ impl GrepEngine {
         let regex =
             Regex::new(&pattern).map_err(|err| GrepError::InvalidPattern(err.to_string()))?;
         let start = Instant::now();
-        let index = self.use_trigram_index.then(|| TrigramIndex::build(records));
+        let filtered = records
+            .iter()
+            .filter(|record| filters_match(record, &request.filters))
+            .collect::<Vec<_>>();
+        let index = self
+            .use_trigram_index
+            .then(|| TrigramIndex::build_refs(&filtered));
         let candidate_indices = index
             .as_ref()
             .and_then(|index| index.candidate_indices(&pattern))
-            .unwrap_or_else(|| (0..records.len()).collect());
+            .unwrap_or_else(|| (0..filtered.len()).collect());
 
         let mut candidates = candidate_indices
             .into_iter()
-            .map(|idx| &records[idx])
-            .filter(|record| filters_match(record, &request.filters))
+            .map(|idx| filtered[idx])
             .collect::<Vec<_>>();
         match request.order {
             GrepOrder::DateDesc => candidates.sort_by(|left, right| {
@@ -320,7 +325,7 @@ struct TrigramIndex {
 }
 
 impl TrigramIndex {
-    fn build(records: &[GrepRecord]) -> Self {
+    fn build_refs(records: &[&GrepRecord]) -> Self {
         let mut postings: HashMap<String, Vec<usize>> = HashMap::new();
         for (idx, record) in records.iter().enumerate() {
             let mut seen = HashSet::new();
@@ -486,6 +491,13 @@ mod tests {
         }
     }
 
+    fn record_with_type(id: &str, source_type: &str, text: &str) -> GrepRecord {
+        GrepRecord {
+            source_type: source_type.into(),
+            ..record(id, text)
+        }
+    }
+
     #[test]
     fn nfkc_search_matches_fullwidth_digits() {
         let engine = GrepEngine::new(100);
@@ -536,6 +548,34 @@ mod tests {
             .search(&records, &request, "wm".into())
             .unwrap();
         assert_eq!(indexed.matches, full_scan.matches);
+    }
+
+    #[test]
+    fn type_filter_is_applied_with_trigram_index() {
+        let records = vec![
+            record_with_type("r1", "claude-ai", "needle from claude"),
+            record_with_type("r2", "github-commit", "needle from github"),
+            record_with_type("r3", "codex", "needle from codex"),
+        ];
+        let request = GrepRequest {
+            pattern: "needle".into(),
+            filters: GrepFilters {
+                types: vec!["github-commit".into()],
+                ..GrepFilters::default()
+            },
+            ..GrepRequest::default()
+        };
+        let indexed = GrepEngine::new(100)
+            .search(&records, &request, "wm".into())
+            .unwrap();
+        let full_scan = GrepEngine::new(100)
+            .without_trigram_index()
+            .search(&records, &request, "wm".into())
+            .unwrap();
+
+        assert_eq!(indexed.matches, full_scan.matches);
+        assert_eq!(indexed.matches.len(), 1);
+        assert_eq!(indexed.matches[0].source_type, "github-commit");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # Track H Handoff: MCP read port
 
 Date: 2026-07-06
-Status: Server/Auth0/Tailscale public surface complete; live claude.ai connector UI registration remains pending.
+Status: Complete. Server/Auth0/Tailscale public surface and live claude.ai, ChatGPT, Claude Code, and Codex MCP access are verified.
 
 ## Implemented
 
@@ -38,7 +38,11 @@ Status: Server/Auth0/Tailscale public surface complete; live claude.ai connector
 - Downloaded the Auth0 public JWKS to local `deploy/personal-lake/mcp-jwks.json`; the file is gitignored because it is generated from the external provider and may rotate.
 - Started Tailscale Funnel: `https://yujiws.tail474356.ts.net/` proxies to `http://127.0.0.1:8090`.
 - Verified public metadata, public 401 challenge, DCR smoke registration, and Auth0-issued JWT `tools/list` against the public endpoint.
-- Kept H4 open only for claude.ai UI registration and `search_lake` invocation, because the Playwright browser was not logged in to Claude.
+- Registered claude.ai custom connector `LETHE Personal Lake`, completed Auth0 OAuth, and verified `search_lake(query="aquisition", source_types=["github-commit"], limit=3)` with Claude Opus 4.8 Max. It returned `result_count=1` and `first_record_id=corpus:github-commit:019f2dea-4cf8-7e53-9f1c-863986634345`.
+- Registered ChatGPT custom app `LETHE Personal Lake`, completed Auth0 OAuth, and verified the same `search_lake` call from ChatGPT with the same record id.
+- Verified Codex CLI MCP access with the same `search_lake` call and record id.
+- Verified Claude Code MCP access through the claude.ai-scoped connector with `--model opus`; Fable was not used. The user-scope Claude Code MCP entry still shows `Needs authentication` because the installed Claude Code CLI does not expose an `mcp login` command, but the active claude.ai-scoped connector is connected and usable.
+- Added read-only MCP tool annotations for all five tools: `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`, and `openWorldHint=false`.
 
 ## Changed Files
 
@@ -64,6 +68,8 @@ Status: Server/Auth0/Tailscale public surface complete; live claude.ai connector
 - `deploy/personal-lake/config.host.toml`
 - `deploy/personal-lake/mcp-jwks.example.json`
 - `.gitignore`
+- `scripts/start_personal_lake_services.ps1`
+- `scripts/start_personal_lake_services.cmd`
 - `scripts/personal_lake_pipeline_smoke.py`
 - `README.md`
 - `docs/development/personal-lake-ingestion.md`
@@ -74,8 +80,9 @@ Status: Server/Auth0/Tailscale public surface complete; live claude.ai connector
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo test -p lethe-e2e --test mcp_read_port`: passed, 4 tests.
-- `cargo test -p lethe-selfhost`: passed, 27 tests.
-- `cargo test -p lethe-e2e --test self_host_api`: passed, 16 tests.
+- `cargo test -p lethe-selfhost`: passed, 28 tests.
+- `cargo test -p lethe-api type_filter_is_applied_with_trigram_index`: passed.
+- `cargo test -p lethe-e2e --test self_host_api`: passed, 18 tests.
 - `cargo test --workspace`: passed. One real-data Codex archive test remains ignored by design unless its environment points to a real archive.
 - `python scripts\check_markdown_links.py`: failed on pre-existing archived sharding-refactor links under `openspec/changes/archive/2026-07-05-sharding-refactor`; no Track H markdown links were added that depend on those missing paths.
 
@@ -98,17 +105,16 @@ Status: Server/Auth0/Tailscale public surface complete; live claude.ai connector
 - `deploy/personal-lake/mcp-jwks.example.json` documents the required JWKS shape. The local `deploy/personal-lake/mcp-jwks.json` was generated from Auth0 and is intentionally gitignored; refresh it from `https://lethe-mcp.jp.auth0.com/.well-known/jwks.json` after Auth0 signing-key rotation.
 - Mock-key test method: `tests/e2e/tests/mcp_read_port.rs` generates an ES256 P-256 key pair with `ring`, builds a matching public JWKS, signs JWTs with controlled `iss`, `aud`, and `exp`, then exercises expired, wrong-audience, and valid-token paths.
 
-## Manual Connectivity
+## Live Connectivity
 
-Live claude.ai custom connector registration was attempted with Playwright, but that browser session was not logged in to Claude and was redirected to `https://claude.ai/login?from=logout`. Server, Auth0, and Funnel prerequisites are complete.
+All live client checks used the public MCP URL `https://yujiws.tail474356.ts.net/mcp` and Auth0 issuer `https://lethe-mcp.jp.auth0.com/`.
 
-Manual steps remaining in claude.ai:
-
-1. Log in to claude.ai.
-2. Register a custom connector with URL `https://yujiws.tail474356.ts.net/mcp`.
-3. Leave OAuth Client ID/Secret blank so Claude uses DCR, or use a deliberately pre-registered Auth0 client if DCR is intentionally disabled later.
-4. Complete the Auth0 OAuth flow in the browser.
-5. Call `search_lake` from claude.ai and confirm it returns projected corpus data.
+| Client | Status | Evidence |
+| --- | --- | --- |
+| claude.ai | Pass | Custom connector `LETHE Personal Lake` completed OAuth and returned `tool_ok=yes; result_count=1; first_record_id=corpus:github-commit:019f2dea-4cf8-7e53-9f1c-863986634345` for `search_lake("aquisition", ["github-commit"], 3)` using Claude Opus 4.8 Max. |
+| ChatGPT | Pass | Developer-mode custom app `LETHE Personal Lake` completed OAuth and the tool call returned the same result count and record id. |
+| Claude Code | Pass | `claude -p --model opus --permission-mode bypassPermissions ...` called the connected claude.ai-scoped MCP connector and returned the same result count and record id. |
+| Codex | Pass | `codex exec --sandbox read-only ...` called `lethe-personal-lake` and returned the same result count and record id. |
 
 ## SHALL Evidence
 
@@ -120,7 +126,7 @@ Manual steps remaining in claude.ai:
 | MCPR-03 | Protected resource metadata must be public and include the managed issuer. | `protected_resource_metadata_contract_is_public` verifies `/.well-known/oauth-protected-resource`; live public metadata returned Auth0 issuer `https://lethe-mcp.jp.auth0.com/` and resource `https://yujiws.tail474356.ts.net/mcp`. |
 | MCPR-03 | Bearer JWT signature, `exp`, and audience must be verified; invalid tokens return 401 with `WWW-Authenticate`. | `mcp_jwt_validation_rejects_expired_and_wrong_audience_and_accepts_valid` covers expired, wrong audience, and valid JWT paths. Live public `/mcp` without token returned 401 + `WWW-Authenticate`; Auth0-issued JWT for audience `https://yujiws.tail474356.ts.net/mcp` returned `tools/list`. |
 | MCPR-03 | Token issuance, DCR, consent UI, and fixed API key auth must not be implemented. | MCP router has only metadata and `/mcp` routes; auth path accepts only Bearer JWTs validated against JWKS. |
-| MCPR-04 | Exactly five read-only tools are exposed and no write tool is present. | `tools/list` contract in `five_mcp_tools_have_contracts_and_read_via_projection` asserts the five names and descriptions. |
+| MCPR-04 | Exactly five read-only tools are exposed and no write tool is present. | `tools/list` contract in `five_mcp_tools_have_contracts_and_read_via_projection` asserts the five names, descriptions, and read-only, non-destructive, idempotent, closed-world annotations. |
 | MCPR-04 | Tools read only projection outputs, not raw supplemental or raw observation stores. | MCP calls `AppService::corpus_*`, `claim_queue_response_filtered`, and `decision_search_response`; tests seed observations/supplementals then assert projected tool responses. No MCP tool directly accesses raw stores. |
 | MCPR-04 | `claim_queue` supports state and `verification_mode` filtering in same-origin group shape. | `five_mcp_tools_have_contracts_and_read_via_projection` calls `claim_queue` with `verification_mode = "generate"` and asserts the projected group response. |
 | MCPR-04 | `search_decisions` reads supersedes-resolved decision ledger projection. | `five_mcp_tools_have_contracts_and_read_via_projection` calls `search_decisions`; `claim_queue_api_filters_pages_and_searches_decisions` covers the underlying Track C projection behavior. |
@@ -130,5 +136,6 @@ Manual steps remaining in claude.ai:
 
 ## Open Items
 
-- Run the live claude.ai custom connector UI flow after logging in to Claude.
+- No Track H implementation items remain.
 - No CLQ-06 MCP stubs remain. Integration should treat `claim_queue` and `search_decisions` as real Track C projection consumers.
+- Operational follow-up: Auth0 still warns about using Auth0-provided Google development keys. Configure a tenant-owned Google OAuth client before treating this as a production identity setup.

@@ -105,9 +105,12 @@ Track H(MCP port)                   │
 - [x] H3 5 ツール(search_lake / get_record / get_thread / claim_queue / search_decisions)を実装する。claim 系 2 ツールは C4 完了までは CLQ-06 契約へのスタブで進めてよい
   - Spec: MCPR-04 / 受け入れ: ツール説明文が spec レビューを通過、各ツールの contract test
   - `claim_queue` / `search_decisions` は Track C4 の実 Projection API に接続済み。生 supplemental は読まない。
-- [ ] H4 Tailscale Funnel で MCP ポートのみを公開し、実際の claude.ai カスタムコネクタ登録 → OAuth フロー → ツール呼び出しの手動疎通を行う
+- [x] H4 Tailscale Funnel で MCP ポートのみを公開し、実際の claude.ai カスタムコネクタ登録 → OAuth フロー → ツール呼び出しの手動疎通を行う
   - Spec: MCPR-01, MCPR-06 / 受け入れ: ブラウザ版 claude.ai から search_lake が実データを返す
-  - 2026-07-06: Tailscale Funnel は `https://yujiws.tail474356.ts.net/ -> http://127.0.0.1:8090` で MCP ポートのみ公開済み。Auth0 tenant `lethe-mcp.jp.auth0.com` に API `LETHE MCP Read Port` (`identifier = https://yujiws.tail474356.ts.net/mcp`, scope `mcp:read`, RS256, DCR enabled) を作成し、JWKS を `deploy/personal-lake/mcp-jwks.json` へ反映。公開 metadata、401 challenge、DCR smoke、Auth0 発行 JWT による `tools/list` は pass。Playwright の claude.ai は未ログインで `/login?from=logout` に遷移したため、ブラウザ版 claude.ai への custom connector 登録と `search_lake` 手動呼び出しのみ未実施。
+  - 2026-07-06: Tailscale Funnel は `https://yujiws.tail474356.ts.net/ -> http://127.0.0.1:8090` で MCP ポートのみ公開済み。Auth0 tenant `lethe-mcp.jp.auth0.com` に API `LETHE MCP Read Port` (`identifier = https://yujiws.tail474356.ts.net/mcp`, scope `mcp:read`, RS256, DCR enabled) を作成し、JWKS を `deploy/personal-lake/mcp-jwks.json` へ反映。公開 metadata、401 challenge、DCR smoke、Auth0 発行 JWT による `tools/list` は pass。
+  - 2026-07-06: claude.ai custom connector `LETHE Personal Lake` を登録し、Auth0 OAuth を完了。Claude Opus 4.8 Max で `search_lake(query="aquisition", source_types=["github-commit"], limit=3)` が `result_count=1`, `first_record_id=corpus:github-commit:019f2dea-4cf8-7e53-9f1c-863986634345` を返すことを確認。
+  - 2026-07-06: ChatGPT custom app `LETHE Personal Lake` を Developer mode で登録し、Auth0 OAuth を完了。ChatGPT の tool call で同じ `search_lake` が `result_count=1`, `first_record_id=corpus:github-commit:019f2dea-4cf8-7e53-9f1c-863986634345` を返すことを確認。
+  - 2026-07-06: Codex CLI と Claude Code でも同じ MCP query を実行し、同じ record id を返すことを確認。Claude Code は `--model opus` を使用し、Fable 系モデルは使用していない。
 
 ## Track I. 統合
 
@@ -119,6 +122,7 @@ Track H(MCP port)                   │
   - 2026-07-06: `decision_post_anchored_to_imported_codex_observation_is_searchable` を追加。Codex JSONL fixture を importer 経由で取り込み、永続化された `sys:codex` observation にアンカーした `decision@1` が `GET /projections/decisions` で検索可能になることを確認。
 - [x] I3 要件被覆の抜き取り確認(本人): 各 spec の SHALL に対する test 対応表を生成し、公開面(Funnel 対象ポート・トークン検証)を実機で最終確認する
   - 受け入れ: 全 SHALL に judgement+evidence が存在
-  - 2026-07-06: `requirements-coverage.md` を生成。local code/test で検証できる項目は evidence を記録済み。Tailscale Funnel と claude.ai custom connector の実機疎通は、ユーザーの管理 ID 基盤/JWKS/ブラウザ UI が必要なため未実施。
-  - 2026-07-06: synthetic personal lake import smoke と一時 selfhost に対する W0 check は pass。実公開面のみ未実施。
-  - 2026-07-06: 実公開面の最終確認を追加実施。Funnel status は HTTPS 443 `/` -> `http://127.0.0.1:8090` のみで、公開 `GET https://yujiws.tail474356.ts.net/.well-known/oauth-protected-resource` は Auth0 issuer/resource を返す。公開 `POST /mcp` は token なしで 401 + `WWW-Authenticate`、公開 `/health/deep` は 404。Auth0 発行 JWT(aud=`https://yujiws.tail474356.ts.net/mcp`)で公開 `POST /mcp` `tools/list` が 5 ツールを返すことを確認。claude.ai custom connector UI 登録は H4 の残件。
+  - 2026-07-06: `requirements-coverage.md` を生成。local code/test と実公開面の両方で検証できる項目は evidence を記録済み。
+  - 2026-07-06: synthetic personal lake import smoke と一時 selfhost に対する W0 check は pass。
+  - 2026-07-06: 実公開面の最終確認を追加実施。Funnel status は HTTPS 443 `/` -> `http://127.0.0.1:8090` のみで、公開 `GET https://yujiws.tail474356.ts.net/.well-known/oauth-protected-resource` は Auth0 issuer/resource を返す。公開 `POST /mcp` は token なしで 401 + `WWW-Authenticate`、公開 `/health/deep` は 404。Auth0 発行 JWT(aud=`https://yujiws.tail474356.ts.net/mcp`)で公開 `POST /mcp` `tools/list` が 5 ツールを返すことを確認。
+  - 2026-07-06: claude.ai、ChatGPT、Claude Code、Codex の各クライアントから実公開 MCP endpoint に接続し、`search_lake(query="aquisition", source_types=["github-commit"], limit=3)` が `corpus:github-commit:019f2dea-4cf8-7e53-9f1c-863986634345` を返すことを確認。

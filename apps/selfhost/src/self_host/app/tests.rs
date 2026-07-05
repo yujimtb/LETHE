@@ -9,8 +9,8 @@ use lethe_adapter_slack::slack::client::{SlackMessage, SlackMessageType};
 use lethe_core::domain::supplemental::InputAnchorSet;
 
 use super::{
-    AppCore, AppService, GoogleSourceRuntime, SelfHostError, SlackSourceRuntime,
-    extract_slide_text_fragments, infer_profile_name_from_fragments,
+    AppCore, AppService, GoogleSourceRuntime, ProjectionSnapshot, SelfHostError,
+    SlackSourceRuntime, extract_slide_text_fragments, infer_profile_name_from_fragments,
     known_thread_roots_from_observations, latest_revision_to_capture, namespace_draft,
     non_empty_state, ranked_self_intro_slide_indices, thread_cursor_key, thread_root_ts,
 };
@@ -23,7 +23,7 @@ use crate::self_host::google::HttpGoogleSlidesClient;
 use crate::self_host::slack::HttpSlackClient;
 use lethe_core::domain::{
     ActorRef, AuthorityModel, CaptureModel, EntityRef, IdempotencyKey, IngestResult, Mutability,
-    Observation, ObserverRef, SchemaRef, SemVer, SourceSystemRef, SupplementalId,
+    Observation, ObserverRef, ProjectionRef, SchemaRef, SemVer, SourceSystemRef, SupplementalId,
     SupplementalRecord,
 };
 use lethe_derivation_gemini::GeminiSlideAnalyzer;
@@ -210,6 +210,69 @@ fn test_mcp_oauth() -> McpOAuthConfig {
             }],
         },
     }
+}
+
+#[test]
+fn bootstrap_rebuilds_snapshot_from_persisted_observations() {
+    let root = std::env::temp_dir().join(format!("lethe-self-host-test-{}", uuid::Uuid::now_v7()));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let observation = Observation {
+        id: Observation::new_id(),
+        schema: SchemaRef::new("schema:claude-message"),
+        schema_version: SemVer::new("1.0.0"),
+        observer: ObserverRef::new("obs:claude-importer"),
+        source_system: Some(SourceSystemRef::new("sys:claude-ai")),
+        actor: None,
+        authority_model: AuthorityModel::LakeAuthoritative,
+        capture_model: CaptureModel::Event,
+        subject: EntityRef::new("conversation:claude:bootstrap"),
+        target: None,
+        payload: serde_json::json!({"text": "persisted bootstrap needle"}),
+        attachments: vec![],
+        published: Utc::now(),
+        recorded_at: Utc::now(),
+        consent: None,
+        idempotency_key: IdempotencyKey::new("claude:bootstrap:needle"),
+        meta: serde_json::json!({
+            "canonical_json": serde_json::json!({
+                "source": "claude-ai",
+                "object_id": "bootstrap-needle",
+                "body": "persisted bootstrap needle"
+            }).to_string(),
+            "source_container": "claude-bootstrap",
+        }),
+    };
+    persistence.persist_observation(&observation).unwrap();
+    persistence
+        .materialize_projection(
+            &ProjectionRef::new("proj:person-page"),
+            &serde_json::to_value(ProjectionSnapshot::default()).unwrap(),
+        )
+        .unwrap();
+    drop(persistence);
+
+    let mut config = test_config(db.clone(), blobs.clone());
+    config.corpus.mode = lethe_projection_corpus::CorpusMode::PersonalAllText;
+    let service = AppService::bootstrap(config).unwrap();
+    let response = service
+        .corpus_grep_response(&lethe_api::api::grep::GrepRequest {
+            pattern: "bootstrap needle".into(),
+            limit: Some(3),
+            ..lethe_api::api::grep::GrepRequest::default()
+        })
+        .unwrap();
+
+    assert_eq!(response.data.matches.len(), 1);
+    assert!(
+        response
+            .data
+            .projection_watermark
+            .starts_with("proj:corpus:")
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

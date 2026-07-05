@@ -465,6 +465,10 @@ fn five_mcp_tools_have_contracts_and_read_via_projection() {
         assert!(!description.trim().is_empty());
         assert!(description.len() <= 100);
         assert!(!description.to_ascii_lowercase().contains("write"));
+        assert_eq!(tool["annotations"]["readOnlyHint"], true);
+        assert_eq!(tool["annotations"]["destructiveHint"], false);
+        assert_eq!(tool["annotations"]["idempotentHint"], true);
+        assert_eq!(tool["annotations"]["openWorldHint"], false);
     }
 
     let search_response = runtime

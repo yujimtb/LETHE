@@ -10,4 +10,7 @@ function New-HexSecret {
 
 Write-Output "LETHE_STORAGE_ENCRYPTION_KEY=$(New-HexSecret -Bytes 32)"
 Write-Output "LETHE_API_READ_TOKEN=$(New-HexSecret -Bytes 32)"
+Write-Output "LETHE_API_WRITE_TOKEN=$(New-HexSecret -Bytes 32)"
 Write-Output "LETHE_API_SYNC_TOKEN=$(New-HexSecret -Bytes 32)"
+Write-Output "LETHE_HTTP_HOST_PORT=8080"
+Write-Output "LETHE_MCP_HOST_PORT=8090"

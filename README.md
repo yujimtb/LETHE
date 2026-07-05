@@ -158,7 +158,17 @@ MCP read port は別 listener で提供します。
 間だけ到達可能です。常時稼働 SLA は提供しません。
 現在の個人 lake Funnel は `https://yujiws.tail474356.ts.net/` を
 `127.0.0.1:8090` に転送します。Claude custom connector には
-`https://yujiws.tail474356.ts.net/mcp` を登録します。
+`https://yujiws.tail474356.ts.net/mcp` を登録します。ChatGPT custom app、
+Codex MCP、Claude Code の claude.ai-scoped connector も同じ URL を使います。
+2026-07-06 時点で、claude.ai、ChatGPT、Claude Code、Codex はいずれも
+`search_lake(query="aquisition", source_types=["github-commit"], limit=3)` で
+`corpus:github-commit:019f2dea-4cf8-7e53-9f1c-863986634345` を取得済みです。
+
+個人 lake を常駐させる場合は `scripts/start_personal_lake_services.cmd` を使います。
+このホストでは Windows Startup の `LETHEPersonalLakeServices.vbs` が
+`scripts\start_personal_lake_services.cmd` を実行し、Docker Compose selfhost と
+Tailscale Funnel を起動します。Windows、Docker Desktop、Tailscale がログイン済みで
+起動できることが前提です。
 
 ## Runtime guarantees
 
