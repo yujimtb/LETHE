@@ -2,6 +2,7 @@ pub mod app;
 pub mod config;
 pub mod failover_spool;
 pub mod google;
+pub mod import_client;
 pub mod mcp;
 pub mod mcp_contract;
 pub mod registry;

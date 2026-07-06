@@ -79,12 +79,14 @@ pub struct ClaimView {
     pub derived_from: InputAnchorSet,
     pub source_refs: Vec<String>,
     pub payload_hash: String,
+    pub project: String,
     pub statement: String,
     pub verification_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_quote: Option<String>,
+    pub backfill: bool,
     pub state: ClaimState,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -102,6 +104,7 @@ pub struct ClaimGroup {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionView {
     pub id: SupplementalId,
+    pub project: String,
     pub statement: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rationale: Option<String>,
@@ -139,16 +142,22 @@ pub struct ClaimQueueProjection {
 
 impl ClaimQueueProjection {
     pub fn groups_matching_state(&self, state: Option<ClaimState>) -> Vec<ClaimGroup> {
-        let Some(state) = state else {
-            return self.groups.clone();
-        };
+        self.groups_matching(state, None)
+    }
+
+    pub fn groups_matching(
+        &self,
+        state: Option<ClaimState>,
+        backfill: Option<bool>,
+    ) -> Vec<ClaimGroup> {
         self.groups
             .iter()
             .filter_map(|group| {
                 let members = group
                     .members
                     .iter()
-                    .filter(|claim| claim.state == state)
+                    .filter(|claim| state.is_none_or(|state| claim.state == state))
+                    .filter(|claim| backfill.is_none_or(|backfill| claim.backfill == backfill))
                     .cloned()
                     .collect::<Vec<_>>();
                 if members.is_empty() {
@@ -253,10 +262,12 @@ struct ClaimAccumulator {
     absorbed: Vec<SupplementalId>,
     source_refs: Vec<String>,
     payload_hash: String,
+    project: String,
     statement: String,
     verification_mode: String,
     context: Option<String>,
     source_quote: Option<String>,
+    backfill: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -307,10 +318,14 @@ fn deduplicate_claims(
                     absorbed: Vec::new(),
                     source_refs: group_source_refs(&record.derived_from, by_id),
                     payload_hash,
+                    project: string_field(&record.payload, "project")
+                        .unwrap_or("uncategorized")
+                        .to_owned(),
                     statement: statement.to_owned(),
                     verification_mode: verification_mode.to_owned(),
                     context: string_field(&record.payload, "context").map(str::to_owned),
                     source_quote: string_field(&record.payload, "source_quote").map(str::to_owned),
+                    backfill: bool_field(&record.payload, "backfill").unwrap_or(false),
                 },
             );
         }
@@ -497,10 +512,12 @@ fn claim_views(
                 derived_from: claim.representative.derived_from.clone(),
                 source_refs: claim.source_refs,
                 payload_hash: claim.payload_hash,
+                project: claim.project,
                 statement: claim.statement,
                 verification_mode: claim.verification_mode,
                 context: claim.context,
                 source_quote: claim.source_quote,
+                backfill: claim.backfill,
                 state: state.state,
                 created_at: claim.representative.created_at,
                 updated_at: state.updated_at,
@@ -575,6 +592,9 @@ fn decision_views(
             let supersedes = supplemental_id_array_field(&record.payload, "supersedes");
             Some(DecisionView {
                 id: record.id.clone(),
+                project: string_field(&record.payload, "project")
+                    .unwrap_or("uncategorized")
+                    .to_owned(),
                 statement: statement.to_owned(),
                 search_text: normalize_search_text(&format!(
                     "{}\n{}",
@@ -820,6 +840,10 @@ fn string_array_field(value: &serde_json::Value, field: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn bool_field(value: &serde_json::Value, field: &str) -> Option<bool> {
+    value.get(field).and_then(serde_json::Value::as_bool)
 }
 
 fn supplemental_id_array_field(value: &serde_json::Value, field: &str) -> Vec<SupplementalId> {
@@ -1070,6 +1094,36 @@ mod tests {
 
         assert_eq!(projection.groups.len(), 1);
         assert_eq!(projection.groups[0].members.len(), 3);
+    }
+
+    #[test]
+    fn backfill_filter_is_orthogonal_to_state_filter() {
+        let mut backfill = claim(
+            "sup:backfill",
+            "obs:backfill",
+            "Backfill claim",
+            "check",
+            at(1),
+            "m1",
+        );
+        backfill.payload["backfill"] = serde_json::Value::Bool(true);
+        let live = claim("sup:live", "obs:live", "Live claim", "check", at(2), "m1");
+        let records = vec![backfill, live];
+
+        let projection = ClaimQueueProjector.project_records(&records);
+        let backfill_groups = projection.groups_matching(Some(ClaimState::Open), Some(true));
+        let live_groups = projection.groups_matching(Some(ClaimState::Open), Some(false));
+
+        assert_eq!(backfill_groups.len(), 1);
+        assert_eq!(
+            backfill_groups[0].members[0].representative_id.as_str(),
+            "sup:backfill"
+        );
+        assert_eq!(live_groups.len(), 1);
+        assert_eq!(
+            live_groups[0].members[0].representative_id.as_str(),
+            "sup:live"
+        );
     }
 
     #[test]

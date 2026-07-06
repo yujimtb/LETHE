@@ -195,17 +195,8 @@ impl SupplementalStore {
         ObservationExists: Fn(&ObservationId) -> bool,
         SupplementalExists: Fn(&SupplementalId) -> bool,
     {
-        // Invariant 2: derivedFrom must have at least one anchor.
-        if record.derived_from.observations.is_empty()
-            && record.derived_from.blobs.is_empty()
-            && record.derived_from.supplementals.is_empty()
-        {
-            return Err(DomainError::Validation(
-                "derivedFrom must reference at least one input".into(),
-            ));
-        }
-
-        // Invariant 4: referenced observations must exist.
+        // Referenced anchors must exist; per-kind empty-anchor policy is
+        // enforced by the supplemental kind registry before this store write.
         for obs_id in &record.derived_from.observations {
             if !observation_exists(obs_id) {
                 return Err(DomainError::Validation(format!(
@@ -454,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_derived_from_rejected() {
+    fn empty_derived_from_is_left_to_registry_policy() {
         let lake = LakeStore::new();
         let mut store = SupplementalStore::new();
         let rec = SupplementalRecord {
@@ -470,7 +461,7 @@ mod tests {
             consent_metadata: None,
             lineage: None,
         };
-        assert!(store.add(rec, &lake).is_err());
+        assert!(store.add(rec, &lake).is_ok());
     }
 
     #[test]

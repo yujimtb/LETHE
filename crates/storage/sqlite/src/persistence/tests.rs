@@ -143,6 +143,68 @@ fn idempotent_append_detects_canonical_json_collision() {
 }
 
 #[test]
+fn bulk_idempotent_append_uses_one_transaction_and_preserves_outcomes() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+
+    let mut first = sample_observation();
+    first.idempotency_key = IdempotencyKey::new("bulk-a");
+    first.meta = serde_json::json!({
+        CANONICAL_JSON_META_KEY: serde_json::json!({
+            "source": "test",
+            "object_id": "bulk-a",
+            "body": "first"
+        }).to_string(),
+        "source_container": "test",
+    });
+
+    let mut duplicate = first.clone();
+    duplicate.id = Observation::new_id();
+
+    let mut collision = first.clone();
+    collision.id = Observation::new_id();
+    collision.meta = serde_json::json!({
+        CANONICAL_JSON_META_KEY: serde_json::json!({
+            "source": "test",
+            "object_id": "bulk-a",
+            "body": "changed"
+        }).to_string(),
+        "source_container": "test",
+    });
+
+    let mut second = sample_observation();
+    second.id = Observation::new_id();
+    second.idempotency_key = IdempotencyKey::new("bulk-b");
+    second.meta = serde_json::json!({
+        CANONICAL_JSON_META_KEY: serde_json::json!({
+            "source": "test",
+            "object_id": "bulk-b",
+            "body": "second"
+        }).to_string(),
+        "source_container": "test",
+    });
+
+    let outcomes = store
+        .append_observations_idempotent(&[first.clone(), duplicate, collision, second.clone()])
+        .unwrap();
+
+    assert_eq!(
+        outcomes,
+        vec![
+            DurableAppendOutcome::Appended(first.id.clone()),
+            DurableAppendOutcome::Duplicate(first.id.clone()),
+            DurableAppendOutcome::CanonicalCollision(first.id.clone()),
+            DurableAppendOutcome::Appended(second.id.clone()),
+        ]
+    );
+    assert_eq!(store.load_observations().unwrap().len(), 2);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
 fn rehome_mode_a_preserves_stored_identity_and_times() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let db = tmp.join("test.sqlite3");

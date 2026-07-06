@@ -19,6 +19,7 @@ lethe-policy = { path = "../../crates/policy" }
 lethe-profile-model = { path = "../../crates/profile-model" }
 lethe-projection-answer-log = { path = "../../crates/projections/answer-log" }
 lethe-projection-claim-queue = { path = "../../crates/projections/claim-queue" }
+lethe-projection-cognition = { path = "../../crates/projections/cognition" }
 lethe-projection-corpus = { path = "../../crates/projections/corpus" }
 lethe-projection-person = { path = "../../crates/projections/person" }
 lethe-registry = { path = "../../crates/registry" }

@@ -21,6 +21,10 @@ pub struct SlackMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
     pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingress_kind: Option<SlackIngressKind>,
+    #[serde(default)]
+    pub mentions: Vec<String>,
     pub message_type: SlackMessageType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edited: Option<SlackEdited>,
@@ -32,6 +36,14 @@ pub struct SlackMessage {
     pub reply_count: u32,
     #[serde(default)]
     pub reply_users_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlackIngressKind {
+    DirectMessage,
+    Mention,
+    Channel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

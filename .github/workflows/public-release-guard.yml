@@ -26,5 +26,8 @@ jobs:
       - name: Check Markdown links
         run: python ./scripts/check_markdown_links.py
 
+      - name: Verify OpenSpec review harness coverage
+        run: cargo run -p lethe-review-harness -- verify --spec-root openspec/changes/review-harness/specs --evidence-root . --tasks-root openspec/changes/review-harness
+
       - name: Test workspace
         run: cargo test --workspace

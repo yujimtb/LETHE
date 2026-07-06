@@ -63,7 +63,6 @@ impl AppService {
             lineage: request.lineage,
         };
 
-        validate_non_empty_anchor(&record.derived_from)?;
         let resolved_observation_ids =
             self.resolve_observation_anchors(&record.derived_from.observations)?;
         let resolved_supplemental_kinds =
@@ -213,23 +212,6 @@ fn invalid_supplemental_id(id: &SupplementalId) -> SelfHostError {
     }
 }
 
-fn validate_non_empty_anchor(derived_from: &InputAnchorSet) -> Result<(), SelfHostError> {
-    if derived_from.observations.is_empty()
-        && derived_from.blobs.is_empty()
-        && derived_from.supplementals.is_empty()
-    {
-        Err(SelfHostError::SupplementalValidation {
-            code: "empty_anchor",
-            detail: serde_json::json!({
-                "field": "derived_from",
-                "reason": "derived_from must include at least one observation, blob, or supplemental"
-            }),
-        })
-    } else {
-        Ok(())
-    }
-}
-
 fn map_supplemental_kind_error(error: SupplementalKindError) -> SelfHostError {
     match error {
         SupplementalKindError::KindNotRegistered {
@@ -267,6 +249,27 @@ fn map_supplemental_kind_error(error: SupplementalKindError) -> SelfHostError {
             detail: serde_json::json!({
                 "kind": kind,
                 "major_version": major_version,
+                "violations": violations
+            }),
+        },
+        SupplementalKindError::MissingRequiredAnchor { kind_ref } => {
+            SelfHostError::SupplementalValidation {
+                code: "empty_anchor",
+                detail: serde_json::json!({
+                    "kind": kind_ref,
+                    "field": "derived_from",
+                    "reason": "kind requires at least one observation, blob, or supplemental anchor"
+                }),
+            }
+        }
+        SupplementalKindError::MissingOriginMetadata {
+            kind_ref,
+            violations,
+        } => SelfHostError::SupplementalValidation {
+            code: "missing_origin",
+            detail: serde_json::json!({
+                "kind": kind_ref,
+                "field": "payload.origin",
                 "violations": violations
             }),
         },

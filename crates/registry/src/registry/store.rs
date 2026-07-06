@@ -12,11 +12,13 @@ use lethe_core::domain::{
 use super::supplemental_kind::{
     SupplementalKindError, SupplementalKindSchema, SupplementalKindValidationConfig,
     SupplementalKindVersion, parse_semver, parse_supplemental_kind_ref, supplemental_kind_key,
-    supplemental_kind_key_for_schema, validate_json_schema_document, validate_supplemental_payload,
+    supplemental_kind_key_for_schema, validate_json_schema_document,
+    validate_supplemental_anchor_policy, validate_supplemental_payload,
     validate_supplemental_record_claim_anchor,
 };
 use super::{
-    EntityType, ObservationSchema, Observer, ProjectionCatalogEntry, SchemaVersion, SourceSystem,
+    ChannelKind, ChannelRecord, EntityType, ObservationSchema, Observer, ProjectionCatalogEntry,
+    SchemaVersion, SourceSystem,
 };
 
 /// In-memory registry that enforces all M02 invariants.
@@ -30,6 +32,8 @@ pub struct RegistryStore {
     observers: HashMap<String, Observer>,
     source_systems: HashMap<String, SourceSystem>,
     projections: HashMap<String, ProjectionCatalogEntry>,
+    channels: HashMap<String, ChannelRecord>,
+    channel_lookup: HashMap<String, String>,
 }
 
 impl RegistryStore {
@@ -185,6 +189,7 @@ impl RegistryStore {
         let version = SupplementalKindVersion {
             kind: schema.kind.clone(),
             version: schema.version.clone(),
+            anchor_required: schema.anchor_required,
             payload_schema: schema.payload_schema.clone(),
             created_at: chrono::Utc::now(),
         };
@@ -264,6 +269,10 @@ impl RegistryStore {
             kind_ref.major_version,
             &record.payload,
         )?;
+        let schema = self
+            .get_supplemental_kind_schema(&kind_ref.kind, kind_ref.major_version)
+            .expect("schema was resolved by validate_supplemental_payload_for_kind");
+        validate_supplemental_anchor_policy(schema, record)?;
         validate_supplemental_record_claim_anchor(record, |id| supplemental_kind_for_id(id))
     }
 
@@ -288,6 +297,49 @@ impl RegistryStore {
 
     pub fn list_source_systems(&self) -> Vec<&SourceSystem> {
         self.source_systems.values().collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // Communication Channel
+    // -----------------------------------------------------------------------
+
+    pub fn register_channel(&mut self, channel: ChannelRecord) -> Result<(), DomainError> {
+        validate_channel_record(&channel)?;
+        if self.channels.contains_key(&channel.id) {
+            return Err(DomainError::Conflict(format!(
+                "Channel {} already exists",
+                channel.id
+            )));
+        }
+        let key = channel.key();
+        if let Some(existing) = self.channel_lookup.get(&key) {
+            return Err(DomainError::Conflict(format!(
+                "Channel lookup key {key} already belongs to {existing}"
+            )));
+        }
+        self.channel_lookup.insert(key, channel.id.clone());
+        self.channels.insert(channel.id.clone(), channel);
+        Ok(())
+    }
+
+    pub fn get_channel(&self, id: &str) -> Option<&ChannelRecord> {
+        self.channels.get(id)
+    }
+
+    pub fn get_channel_by_source(
+        &self,
+        kind: ChannelKind,
+        source_instance_id: &str,
+        external_id: &str,
+    ) -> Option<&ChannelRecord> {
+        let key = ChannelRecord::lookup_key(kind, source_instance_id, external_id);
+        self.channel_lookup
+            .get(&key)
+            .and_then(|id| self.channels.get(id))
+    }
+
+    pub fn list_channels(&self) -> Vec<&ChannelRecord> {
+        self.channels.values().collect()
     }
 
     // -----------------------------------------------------------------------
@@ -356,6 +408,36 @@ impl RegistryStore {
             .get_mut(&id.0)
             .ok_or_else(|| DomainError::NotFound(format!("Projection {} not found", id)))?;
         entry.status = status;
+        Ok(())
+    }
+}
+
+fn validate_channel_record(channel: &ChannelRecord) -> Result<(), DomainError> {
+    require_channel_field("channel.id", &channel.id)?;
+    require_channel_field("channel.source_instance_id", &channel.source_instance_id)?;
+    require_channel_field("channel.external_id", &channel.external_id)?;
+    require_channel_field("channel.connection_ref", &channel.connection_ref)?;
+    require_channel_field(
+        "channel.default_consent_scope",
+        &channel.default_consent_scope,
+    )?;
+    if channel.reply_slo_seconds == 0 {
+        return Err(DomainError::Validation(
+            "channel.reply_slo_seconds must be positive".to_owned(),
+        ));
+    }
+    if channel.freshness_threshold_seconds == 0 {
+        return Err(DomainError::Validation(
+            "channel.freshness_threshold_seconds must be positive".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_channel_field(name: &str, value: &str) -> Result<(), DomainError> {
+    if value.trim().is_empty() {
+        Err(DomainError::Validation(format!("{name} must not be blank")))
+    } else {
         Ok(())
     }
 }
@@ -652,6 +734,7 @@ mod tests {
             .register_supplemental_kind_schema(SupplementalKindSchema {
                 kind: "claim".into(),
                 version: SemVer::new("1.0.0"),
+                anchor_required: true,
                 payload_schema: serde_json::json!({
                     "type": "object",
                     "required": ["statement"],
@@ -668,6 +751,7 @@ mod tests {
             .register_supplemental_kind_schema(SupplementalKindSchema {
                 kind: "claim".into(),
                 version: SemVer::new("1.1.0"),
+                anchor_required: true,
                 payload_schema: serde_json::json!({
                     "type": "object",
                     "required": ["statement", "verification_mode"],
@@ -694,6 +778,7 @@ mod tests {
             .register_supplemental_kind_schema(SupplementalKindSchema {
                 kind: "claim".into(),
                 version: SemVer::new("1.0.0"),
+                anchor_required: true,
                 payload_schema: serde_json::json!({
                     "type": "object",
                     "required": ["statement", "verification_mode"],
@@ -711,6 +796,7 @@ mod tests {
             .register_supplemental_kind_schema(SupplementalKindSchema {
                 kind: "claim".into(),
                 version: SemVer::new("1.1.0"),
+                anchor_required: true,
                 payload_schema: serde_json::json!({
                     "type": "object",
                     "required": ["statement"],
@@ -737,6 +823,7 @@ mod tests {
             .register_supplemental_kind_schema(SupplementalKindSchema {
                 kind: "claim".into(),
                 version: SemVer::new("1.0.0"),
+                anchor_required: true,
                 payload_schema: serde_json::json!({
                     "type": "object",
                     "required": ["statement"],
@@ -753,6 +840,7 @@ mod tests {
             .register_supplemental_kind_schema(SupplementalKindSchema {
                 kind: "claim".into(),
                 version: SemVer::new("1.1.0"),
+                anchor_required: true,
                 payload_schema: serde_json::json!({
                     "type": "object",
                     "required": ["statement"],
@@ -782,6 +870,7 @@ mod tests {
             .register_supplemental_kind_schema(SupplementalKindSchema {
                 kind: "claim".into(),
                 version: SemVer::new("2.0.0"),
+                anchor_required: true,
                 payload_schema: serde_json::json!({
                     "type": "object",
                     "required": ["statement"],
@@ -798,6 +887,7 @@ mod tests {
             .register_supplemental_kind_schema(SupplementalKindSchema {
                 kind: "claim".into(),
                 version: SemVer::new("1.1.0"),
+                anchor_required: true,
                 payload_schema: serde_json::json!({
                     "type": "object",
                     "required": ["statement"],

@@ -789,6 +789,12 @@ mod tests {
             corpus: Vec::new(),
             answer_log: Vec::new(),
             claim_queue: Default::default(),
+            freshness: Default::default(),
+            resume_snapshot: Default::default(),
+            plan_state: Default::default(),
+            card_queue: Default::default(),
+            reply_slo: Default::default(),
+            break_glass: Default::default(),
             built_at: Utc::now(),
             lineage: ProjectionSnapshot::default().lineage,
         };

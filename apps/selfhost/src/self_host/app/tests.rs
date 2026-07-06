@@ -10,14 +10,15 @@ use lethe_core::domain::supplemental::InputAnchorSet;
 
 use super::{
     AppCore, AppService, GoogleSourceRuntime, ProjectionSnapshot, SelfHostError,
-    SlackSourceRuntime, extract_slide_text_fragments, infer_profile_name_from_fragments,
-    known_thread_roots_from_observations, latest_revision_to_capture, namespace_draft,
-    non_empty_state, ranked_self_intro_slide_indices, thread_cursor_key, thread_root_ts,
+    SlackSourceRuntime, classify_slack_ingress, extract_slide_text_fragments,
+    infer_profile_name_from_fragments, known_thread_roots_from_observations,
+    latest_revision_to_capture, namespace_draft, non_empty_state, ranked_self_intro_slide_indices,
+    thread_cursor_key, thread_root_ts,
 };
 use crate::self_host::config::{
-    ApiTokenConfig, CorpusProjectionConfig, GoogleConfig, JsonWebKey, JsonWebKeySet,
-    McpOAuthConfig, ResourceLimits, SecretString, SelfHostConfig, SlackConfig, SlideAiConfig,
-    SupplementalConfig,
+    ApiTokenConfig, CorpusProjectionConfig, FreshnessConfig, GoogleConfig, JsonWebKey,
+    JsonWebKeySet, McpOAuthConfig, OpsConfig, ResourceLimits, SecretString, SelfHostConfig,
+    SlackConfig, SlideAiConfig, SupplementalConfig,
 };
 use crate::self_host::google::HttpGoogleSlidesClient;
 use crate::self_host::slack::HttpSlackClient;
@@ -164,12 +165,25 @@ fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
         corpus: CorpusProjectionConfig {
             mode: lethe_projection_corpus::CorpusMode::WorkspaceFiltered,
         },
+        freshness: FreshnessConfig {
+            threshold_seconds: std::collections::BTreeMap::from([
+                ("sys:claude-ai".to_owned(), 36 * 3600),
+                ("sys:chatgpt".to_owned(), 36 * 3600),
+                ("sys:claude-code".to_owned(), 48 * 3600),
+                ("sys:codex".to_owned(), 48 * 3600),
+            ]),
+        },
+        ops: OpsConfig {
+            backfill_nightly_budget_items: 1000,
+        },
         slack_sources: vec![SlackConfig {
             id: "slack-test".into(),
             bot_token: SecretString::new("xoxb-test-token").unwrap(),
             thread_token: SecretString::new("xoxp-test-thread-token").unwrap(),
             channel_ids: vec!["C01ABC".into()],
+            mention_user_ids: vec!["U-BOT".into()],
         }],
+        channels: test_channels(),
         google_sources: vec![GoogleConfig {
             id: "google-test".into(),
             access_token: Some(SecretString::new("ya29.test-token").unwrap()),
@@ -210,6 +224,79 @@ fn test_mcp_oauth() -> McpOAuthConfig {
             }],
         },
     }
+}
+
+fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppService {
+    AppService {
+        core: Arc::new(Mutex::new(
+            AppCore::from_persisted(
+                vec![],
+                vec![],
+                vec![],
+                config.corpus.projector_config(),
+                super::freshness_thresholds(&config),
+                config.channels.clone(),
+            )
+            .unwrap(),
+        )),
+        persistence: Arc::new(Mutex::new(Box::new(persistence))),
+        config: Arc::new(config.clone()),
+        slack_sources: vec![SlackSourceRuntime {
+            config: config.slack_sources[0].clone(),
+            client: HttpSlackClient::new(config.slack_sources[0].bot_token.expose().to_owned())
+                .unwrap(),
+            replies_client: HttpSlackClient::new(
+                config.slack_sources[0].thread_token.expose().to_owned(),
+            )
+            .unwrap(),
+        }],
+        google_sources: vec![GoogleSourceRuntime {
+            config: config.google_sources[0].clone(),
+            client: HttpGoogleSlidesClient::new(&config.google_sources[0]).unwrap(),
+        }],
+        slide_analyzer: config
+            .slide_ai
+            .as_ref()
+            .map(|slide_ai| GeminiSlideAnalyzer::new(slide_ai.api_key.expose(), &slide_ai.model))
+            .transpose()
+            .unwrap(),
+        resilient_executor: Arc::new(ResilientExecutor::new(
+            3,
+            std::time::Duration::from_secs(60),
+        )),
+        audit_log: Arc::new(InMemoryAuditLog::new()),
+    }
+}
+
+fn test_channels() -> Vec<lethe_registry::registry::ChannelRecord> {
+    vec![
+        lethe_registry::registry::ChannelRecord {
+            id: "chan:slack-test:C01ABC".into(),
+            kind: lethe_registry::registry::ChannelKind::Slack,
+            source_instance_id: "slack-test".into(),
+            external_id: "C01ABC".into(),
+            connection_ref: "source:slack-test".into(),
+            default_consent_scope: "org_federated".into(),
+            reply_slo_seconds: 1800,
+            freshness_threshold_seconds: 1800,
+            break_glass_channel: false,
+            break_glass_senders: vec!["U-URGENT".into()],
+            enabled: true,
+        },
+        lethe_registry::registry::ChannelRecord {
+            id: "chan:slack-test:payload-limit".into(),
+            kind: lethe_registry::registry::ChannelKind::Slack,
+            source_instance_id: "payload-limit-test".into(),
+            external_id: "C01ABC".into(),
+            connection_ref: "source:payload-limit-test".into(),
+            default_consent_scope: "personal".into(),
+            reply_slo_seconds: 1800,
+            freshness_threshold_seconds: 1800,
+            break_glass_channel: false,
+            break_glass_senders: vec![],
+            enabled: true,
+        },
+    ]
 }
 
 #[test]
@@ -286,6 +373,8 @@ fn thread_root_ts_returns_parent_thread_identifier() {
         user_name: "alice".into(),
         email: None,
         text: "hello".into(),
+        ingress_kind: Some(lethe_adapter_slack::slack::client::SlackIngressKind::Channel),
+        mentions: vec![],
         message_type: SlackMessageType::Message,
         edited: None,
         reactions: vec![],
@@ -295,6 +384,22 @@ fn thread_root_ts_returns_parent_thread_identifier() {
     };
 
     assert_eq!(thread_root_ts(&message), Some("1234567890.123456"));
+}
+
+#[test]
+fn classify_slack_ingress_distinguishes_dm_mention_and_channel() {
+    assert_eq!(
+        classify_slack_ingress("D01", &[], &["U-BOT".into()]),
+        lethe_adapter_slack::slack::client::SlackIngressKind::DirectMessage
+    );
+    assert_eq!(
+        classify_slack_ingress("C01", &["U-BOT".into()], &["U-BOT".into()]),
+        lethe_adapter_slack::slack::client::SlackIngressKind::Mention
+    );
+    assert_eq!(
+        classify_slack_ingress("C01", &[], &["U-BOT".into()]),
+        lethe_adapter_slack::slack::client::SlackIngressKind::Channel
+    );
 }
 
 #[test]
@@ -505,7 +610,17 @@ fn ingest_draft_duplicate_is_decided_by_persistence_without_cache_append() {
 
     let config = test_config(db.clone(), blobs.clone());
     let service = AppService {
-        core: Arc::new(Mutex::new(AppCore::new(vec![], vec![], vec![]).unwrap())),
+        core: Arc::new(Mutex::new(
+            AppCore::from_persisted(
+                vec![],
+                vec![],
+                vec![],
+                config.corpus.projector_config(),
+                super::freshness_thresholds(&config),
+                config.channels.clone(),
+            )
+            .unwrap(),
+        )),
         persistence: Arc::new(Mutex::new(Box::new(persistence))),
         config: Arc::new(config.clone()),
         slack_sources: vec![SlackSourceRuntime {
@@ -561,6 +676,7 @@ fn ingest_draft_duplicate_is_decided_by_persistence_without_cache_append() {
                 "body": "persisted"
             }).to_string(),
             "source_container": "slack-test:C01ABC",
+            "source_instance": "slack-test",
         }),
     };
 
@@ -575,6 +691,59 @@ fn ingest_draft_duplicate_is_decided_by_persistence_without_cache_append() {
             .unwrap()
             .len(),
         1
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn ingest_observation_drafts_enforces_payload_limit_before_bulk_append() {
+    let root = std::env::temp_dir().join(format!("lethe-self-host-test-{}", uuid::Uuid::now_v7()));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let mut config = test_config(db.clone(), blobs);
+    config.resource_limits.max_payload_bytes = 1;
+    let service = test_service(config, persistence);
+
+    let draft = ObservationDraft {
+        schema: SchemaRef::new("schema:slack-message"),
+        schema_version: SemVer::new("1.0.0"),
+        observer: ObserverRef::new("obs:slack-crawler"),
+        source_system: Some(SourceSystemRef::new("sys:slack")),
+        authority_model: AuthorityModel::LakeAuthoritative,
+        capture_model: CaptureModel::Event,
+        subject: EntityRef::new("message:slack:too-large"),
+        target: None,
+        payload: serde_json::json!({"text": "too large"}),
+        attachments: vec![],
+        published: Utc::now(),
+        idempotency_key: IdempotencyKey::new("slack:C01ABC:too-large"),
+        meta: serde_json::json!({
+            "canonical_json": serde_json::json!({
+                "source": "slack",
+                "object_id": "channel:C01ABC:ts:too-large",
+                "body": "too large"
+            }).to_string(),
+            "source_container": "slack-test:C01ABC",
+        }),
+    };
+
+    let err = service
+        .ingest_observation_drafts(vec![draft], "payload-limit-test")
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        SelfHostError::Ingestion(message) if message.contains("exceeds configured maximum 1")
+    ));
+    assert_eq!(
+        service
+            .persistence_lock()
+            .unwrap()
+            .observation_page(0, 10)
+            .unwrap()
+            .len(),
+        0
     );
 
     let _ = std::fs::remove_dir_all(root);

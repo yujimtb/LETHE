@@ -1,0 +1,12 @@
+[package]
+name = "lethe-import-chatgpt"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chrono.workspace = true
+lethe-adapter-chatgpt = { path = "../../../crates/adapters/chatgpt" }
+lethe-core = { path = "../../../crates/core" }
+lethe-selfhost = { path = "../../selfhost" }
+serde.workspace = true
+serde_json.workspace = true

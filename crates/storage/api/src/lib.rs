@@ -62,6 +62,15 @@ pub struct SyncMetricRecord {
 
 pub trait ObservationStore: Send {
     fn append_observation(&self, observation: &Observation) -> StorageResult<AppendOutcome>;
+    fn append_observations(
+        &self,
+        observations: &[Observation],
+    ) -> StorageResult<Vec<AppendOutcome>> {
+        observations
+            .iter()
+            .map(|observation| self.append_observation(observation))
+            .collect()
+    }
     fn load_observations(&self) -> StorageResult<Vec<Observation>>;
     fn rehome_observation(
         &self,
@@ -204,6 +213,12 @@ pub mod conformance {
         assert!(matches!(
             store.append_observation(&observation).unwrap(),
             AppendOutcome::Duplicate(_)
+        ));
+
+        let bulk = vec![sample_observation("conformance:bulk")];
+        assert!(matches!(
+            store.append_observations(&bulk).unwrap().as_slice(),
+            [AppendOutcome::Appended(_)]
         ));
     }
 

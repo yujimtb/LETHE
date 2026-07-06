@@ -13,6 +13,7 @@ use ring::signature;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::self_host::app::SupplementalWriteRequest;
 use crate::self_host::app::{AppService, SelfHostError};
 use crate::self_host::config::{JsonWebKey, JsonWebKeySet, McpOAuthConfig};
 use crate::self_host::mcp_contract::{
@@ -31,6 +32,20 @@ const CLAIM_QUEUE_DESCRIPTION: &str =
     "List folded claim groups from the claim queue projection, filterable by state.";
 const SEARCH_DECISIONS_DESCRIPTION: &str =
     "Search the folded decision ledger with supersedes resolution.";
+const WRITE_SUPPLEMENTAL_DESCRIPTION: &str = "Write one supplemental record as post-processing for an observation already ingested into the lake. This is not for live self-enrichment during the same conversation. Kinds with anchor_required=true require resolved anchors; system-event kinds with anchor_required=false require payload.origin.";
+
+#[derive(Debug, Clone)]
+struct VerifiedToken {
+    scopes: Vec<String>,
+}
+
+impl VerifiedToken {
+    fn has_scope(&self, required: &str) -> bool {
+        self.scopes
+            .iter()
+            .any(|scope| scope == "*" || scope == required)
+    }
+}
 
 #[derive(Clone)]
 struct McpState {
@@ -44,7 +59,7 @@ impl McpState {
         Self { service, oauth }
     }
 
-    fn verify_authorization(&self, headers: &HeaderMap) -> Result<(), McpHttpError> {
+    fn verify_authorization(&self, headers: &HeaderMap) -> Result<VerifiedToken, McpHttpError> {
         let Some(header) = headers.get(AUTHORIZATION) else {
             return Err(McpHttpError::invalid_token(
                 &self.oauth.protected_resource_metadata_url,
@@ -88,7 +103,7 @@ async fn protected_resource_metadata(State(state): State<McpState>) -> Json<Valu
         "authorization_servers": [state.oauth.issuer],
         "issuer": state.oauth.issuer,
         "bearer_methods_supported": ["header"],
-        "scopes_supported": ["mcp:read"],
+        "scopes_supported": ["mcp:read", "write:supplemental"],
     }))
 }
 
@@ -97,7 +112,7 @@ async fn mcp_post(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, McpHttpError> {
-    state.verify_authorization(&headers)?;
+    let token = state.verify_authorization(&headers)?;
     let request: JsonRpcRequest = serde_json::from_slice(&body)
         .map_err(|error| McpHttpError::bad_request(format!("invalid JSON-RPC request: {error}")))?;
     if request.jsonrpc != "2.0" {
@@ -108,7 +123,7 @@ async fn mcp_post(
     let Some(id) = request.id.clone() else {
         return Ok(StatusCode::ACCEPTED.into_response());
     };
-    let response = match handle_json_rpc(&state.service, request).await {
+    let response = match handle_json_rpc(&state.service, &token, request).await {
         Ok(result) => json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -128,6 +143,7 @@ async fn mcp_post(
 
 async fn handle_json_rpc(
     service: &AppService,
+    token: &VerifiedToken,
     request: JsonRpcRequest,
 ) -> Result<Value, JsonRpcAppError> {
     match request.method.as_str() {
@@ -142,7 +158,7 @@ async fn handle_json_rpc(
         "tools/list" => Ok(tools_list_result()),
         "tools/call" => {
             let params: ToolCallParams = parse_params(request.params)?;
-            call_tool(service, params)
+            call_tool(service, token, params)
         }
         other => Err(JsonRpcAppError::method_not_found(format!(
             "unsupported MCP method: {other}"
@@ -221,6 +237,34 @@ fn tools_list_result() -> Value {
                         "limit": { "type": "integer", "minimum": 1 }
                     }
                 })
+            ),
+            write_tool_definition(
+                "write_supplemental",
+                WRITE_SUPPLEMENTAL_DESCRIPTION,
+                json!({
+                    "type": "object",
+                    "required": ["id", "kind", "derived_from", "payload", "created_by", "mutability"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "id": { "type": "string", "pattern": "^sup:[0-9a-fA-F-]{36}$" },
+                        "kind": { "type": "string" },
+                        "derived_from": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "observations": { "type": "array", "items": { "type": "string" } },
+                                "blobs": { "type": "array", "items": { "type": "string" } },
+                                "supplementals": { "type": "array", "items": { "type": "string" } }
+                            }
+                        },
+                        "payload": { "type": "object" },
+                        "created_by": { "type": "string" },
+                        "mutability": { "type": "string", "enum": ["append_only", "managed_cache"] },
+                        "model_version": { "type": "string" },
+                        "consent_metadata": { "type": "object" },
+                        "lineage": { "type": "string" }
+                    }
+                })
             )
         ]
     })
@@ -240,9 +284,28 @@ fn tool_definition(name: &str, description: &str, input_schema: Value) -> Value 
     })
 }
 
-fn call_tool(service: &AppService, params: ToolCallParams) -> Result<Value, JsonRpcAppError> {
+fn write_tool_definition(name: &str, description: &str, input_schema: Value) -> Value {
+    json!({
+        "name": name,
+        "description": description,
+        "inputSchema": input_schema,
+        "annotations": {
+            "readOnlyHint": false,
+            "destructiveHint": false,
+            "idempotentHint": false,
+            "openWorldHint": false
+        }
+    })
+}
+
+fn call_tool(
+    service: &AppService,
+    token: &VerifiedToken,
+    params: ToolCallParams,
+) -> Result<Value, JsonRpcAppError> {
     match params.name.as_str() {
         "search_lake" => {
+            ensure_scope(token, "mcp:read")?;
             let args: SearchLakeArguments = parse_arguments(params.arguments)?;
             ensure_not_blank("query", &args.query)?;
             let response = service.corpus_grep_response(&lethe_api::api::grep::GrepRequest {
@@ -258,37 +321,63 @@ fn call_tool(service: &AppService, params: ToolCallParams) -> Result<Value, Json
             tool_result(response)
         }
         "get_record" => {
+            ensure_scope(token, "mcp:read")?;
             let args: GetRecordArguments = parse_arguments(params.arguments)?;
             ensure_not_blank("record_id", &args.record_id)?;
             let response = service.corpus_record_response(&args.record_id)?;
             tool_result(response)
         }
         "get_thread" => {
+            ensure_scope(token, "mcp:read")?;
             let args: GetThreadArguments = parse_arguments(params.arguments)?;
             ensure_not_blank("record_id", &args.record_id)?;
             let response = service.corpus_thread_response(&args.record_id)?;
             tool_result(response)
         }
         "claim_queue" => {
+            ensure_scope(token, "mcp:read")?;
             let args: ClaimQueueArguments = parse_arguments(params.arguments)?;
             let response = service.claim_queue_response_filtered(
                 parse_claim_state(args.state.as_deref())?,
                 args.verification_mode.as_deref(),
+                None,
                 args.limit.unwrap_or(20),
                 args.cursor.as_deref(),
             )?;
             tool_result(response)
         }
         "search_decisions" => {
+            ensure_scope(token, "mcp:read")?;
             let args: SearchDecisionsArguments = parse_arguments(params.arguments)?;
             ensure_not_blank("query", &args.query)?;
             let response = service
                 .decision_search_response(Some(args.query.as_str()), args.limit.unwrap_or(20))?;
             tool_result(response)
         }
+        "write_supplemental" => {
+            ensure_scope(token, "write:supplemental")?;
+            let args: SupplementalWriteRequest = parse_arguments(params.arguments)?;
+            let response = service.write_supplemental(args)?;
+            tool_result(WriteSupplementalResult { record: response })
+        }
         other => Err(JsonRpcAppError::invalid_params(format!(
             "unknown tool: {other}"
         ))),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct WriteSupplementalResult {
+    record: lethe_core::domain::SupplementalRecord,
+}
+
+fn ensure_scope(token: &VerifiedToken, required: &str) -> Result<(), JsonRpcAppError> {
+    if token.has_scope(required) {
+        Ok(())
+    } else {
+        Err(JsonRpcAppError::permission_denied(format!(
+            "token lacks required scope {required}"
+        )))
     }
 }
 
@@ -388,6 +477,13 @@ impl JsonRpcAppError {
             message,
         }
     }
+
+    fn permission_denied(message: String) -> Self {
+        Self {
+            code: -32003,
+            message,
+        }
+    }
 }
 
 impl From<SelfHostError> for JsonRpcAppError {
@@ -398,6 +494,12 @@ impl From<SelfHostError> for JsonRpcAppError {
                 Self::internal(format!("ProjectionStale: {detail}"))
             }
             SelfHostError::ReadMode(detail) => Self::invalid_params(detail),
+            SelfHostError::SupplementalValidation { code, detail } => {
+                Self::invalid_params(format!("SupplementalValidation:{code}: {detail}"))
+            }
+            SelfHostError::SupplementalConflict { code, detail } => {
+                Self::internal(format!("SupplementalConflict:{code}: {detail}"))
+            }
             other => Self::internal(other.to_string()),
         }
     }
@@ -484,6 +586,7 @@ struct JwtClaims {
     iss: String,
     exp: i64,
     aud: AudienceClaim,
+    scope: ScopeClaim,
 }
 
 #[derive(Debug, Deserialize)]
@@ -491,6 +594,26 @@ struct JwtClaims {
 enum AudienceClaim {
     Single(String),
     Multiple(Vec<String>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ScopeClaim {
+    SpaceDelimited(String),
+    List(Vec<String>),
+}
+
+impl ScopeClaim {
+    fn into_scopes(self) -> Vec<String> {
+        match self {
+            Self::SpaceDelimited(value) => value
+                .split_whitespace()
+                .filter(|scope| !scope.is_empty())
+                .map(ToOwned::to_owned)
+                .collect(),
+            Self::List(values) => values,
+        }
+    }
 }
 
 impl AudienceClaim {
@@ -502,7 +625,7 @@ impl AudienceClaim {
     }
 }
 
-fn verify_jwt(token: &str, oauth: &McpOAuthConfig) -> Result<(), JwtError> {
+fn verify_jwt(token: &str, oauth: &McpOAuthConfig) -> Result<VerifiedToken, JwtError> {
     let parts = token.split('.').collect::<Vec<_>>();
     if parts.len() != 3 {
         return Err(JwtError::WrongPartCount);
@@ -529,7 +652,9 @@ fn verify_jwt(token: &str, oauth: &McpOAuthConfig) -> Result<(), JwtError> {
     if !claims.aud.contains(&oauth.audience) {
         return Err(JwtError::AudienceMismatch);
     }
-    Ok(())
+    Ok(VerifiedToken {
+        scopes: claims.scope.into_scopes(),
+    })
 }
 
 fn find_jwk<'a>(jwks: &'a JsonWebKeySet, kid: &str) -> Result<&'a JsonWebKey, JwtError> {

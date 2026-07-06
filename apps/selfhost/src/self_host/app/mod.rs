@@ -50,6 +50,11 @@ use lethe_profile_model::{
 };
 use lethe_projection_answer_log::{AnswerLogProjector, AnswerLogRecord};
 use lethe_projection_claim_queue::{ClaimQueueProjection, ClaimQueueProjector};
+use lethe_projection_cognition::{
+    CardQueueProjection, CardQueueProjector, CognitionStateProjector, FreshnessProjection,
+    FreshnessProjector, FreshnessThreshold, PlanStateProjection, ReplySloProjection,
+    ReplySloProjector, ResumeSnapshotProjection,
+};
 use lethe_projection_corpus::{CorpusConfig, CorpusProjector, CorpusRecord};
 use lethe_projection_person::person_page::projector::PersonPageProjector;
 use lethe_projection_person::person_page::types::{
@@ -107,7 +112,7 @@ pub struct SyncReport {
     pub last_sync_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct ImportReport {
     pub ingested: usize,
     pub duplicates: usize,
@@ -131,6 +136,52 @@ struct SlideImageCandidate {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BreakGlassProjection {
+    pub channels: Vec<BreakGlassChannel>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BreakGlassChannel {
+    pub channel_id: String,
+    pub kind: String,
+    pub source_instance_id: String,
+    pub external_id: String,
+    pub channel_allowed: bool,
+    pub senders: Vec<String>,
+}
+
+impl Default for BreakGlassProjection {
+    fn default() -> Self {
+        Self {
+            channels: Vec::new(),
+        }
+    }
+}
+
+impl BreakGlassProjection {
+    fn from_channels(channels: &[lethe_registry::registry::ChannelRecord]) -> Self {
+        let mut channels = channels
+            .iter()
+            .filter(|channel| channel.enabled)
+            .map(|channel| {
+                let mut senders = channel.break_glass_senders.clone();
+                senders.sort();
+                BreakGlassChannel {
+                    channel_id: channel.id.clone(),
+                    kind: channel.kind.as_str().to_owned(),
+                    source_instance_id: channel.source_instance_id.clone(),
+                    external_id: channel.external_id.clone(),
+                    channel_allowed: channel.break_glass_channel,
+                    senders,
+                }
+            })
+            .collect::<Vec<_>>();
+        channels.sort_by(|left, right| left.channel_id.cmp(&right.channel_id));
+        Self { channels }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProjectionSnapshot {
     pub identity: IdentityResolutionOutput,
     pub person_page: PersonPageOutput,
@@ -140,6 +191,18 @@ pub struct ProjectionSnapshot {
     pub answer_log: Vec<AnswerLogRecord>,
     #[serde(default)]
     pub claim_queue: ClaimQueueProjection,
+    #[serde(default)]
+    pub freshness: FreshnessProjection,
+    #[serde(default)]
+    pub resume_snapshot: ResumeSnapshotProjection,
+    #[serde(default)]
+    pub plan_state: PlanStateProjection,
+    #[serde(default)]
+    pub card_queue: CardQueueProjection,
+    #[serde(default)]
+    pub reply_slo: ReplySloProjection,
+    #[serde(default)]
+    pub break_glass: BreakGlassProjection,
     pub built_at: DateTime<Utc>,
     pub lineage: LineageManifest,
 }
@@ -152,6 +215,16 @@ impl Default for ProjectionSnapshot {
             corpus: Vec::new(),
             answer_log: Vec::new(),
             claim_queue: ClaimQueueProjection::default(),
+            freshness: FreshnessProjection::default(),
+            resume_snapshot: ResumeSnapshotProjection {
+                projects: Vec::new(),
+            },
+            plan_state: PlanStateProjection {
+                projects: Vec::new(),
+            },
+            card_queue: CardQueueProjection::default(),
+            reply_slo: ReplySloProjection::default(),
+            break_glass: BreakGlassProjection::default(),
             built_at: Utc::now(),
             lineage: LineageManifest::new(
                 ProjectionRef::new("proj:person-page"),
@@ -170,6 +243,7 @@ pub struct AppCore {
     pub blobs: BlobStore,
     pub supplemental: SupplementalStore,
     corpus_config: CorpusConfig,
+    freshness_thresholds: Vec<FreshnessThreshold>,
     pub snapshot: ProjectionSnapshot,
     pub last_sync_at: Option<DateTime<Utc>>,
     pub last_sync_error: Option<String>,
@@ -182,6 +256,8 @@ impl AppCore {
         persisted_blobs: Vec<Vec<u8>>,
         persisted_supplementals: Vec<lethe_core::domain::SupplementalRecord>,
         corpus_config: CorpusConfig,
+        freshness_thresholds: Vec<FreshnessThreshold>,
+        channels: Vec<lethe_registry::registry::ChannelRecord>,
     ) -> Result<Self, SelfHostError> {
         let mut lake = LakeStore::new();
         for observation in observations {
@@ -206,13 +282,23 @@ impl AppCore {
             })?;
         }
 
+        let mut registry = seed_registry();
+        for channel in channels {
+            registry.register_channel(channel).map_err(|err| {
+                SelfHostError::Config(crate::self_host::config::ConfigError::Invalid(
+                    err.to_string(),
+                ))
+            })?;
+        }
+
         let mut core = Self {
-            registry: seed_registry(),
+            registry,
             catalog: seed_projection_catalog(),
             lake,
             blobs,
             supplemental,
             corpus_config,
+            freshness_thresholds,
             snapshot: ProjectionSnapshot::default(),
             last_sync_at: None,
             last_sync_error: None,
@@ -233,6 +319,8 @@ impl AppCore {
             persisted_blobs,
             persisted_supplementals,
             CorpusConfig::default(),
+            Vec::new(),
+            Vec::new(),
         )
     }
 
@@ -256,6 +344,22 @@ impl AppCore {
         let answer_log = AnswerLogProjector.project_observations(self.lake.list());
         let claim_queue = ClaimQueueProjector.project_records(&all_supplemental_records);
         let built_at = Utc::now();
+        let freshness = FreshnessProjector::new(self.freshness_thresholds.clone(), built_at)
+            .project_observations(self.lake.list());
+        let cognition_projector = CognitionStateProjector::new(built_at);
+        let resume_snapshot = cognition_projector.resume_snapshot(&all_supplemental_records);
+        let plan_state = cognition_projector.plan_state(&all_supplemental_records);
+        let card_queue =
+            CardQueueProjector::new(built_at).project_records(&all_supplemental_records);
+        let reply_slo = ReplySloProjector::new(built_at)
+            .project_records(self.lake.list(), &all_supplemental_records);
+        let channels = self
+            .registry
+            .list_channels()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let break_glass = BreakGlassProjection::from_channels(&channels);
         let lineage = build_person_page_lineage(
             self.lake.list(),
             &supplemental_records,
@@ -271,6 +375,12 @@ impl AppCore {
             corpus,
             answer_log,
             claim_queue,
+            freshness,
+            resume_snapshot,
+            plan_state,
+            card_queue,
+            reply_slo,
+            break_glass,
             built_at,
             lineage,
         };
@@ -286,6 +396,30 @@ impl AppCore {
             .set_status(&ProjectionRef::new("proj:corpus"), ProjectionStatus::Active);
         self.catalog.set_status(
             &ProjectionRef::new("proj:claim-queue"),
+            ProjectionStatus::Active,
+        );
+        self.catalog.set_status(
+            &ProjectionRef::new("proj:freshness"),
+            ProjectionStatus::Active,
+        );
+        self.catalog.set_status(
+            &ProjectionRef::new("proj:resume-snapshot"),
+            ProjectionStatus::Active,
+        );
+        self.catalog.set_status(
+            &ProjectionRef::new("proj:plan-state"),
+            ProjectionStatus::Active,
+        );
+        self.catalog.set_status(
+            &ProjectionRef::new("proj:card-queue"),
+            ProjectionStatus::Active,
+        );
+        self.catalog.set_status(
+            &ProjectionRef::new("proj:reply-slo"),
+            ProjectionStatus::Active,
+        );
+        self.catalog.set_status(
+            &ProjectionRef::new("proj:break-glass"),
             ProjectionStatus::Active,
         );
         self.catalog.set_status(
@@ -377,6 +511,8 @@ impl ProjectionSnapshot {
         observations: Vec<Observation>,
         persisted_supplementals: Vec<lethe_core::domain::SupplementalRecord>,
         corpus_config: CorpusConfig,
+        freshness_thresholds: Vec<FreshnessThreshold>,
+        channels: Vec<lethe_registry::registry::ChannelRecord>,
     ) -> Result<Self, SelfHostError> {
         let mut lake = LakeStore::new();
         for observation in observations {
@@ -407,6 +543,16 @@ impl ProjectionSnapshot {
         let answer_log = AnswerLogProjector.project_observations(lake.list());
         let claim_queue = ClaimQueueProjector.project_records(&all_supplemental_records);
         let built_at = Utc::now();
+        let freshness = FreshnessProjector::new(freshness_thresholds, built_at)
+            .project_observations(lake.list());
+        let cognition_projector = CognitionStateProjector::new(built_at);
+        let resume_snapshot = cognition_projector.resume_snapshot(&all_supplemental_records);
+        let plan_state = cognition_projector.plan_state(&all_supplemental_records);
+        let card_queue =
+            CardQueueProjector::new(built_at).project_records(&all_supplemental_records);
+        let reply_slo = ReplySloProjector::new(built_at)
+            .project_records(lake.list(), &all_supplemental_records);
+        let break_glass = BreakGlassProjection::from_channels(&channels);
         let lineage = build_person_page_lineage(
             lake.list(),
             &supplemental_records,
@@ -422,6 +568,12 @@ impl ProjectionSnapshot {
             corpus,
             answer_log,
             claim_queue,
+            freshness,
+            resume_snapshot,
+            plan_state,
+            card_queue,
+            reply_slo,
+            break_glass,
             built_at,
             lineage,
         })
@@ -456,6 +608,8 @@ impl AppService {
             Vec::new(),
             supplementals,
             config.corpus.projector_config(),
+            freshness_thresholds(&config),
+            config.channels.clone(),
         )?;
         persistence.materialize_projection(
             &ProjectionRef::new("proj:person-page"),
@@ -635,19 +789,77 @@ impl AppService {
             quarantined: 0,
         };
 
+        let mut core = self.core_lock()?;
+        let mut observations = Vec::new();
         for draft in drafts {
-            match self.ingest_draft(namespace_draft(draft, source_instance_id))? {
-                IngestResult::Ingested { .. } => report.ingested += 1,
-                IngestResult::Duplicate { .. } => report.duplicates += 1,
-                IngestResult::Quarantined { .. } => report.quarantined += 1,
-                IngestResult::Rejected { message, .. } => {
+            let payload_bytes = serde_json::to_vec(&draft.payload)?.len();
+            if payload_bytes > self.config.resource_limits.max_payload_bytes {
+                return Err(SelfHostError::Ingestion(format!(
+                    "payload size {payload_bytes} exceeds configured maximum {}",
+                    self.config.resource_limits.max_payload_bytes
+                )));
+            }
+            match core.prepare_observation(namespace_draft(draft, source_instance_id)) {
+                Ok(observation) => observations.push(observation),
+                Err(IngestResult::Duplicate { .. }) => report.duplicates += 1,
+                Err(IngestResult::Rejected { message, .. }) => {
                     return Err(SelfHostError::Ingestion(message));
+                }
+                Err(IngestResult::Quarantined { ticket }) => {
+                    return Err(SelfHostError::Ingestion(ticket.reason));
+                }
+                Err(IngestResult::Ingested { .. }) => {
+                    return Err(SelfHostError::Ingestion(
+                        "prepared observation unexpectedly returned an ingested result".to_owned(),
+                    ));
                 }
             }
         }
 
+        let outcomes = self
+            .persistence_lock()?
+            .append_observations(&observations)
+            .map_err(SelfHostError::Storage)?;
+        if outcomes.len() != observations.len() {
+            return Err(SelfHostError::Ingestion(format!(
+                "bulk append returned {} outcomes for {} observations",
+                outcomes.len(),
+                observations.len()
+            )));
+        }
+
+        for (observation, outcome) in observations.into_iter().zip(outcomes) {
+            match outcome {
+                DurableAppendOutcome::Appended(_) => {
+                    match core.lake.append_idempotent(observation) {
+                        lethe_engine::lake::store::AppendOutcome::Appended(_) => {
+                            report.ingested += 1;
+                        }
+                        lethe_engine::lake::store::AppendOutcome::Duplicate(existing_id)
+                        | lethe_engine::lake::store::AppendOutcome::Conflict(existing_id) => {
+                            return Err(SelfHostError::Ingestion(format!(
+                                "SQLite accepted bulk observation, but cache already contains {existing_id}"
+                            )));
+                        }
+                    }
+                }
+                DurableAppendOutcome::Duplicate(_) => report.duplicates += 1,
+                DurableAppendOutcome::CanonicalCollision(_) => report.quarantined += 1,
+            }
+        }
+
         if report.ingested > 0 {
-            let mut core = self.core_lock()?;
+            self.emit_audit(
+                "actor:self-host",
+                AuditEventKind::WriteExecution,
+                serde_json::json!({
+                    "mode": "bulk_observation_import",
+                    "source_instance_id": source_instance_id,
+                    "ingested": report.ingested,
+                    "duplicates": report.duplicates,
+                    "quarantined": report.quarantined,
+                }),
+            );
             core.rebuild_snapshot();
             self.persistence_lock()?.materialize_projection(
                 &ProjectionRef::new("proj:person-page"),
@@ -659,6 +871,34 @@ impl AppService {
     }
 }
 
+fn freshness_thresholds(config: &SelfHostConfig) -> Vec<FreshnessThreshold> {
+    let mut thresholds = config
+        .freshness
+        .threshold_seconds
+        .iter()
+        .map(|(source_id, seconds)| {
+            (
+                source_id.clone(),
+                FreshnessThreshold {
+                    source_id: source_id.clone(),
+                    max_age_seconds: *seconds,
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    for channel in config.channels.iter().filter(|channel| channel.enabled) {
+        thresholds
+            .entry(channel.id.clone())
+            .or_insert_with(|| FreshnessThreshold {
+                source_id: channel.id.clone(),
+                max_age_seconds: channel.freshness_threshold_seconds as i64,
+            });
+    }
+    let mut values = thresholds.into_values().collect::<Vec<_>>();
+    values.sort_by(|left, right| left.source_id.cmp(&right.source_id));
+    values
+}
+
 mod media_support;
 pub(crate) mod projection_api;
 mod service_support;
@@ -668,7 +908,10 @@ mod sync;
 mod sync_support;
 
 use media_support::*;
+#[cfg(test)]
+use service_support::classify_slack_ingress;
 use service_support::{
+    build_channel_registry_projection_lineage, build_mixed_projection_lineage,
     build_person_page_lineage, build_projection_lineage, build_supplemental_projection_lineage,
     consent_status_for_person_id, namespace_draft,
 };

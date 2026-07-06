@@ -12,9 +12,9 @@ use lethe_projection_corpus::{CorpusConfig, CorpusMode};
 use lethe_runtime::runtime::partition::RoutingKeyOrder;
 use lethe_selfhost::self_host::app::{AppService, ProjectionSnapshot};
 use lethe_selfhost::self_host::config::{
-    ApiTokenConfig, CorpusProjectionConfig, GoogleConfig, JsonWebKey, JsonWebKeySet,
-    McpOAuthConfig, ResourceLimits, SecretString, SelfHostConfig, SlackConfig, SlideAiConfig,
-    SupplementalConfig,
+    ApiTokenConfig, CorpusProjectionConfig, FreshnessConfig, GoogleConfig, JsonWebKey,
+    JsonWebKeySet, McpOAuthConfig, OpsConfig, ResourceLimits, SecretString, SelfHostConfig,
+    SlackConfig, SlideAiConfig, SupplementalConfig,
 };
 use lethe_selfhost::self_host::server::build_router;
 use lethe_storage_sqlite::persistence::SqlitePersistence;
@@ -151,6 +151,8 @@ fn test_config_with_corpus(db: PathBuf, blobs: PathBuf, corpus_mode: CorpusMode)
                     mode: corpus_mode,
                     ..CorpusConfig::default()
                 },
+                Vec::new(),
+                Vec::new(),
             )
             .unwrap();
             persistence
@@ -188,11 +190,34 @@ fn test_config_with_corpus(db: PathBuf, blobs: PathBuf, corpus_mode: CorpusMode)
             retention_days: 30,
         },
         corpus: CorpusProjectionConfig { mode: corpus_mode },
+        freshness: FreshnessConfig {
+            threshold_seconds: std::collections::BTreeMap::from([(
+                "sys:slack".to_owned(),
+                36 * 3600,
+            )]),
+        },
+        ops: OpsConfig {
+            backfill_nightly_budget_items: 1000,
+        },
+        channels: vec![lethe_registry::registry::ChannelRecord {
+            id: "chan:slack-test:C01ABC".into(),
+            kind: lethe_registry::registry::ChannelKind::Slack,
+            source_instance_id: "slack-test".into(),
+            external_id: "C01ABC".into(),
+            connection_ref: "source:slack-test".into(),
+            default_consent_scope: "org_federated".into(),
+            reply_slo_seconds: 1800,
+            freshness_threshold_seconds: 1800,
+            break_glass_channel: false,
+            break_glass_senders: vec![],
+            enabled: true,
+        }],
         slack_sources: vec![SlackConfig {
             id: "slack-test".into(),
             bot_token: SecretString::new("xoxb-test-token").unwrap(),
             thread_token: SecretString::new("xoxp-test-thread-token").unwrap(),
             channel_ids: vec!["C01ABC".into()],
+            mention_user_ids: vec!["U-BOT".into()],
         }],
         google_sources: vec![GoogleConfig {
             id: "google-test".into(),
@@ -811,27 +836,43 @@ fn personal_corpus_grep_hits_all_text_source_types() {
             "2026-07-01T00:04:00Z",
         ),
         personal_text_observation(
-            "schema:claude-code-message",
+            "schema:coding-agent-message",
             "sys:claude-code",
             "message:claude-code:main:m1",
             serde_json::json!({
                 "session_id": "cc-main",
-                "message_uuid": "cc-msg",
-                "role": "assistant",
-                "text": format!("{needle} claude code")
+                "transcript_id": "cc-transcript",
+                "parent_message_id": null,
+                "parent_thread_id": null,
+                "is_sidechain": false,
+                "thread_source": "main",
+                "object_id": "cc-msg",
+                "item": {
+                    "kind": "message",
+                    "role": "assistant",
+                    "text": format!("{needle} claude code")
+                }
             }),
             "personal:claude-code",
             "2026-07-01T00:05:00Z",
         ),
         personal_text_observation(
-            "schema:codex-message",
+            "schema:coding-agent-message",
             "sys:codex",
             "message:codex:main:m1",
             serde_json::json!({
                 "session_id": "codex-main",
-                "message_uuid": "codex-msg",
-                "role": "assistant",
-                "text": format!("{needle} codex")
+                "transcript_id": "codex-transcript",
+                "parent_message_id": null,
+                "parent_thread_id": null,
+                "is_sidechain": false,
+                "thread_source": "main",
+                "object_id": "codex-msg",
+                "item": {
+                    "kind": "message",
+                    "role": "assistant",
+                    "text": format!("{needle} codex")
+                }
             }),
             "personal:codex",
             "2026-07-01T00:06:00Z",
@@ -893,29 +934,43 @@ fn coding_agent_get_thread_preserves_parent_child_sessions() {
     let (root, db, blobs) = temp_paths();
     let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
     let main = personal_text_observation(
-        "schema:claude-code-message",
+        "schema:coding-agent-message",
         "sys:claude-code",
         "message:claude-code:main:m1",
         serde_json::json!({
             "session_id": "main-session",
-            "message_uuid": "main-message",
-            "role": "user",
-            "text": "main session context"
+            "transcript_id": "main-transcript",
+            "parent_message_id": null,
+            "parent_thread_id": null,
+            "is_sidechain": false,
+            "thread_source": "main",
+            "object_id": "main-message",
+            "item": {
+                "kind": "message",
+                "role": "user",
+                "text": "main session context"
+            }
         }),
         "thread:main",
         "2026-07-01T00:00:00Z",
     );
     let child = personal_text_observation(
-        "schema:claude-code-message",
+        "schema:coding-agent-message",
         "sys:claude-code",
         "message:claude-code:child:m1",
         serde_json::json!({
             "session_id": "child-session",
-            "parent_session_id": "main-session",
+            "transcript_id": "child-transcript",
+            "parent_message_id": null,
+            "parent_thread_id": "main-session",
             "is_sidechain": true,
-            "message_uuid": "child-message",
-            "role": "assistant",
-            "text": "delegated sidechain conclusion"
+            "thread_source": "sidechain",
+            "object_id": "child-message",
+            "item": {
+                "kind": "message",
+                "role": "assistant",
+                "text": "delegated sidechain conclusion"
+            }
         }),
         "thread:child",
         "2026-07-01T00:01:00Z",

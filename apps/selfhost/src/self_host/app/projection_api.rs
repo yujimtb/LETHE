@@ -1,5 +1,6 @@
 use super::*;
 use lethe_projection_claim_queue::{ClaimGroup, ClaimState, DecisionView, ProjectionAuditEvent};
+use lethe_projection_cognition::{CardState, ReplyCard};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -18,6 +19,16 @@ pub struct DecisionSearchPage {
     pub matches: Vec<DecisionView>,
     pub total: usize,
     pub limit: usize,
+    pub audit_log: Vec<ProjectionAuditEvent>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CardQueuePage {
+    pub cards: Vec<ReplyCard>,
+    pub total: usize,
+    pub limit: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
     pub audit_log: Vec<ProjectionAuditEvent>,
 }
 
@@ -467,13 +478,14 @@ impl AppService {
         limit: usize,
         cursor: Option<&str>,
     ) -> Result<ResponseEnvelope<ClaimQueuePage>, SelfHostError> {
-        self.claim_queue_response_filtered(state, None, limit, cursor)
+        self.claim_queue_response_filtered(state, None, None, limit, cursor)
     }
 
     pub fn claim_queue_response_filtered(
         &self,
         state: Option<ClaimState>,
         verification_mode: Option<&str>,
+        backfill: Option<bool>,
         limit: usize,
         cursor: Option<&str>,
     ) -> Result<ResponseEnvelope<ClaimQueuePage>, SelfHostError> {
@@ -488,7 +500,7 @@ impl AppService {
         let core = self.core_lock()?;
         self.ensure_projection_fresh(&core.catalog, "proj:claim-queue")?;
         let mode = self.resolve_read_mode(&core.catalog, "proj:claim-queue", None, None)?;
-        let mut groups = core.snapshot.claim_queue.groups_matching_state(state);
+        let mut groups = core.snapshot.claim_queue.groups_matching(state, backfill);
         if let Some(verification_mode) = verification_mode {
             for group in &mut groups {
                 group
@@ -579,6 +591,191 @@ impl AppService {
             )?,
         })
     }
+
+    pub fn freshness_response(
+        &self,
+    ) -> Result<ResponseEnvelope<lethe_projection_cognition::FreshnessProjection>, SelfHostError>
+    {
+        let core = self.core_lock()?;
+        self.ensure_projection_fresh(&core.catalog, "proj:freshness")?;
+        let mode = self.resolve_read_mode(&core.catalog, "proj:freshness", None, None)?;
+        let lineage = build_projection_lineage(
+            "proj:freshness",
+            core.lake.list(),
+            core.snapshot.freshness.sources.len(),
+            core.snapshot.built_at,
+        );
+        Ok(ResponseEnvelope {
+            data: core.snapshot.freshness.clone(),
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:freshness",
+                mode,
+                core.snapshot.built_at,
+                &lineage,
+            )?,
+        })
+    }
+
+    pub fn reply_slo_response(
+        &self,
+    ) -> Result<ResponseEnvelope<lethe_projection_cognition::ReplySloProjection>, SelfHostError>
+    {
+        let core = self.core_lock()?;
+        self.ensure_projection_fresh(&core.catalog, "proj:reply-slo")?;
+        let mode = self.resolve_read_mode(&core.catalog, "proj:reply-slo", None, None)?;
+        let lineage = build_mixed_projection_lineage(
+            "proj:reply-slo",
+            core.lake.list(),
+            &core.supplemental.list(),
+            core.snapshot.reply_slo.rows.len(),
+            core.snapshot.built_at,
+        );
+        Ok(ResponseEnvelope {
+            data: core.snapshot.reply_slo.clone(),
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:reply-slo",
+                mode,
+                core.snapshot.built_at,
+                &lineage,
+            )?,
+        })
+    }
+
+    pub fn break_glass_response(
+        &self,
+    ) -> Result<ResponseEnvelope<BreakGlassProjection>, SelfHostError> {
+        let core = self.core_lock()?;
+        self.ensure_projection_fresh(&core.catalog, "proj:break-glass")?;
+        let mode = self.resolve_read_mode(&core.catalog, "proj:break-glass", None, None)?;
+        let lineage = build_channel_registry_projection_lineage(
+            "proj:break-glass",
+            &core.registry.list_channels(),
+            core.snapshot.break_glass.channels.len(),
+            core.snapshot.built_at,
+        );
+        Ok(ResponseEnvelope {
+            data: core.snapshot.break_glass.clone(),
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:break-glass",
+                mode,
+                core.snapshot.built_at,
+                &lineage,
+            )?,
+        })
+    }
+
+    pub fn resume_snapshot_response(
+        &self,
+    ) -> Result<ResponseEnvelope<lethe_projection_cognition::ResumeSnapshotProjection>, SelfHostError>
+    {
+        let core = self.core_lock()?;
+        self.ensure_projection_fresh(&core.catalog, "proj:resume-snapshot")?;
+        let mode = self.resolve_read_mode(&core.catalog, "proj:resume-snapshot", None, None)?;
+        let lineage = build_supplemental_projection_lineage(
+            "proj:resume-snapshot",
+            &core.supplemental.list(),
+            core.snapshot.resume_snapshot.projects.len(),
+            core.snapshot.built_at,
+        );
+        Ok(ResponseEnvelope {
+            data: core.snapshot.resume_snapshot.clone(),
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:resume-snapshot",
+                mode,
+                core.snapshot.built_at,
+                &lineage,
+            )?,
+        })
+    }
+
+    pub fn plan_state_response(
+        &self,
+    ) -> Result<ResponseEnvelope<lethe_projection_cognition::PlanStateProjection>, SelfHostError>
+    {
+        let core = self.core_lock()?;
+        self.ensure_projection_fresh(&core.catalog, "proj:plan-state")?;
+        let mode = self.resolve_read_mode(&core.catalog, "proj:plan-state", None, None)?;
+        let lineage = build_supplemental_projection_lineage(
+            "proj:plan-state",
+            &core.supplemental.list(),
+            core.snapshot.plan_state.projects.len(),
+            core.snapshot.built_at,
+        );
+        Ok(ResponseEnvelope {
+            data: core.snapshot.plan_state.clone(),
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:plan-state",
+                mode,
+                core.snapshot.built_at,
+                &lineage,
+            )?,
+        })
+    }
+
+    pub fn card_queue_response(
+        &self,
+        state: Option<CardState>,
+        channel: Option<&str>,
+        automatic: Option<bool>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ResponseEnvelope<CardQueuePage>, SelfHostError> {
+        if limit == 0 || limit > self.config.resource_limits.max_page_size {
+            return Err(SelfHostError::ReadMode(format!(
+                "page limit must be between 1 and {}",
+                self.config.resource_limits.max_page_size
+            )));
+        }
+        let offset = parse_cursor(cursor)?;
+        let core = self.core_lock()?;
+        self.ensure_projection_fresh(&core.catalog, "proj:card-queue")?;
+        let mode = self.resolve_read_mode(&core.catalog, "proj:card-queue", None, None)?;
+        let cards = core
+            .snapshot
+            .card_queue
+            .cards
+            .iter()
+            .filter(|card| state.is_none_or(|state| card.state == state))
+            .filter(|card| channel.is_none_or(|channel| card.channel == channel))
+            .filter(|card| automatic.is_none_or(|automatic| card.automatic_send == automatic))
+            .cloned()
+            .collect::<Vec<_>>();
+        let total = cards.len();
+        let start = offset.min(total);
+        let end = (start + limit).min(total);
+        let next_cursor = if end < total {
+            Some(end.to_string())
+        } else {
+            None
+        };
+        let lineage = build_supplemental_projection_lineage(
+            "proj:card-queue",
+            &core.supplemental.list(),
+            core.snapshot.card_queue.cards.len(),
+            core.snapshot.built_at,
+        );
+        Ok(ResponseEnvelope {
+            data: CardQueuePage {
+                cards: cards[start..end].to_vec(),
+                total,
+                limit,
+                next_cursor,
+                audit_log: core.snapshot.card_queue.audit_log.clone(),
+            },
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:card-queue",
+                mode,
+                core.snapshot.built_at,
+                &lineage,
+            )?,
+        })
+    }
 }
 
 fn validate_verification_mode_filter(value: Option<&str>) -> Result<(), SelfHostError> {
@@ -624,7 +821,10 @@ fn build_corpus_thread_response(
             return coding_agent_thread_response(corpus, record);
         }
         if let Some(thread_ts) = record.thread_ts.as_deref() {
-            return slack_thread_response(corpus, thread_ts);
+            if record.source_type == "slack" {
+                return slack_thread_response(corpus, thread_ts);
+            }
+            return generic_thread_response(corpus, &record.source_type, thread_ts);
         }
         return Ok(lethe_api::api::grep::ThreadResponse {
             thread_ts: record.record_id.clone(),
@@ -642,8 +842,50 @@ fn build_corpus_thread_response(
     }) {
         return coding_agent_thread_response(corpus, record);
     }
+    if let Some(record) = corpus.iter().find(|record| {
+        record.thread_ts.as_deref() == Some(thread_ref)
+            || metadata_str(record, "thread_key") == Some(thread_ref)
+    }) {
+        if record.source_type != "slack" {
+            return generic_thread_response(corpus, &record.source_type, thread_ref);
+        }
+    }
 
     slack_thread_response(corpus, thread_ref)
+}
+
+fn generic_thread_response(
+    corpus: &[CorpusRecord],
+    source_type: &str,
+    thread_ref: &str,
+) -> Result<lethe_api::api::grep::ThreadResponse, SelfHostError> {
+    let mut records = corpus
+        .iter()
+        .filter(|record| record.source_type == source_type)
+        .filter(|record| {
+            record.thread_ts.as_deref() == Some(thread_ref)
+                || metadata_str(record, "thread_key") == Some(thread_ref)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if records.is_empty() {
+        return Err(SelfHostError::NotFound(thread_ref.to_owned()));
+    }
+    records.sort_by(|left, right| {
+        left.timestamp
+            .cmp(&right.timestamp)
+            .then_with(|| left.record_id.cmp(&right.record_id))
+    });
+    Ok(lethe_api::api::grep::ThreadResponse {
+        thread_ts: thread_ref.to_owned(),
+        records: records.into_iter().map(grep_record_from_corpus).collect(),
+        structure: Some(lethe_api::api::grep::ThreadStructure {
+            thread_key: thread_ref.to_owned(),
+            source_type: source_type.to_owned(),
+            root_session: None,
+            sidechains: Vec::new(),
+        }),
+    })
 }
 
 fn slack_thread_response(

@@ -6,6 +6,8 @@ use axum::http::{Request, StatusCode};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{Duration, Utc};
+use lethe_adapter_api::traits::ObservationDraft;
+use lethe_adapter_chatgpt::{ChatGptImportBatch, ChatGptImportFilter, ChatGptImporter};
 use lethe_core::domain::supplemental::InputAnchorSet;
 use lethe_core::domain::{
     ActorRef, AuthorityModel, CaptureModel, EntityRef, IdempotencyKey, Mutability, Observation,
@@ -15,8 +17,9 @@ use lethe_projection_corpus::{CorpusConfig, CorpusMode};
 use lethe_runtime::runtime::partition::RoutingKeyOrder;
 use lethe_selfhost::self_host::app::{AppService, ProjectionSnapshot};
 use lethe_selfhost::self_host::config::{
-    ApiTokenConfig, CorpusProjectionConfig, GoogleConfig, JsonWebKey, JsonWebKeySet,
-    McpOAuthConfig, ResourceLimits, SecretString, SelfHostConfig, SupplementalConfig,
+    ApiTokenConfig, CorpusProjectionConfig, FreshnessConfig, GoogleConfig, JsonWebKey,
+    JsonWebKeySet, McpOAuthConfig, OpsConfig, ResourceLimits, SecretString, SelfHostConfig,
+    SupplementalConfig,
 };
 use lethe_selfhost::self_host::mcp::build_mcp_router;
 use lethe_selfhost::self_host::server::build_router;
@@ -75,7 +78,7 @@ fn signer_and_oauth() -> (JwtSigner, McpOAuthConfig) {
     )
 }
 
-fn sign_jwt(signer: &JwtSigner, audience: &str, exp: i64) -> String {
+fn sign_jwt(signer: &JwtSigner, audience: &str, exp: i64, scope: &str) -> String {
     let header = serde_json::json!({
         "alg": "ES256",
         "kid": TEST_KID,
@@ -86,7 +89,8 @@ fn sign_jwt(signer: &JwtSigner, audience: &str, exp: i64) -> String {
         "sub": "user:test",
         "aud": audience,
         "exp": exp,
-        "iat": Utc::now().timestamp()
+        "iat": Utc::now().timestamp(),
+        "scope": scope
     });
     let signing_input = format!("{}.{}", encode_json(&header), encode_json(&claims));
     let rng = SystemRandom::new();
@@ -142,6 +146,38 @@ fn observation(text: &str, key: &str) -> Observation {
     }
 }
 
+fn chatgpt_fixture_drafts() -> Vec<ObservationDraft> {
+    let fixture = serde_json::json!([{
+        "id": "chatgpt-e2e-conversation",
+        "title": "MCP write fixture",
+        "mapping": {
+            "msg-user": {
+                "id": "msg-user",
+                "parent": null,
+                "message": {
+                    "author": { "role": "user" },
+                    "content": { "content_type": "text", "parts": ["remember this decision context"] },
+                    "create_time": 1780000200.0
+                }
+            }
+        }
+    }])
+    .to_string();
+    let importer = ChatGptImporter::new(SemVer::new("1.0.0"));
+    let mut batch = ChatGptImportBatch::default();
+    importer
+        .import_json_str(
+            &fixture,
+            "chatgpt/conversations.json",
+            &ChatGptImportFilter::default(),
+            &mut batch,
+        )
+        .unwrap();
+    assert!(batch.audit.skipped_records.is_empty());
+    assert_eq!(batch.drafts.len(), 1);
+    batch.drafts
+}
+
 fn test_config(db: PathBuf, blobs: PathBuf, oauth: McpOAuthConfig) -> SelfHostConfig {
     if db.exists() {
         let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
@@ -154,6 +190,8 @@ fn test_config(db: PathBuf, blobs: PathBuf, oauth: McpOAuthConfig) -> SelfHostCo
                     mode: CorpusMode::WorkspaceFiltered,
                     ..CorpusConfig::default()
                 },
+                Vec::new(),
+                Vec::new(),
             )
             .unwrap();
             persistence
@@ -188,6 +226,16 @@ fn test_config(db: PathBuf, blobs: PathBuf, oauth: McpOAuthConfig) -> SelfHostCo
         corpus: CorpusProjectionConfig {
             mode: CorpusMode::WorkspaceFiltered,
         },
+        freshness: FreshnessConfig {
+            threshold_seconds: std::collections::BTreeMap::from([(
+                "sys:slack".to_owned(),
+                36 * 3600,
+            )]),
+        },
+        ops: OpsConfig {
+            backfill_nightly_budget_items: 1000,
+        },
+        channels: vec![],
         slack_sources: vec![],
         google_sources: Vec::<GoogleConfig>::new(),
         slide_analysis_limit: None,
@@ -199,6 +247,13 @@ fn test_config(db: PathBuf, blobs: PathBuf, oauth: McpOAuthConfig) -> SelfHostCo
 }
 
 fn service_with_records(oauth: McpOAuthConfig) -> (PathBuf, AppService) {
+    let (root, service, _) = service_with_records_and_first_id(oauth);
+    (root, service)
+}
+
+fn service_with_records_and_first_id(
+    oauth: McpOAuthConfig,
+) -> (PathBuf, AppService, lethe_core::domain::ObservationId) {
     let (root, db, blobs) = temp_paths();
     let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
     let first = observation("部屋１２３の忘れ物", "a");
@@ -214,7 +269,7 @@ fn service_with_records(oauth: McpOAuthConfig) -> (PathBuf, AppService) {
         .persist_supplemental(&decision_supplemental(&first_id))
         .unwrap();
     let service = AppService::bootstrap(test_config(db, blobs, oauth)).unwrap();
-    (root, service)
+    (root, service, first_id)
 }
 
 fn claim_supplemental(observation_id: &lethe_core::domain::ObservationId) -> SupplementalRecord {
@@ -264,10 +319,19 @@ fn decision_supplemental(observation_id: &lethe_core::domain::ObservationId) -> 
 }
 
 fn valid_token(signer: &JwtSigner) -> String {
+    scoped_token(signer, "mcp:read write:supplemental")
+}
+
+fn read_only_token(signer: &JwtSigner) -> String {
+    scoped_token(signer, "mcp:read")
+}
+
+fn scoped_token(signer: &JwtSigner, scope: &str) -> String {
     sign_jwt(
         signer,
         TEST_AUDIENCE,
         (Utc::now() + Duration::hours(1)).timestamp(),
+        scope,
     )
 }
 
@@ -347,6 +411,7 @@ fn mcp_jwt_validation_rejects_expired_and_wrong_audience_and_accepts_valid() {
         &signer,
         TEST_AUDIENCE,
         (Utc::now() - Duration::minutes(1)).timestamp(),
+        "mcp:read",
     );
     let expired_response = runtime
         .block_on(async {
@@ -368,6 +433,7 @@ fn mcp_jwt_validation_rejects_expired_and_wrong_audience_and_accepts_valid() {
         &signer,
         "other-audience",
         (Utc::now() + Duration::hours(1)).timestamp(),
+        "mcp:read",
     );
     let wrong_audience_response = runtime
         .block_on(async {
@@ -426,7 +492,7 @@ fn mcp_and_internal_api_routes_are_separate() {
 }
 
 #[test]
-fn five_mcp_tools_have_contracts_and_read_via_projection() {
+fn six_mcp_tools_have_contracts_and_read_via_projection() {
     let (signer, oauth) = signer_and_oauth();
     let (_root, service) = service_with_records(oauth);
     let app = build_mcp_router(service);
@@ -457,17 +523,22 @@ fn five_mcp_tools_have_contracts_and_read_via_projection() {
             "get_record",
             "get_thread",
             "claim_queue",
-            "search_decisions"
+            "search_decisions",
+            "write_supplemental"
         ]
     );
     for tool in tools {
         let description = tool["description"].as_str().unwrap();
         assert!(!description.trim().is_empty());
-        assert!(description.len() <= 100);
-        assert!(!description.to_ascii_lowercase().contains("write"));
-        assert_eq!(tool["annotations"]["readOnlyHint"], true);
+        if tool["name"] == "write_supplemental" {
+            assert!(description.contains("post-processing"));
+            assert_eq!(tool["annotations"]["readOnlyHint"], false);
+        } else {
+            assert!(description.len() <= 100);
+            assert!(!description.to_ascii_lowercase().contains("write"));
+            assert_eq!(tool["annotations"]["readOnlyHint"], true);
+        }
         assert_eq!(tool["annotations"]["destructiveHint"], false);
-        assert_eq!(tool["annotations"]["idempotentHint"], true);
         assert_eq!(tool["annotations"]["openWorldHint"], false);
     }
 
@@ -595,5 +666,200 @@ fn five_mcp_tools_have_contracts_and_read_via_projection() {
         missing_json["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("RecordNotFound"))
+    );
+}
+
+#[test]
+fn write_supplemental_requires_write_scope_and_refreshes_projection() {
+    let (signer, oauth) = signer_and_oauth();
+    let (_root, service, observation_id) = service_with_records_and_first_id(oauth);
+    let app = build_mcp_router(service);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let arguments = serde_json::json!({
+        "id": "sup:00000000-0000-7000-8000-000000000001",
+        "kind": "decision@1",
+        "derived_from": {
+            "observations": [observation_id.as_str()],
+            "blobs": [],
+            "supplementals": []
+        },
+        "payload": {
+            "statement": "MCP write decision",
+            "rationale": "write path fixture"
+        },
+        "created_by": "actor:mcp-test",
+        "mutability": "append_only"
+    });
+
+    let read_only_response = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(mcp_request(
+                    &read_only_token(&signer),
+                    tool_call("write_supplemental", arguments.clone()),
+                ))
+                .await
+        })
+        .unwrap();
+    assert_eq!(read_only_response.status(), StatusCode::OK);
+    let read_only_json = response_json(&runtime, read_only_response);
+    assert_eq!(read_only_json["error"]["code"], -32003);
+
+    let unresolved_arguments = serde_json::json!({
+        "id": "sup:00000000-0000-7000-8000-000000000002",
+        "kind": "decision@1",
+        "derived_from": {
+            "observations": ["obs:missing"],
+            "blobs": [],
+            "supplementals": []
+        },
+        "payload": {
+            "statement": "MCP unresolved decision",
+            "rationale": "missing anchor fixture"
+        },
+        "created_by": "actor:mcp-test",
+        "mutability": "append_only"
+    });
+    let unresolved_response = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(mcp_request(
+                    &valid_token(&signer),
+                    tool_call("write_supplemental", unresolved_arguments),
+                ))
+                .await
+        })
+        .unwrap();
+    assert_eq!(unresolved_response.status(), StatusCode::OK);
+    let unresolved_json = response_json(&runtime, unresolved_response);
+    assert_eq!(unresolved_json["error"]["code"], -32602);
+    assert!(
+        unresolved_json["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("SupplementalValidation:unresolved_anchor"))
+    );
+
+    let write_response = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(mcp_request(
+                    &valid_token(&signer),
+                    tool_call("write_supplemental", arguments),
+                ))
+                .await
+        })
+        .unwrap();
+    assert_eq!(write_response.status(), StatusCode::OK);
+    let write_json = response_json(&runtime, write_response);
+    assert_eq!(
+        write_json["result"]["structuredContent"]["record"]["kind"],
+        "decision@1"
+    );
+
+    let search_response = runtime
+        .block_on(async {
+            app.oneshot(mcp_request(
+                &valid_token(&signer),
+                tool_call(
+                    "search_decisions",
+                    serde_json::json!({"query": "write decision"}),
+                ),
+            ))
+            .await
+        })
+        .unwrap();
+    let search_json = response_json(&runtime, search_response);
+    let matches = search_json["result"]["structuredContent"]["data"]["matches"]
+        .as_array()
+        .unwrap();
+    assert!(
+        matches
+            .iter()
+            .any(|item| item["statement"] == "MCP write decision")
+    );
+}
+
+#[test]
+fn chatgpt_fixture_import_then_mcp_write_decision_is_searchable() {
+    let (signer, oauth) = signer_and_oauth();
+    let (_root, db, blobs) = temp_paths();
+    let service = AppService::bootstrap(test_config(db.clone(), blobs.clone(), oauth)).unwrap();
+    let report = service
+        .ingest_observation_drafts(chatgpt_fixture_drafts(), "chatgpt-e2e")
+        .unwrap();
+    assert_eq!(report.ingested, 1);
+    assert_eq!(report.duplicates, 0);
+    assert_eq!(report.quarantined, 0);
+
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let observations = persistence.load_observations().unwrap();
+    let chatgpt_observation_id = observations
+        .iter()
+        .find(|observation| {
+            observation
+                .source_system
+                .as_ref()
+                .is_some_and(|source| source.as_str() == "sys:chatgpt")
+        })
+        .map(|observation| observation.id.clone())
+        .unwrap();
+    drop(persistence);
+
+    let app = build_mcp_router(service);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let arguments = serde_json::json!({
+        "id": "sup:00000000-0000-7000-8000-000000000101",
+        "kind": "decision@1",
+        "derived_from": {
+            "observations": [chatgpt_observation_id.as_str()],
+            "blobs": [],
+            "supplementals": []
+        },
+        "payload": {
+            "statement": "ChatGPT fixture decision",
+            "rationale": "cross-client mcp write fixture"
+        },
+        "created_by": "actor:mcp-test",
+        "mutability": "append_only"
+    });
+
+    let write_response = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(mcp_request(
+                    &valid_token(&signer),
+                    tool_call("write_supplemental", arguments),
+                ))
+                .await
+        })
+        .unwrap();
+    assert_eq!(write_response.status(), StatusCode::OK);
+    let write_json = response_json(&runtime, write_response);
+    assert_eq!(
+        write_json["result"]["structuredContent"]["record"]["kind"],
+        "decision@1"
+    );
+
+    let search_response = runtime
+        .block_on(async {
+            app.oneshot(mcp_request(
+                &valid_token(&signer),
+                tool_call(
+                    "search_decisions",
+                    serde_json::json!({"query": "fixture decision"}),
+                ),
+            ))
+            .await
+        })
+        .unwrap();
+    assert_eq!(search_response.status(), StatusCode::OK);
+    let search_json = response_json(&runtime, search_response);
+    let matches = search_json["result"]["structuredContent"]["data"]["matches"]
+        .as_array()
+        .unwrap();
+    assert!(
+        matches
+            .iter()
+            .any(|item| item["statement"] == "ChatGPT fixture decision")
     );
 }

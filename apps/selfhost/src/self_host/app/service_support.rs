@@ -110,6 +110,25 @@ impl AppService {
                 core.snapshot.claim_queue.claims.len() + core.snapshot.claim_queue.decisions.len(),
                 core.snapshot.built_at,
             )),
+            "proj:freshness" => Ok(build_projection_lineage(
+                "proj:freshness",
+                core.lake.list(),
+                core.snapshot.freshness.sources.len(),
+                core.snapshot.built_at,
+            )),
+            "proj:reply-slo" => Ok(build_mixed_projection_lineage(
+                "proj:reply-slo",
+                core.lake.list(),
+                &core.supplemental.list(),
+                core.snapshot.reply_slo.rows.len(),
+                core.snapshot.built_at,
+            )),
+            "proj:break-glass" => Ok(build_channel_registry_projection_lineage(
+                "proj:break-glass",
+                &core.registry.list_channels(),
+                core.snapshot.break_glass.channels.len(),
+                core.snapshot.built_at,
+            )),
             _ => Err(SelfHostError::NotFound(projection_id.to_string())),
         }
     }
@@ -168,8 +187,13 @@ impl AppService {
             let store = self.persistence_lock()?;
             (store.load_observations()?, store.load_supplementals()?)
         };
-        let snapshot =
-            ProjectionSnapshot::build(observations, supplementals, core.corpus_config.clone())?;
+        let snapshot = ProjectionSnapshot::build(
+            observations,
+            supplementals,
+            core.corpus_config.clone(),
+            core.freshness_thresholds.clone(),
+            core.registry.list_channels().into_iter().cloned().collect(),
+        )?;
         let snapshot_value = serde_json::to_value(&snapshot)?;
         self.persistence_lock()?
             .materialize_projection(&ProjectionRef::new("proj:person-page"), &snapshot_value)?;
@@ -285,6 +309,21 @@ impl AppService {
         latest_ts: &mut Option<String>,
     ) -> Result<IngestResult, SelfHostError> {
         message.channel_id = channel_id.to_string();
+        let source = self
+            .config
+            .slack_sources
+            .iter()
+            .find(|source| source.id == source_instance_id)
+            .ok_or_else(|| {
+                SelfHostError::Ingestion(format!(
+                    "slack source instance {source_instance_id} is not configured"
+                ))
+            })?;
+        message.ingress_kind = Some(classify_slack_ingress(
+            channel_id,
+            &message.mentions,
+            &source.mention_user_ids,
+        ));
         for file in &mut message.files {
             if file.blob_ref.is_none() {
                 let policy = self.slack_adapter_config();
@@ -496,6 +535,24 @@ impl AppService {
     }
 }
 
+pub(super) fn classify_slack_ingress(
+    channel_id: &str,
+    mentions: &[String],
+    mention_user_ids: &[String],
+) -> lethe_adapter_slack::slack::client::SlackIngressKind {
+    if channel_id.starts_with('D') {
+        return lethe_adapter_slack::slack::client::SlackIngressKind::DirectMessage;
+    }
+    if mentions.iter().any(|mention| {
+        mention_user_ids
+            .iter()
+            .any(|candidate| candidate == mention)
+    }) {
+        return lethe_adapter_slack::slack::client::SlackIngressKind::Mention;
+    }
+    lethe_adapter_slack::slack::client::SlackIngressKind::Channel
+}
+
 pub(super) fn namespace_draft(
     mut draft: ObservationDraft,
     source_instance_id: &str,
@@ -641,6 +698,95 @@ pub(super) fn build_supplemental_projection_lineage(
         source_ref: "supplemental".to_string(),
         watermark_position: None,
         record_count: supplementals.len(),
+    });
+    for input_ref in input_refs {
+        lineage.add_input_ref(input_ref);
+    }
+    lineage
+}
+
+pub(super) fn build_mixed_projection_lineage(
+    projection_id: &str,
+    observations: &[Observation],
+    supplementals: &[&lethe_core::domain::SupplementalRecord],
+    output_count: usize,
+    built_at: DateTime<Utc>,
+) -> LineageManifest {
+    let mut input_refs = observations
+        .iter()
+        .map(|observation| format!("observation:{}", observation.id))
+        .chain(
+            supplementals
+                .iter()
+                .map(|record| format!("supplemental:{}", record.id)),
+        )
+        .collect::<Vec<_>>();
+    input_refs.sort();
+
+    let mut hasher = Sha256::new();
+    hasher.update(projection_id.as_bytes());
+    hasher.update(b"@1.0.0\n");
+    for input_ref in &input_refs {
+        hasher.update(input_ref.as_bytes());
+        hasher.update(b"\n");
+    }
+    let build_id = format!("build-{}", hex::encode(hasher.finalize()));
+    let mut lineage = LineageManifest::new(
+        ProjectionRef::new(projection_id),
+        SemVer::new("1.0.0"),
+        build_id,
+    );
+    lineage.built_at = built_at;
+    lineage.output_count = output_count;
+    lineage.deterministic = true;
+    lineage.add_source(SourceSnapshot {
+        source_ref: "lake".to_string(),
+        watermark_position: Some(observations.len()),
+        record_count: observations.len(),
+    });
+    lineage.add_source(SourceSnapshot {
+        source_ref: "supplemental".to_string(),
+        watermark_position: None,
+        record_count: supplementals.len(),
+    });
+    for input_ref in input_refs {
+        lineage.add_input_ref(input_ref);
+    }
+    lineage
+}
+
+pub(super) fn build_channel_registry_projection_lineage(
+    projection_id: &str,
+    channels: &[&lethe_registry::registry::ChannelRecord],
+    output_count: usize,
+    built_at: DateTime<Utc>,
+) -> LineageManifest {
+    let mut input_refs = channels
+        .iter()
+        .map(|channel| format!("channel:{}", channel.id))
+        .collect::<Vec<_>>();
+    input_refs.sort();
+
+    let mut hasher = Sha256::new();
+    hasher.update(projection_id.as_bytes());
+    hasher.update(b"@1.0.0\n");
+    for input_ref in &input_refs {
+        hasher.update(input_ref.as_bytes());
+        hasher.update(b"\n");
+    }
+    let build_id = format!("build-{}", hex::encode(hasher.finalize()));
+    let mut lineage = LineageManifest::new(
+        ProjectionRef::new(projection_id),
+        SemVer::new("1.0.0"),
+        build_id,
+    );
+    lineage.built_at = built_at;
+    lineage.output_count = output_count;
+    lineage.deterministic = true;
+    lineage.add_source(SourceSnapshot {
+        source_ref: "registry:channels".to_string(),
+        watermark_position: None,
+        record_count: channels.len(),
     });
     for input_ref in input_refs {
         lineage.add_input_ref(input_ref);

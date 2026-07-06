@@ -9,6 +9,7 @@ axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
 lethe-adapter-api = { path = "../../crates/adapters/api" }
+lethe-adapter-chatgpt = { path = "../../crates/adapters/chatgpt" }
 lethe-adapter-claude = { path = "../../crates/adapters/claude" }
 lethe-adapter-coding-agent = { path = "../../crates/adapters/coding-agent" }
 lethe-adapter-gslides = { path = "../../crates/adapters/gslides" }

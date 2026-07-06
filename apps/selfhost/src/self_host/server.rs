@@ -1,5 +1,5 @@
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -7,20 +7,34 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 
-use crate::self_host::app::{AppService, SelfHostError, SupplementalWriteRequest, WriteEnvelope};
+use crate::self_host::app::{
+    AppService, ImportReport, SelfHostError, SupplementalWriteRequest, WriteEnvelope,
+};
+use lethe_adapter_api::traits::ObservationDraft;
 use lethe_api::api::envelope::{ErrorResponse, ResponseEnvelope};
 use lethe_api::api::health::HealthResponse;
 use lethe_api::api::pagination::PaginationParams;
 use lethe_core::domain::BlobRef;
 use lethe_projection_claim_queue::ClaimState;
+use lethe_projection_cognition::CardState;
 
 pub fn build_router(service: AppService) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/health/deep", get(deep_health))
         .route("/admin/sync", post(sync_now))
+        .route(
+            "/api/import/observation-drafts",
+            post(import_observation_drafts).layer(DefaultBodyLimit::max(128 * 1024 * 1024)),
+        )
         .route("/projections/claim-queue", get(claim_queue))
         .route("/projections/decisions", get(decisions))
+        .route("/projections/freshness", get(freshness))
+        .route("/projections/reply-slo", get(reply_slo))
+        .route("/projections/break-glass", get(break_glass))
+        .route("/projections/resume-snapshot", get(resume_snapshot))
+        .route("/projections/plan-state", get(plan_state))
+        .route("/projections/card-queue", get(card_queue))
         .route("/supplementals", post(create_supplemental))
         .route(
             "/api/projections/{projection_id}/blobs/{blob_hash}",
@@ -86,6 +100,7 @@ struct PersonsQuery {
 #[derive(Debug, Deserialize, Default)]
 struct ClaimQueueQuery {
     state: Option<ClaimState>,
+    backfill: Option<bool>,
     limit: Option<usize>,
     cursor: Option<String>,
 }
@@ -94,6 +109,21 @@ struct ClaimQueueQuery {
 struct DecisionsQuery {
     q: Option<String>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CardQueueQuery {
+    state: Option<CardState>,
+    channel: Option<String>,
+    automatic: Option<bool>,
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportObservationDraftsRequest {
+    source_instance_id: String,
+    drafts: Vec<ObservationDraft>,
 }
 
 async fn health(State(service): State<AppService>) -> Result<Json<HealthResponse>, ApiError> {
@@ -119,6 +149,20 @@ async fn sync_now(
     Ok(Json(report))
 }
 
+async fn import_observation_drafts(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Json(request): Json<ImportObservationDraftsRequest>,
+) -> Result<Json<ImportReport>, ApiError> {
+    service.authorize_headers(&headers, "write:observations")?;
+    let report = tokio::task::spawn_blocking(move || {
+        service.ingest_observation_drafts(request.drafts, &request.source_instance_id)
+    })
+    .await
+    .map_err(|err| ApiError::internal(err.to_string()))??;
+    Ok(Json(report))
+}
+
 async fn claim_queue(
     State(service): State<AppService>,
     headers: HeaderMap,
@@ -126,8 +170,10 @@ async fn claim_queue(
 ) -> Result<Json<ResponseEnvelope<crate::self_host::app::projection_api::ClaimQueuePage>>, ApiError>
 {
     service.authorize_headers(&headers, "read:corpus")?;
-    Ok(Json(service.claim_queue_response(
+    Ok(Json(service.claim_queue_response_filtered(
         query.state,
+        None,
+        query.backfill,
         query.limit.unwrap_or(20),
         query.cursor.as_deref(),
     )?))
@@ -145,6 +191,63 @@ async fn decisions(
     Ok(Json(service.decision_search_response(
         query.q.as_deref(),
         query.limit.unwrap_or(20),
+    )?))
+}
+
+async fn freshness(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+) -> Result<Json<ResponseEnvelope<lethe_projection_cognition::FreshnessProjection>>, ApiError> {
+    service.authorize_headers(&headers, "read:corpus")?;
+    Ok(Json(service.freshness_response()?))
+}
+
+async fn reply_slo(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+) -> Result<Json<ResponseEnvelope<lethe_projection_cognition::ReplySloProjection>>, ApiError> {
+    service.authorize_headers(&headers, "read:corpus")?;
+    Ok(Json(service.reply_slo_response()?))
+}
+
+async fn break_glass(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+) -> Result<Json<ResponseEnvelope<crate::self_host::app::BreakGlassProjection>>, ApiError> {
+    service.authorize_headers(&headers, "read:corpus")?;
+    Ok(Json(service.break_glass_response()?))
+}
+
+async fn resume_snapshot(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+) -> Result<Json<ResponseEnvelope<lethe_projection_cognition::ResumeSnapshotProjection>>, ApiError>
+{
+    service.authorize_headers(&headers, "read:corpus")?;
+    Ok(Json(service.resume_snapshot_response()?))
+}
+
+async fn plan_state(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+) -> Result<Json<ResponseEnvelope<lethe_projection_cognition::PlanStateProjection>>, ApiError> {
+    service.authorize_headers(&headers, "read:corpus")?;
+    Ok(Json(service.plan_state_response()?))
+}
+
+async fn card_queue(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Query(query): Query<CardQueueQuery>,
+) -> Result<Json<ResponseEnvelope<crate::self_host::app::projection_api::CardQueuePage>>, ApiError>
+{
+    service.authorize_headers(&headers, "read:corpus")?;
+    Ok(Json(service.card_queue_response(
+        query.state,
+        query.channel.as_deref(),
+        query.automatic,
+        query.limit.unwrap_or(20),
+        query.cursor.as_deref(),
     )?))
 }
 
@@ -467,7 +570,16 @@ fn ensure_projection_answer_log(projection_id: &str) -> Result<(), ApiError> {
 
 fn ensure_known_projection(projection_id: &str) -> Result<(), ApiError> {
     match projection_id {
-        "proj:person-page" | "proj:corpus" | "proj:answer-log" | "proj:claim-queue" => Ok(()),
+        "proj:person-page"
+        | "proj:corpus"
+        | "proj:answer-log"
+        | "proj:claim-queue"
+        | "proj:freshness"
+        | "proj:reply-slo"
+        | "proj:break-glass"
+        | "proj:resume-snapshot"
+        | "proj:plan-state"
+        | "proj:card-queue" => Ok(()),
         _ => Err(ApiError::not_found()),
     }
 }

@@ -1,3 +1,55 @@
+[[channels]]
+id = "chan:slack-primary:C01234567"
+kind = "slack"
+source_instance_id = "slack-primary"
+external_id = "C01234567"
+connection_ref = "slack-primary"
+default_consent_scope = "org_federated"
+reply_slo_seconds = 1800
+freshness_threshold_seconds = 1800
+break_glass_channel = false
+break_glass_senders = []
+enabled = true
+
+[[channels]]
+id = "chan:slack-primary:D01234567"
+kind = "slack"
+source_instance_id = "slack-primary"
+external_id = "D01234567"
+connection_ref = "slack-primary"
+default_consent_scope = "personal"
+reply_slo_seconds = 1800
+freshness_threshold_seconds = 1800
+break_glass_channel = true
+break_glass_senders = ["U01234567"]
+enabled = true
+
+[[channels]]
+id = "chan:gmail-primary:primary"
+kind = "gmail"
+source_instance_id = "gmail-primary"
+external_id = "primary"
+connection_ref = "gmail-primary"
+default_consent_scope = "personal"
+reply_slo_seconds = 1800
+freshness_threshold_seconds = 1800
+break_glass_channel = false
+break_glass_senders = ["director@example.com"]
+enabled = true
+
+[[channels]]
+id = "chan:discord-primary:123456789012345678"
+kind = "discord"
+source_instance_id = "discord-primary"
+external_id = "123456789012345678"
+connection_ref = "discord-primary"
+default_consent_scope = "personal"
+reply_slo_seconds = 1800
+freshness_threshold_seconds = 1800
+break_glass_channel = false
+break_glass_senders = []
+enabled = true
+
 [server]
 bind_addr = "127.0.0.1:8080"
 mcp_bind_addr = "127.0.0.1:8090"
@@ -31,6 +83,15 @@ retention_days = 30
 [corpus]
 mode = "workspace_filtered"
 
+[freshness.threshold_seconds]
+"chan:slack-primary:C01234567" = 1800
+"chan:slack-primary:D01234567" = 1800
+"chan:gmail-primary:primary" = 1800
+"chan:discord-primary:123456789012345678" = 1800
+
+[ops]
+backfill_nightly_budget_items = 10000
+
 [supplemental]
 reject_unregistered_kinds = true
 
@@ -53,6 +114,7 @@ id = "slack-primary"
 bot_token_env = "LETHE_SLACK_PRIMARY_BOT_TOKEN"
 thread_token_env = "LETHE_SLACK_PRIMARY_THREAD_TOKEN"
 channel_ids = ["C01234567", "C08999999"]
+mention_user_ids = ["U01234567"]
 
 [[sources.google_slides]]
 id = "gslides-primary"

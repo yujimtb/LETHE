@@ -58,6 +58,11 @@ impl<C: SlackClient> SlackAdapter<C> {
         let published = parse_slack_ts(&msg.ts).ok_or_else(|| AdapterError::MalformedResponse {
             message: format!("invalid Slack timestamp: {}", msg.ts),
         })?;
+        let ingress_kind = msg
+            .ingress_kind
+            .ok_or_else(|| AdapterError::MalformedResponse {
+                message: "Slack message missing ingress_kind".to_string(),
+            })?;
         let identity = declare_canonical_identity("slack", self, self, msg);
 
         let subject = EntityRef::new(format!("message:slack:{}-{}", msg.channel_id, msg.ts));
@@ -66,6 +71,10 @@ impl<C: SlackClient> SlackAdapter<C> {
             "sourceAdapterVersion": self.config.adapter_version.as_str(),
             OBJECT_ID_META_KEY: identity.object_id,
             CANONICAL_JSON_META_KEY: identity.canonical_json,
+            "communication_channel_kind": "slack",
+            "communication_channel_external_id": msg.channel_id,
+            "communication_sender_id": msg.user_id,
+            "communication_thread_ref": format!("slack:thread:{}", msg.thread_ts.as_deref().unwrap_or(msg.ts.as_str())),
         });
 
         if msg.message_type == SlackMessageType::Delete {
@@ -80,6 +89,8 @@ impl<C: SlackClient> SlackAdapter<C> {
             "user_id": msg.user_id,
             "user_name": msg.user_name,
             "text": msg.text,
+            "ingress_kind": ingress_kind,
+            "mentions": msg.mentions,
             "message_type": msg.message_type,
         });
 
@@ -325,6 +336,8 @@ mod tests {
             user_name: "tanaka".into(),
             email: Some("tanaka@example.jp".into()),
             text: "Hello everyone!".into(),
+            ingress_kind: Some(SlackIngressKind::Channel),
+            mentions: vec![],
             message_type: SlackMessageType::Message,
             edited: None,
             reactions: vec![],
@@ -353,9 +366,48 @@ mod tests {
             "message:slack:C01ABC-1234567890.123456"
         );
         assert_eq!(draft.payload["text"], "Hello everyone!");
+        assert_eq!(draft.payload["ingress_kind"], "channel");
         assert_eq!(draft.payload["message_type"], "message");
         assert_eq!(draft.authority_model, AuthorityModel::LakeAuthoritative);
         assert_eq!(draft.capture_model, CaptureModel::Event);
+    }
+
+    #[test]
+    fn map_dm_mention_and_channel_ingress_kinds() {
+        let adapter = SlackAdapter::new(FixtureSlackClient::new(), test_config());
+        let mut dm = sample_message();
+        dm.channel_id = "D01DM".into();
+        dm.ingress_kind = Some(SlackIngressKind::DirectMessage);
+        let mut mention = sample_message();
+        mention.text = "<@U-BOT> ping".into();
+        mention.mentions = vec!["U-BOT".into()];
+        mention.ingress_kind = Some(SlackIngressKind::Mention);
+        let channel = sample_message();
+
+        let dm = adapter.map_message(&dm).unwrap();
+        let mention = adapter.map_message(&mention).unwrap();
+        let channel = adapter.map_message(&channel).unwrap();
+
+        assert_eq!(dm.payload["ingress_kind"], "direct_message");
+        assert_eq!(mention.payload["ingress_kind"], "mention");
+        assert_eq!(mention.payload["mentions"][0], "U-BOT");
+        assert_eq!(channel.payload["ingress_kind"], "channel");
+        assert!(
+            dm.idempotency_key
+                .as_str()
+                .starts_with("slack:channel:D01DM:ts:")
+        );
+    }
+
+    #[test]
+    fn missing_ingress_kind_is_rejected() {
+        let adapter = SlackAdapter::new(FixtureSlackClient::new(), test_config());
+        let mut msg = sample_message();
+        msg.ingress_kind = None;
+
+        let err = adapter.map_message(&msg).unwrap_err();
+
+        assert!(matches!(err, AdapterError::MalformedResponse { .. }));
     }
 
     #[test]

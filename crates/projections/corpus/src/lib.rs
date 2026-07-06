@@ -524,11 +524,17 @@ fn personal_source_type(observation: &Observation) -> String {
     if matches!(source_system, Some("sys:github")) || schema == "schema:github-event" {
         return github_source_type(&observation.payload).to_owned();
     }
-    if matches!(source_system, Some("sys:claude-code")) || schema.contains("claude-code") {
+    if matches!(source_system, Some("sys:claude-code")) {
         return "claude-code".to_owned();
     }
-    if matches!(source_system, Some("sys:codex")) || schema.contains("codex") {
+    if matches!(source_system, Some("sys:codex")) {
         return "codex".to_owned();
+    }
+    if matches!(source_system, Some("sys:gmail")) || schema == "schema:gmail-message" {
+        return "gmail".to_owned();
+    }
+    if matches!(source_system, Some("sys:discord")) || schema == "schema:discord-message" {
+        return "discord".to_owned();
     }
 
     source_system
@@ -554,11 +560,24 @@ fn personal_text(observation: &Observation, source_type: &str) -> Option<String>
             github_text(&observation.payload)
         }
         "claude-code" | "codex" => coding_agent_text(&observation.payload),
+        "gmail" => gmail_text(&observation.payload),
+        "discord" => string_at(&observation.payload, &["content"]).map(str::to_owned),
         _ => {
             let text = value_text(&observation.payload);
             (!text.trim().is_empty()).then_some(text)
         }
     }
+}
+
+fn gmail_text(payload: &serde_json::Value) -> Option<String> {
+    let parts = [
+        string_at(payload, &["subject"]).unwrap_or(""),
+        string_at(payload, &["text"]).unwrap_or(""),
+    ]
+    .into_iter()
+    .filter(|part| !part.trim().is_empty())
+    .collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join("\n"))
 }
 
 fn github_text(payload: &serde_json::Value) -> Option<String> {
@@ -586,38 +605,44 @@ fn github_text(payload: &serde_json::Value) -> Option<String> {
 }
 
 fn coding_agent_text(payload: &serde_json::Value) -> Option<String> {
-    let mut parts = Vec::new();
-    for path in [
-        &["text"][..],
-        &["content"][..],
-        &["message"][..],
-        &["tool", "name"][..],
-        &["tool_name"][..],
-        &["target"][..],
-        &["target_ref"][..],
-        &["path"][..],
-        &["pattern"][..],
-    ] {
-        if let Some(value) = string_at(payload, path)
-            && !value.trim().is_empty()
-        {
-            parts.push(value.to_owned());
-        }
-    }
-    if let Some(values) = payload
-        .pointer("/target_refs")
-        .and_then(serde_json::Value::as_array)
-    {
-        parts.extend(
-            values
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .map(ToOwned::to_owned),
-        );
+    let item = payload.get("item")?;
+    let mut parts = match string_at(item, &["kind"])? {
+        "message" => string_at(item, &["text"])
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| vec![value.to_owned()])?,
+        "tool_call" => string_at(item, &["tool_name"])
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| vec![value.to_owned()])
+            .unwrap_or_default(),
+        _ => return None,
+    };
+    if let Some(references) = item.get("references") {
+        collect_reference_text(references, &mut parts);
     }
     let text = parts.join("\n");
     (!text.trim().is_empty()).then_some(text)
+}
+
+fn collect_reference_text(value: &serde_json::Value, parts: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(text) => {
+            if !text.trim().is_empty() {
+                parts.push(text.to_owned());
+            }
+        }
+        serde_json::Value::Number(number) => parts.push(number.to_string()),
+        serde_json::Value::Bool(flag) => parts.push(flag.to_string()),
+        serde_json::Value::Array(values) => {
+            values
+                .iter()
+                .for_each(|value| collect_reference_text(value, parts));
+        }
+        serde_json::Value::Object(map) => {
+            map.values()
+                .for_each(|value| collect_reference_text(value, parts));
+        }
+        serde_json::Value::Null => {}
+    }
 }
 
 fn personal_anchor_url(observation: &Observation, source_type: &str) -> String {
@@ -648,11 +673,23 @@ fn personal_anchor_url(observation: &Observation, source_type: &str) -> String {
             format!("github://{repo}/{object_type}/{object_id}")
         }
         "claude-code" | "codex" => {
-            let session = coding_session_id(&observation.payload, &observation.meta)
+            let session = coding_session_id(&observation.payload)
                 .unwrap_or_else(|| observation.id.as_str().to_owned());
-            let message = coding_message_id(&observation.payload, &observation.meta)
+            let message = coding_message_id(&observation.payload)
                 .unwrap_or_else(|| observation.id.as_str().to_owned());
             format!("{source_type}://session/{session}/message/{message}")
+        }
+        "gmail" => {
+            let account = string_at(&observation.payload, &["account_id"]).unwrap_or("unknown");
+            let message =
+                string_at(&observation.payload, &["message_id"]).unwrap_or(observation.id.as_str());
+            format!("gmail://{account}/message/{message}")
+        }
+        "discord" => {
+            let channel = string_at(&observation.payload, &["channel_id"]).unwrap_or("unknown");
+            let message =
+                string_at(&observation.payload, &["message_id"]).unwrap_or(observation.id.as_str());
+            format!("discord://{channel}/message/{message}")
         }
         _ => format!("observation://{}", observation.id.as_str()),
     }
@@ -677,9 +714,15 @@ fn personal_title(observation: &Observation, source_type: &str) -> String {
         ),
         "claude-code" | "codex" => format!(
             "{source_type} session {}",
-            coding_session_id(&observation.payload, &observation.meta)
-                .unwrap_or_else(|| "unknown".to_owned())
+            coding_session_id(&observation.payload).unwrap_or_else(|| "unknown".to_owned())
         ),
+        "gmail" => string_at(&observation.payload, &["subject"])
+            .unwrap_or("Gmail message")
+            .to_owned(),
+        "discord" => string_at(&observation.payload, &["channel_name"])
+            .or_else(|| string_at(&observation.payload, &["guild_name"]))
+            .unwrap_or("Discord message")
+            .to_owned(),
         _ => title(observation),
     }
 }
@@ -690,9 +733,18 @@ fn personal_location(observation: &Observation, source_type: &str) -> Option<Str
         "github-issue" | "github-pr" | "github-comment" | "github-commit" | "github-event" => {
             string_at(&observation.payload, &["object_type"]).map(str::to_owned)
         }
-        "claude-code" | "codex" => string_at(&observation.payload, &["role"])
-            .or_else(|| string_at(&observation.payload, &["sender"]))
-            .map(str::to_owned),
+        "claude-code" | "codex" => coding_item_location(&observation.payload),
+        "gmail" => string_at(&observation.payload, &["from"]).map(str::to_owned),
+        "discord" => string_at(&observation.payload, &["author_name"]).map(str::to_owned),
+        _ => None,
+    }
+}
+
+fn coding_item_location(payload: &serde_json::Value) -> Option<String> {
+    let item = payload.get("item")?;
+    match string_at(item, &["kind"])? {
+        "message" => string_at(item, &["role"]).map(str::to_owned),
+        "tool_call" => string_at(item, &["tool_name"]).map(|tool_name| format!("tool:{tool_name}")),
         _ => None,
     }
 }
@@ -703,7 +755,9 @@ fn personal_container(observation: &Observation, source_type: &str) -> Option<St
             string_at(&observation.payload, &["repo"]).map(str::to_owned)
         }
         "claude-ai" => string_at(&observation.payload, &["conversation_uuid"]).map(str::to_owned),
-        "claude-code" | "codex" => coding_session_id(&observation.payload, &observation.meta),
+        "claude-code" | "codex" => coding_session_id(&observation.payload),
+        "gmail" => string_at(&observation.payload, &["account_id"]).map(str::to_owned),
+        "discord" => string_at(&observation.payload, &["channel_id"]).map(str::to_owned),
         _ => string_at(&observation.payload, &["artifact", "containerId"]).map(str::to_owned),
     }
 }
@@ -713,11 +767,16 @@ fn personal_thread_key(observation: &Observation, source_type: &str) -> Option<S
         "claude-ai" => string_at(&observation.payload, &["conversation_uuid"])
             .map(|conversation| format!("claude-ai:conversation:{conversation}")),
         "claude-code" | "codex" => {
-            let session = coding_session_id(&observation.payload, &observation.meta)?;
-            let root = coding_parent_session_id(&observation.payload, &observation.meta)
-                .unwrap_or_else(|| session.clone());
+            let session = coding_session_id(&observation.payload)?;
+            let root =
+                coding_parent_session_id(&observation.payload).unwrap_or_else(|| session.clone());
             Some(format!("{source_type}:session:{root}"))
         }
+        "gmail" => string_at(&observation.payload, &["thread_id"])
+            .map(|thread| format!("gmail:thread:{thread}")),
+        "discord" => string_at(&observation.payload, &["referenced_message_id"])
+            .or_else(|| string_at(&observation.payload, &["message_id"]))
+            .map(|message| format!("discord:thread:{message}")),
         _ => None,
     }
 }
@@ -764,16 +823,49 @@ fn personal_metadata(
             serde_json::Value::String(repo.to_owned()),
         );
     }
+    if matches!(source_type, "gmail") {
+        for field in [
+            "account_id",
+            "message_id",
+            "thread_id",
+            "from",
+            "in_reply_to",
+        ] {
+            if let Some(value) = string_at(&observation.payload, &[field]) {
+                metadata.insert(
+                    field.to_owned(),
+                    serde_json::Value::String(value.to_owned()),
+                );
+            }
+        }
+        if let Some(references) = observation.payload.get("references") {
+            metadata.insert("references".to_owned(), references.clone());
+        }
+    }
+    if matches!(source_type, "discord") {
+        for field in [
+            "channel_id",
+            "message_id",
+            "author_id",
+            "guild_id",
+            "referenced_message_id",
+        ] {
+            if let Some(value) = string_at(&observation.payload, &[field]) {
+                metadata.insert(
+                    field.to_owned(),
+                    serde_json::Value::String(value.to_owned()),
+                );
+            }
+        }
+    }
     if matches!(source_type, "claude-code" | "codex") {
-        if let Some(session_id) = coding_session_id(&observation.payload, &observation.meta) {
+        if let Some(session_id) = coding_session_id(&observation.payload) {
             metadata.insert(
                 "session_id".to_owned(),
                 serde_json::Value::String(session_id),
             );
         }
-        if let Some(parent_session_id) =
-            coding_parent_session_id(&observation.payload, &observation.meta)
-        {
+        if let Some(parent_session_id) = coding_parent_session_id(&observation.payload) {
             metadata.insert(
                 "parent_session_id".to_owned(),
                 serde_json::Value::String(parent_session_id),
@@ -781,9 +873,9 @@ fn personal_metadata(
         }
         metadata.insert(
             "is_sidechain".to_owned(),
-            serde_json::Value::Bool(coding_is_sidechain(&observation.payload, &observation.meta)),
+            serde_json::Value::Bool(coding_is_sidechain(&observation.payload)),
         );
-        if let Some(message_id) = coding_message_id(&observation.payload, &observation.meta) {
+        if let Some(message_id) = coding_message_id(&observation.payload) {
             metadata.insert(
                 "message_id".to_owned(),
                 serde_json::Value::String(message_id),
@@ -811,65 +903,20 @@ fn number_like(payload: &serde_json::Value, field: &str) -> Option<String> {
     })
 }
 
-fn coding_session_id(payload: &serde_json::Value, meta: &serde_json::Value) -> Option<String> {
-    first_string_owned(
-        payload,
-        meta,
-        &[
-            &["session_id"][..],
-            &["sessionId"][..],
-            &["session", "id"][..],
-            &["session", "session_id"][..],
-        ],
-    )
+fn coding_session_id(payload: &serde_json::Value) -> Option<String> {
+    string_owned_at(payload, &["session_id"])
 }
 
-fn coding_parent_session_id(
-    payload: &serde_json::Value,
-    meta: &serde_json::Value,
-) -> Option<String> {
-    first_string_owned(
-        payload,
-        meta,
-        &[
-            &["parent_session_id"][..],
-            &["parentSessionId"][..],
-            &["parent_session"][..],
-            &["session", "parent_session_id"][..],
-            &["sidechain", "parent_session_id"][..],
-        ],
-    )
+fn coding_parent_session_id(payload: &serde_json::Value) -> Option<String> {
+    string_owned_at(payload, &["parent_thread_id"])
 }
 
-fn coding_message_id(payload: &serde_json::Value, meta: &serde_json::Value) -> Option<String> {
-    first_string_owned(
-        payload,
-        meta,
-        &[
-            &["message_uuid"][..],
-            &["message_id"][..],
-            &["messageId"][..],
-            &["uuid"][..],
-        ],
-    )
+fn coding_message_id(payload: &serde_json::Value) -> Option<String> {
+    string_owned_at(payload, &["object_id"])
 }
 
-fn coding_is_sidechain(payload: &serde_json::Value, meta: &serde_json::Value) -> bool {
-    bool_at(payload, &["is_sidechain"])
-        .or_else(|| bool_at(payload, &["sidechain"]))
-        .or_else(|| bool_at(meta, &["is_sidechain"]))
-        .unwrap_or_else(|| coding_parent_session_id(payload, meta).is_some())
-}
-
-fn first_string_owned(
-    payload: &serde_json::Value,
-    meta: &serde_json::Value,
-    paths: &[&[&str]],
-) -> Option<String> {
-    paths
-        .iter()
-        .find_map(|path| string_owned_at(payload, path))
-        .or_else(|| paths.iter().find_map(|path| string_owned_at(meta, path)))
+fn coding_is_sidechain(payload: &serde_json::Value) -> bool {
+    bool_at(payload, &["is_sidechain"]).unwrap_or(false)
 }
 
 fn string_owned_at(value: &serde_json::Value, path: &[&str]) -> Option<String> {
@@ -1345,23 +1392,64 @@ mod tests {
                 }),
             ),
             obs_with_source(
-                "schema:claude-code-message",
+                "schema:coding-agent-message",
                 Some("sys:claude-code"),
                 serde_json::json!({
                     "session_id": "main-session",
-                    "message_uuid": "cc-1",
-                    "role": "assistant",
-                    "text": "needle claude code"
+                    "transcript_id": "main-transcript",
+                    "parent_message_id": null,
+                    "is_sidechain": false,
+                    "parent_thread_id": null,
+                    "thread_source": "main",
+                    "object_id": "cc-1",
+                    "item": {
+                        "kind": "message",
+                        "role": "assistant",
+                        "text": "needle claude code"
+                    }
                 }),
             ),
             obs_with_source(
-                "schema:codex-message",
+                "schema:coding-agent-message",
                 Some("sys:codex"),
                 serde_json::json!({
                     "session_id": "codex-session",
-                    "message_uuid": "codex-1",
-                    "role": "assistant",
-                    "text": "needle codex"
+                    "transcript_id": "codex-transcript",
+                    "parent_message_id": null,
+                    "is_sidechain": false,
+                    "parent_thread_id": null,
+                    "thread_source": "main",
+                    "object_id": "codex-1",
+                    "item": {
+                        "kind": "message",
+                        "role": "assistant",
+                        "text": "needle codex"
+                    }
+                }),
+            ),
+            obs_with_source(
+                "schema:gmail-message",
+                Some("sys:gmail"),
+                serde_json::json!({
+                    "account_id": "me@example.test",
+                    "message_id": "<m1@example.test>",
+                    "thread_id": "thread-1",
+                    "from": "sender@example.test",
+                    "subject": "needle gmail subject",
+                    "text": "needle gmail body",
+                    "references": ["<root@example.test>"]
+                }),
+            ),
+            obs_with_source(
+                "schema:discord-message",
+                Some("sys:discord"),
+                serde_json::json!({
+                    "channel_id": "D01",
+                    "message_id": "M01",
+                    "author_id": "U01",
+                    "author_name": "Alice",
+                    "content": "needle discord",
+                    "is_dm": true
                 }),
             ),
         ]);
@@ -1380,28 +1468,66 @@ mod tests {
                 "github-commit",
                 "claude-code",
                 "codex",
+                "discord",
+                "gmail",
             ])
         );
+    }
+
+    #[test]
+    fn personal_all_text_preserves_gmail_thread_metadata() {
+        let projector = CorpusProjector::personal_all_text_config();
+        let records = projector.project_observations(&[obs_with_source(
+            "schema:gmail-message",
+            Some("sys:gmail"),
+            serde_json::json!({
+                "account_id": "me@example.test",
+                "message_id": "<reply@example.test>",
+                "thread_id": "thread-1",
+                "from": "sender@example.test",
+                "subject": "Re: Plan",
+                "text": "reply body",
+                "references": ["<root@example.test>"],
+                "in_reply_to": "<root@example.test>"
+            }),
+        )]);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source_type, "gmail");
+        assert_eq!(
+            records[0].thread_ts.as_deref(),
+            Some("gmail:thread:thread-1")
+        );
+        assert_eq!(records[0].metadata["message_id"], "<reply@example.test>");
+        assert_eq!(records[0].metadata["references"][0], "<root@example.test>");
     }
 
     #[test]
     fn personal_all_text_preserves_coding_agent_sidechain_metadata() {
         let projector = CorpusProjector::personal_all_text_config();
         let records = projector.project_observations(&[obs_with_source(
-            "schema:claude-code-message",
+            "schema:coding-agent-message",
             Some("sys:claude-code"),
             serde_json::json!({
                 "session_id": "child-session",
+                "transcript_id": "child-transcript",
+                "parent_message_id": null,
                 "parent_session_id": "main-session",
                 "is_sidechain": true,
-                "message_uuid": "child-message",
-                "role": "assistant",
-                "text": "sidechain finding"
+                "parent_thread_id": "main-session",
+                "thread_source": "sidechain",
+                "object_id": "child-message",
+                "item": {
+                    "kind": "message",
+                    "role": "assistant",
+                    "text": "sidechain finding"
+                }
             }),
         )]);
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].source_type, "claude-code");
+        assert_eq!(records[0].source_location.as_deref(), Some("assistant"));
         assert_eq!(
             records[0].metadata["thread_key"],
             "claude-code:session:main-session"
@@ -1409,6 +1535,39 @@ mod tests {
         assert_eq!(records[0].metadata["session_id"], "child-session");
         assert_eq!(records[0].metadata["parent_session_id"], "main-session");
         assert_eq!(records[0].metadata["is_sidechain"], true);
+        assert_eq!(records[0].metadata["message_id"], "child-message");
+    }
+
+    #[test]
+    fn personal_all_text_indexes_coding_agent_tool_call_references() {
+        let projector = CorpusProjector::personal_all_text_config();
+        let records = projector.project_observations(&[obs_with_source(
+            "schema:coding-agent-message",
+            Some("sys:codex"),
+            serde_json::json!({
+                "session_id": "codex-session",
+                "transcript_id": "codex-transcript",
+                "parent_message_id": null,
+                "is_sidechain": false,
+                "parent_thread_id": null,
+                "thread_source": "main",
+                "object_id": "codex-tool-1",
+                "item": {
+                    "kind": "tool_call",
+                    "tool_name": "Read",
+                    "references": {
+                        "file_path": "D:/repo/needle.md",
+                        "pattern": "needle pattern"
+                    }
+                }
+            }),
+        )]);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source_type, "codex");
+        assert_eq!(records[0].source_location.as_deref(), Some("tool:Read"));
+        assert!(records[0].text.contains("D:/repo/needle.md"));
+        assert!(records[0].text.contains("needle pattern"));
     }
 
     #[test]

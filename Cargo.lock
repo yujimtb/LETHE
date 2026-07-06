@@ -899,6 +899,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lethe-adapter-chatgpt"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "lethe-adapter-api",
+ "lethe-core",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lethe-adapter-claude"
 version = "0.1.0"
 dependencies = [
@@ -919,6 +931,17 @@ dependencies = [
  "lethe-core",
  "lethe-engine",
  "lethe-registry",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lethe-adapter-discord"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "lethe-adapter-api",
+ "lethe-core",
  "serde",
  "serde_json",
 ]
@@ -958,6 +981,17 @@ dependencies = [
 
 [[package]]
 name = "lethe-adapter-github"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "lethe-adapter-api",
+ "lethe-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lethe-adapter-gmail"
 version = "0.1.0"
 dependencies = [
  "chrono",
@@ -1058,6 +1092,7 @@ dependencies = [
  "base64",
  "chrono",
  "lethe-adapter-api",
+ "lethe-adapter-chatgpt",
  "lethe-adapter-claude",
  "lethe-adapter-coding-agent",
  "lethe-adapter-gslides",
@@ -1095,6 +1130,18 @@ dependencies = [
  "serde_json",
  "sha2",
  "uuid",
+]
+
+[[package]]
+name = "lethe-import-chatgpt"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "lethe-adapter-chatgpt",
+ "lethe-core",
+ "lethe-selfhost",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1183,6 +1230,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lethe-projection-cognition"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "lethe-core",
+ "lethe-engine",
+ "lethe-projection-claim-queue",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lethe-projection-corpus"
 version = "0.1.0"
 dependencies = [
@@ -1220,6 +1279,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lethe-review-harness"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "lethe-runtime"
 version = "0.1.0"
 dependencies = [
@@ -1251,6 +1320,7 @@ dependencies = [
  "lethe-profile-model",
  "lethe-projection-answer-log",
  "lethe-projection-claim-queue",
+ "lethe-projection-cognition",
  "lethe-projection-corpus",
  "lethe-projection-person",
  "lethe-registry",

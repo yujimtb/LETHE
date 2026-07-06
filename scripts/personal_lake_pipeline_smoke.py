@@ -8,16 +8,20 @@ import json
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.request
 import zipfile
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 IMPORT_RE = re.compile(
-    r"(?P<kind>claude|github) import complete: "
+    r"(?P<kind>claude|chatgpt|github) import complete: "
     r"ingested=(?P<ingested>\d+), "
     r"duplicates=(?P<duplicates>\d+), "
     r"quarantined=(?P<quarantined>\d+)"
@@ -33,116 +37,183 @@ def main() -> int:
     config_path = work_dir / "config.toml"
     claude_zip = work_dir / "claude-export.zip"
     claude_conversations_dir = work_dir / "claude-conversations"
+    source_archive = work_dir / "source-archive"
     github_dump = work_dir / "github-dump.json"
+    http_port = free_tcp_port()
+    mcp_port = free_tcp_port()
+    base_url = f"http://127.0.0.1:{http_port}"
 
-    write_config(config_path, db_path, blob_dir)
+    write_config(config_path, db_path, blob_dir, http_port, mcp_port)
     write_claude_fixture(claude_zip, claude_conversations_dir)
+    write_chatgpt_fixture(source_archive)
     write_github_fixture(github_dump)
 
     env = smoke_env(config_path)
-
-    claude_first = run_import(
-        [
-            "cargo",
-            "run",
-            "-q",
-            "-p",
-            "lethe-import-claude",
-            "--",
-            f"--zip={claude_zip}",
-            "--source-instance=smoke-claude",
-        ],
-        env,
-    )
-    assert_report("claude first import", claude_first, ingested=2, duplicates=0, quarantined=0)
-
-    claude_second = run_import(
-        [
-            "cargo",
-            "run",
-            "-q",
-            "-p",
-            "lethe-import-claude",
-            "--",
-            f"--zip={claude_zip}",
-            "--source-instance=smoke-claude",
-        ],
-        env,
-    )
-    assert_report("claude second import", claude_second, ingested=0, duplicates=2, quarantined=0)
-
-    github_first = run_import(
-        [
-            "cargo",
-            "run",
-            "-q",
-            "-p",
-            "lethe-import-github",
-            "--",
-            f"--dump={github_dump}",
-            "--source-instance=smoke-github",
-        ],
-        env,
-    )
-    assert_report("github first import", github_first, ingested=7, duplicates=0, quarantined=0)
-
-    github_second = run_import(
-        [
-            "cargo",
-            "run",
-            "-q",
-            "-p",
-            "lethe-import-github",
-            "--",
-            f"--dump={github_dump}",
-            "--source-instance=smoke-github",
-        ],
-        env,
-    )
-    assert_report("github second import", github_second, ingested=0, duplicates=7, quarantined=0)
-
-    sanity = run(
-        [
-            sys.executable,
-            str(ROOT / "scripts" / "personal_lake_sanity.py"),
-            "--db",
-            str(db_path),
-            "--github-dump",
-            str(github_dump),
-            "--github-source-instance",
-            "smoke-github",
-            "--claude-conversations-dir",
-            str(claude_conversations_dir),
-            "--claude-source-instance",
-            "smoke-claude",
-        ],
-        env,
-    )
-    sanity_summary = json.loads(sanity.stdout)
-
-    observation_count = sqlite_observation_count(db_path)
-    if observation_count != 9:
-        fail(f"expected 9 observations after smoke imports, found {observation_count}")
-
-    print(
-        json.dumps(
-            {
-                "status": "ok",
-                "work_dir": str(work_dir),
-                "database": str(db_path),
-                "observations": observation_count,
-                "reports": [
-                    claude_first,
-                    claude_second,
-                    github_first,
-                    github_second,
-                ],
-                "sanity": sanity_summary,
-            },
-            indent=2,
-            sort_keys=True,
+    server = start_selfhost(env, base_url)
+    try:
+        claude_first = run_import(
+            [
+                "cargo",
+                "run",
+                "-q",
+                "-p",
+                "lethe-import-claude",
+                "--",
+                f"--zip={claude_zip}",
+                "--source-instance=smoke-claude",
+                f"--base-url={base_url}",
+                "--api-token-env=LETHE_API_WRITE_TOKEN",
+            ],
+            env,
         )
-    )
+        assert_report(
+            "claude first import", claude_first, ingested=2, duplicates=0, quarantined=0
+        )
+
+        claude_second = run_import(
+            [
+                "cargo",
+                "run",
+                "-q",
+                "-p",
+                "lethe-import-claude",
+                "--",
+                f"--zip={claude_zip}",
+                "--source-instance=smoke-claude",
+                f"--base-url={base_url}",
+                "--api-token-env=LETHE_API_WRITE_TOKEN",
+            ],
+            env,
+        )
+        assert_report(
+            "claude second import", claude_second, ingested=0, duplicates=2, quarantined=0
+        )
+
+        chatgpt_first = run_import(
+            [
+                "cargo",
+                "run",
+                "-q",
+                "-p",
+                "lethe-import-chatgpt",
+                "--",
+                f"--archive-root={source_archive}",
+                "--source-instance=smoke-chatgpt",
+                f"--base-url={base_url}",
+                "--api-token-env=LETHE_API_WRITE_TOKEN",
+                "--backfill",
+            ],
+            env,
+        )
+        assert_report(
+            "chatgpt first import", chatgpt_first, ingested=2, duplicates=0, quarantined=0
+        )
+
+        chatgpt_second = run_import(
+            [
+                "cargo",
+                "run",
+                "-q",
+                "-p",
+                "lethe-import-chatgpt",
+                "--",
+                f"--archive-root={source_archive}",
+                "--source-instance=smoke-chatgpt",
+                f"--base-url={base_url}",
+                "--api-token-env=LETHE_API_WRITE_TOKEN",
+                "--backfill",
+            ],
+            env,
+        )
+        assert_report(
+            "chatgpt second import", chatgpt_second, ingested=0, duplicates=2, quarantined=0
+        )
+
+        github_first = run_import(
+            [
+                "cargo",
+                "run",
+                "-q",
+                "-p",
+                "lethe-import-github",
+                "--",
+                f"--dump={github_dump}",
+                "--source-instance=smoke-github",
+                f"--base-url={base_url}",
+                "--api-token-env=LETHE_API_WRITE_TOKEN",
+            ],
+            env,
+        )
+        assert_report(
+            "github first import", github_first, ingested=7, duplicates=0, quarantined=0
+        )
+
+        github_second = run_import(
+            [
+                "cargo",
+                "run",
+                "-q",
+                "-p",
+                "lethe-import-github",
+                "--",
+                f"--dump={github_dump}",
+                "--source-instance=smoke-github",
+                f"--base-url={base_url}",
+                "--api-token-env=LETHE_API_WRITE_TOKEN",
+            ],
+            env,
+        )
+        assert_report(
+            "github second import", github_second, ingested=0, duplicates=7, quarantined=0
+        )
+
+        sanity = run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "personal_lake_sanity.py"),
+                "--db",
+                str(db_path),
+                "--github-dump",
+                str(github_dump),
+                "--github-source-instance",
+                "smoke-github",
+                "--claude-conversations-dir",
+                str(claude_conversations_dir),
+                "--claude-source-instance",
+                "smoke-claude",
+            ],
+            env,
+        )
+        sanity_summary = json.loads(sanity.stdout)
+
+        observation_count = sqlite_observation_count(db_path)
+        if observation_count != 11:
+            fail(f"expected 11 observations after smoke imports, found {observation_count}")
+
+        print(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "work_dir": str(work_dir),
+                    "base_url": base_url,
+                    "database": str(db_path),
+                    "observations": observation_count,
+                    "reports": [
+                        claude_first,
+                        claude_second,
+                        chatgpt_first,
+                        chatgpt_second,
+                        github_first,
+                        github_second,
+                    ],
+                    "sanity": sanity_summary,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    finally:
+        stop_process(server)
     return 0
 
 
@@ -164,7 +235,9 @@ def prepare_work_dir(path: Path) -> Path:
     return resolved
 
 
-def write_config(config_path: Path, db_path: Path, blob_dir: Path) -> None:
+def write_config(
+    config_path: Path, db_path: Path, blob_dir: Path, http_port: int, mcp_port: int
+) -> None:
     jwks_path = config_path.with_name("mcp-jwks.json")
     jwks_path.write_text(
         json.dumps(
@@ -186,9 +259,11 @@ def write_config(config_path: Path, db_path: Path, blob_dir: Path) -> None:
     )
     config_path.write_text(
         f"""
+channels = []
+
 [server]
-bind_addr = "127.0.0.1:0"
-mcp_bind_addr = "127.0.0.1:1"
+bind_addr = "127.0.0.1:{http_port}"
+mcp_bind_addr = "127.0.0.1:{mcp_port}"
 
 [mcp]
 resource_url = "https://mcp.example.test/mcp"
@@ -219,6 +294,15 @@ retention_days = 3650
 [corpus]
 mode = "personal_all_text"
 
+[freshness.threshold_seconds]
+"sys:claude-ai" = 129600
+"sys:chatgpt" = 129600
+"sys:claude-code" = 172800
+"sys:codex" = 172800
+
+[ops]
+backfill_nightly_budget_items = 10000
+
 [supplemental]
 reject_unregistered_kinds = true
 
@@ -229,6 +313,10 @@ scopes = ["read:persons", "read:timeline", "read:corpus"]
 [[api_tokens]]
 token_env = "LETHE_API_SYNC_TOKEN"
 scopes = ["admin:sync", "admin:health"]
+
+[[api_tokens]]
+token_env = "LETHE_API_WRITE_TOKEN"
+scopes = ["write:supplemental", "write:observations"]
 
 [sources]
 slack = []
@@ -266,6 +354,41 @@ def write_claude_fixture(zip_path: Path, conversations_dir: Path) -> None:
     export = {"conversations": [conversation]}
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("conversations.json", json.dumps(export))
+
+
+def write_chatgpt_fixture(archive_root: Path) -> None:
+    chatgpt_dir = archive_root / "chatgpt"
+    chatgpt_dir.mkdir(parents=True)
+    export = [
+        {
+            "id": "smoke-chatgpt-conversation",
+            "title": "Smoke ChatGPT",
+            "mapping": {
+                "msg-user": {
+                    "id": "msg-user",
+                    "parent": None,
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"content_type": "text", "parts": ["hello chatgpt"]},
+                        "create_time": 1780000100.0,
+                    },
+                },
+                "msg-assistant": {
+                    "id": "msg-assistant",
+                    "parent": "msg-user",
+                    "message": {
+                        "author": {"role": "assistant"},
+                        "content": {"content_type": "text", "parts": ["hello back"]},
+                        "create_time": 1780000101.0,
+                    },
+                },
+            },
+        }
+    ]
+    (chatgpt_dir / "conversations.json").write_text(
+        json.dumps(export, indent=2),
+        encoding="utf-8",
+    )
 
 
 def write_github_fixture(path: Path) -> None:
@@ -384,7 +507,66 @@ def smoke_env(config_path: Path) -> dict[str, str]:
     env["LETHE_STORAGE_ENCRYPTION_KEY"] = "01" * 32
     env["LETHE_API_READ_TOKEN"] = "smoke-read-token"
     env["LETHE_API_SYNC_TOKEN"] = "smoke-sync-token"
+    env["LETHE_API_WRITE_TOKEN"] = "smoke-write-token"
     return env
+
+
+def free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def start_selfhost(env: dict[str, str], base_url: str) -> subprocess.Popen[str]:
+    process = subprocess.Popen(
+        ["cargo", "run", "-q", "-p", "lethe-selfhost"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    wait_for_deep_health(process, base_url, env["LETHE_API_SYNC_TOKEN"])
+    return process
+
+
+def wait_for_deep_health(
+    process: subprocess.Popen[str], base_url: str, sync_token: str
+) -> None:
+    deadline = time.monotonic() + 60
+    url = f"{base_url.rstrip('/')}/health/deep"
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            stdout, stderr = process.communicate()
+            fail(
+                "lethe-selfhost exited before health became ready"
+                + f"\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            )
+        request = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {sync_token}"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=2) as response:
+                if response.status == 200:
+                    return
+        except (urllib.error.URLError, TimeoutError):
+            pass
+        time.sleep(0.25)
+    stop_process(process)
+    fail(f"lethe-selfhost did not become healthy at {url}")
+
+
+def stop_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10)
 
 
 def run_import(command: list[str], env: dict[str, str]) -> dict[str, int | str]:

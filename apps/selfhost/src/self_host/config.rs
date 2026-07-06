@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
@@ -8,6 +8,7 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use lethe_projection_corpus::{CorpusConfig, CorpusMode};
+use lethe_registry::registry::{ChannelKind, ChannelRecord};
 use lethe_runtime::runtime::partition::RoutingKeyOrder;
 use serde::Deserialize;
 
@@ -24,6 +25,9 @@ pub struct SelfHostConfig {
     pub api_tokens: Vec<ApiTokenConfig>,
     pub resource_limits: ResourceLimits,
     pub corpus: CorpusProjectionConfig,
+    pub freshness: FreshnessConfig,
+    pub ops: OpsConfig,
+    pub channels: Vec<ChannelRecord>,
     pub slack_sources: Vec<SlackConfig>,
     pub google_sources: Vec<GoogleConfig>,
     pub slide_analysis_limit: Option<usize>,
@@ -108,6 +112,16 @@ pub struct CorpusProjectionConfig {
     pub mode: CorpusMode,
 }
 
+#[derive(Debug, Clone)]
+pub struct FreshnessConfig {
+    pub threshold_seconds: BTreeMap<String, i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpsConfig {
+    pub backfill_nightly_budget_items: usize,
+}
+
 impl CorpusProjectionConfig {
     pub fn projector_config(&self) -> CorpusConfig {
         CorpusConfig {
@@ -123,6 +137,7 @@ pub struct SlackConfig {
     pub bot_token: SecretString,
     pub thread_token: SecretString,
     pub channel_ids: Vec<String>,
+    pub mention_user_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +186,9 @@ struct FileConfig {
     runtime: RuntimeFileConfig,
     limits: LimitsFileConfig,
     corpus: CorpusFileConfig,
+    freshness: FreshnessFileConfig,
+    ops: OpsFileConfig,
+    channels: Vec<ChannelFileConfig>,
     api_tokens: Vec<ApiTokenFileConfig>,
     sources: SourcesFileConfig,
     supplemental: SupplementalFileConfig,
@@ -234,6 +252,18 @@ struct CorpusFileConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct FreshnessFileConfig {
+    threshold_seconds: BTreeMap<String, i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpsFileConfig {
+    backfill_nightly_budget_items: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ApiTokenFileConfig {
     token_env: String,
     scopes: Vec<String>,
@@ -253,6 +283,23 @@ struct SlackFileConfig {
     bot_token_env: String,
     thread_token_env: String,
     channel_ids: Vec<String>,
+    mention_user_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChannelFileConfig {
+    id: String,
+    kind: ChannelKind,
+    source_instance_id: String,
+    external_id: String,
+    connection_ref: String,
+    default_consent_scope: String,
+    reply_slo_seconds: u64,
+    freshness_threshold_seconds: u64,
+    break_glass_channel: bool,
+    break_glass_senders: Vec<String>,
+    enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -323,9 +370,28 @@ impl SelfHostConfig {
                     bot_token: SecretString::new(required_env(&source.bot_token_env)?)?,
                     thread_token: SecretString::new(required_env(&source.thread_token_env)?)?,
                     channel_ids: source.channel_ids,
+                    mention_user_ids: source.mention_user_ids,
                 })
             })
             .collect::<Result<Vec<_>, ConfigError>>()?;
+
+        let channels = raw
+            .channels
+            .into_iter()
+            .map(|channel| ChannelRecord {
+                id: channel.id,
+                kind: channel.kind,
+                source_instance_id: channel.source_instance_id,
+                external_id: channel.external_id,
+                connection_ref: channel.connection_ref,
+                default_consent_scope: channel.default_consent_scope,
+                reply_slo_seconds: channel.reply_slo_seconds,
+                freshness_threshold_seconds: channel.freshness_threshold_seconds,
+                break_glass_channel: channel.break_glass_channel,
+                break_glass_senders: channel.break_glass_senders,
+                enabled: channel.enabled,
+            })
+            .collect::<Vec<_>>();
 
         let google_sources = raw
             .sources
@@ -396,6 +462,13 @@ impl SelfHostConfig {
             corpus: CorpusProjectionConfig {
                 mode: raw.corpus.mode,
             },
+            freshness: FreshnessConfig {
+                threshold_seconds: raw.freshness.threshold_seconds,
+            },
+            ops: OpsConfig {
+                backfill_nightly_budget_items: raw.ops.backfill_nightly_budget_items,
+            },
+            channels,
             slack_sources,
             google_sources,
             slide_analysis_limit,
@@ -463,6 +536,23 @@ impl FileConfig {
                 "api_tokens must contain at least one entry".to_owned(),
             ));
         }
+        if self.freshness.threshold_seconds.is_empty() {
+            return Err(ConfigError::Invalid(
+                "freshness.threshold_seconds must not be empty".to_owned(),
+            ));
+        }
+        for (source_id, seconds) in &self.freshness.threshold_seconds {
+            require_non_empty("freshness.threshold_seconds key", source_id)?;
+            if *seconds <= 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "freshness threshold for {source_id} must be positive"
+                )));
+            }
+        }
+        require_positive(
+            "ops.backfill_nightly_budget_items",
+            self.ops.backfill_nightly_budget_items,
+        )?;
         if !self.sources.google_slides.is_empty() && self.derivation.is_none() {
             return Err(ConfigError::Invalid(
                 "derivation is required when google_slides sources are configured".to_owned(),
@@ -509,7 +599,14 @@ impl FileConfig {
                     source.id
                 )));
             }
+            if source.mention_user_ids.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "slack source {} has no mention_user_ids",
+                    source.id
+                )));
+            }
         }
+        validate_channels(&self.channels)?;
         for source in &self.sources.google_slides {
             if source.presentation_ids.is_empty() {
                 return Err(ConfigError::Invalid(format!(
@@ -520,6 +617,45 @@ impl FileConfig {
         }
         Ok(())
     }
+}
+
+fn validate_channels(channels: &[ChannelFileConfig]) -> Result<(), ConfigError> {
+    let mut ids = HashSet::new();
+    let mut keys = HashSet::new();
+    for channel in channels {
+        require_non_empty("channels.id", &channel.id)?;
+        require_non_empty("channels.source_instance_id", &channel.source_instance_id)?;
+        require_non_empty("channels.external_id", &channel.external_id)?;
+        require_non_empty("channels.connection_ref", &channel.connection_ref)?;
+        require_non_empty(
+            "channels.default_consent_scope",
+            &channel.default_consent_scope,
+        )?;
+        require_positive(
+            "channels.reply_slo_seconds",
+            channel.reply_slo_seconds as usize,
+        )?;
+        require_positive(
+            "channels.freshness_threshold_seconds",
+            channel.freshness_threshold_seconds as usize,
+        )?;
+        if !ids.insert(channel.id.as_str()) {
+            return Err(ConfigError::Invalid(format!(
+                "duplicate channel id: {}",
+                channel.id
+            )));
+        }
+        let key = format!(
+            "{}:{}:{}",
+            channel.kind, channel.source_instance_id, channel.external_id
+        );
+        if !keys.insert(key.clone()) {
+            return Err(ConfigError::Invalid(format!(
+                "duplicate channel lookup key: {key}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn required_env(name: &str) -> Result<String, ConfigError> {
@@ -652,6 +788,7 @@ mod tests {
     fn duplicate_source_ids_are_rejected() {
         let raw: FileConfig = toml::from_str(
             r#"
+            channels = []
             [server]
             bind_addr = "127.0.0.1:8080"
             mcp_bind_addr = "127.0.0.1:8090"
@@ -678,6 +815,10 @@ mod tests {
             retention_days = 30
             [corpus]
             mode = "workspace_filtered"
+            [freshness.threshold_seconds]
+            "sys:slack" = 129600
+            [ops]
+            backfill_nightly_budget_items = 1000
             [supplemental]
             reject_unregistered_kinds = true
             [[api_tokens]]
@@ -689,6 +830,7 @@ mod tests {
             bot_token_env = "BOT"
             thread_token_env = "THREAD"
             channel_ids = ["C1"]
+            mention_user_ids = ["U123"]
             [[sources.google_slides]]
             id = "same"
             access_token_env = "GOOGLE"
@@ -708,6 +850,7 @@ mod tests {
     fn empty_sources_are_allowed_for_import_only_instance() {
         let raw: FileConfig = toml::from_str(
             r#"
+            channels = []
             [server]
             bind_addr = "127.0.0.1:8080"
             mcp_bind_addr = "127.0.0.1:8090"
@@ -734,6 +877,10 @@ mod tests {
             retention_days = 3650
             [corpus]
             mode = "personal_all_text"
+            [freshness.threshold_seconds]
+            "sys:slack" = 129600
+            [ops]
+            backfill_nightly_budget_items = 1000
             [supplemental]
             reject_unregistered_kinds = true
             [[api_tokens]]
@@ -753,6 +900,7 @@ mod tests {
     fn mcp_listener_must_not_share_internal_api_port() {
         let raw: FileConfig = toml::from_str(
             r#"
+            channels = []
             [server]
             bind_addr = "127.0.0.1:8080"
             mcp_bind_addr = "127.0.0.1:8080"
@@ -779,6 +927,10 @@ mod tests {
             retention_days = 3650
             [corpus]
             mode = "personal_all_text"
+            [freshness.threshold_seconds]
+            "sys:slack" = 129600
+            [ops]
+            backfill_nightly_budget_items = 1000
             [supplemental]
             reject_unregistered_kinds = true
             [[api_tokens]]
@@ -799,6 +951,7 @@ mod tests {
     fn google_sources_require_derivation_config() {
         let raw: FileConfig = toml::from_str(
             r#"
+            channels = []
             [server]
             bind_addr = "127.0.0.1:8080"
             mcp_bind_addr = "127.0.0.1:8090"
@@ -825,6 +978,10 @@ mod tests {
             retention_days = 30
             [corpus]
             mode = "workspace_filtered"
+            [freshness.threshold_seconds]
+            "sys:slack" = 129600
+            [ops]
+            backfill_nightly_budget_items = 1000
             [supplemental]
             reject_unregistered_kinds = true
             [[api_tokens]]

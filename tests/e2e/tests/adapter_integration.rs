@@ -90,6 +90,20 @@ fn setup_registry_for_slack() -> RegistryStore {
         registered_at: None,
     })
     .unwrap();
+    reg.register_channel(ChannelRecord {
+        id: "chan:slack-test:C01ABC".into(),
+        kind: ChannelKind::Slack,
+        source_instance_id: "slack-test".into(),
+        external_id: "C01ABC".into(),
+        connection_ref: "source:slack-test".into(),
+        default_consent_scope: "org_federated".into(),
+        reply_slo_seconds: 1800,
+        freshness_threshold_seconds: 1800,
+        break_glass_channel: false,
+        break_glass_senders: vec![],
+        enabled: true,
+    })
+    .unwrap();
     reg
 }
 
@@ -244,6 +258,14 @@ fn gslides_config() -> AdapterConfig {
 
 /// Convert an ObservationDraft to an IngestRequest.
 fn draft_to_ingest(draft: &ObservationDraft) -> IngestRequest {
+    let mut meta = draft.meta.clone();
+    if draft
+        .source_system
+        .as_ref()
+        .is_some_and(|source| source.as_str() == "sys:slack")
+    {
+        meta["source_instance"] = serde_json::json!("slack-test");
+    }
     IngestRequest {
         schema: draft.schema.clone(),
         schema_version: draft.schema_version.clone(),
@@ -257,7 +279,7 @@ fn draft_to_ingest(draft: &ObservationDraft) -> IngestRequest {
         attachments: draft.attachments.clone(),
         published: draft.published,
         idempotency_key: draft.idempotency_key.clone(),
-        meta: draft.meta.clone(),
+        meta,
     }
 }
 
@@ -271,6 +293,8 @@ fn sample_slack_message() -> SlackMessage {
         user_name: "tanaka".into(),
         email: Some("tanaka@example.jp".into()),
         text: "Hello everyone!".into(),
+        ingress_kind: Some(lethe_adapter_slack::slack::client::SlackIngressKind::Channel),
+        mentions: vec![],
         message_type: SlackMessageType::Message,
         edited: None,
         reactions: vec![],

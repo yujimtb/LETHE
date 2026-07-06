@@ -19,6 +19,24 @@ pub fn seed_registry() -> RegistryStore {
         .unwrap();
     registry
         .register_source_system(SourceSystem {
+            id: SourceSystemRef::new("sys:gmail"),
+            name: "Gmail".into(),
+            provider: Some("Google".into()),
+            api_version: Some("v1".into()),
+            source_class: SourceClass::ImmutableText,
+        })
+        .unwrap();
+    registry
+        .register_source_system(SourceSystem {
+            id: SourceSystemRef::new("sys:discord"),
+            name: "Discord".into(),
+            provider: Some("Discord".into()),
+            api_version: Some("v10".into()),
+            source_class: SourceClass::ImmutableText,
+        })
+        .unwrap();
+    registry
+        .register_source_system(SourceSystem {
             id: SourceSystemRef::new("sys:google-slides"),
             name: "Google Slides".into(),
             provider: Some("Google".into()),
@@ -31,6 +49,15 @@ pub fn seed_registry() -> RegistryStore {
             id: SourceSystemRef::new("sys:claude-ai"),
             name: "claude.ai".into(),
             provider: Some("Anthropic".into()),
+            api_version: None,
+            source_class: SourceClass::ImmutableText,
+        })
+        .unwrap();
+    registry
+        .register_source_system(SourceSystem {
+            id: SourceSystemRef::new("sys:chatgpt"),
+            name: "ChatGPT".into(),
+            provider: Some("OpenAI".into()),
             api_version: None,
             source_class: SourceClass::ImmutableText,
         })
@@ -107,12 +134,54 @@ pub fn seed_registry() -> RegistryStore {
         .unwrap();
     registry
         .register_observer(Observer {
+            id: ObserverRef::new("obs:gmail-importer"),
+            name: "Gmail Importer".into(),
+            observer_type: ObserverType::Crawler,
+            source_system: SourceSystemRef::new("sys:gmail"),
+            adapter_version: SemVer::new("1.0.0"),
+            schemas: vec![SchemaRef::new("schema:gmail-message")],
+            authority_model: AuthorityModel::LakeAuthoritative,
+            capture_model: CaptureModel::Event,
+            owner: "lethe".into(),
+            trust_level: TrustLevel::Automated,
+        })
+        .unwrap();
+    registry
+        .register_observer(Observer {
+            id: ObserverRef::new("obs:discord-importer"),
+            name: "Discord Importer".into(),
+            observer_type: ObserverType::Crawler,
+            source_system: SourceSystemRef::new("sys:discord"),
+            adapter_version: SemVer::new("1.0.0"),
+            schemas: vec![SchemaRef::new("schema:discord-message")],
+            authority_model: AuthorityModel::LakeAuthoritative,
+            capture_model: CaptureModel::Event,
+            owner: "lethe".into(),
+            trust_level: TrustLevel::Automated,
+        })
+        .unwrap();
+    registry
+        .register_observer(Observer {
             id: ObserverRef::new("obs:claude-ai-importer"),
             name: "claude.ai Importer".into(),
             observer_type: ObserverType::Crawler,
             source_system: SourceSystemRef::new("sys:claude-ai"),
             adapter_version: SemVer::new("1.0.0"),
             schemas: vec![SchemaRef::new("schema:claude-message")],
+            authority_model: AuthorityModel::LakeAuthoritative,
+            capture_model: CaptureModel::Event,
+            owner: "lethe".into(),
+            trust_level: TrustLevel::Automated,
+        })
+        .unwrap();
+    registry
+        .register_observer(Observer {
+            id: ObserverRef::new("obs:chatgpt-importer"),
+            name: "ChatGPT Importer".into(),
+            observer_type: ObserverType::Crawler,
+            source_system: SourceSystemRef::new("sys:chatgpt"),
+            adapter_version: SemVer::new("1.0.0"),
+            schemas: vec![SchemaRef::new("schema:chatgpt-message")],
             authority_model: AuthorityModel::LakeAuthoritative,
             capture_model: CaptureModel::Event,
             owner: "lethe".into(),
@@ -297,6 +366,12 @@ pub fn seed_projection_catalog() -> ProjectionCatalog {
     catalog.register(slide_analysis_spec()).unwrap();
     catalog.register(corpus_spec()).unwrap();
     catalog.register(claim_queue_spec()).unwrap();
+    catalog.register(freshness_spec()).unwrap();
+    catalog.register(reply_slo_spec()).unwrap();
+    catalog.register(break_glass_spec()).unwrap();
+    catalog.register(resume_snapshot_spec()).unwrap();
+    catalog.register(plan_state_spec()).unwrap();
+    catalog.register(card_queue_spec()).unwrap();
     catalog.register(answer_log_spec()).unwrap();
     catalog.set_status(
         &ProjectionRef::new("proj:identity-resolution"),
@@ -316,6 +391,30 @@ pub fn seed_projection_catalog() -> ProjectionCatalog {
         ProjectionStatus::Active,
     );
     catalog.set_status(
+        &ProjectionRef::new("proj:freshness"),
+        ProjectionStatus::Active,
+    );
+    catalog.set_status(
+        &ProjectionRef::new("proj:reply-slo"),
+        ProjectionStatus::Active,
+    );
+    catalog.set_status(
+        &ProjectionRef::new("proj:break-glass"),
+        ProjectionStatus::Active,
+    );
+    catalog.set_status(
+        &ProjectionRef::new("proj:resume-snapshot"),
+        ProjectionStatus::Active,
+    );
+    catalog.set_status(
+        &ProjectionRef::new("proj:plan-state"),
+        ProjectionStatus::Active,
+    );
+    catalog.set_status(
+        &ProjectionRef::new("proj:card-queue"),
+        ProjectionStatus::Active,
+    );
+    catalog.set_status(
         &ProjectionRef::new("proj:answer-log"),
         ProjectionStatus::Active,
     );
@@ -327,6 +426,18 @@ fn base_schemas() -> Vec<ObservationSchema> {
         ObservationSchema {
             id: SchemaRef::new("schema:claude-message"),
             name: "claude.ai Message".into(),
+            version: SemVer::new("1.0.0"),
+            subject_type: EntityTypeRef::new("et:message"),
+            target_type: None,
+            payload_schema: serde_json::json!({"type": "object"}),
+            source_contracts: vec![],
+            attachment_config: None,
+            registered_by: None,
+            registered_at: None,
+        },
+        ObservationSchema {
+            id: SchemaRef::new("schema:chatgpt-message"),
+            name: "ChatGPT Message".into(),
             version: SemVer::new("1.0.0"),
             subject_type: EntityTypeRef::new("et:message"),
             target_type: None,
@@ -363,6 +474,30 @@ fn base_schemas() -> Vec<ObservationSchema> {
         ObservationSchema {
             id: SchemaRef::new("schema:slack-message"),
             name: "Slack Message".into(),
+            version: SemVer::new("1.0.0"),
+            subject_type: EntityTypeRef::new("et:message"),
+            target_type: None,
+            payload_schema: serde_json::json!({"type": "object"}),
+            source_contracts: vec![],
+            attachment_config: None,
+            registered_by: None,
+            registered_at: None,
+        },
+        ObservationSchema {
+            id: SchemaRef::new("schema:gmail-message"),
+            name: "Gmail Message".into(),
+            version: SemVer::new("1.0.0"),
+            subject_type: EntityTypeRef::new("et:message"),
+            target_type: None,
+            payload_schema: serde_json::json!({"type": "object"}),
+            source_contracts: vec![],
+            attachment_config: None,
+            registered_by: None,
+            registered_at: None,
+        },
+        ObservationSchema {
+            id: SchemaRef::new("schema:discord-message"),
+            name: "Discord Message".into(),
             version: SemVer::new("1.0.0"),
             subject_type: EntityTypeRef::new("et:message"),
             target_type: None,
@@ -704,6 +839,229 @@ fn claim_queue_spec() -> ProjectionSpec {
         gap_action: None,
         tags: vec!["claim-queue".into(), "decisions".into()],
         description: Some("Deduplicated claim queue and decision ledger projection".into()),
+        created_by: "self-host".into(),
+    }
+}
+
+fn freshness_spec() -> ProjectionSpec {
+    ProjectionSpec {
+        id: ProjectionRef::new("proj:freshness"),
+        name: "Freshness".into(),
+        version: SemVer::new("1.0.0"),
+        kind: ProjectionKind::CachedProjection,
+        sources: vec![SourceDecl {
+            source: SourceRef::Lake,
+            filter_schemas: vec![],
+            filter_derivations: vec![],
+        }],
+        read_modes: vec![ReadModePolicy {
+            mode: ReadMode::OperationalLatest,
+            source_policy: "lake-latest".into(),
+        }],
+        build: BuildSpec {
+            build_type: "rust".into(),
+            entrypoint: None,
+            projector: "freshness".into(),
+        },
+        outputs: vec![OutputSpec {
+            format: "json".into(),
+            tables: vec!["source_freshness".into(), "missing_sources".into()],
+        }],
+        reconciliation: None,
+        deterministic_in: vec![],
+        gap_action: None,
+        tags: vec!["freshness".into(), "ops".into()],
+        description: Some("Per-source latest observation freshness".into()),
+        created_by: "self-host".into(),
+    }
+}
+
+fn reply_slo_spec() -> ProjectionSpec {
+    ProjectionSpec {
+        id: ProjectionRef::new("proj:reply-slo"),
+        name: "Reply SLO".into(),
+        version: SemVer::new("1.0.0"),
+        kind: ProjectionKind::CachedProjection,
+        sources: vec![
+            SourceDecl {
+                source: SourceRef::Lake,
+                filter_schemas: vec![
+                    SchemaRef::new("schema:slack-message"),
+                    SchemaRef::new("schema:gmail-message"),
+                    SchemaRef::new("schema:discord-message"),
+                ],
+                filter_derivations: vec![],
+            },
+            SourceDecl {
+                source: SourceRef::Supplemental,
+                filter_schemas: vec![],
+                filter_derivations: vec!["reply-draft@1".into(), "send-record@1".into()],
+            },
+        ],
+        read_modes: vec![ReadModePolicy {
+            mode: ReadMode::OperationalLatest,
+            source_policy: "lake-and-supplemental-latest".into(),
+        }],
+        build: BuildSpec {
+            build_type: "rust".into(),
+            entrypoint: None,
+            projector: "reply-slo".into(),
+        },
+        outputs: vec![OutputSpec {
+            format: "json".into(),
+            tables: vec!["reply_slo_rows".into(), "reply_slo_overdue".into()],
+        }],
+        reconciliation: Some(ReconciliationPolicy::DualTrack),
+        deterministic_in: vec![],
+        gap_action: None,
+        tags: vec!["reply".into(), "slo".into(), "ops".into()],
+        description: Some("Reply SLO status by communication observation".into()),
+        created_by: "self-host".into(),
+    }
+}
+
+fn break_glass_spec() -> ProjectionSpec {
+    ProjectionSpec {
+        id: ProjectionRef::new("proj:break-glass"),
+        name: "Break Glass".into(),
+        version: SemVer::new("1.0.0"),
+        kind: ProjectionKind::CachedProjection,
+        sources: vec![SourceDecl {
+            source: SourceRef::SourceNative {
+                system: "registry:channels".into(),
+                read_mode: ReadMode::OperationalLatest,
+                fallback: None,
+            },
+            filter_schemas: vec![],
+            filter_derivations: vec![],
+        }],
+        read_modes: vec![ReadModePolicy {
+            mode: ReadMode::OperationalLatest,
+            source_policy: "registry-latest".into(),
+        }],
+        build: BuildSpec {
+            build_type: "rust".into(),
+            entrypoint: None,
+            projector: "break-glass".into(),
+        },
+        outputs: vec![OutputSpec {
+            format: "json".into(),
+            tables: vec!["break_glass_channels".into()],
+        }],
+        reconciliation: None,
+        deterministic_in: vec![],
+        gap_action: None,
+        tags: vec!["break-glass".into(), "ops".into(), "communications".into()],
+        description: Some("Communication channel break-glass whitelist".into()),
+        created_by: "self-host".into(),
+    }
+}
+
+fn resume_snapshot_spec() -> ProjectionSpec {
+    ProjectionSpec {
+        id: ProjectionRef::new("proj:resume-snapshot"),
+        name: "Resume Snapshot".into(),
+        version: SemVer::new("1.0.0"),
+        kind: ProjectionKind::CachedProjection,
+        sources: vec![SourceDecl {
+            source: SourceRef::Supplemental,
+            filter_schemas: vec![],
+            filter_derivations: vec![
+                "session-summary@1".into(),
+                "parking@1".into(),
+                "claim@1".into(),
+            ],
+        }],
+        read_modes: vec![ReadModePolicy {
+            mode: ReadMode::OperationalLatest,
+            source_policy: "supplemental-latest".into(),
+        }],
+        build: BuildSpec {
+            build_type: "rust".into(),
+            entrypoint: None,
+            projector: "resume-snapshot".into(),
+        },
+        outputs: vec![OutputSpec {
+            format: "json".into(),
+            tables: vec!["resume_project_cards".into()],
+        }],
+        reconciliation: None,
+        deterministic_in: vec![],
+        gap_action: None,
+        tags: vec!["resume".into()],
+        description: Some(
+            "Project resume cards from session summaries, parking, and open claims".into(),
+        ),
+        created_by: "self-host".into(),
+    }
+}
+
+fn plan_state_spec() -> ProjectionSpec {
+    ProjectionSpec {
+        id: ProjectionRef::new("proj:plan-state"),
+        name: "Plan State".into(),
+        version: SemVer::new("1.0.0"),
+        kind: ProjectionKind::CachedProjection,
+        sources: vec![SourceDecl {
+            source: SourceRef::Supplemental,
+            filter_schemas: vec![],
+            filter_derivations: vec!["claim@1".into(), "parking@1".into(), "decision@1".into()],
+        }],
+        read_modes: vec![ReadModePolicy {
+            mode: ReadMode::OperationalLatest,
+            source_policy: "supplemental-latest".into(),
+        }],
+        build: BuildSpec {
+            build_type: "rust".into(),
+            entrypoint: None,
+            projector: "plan-state".into(),
+        },
+        outputs: vec![OutputSpec {
+            format: "json".into(),
+            tables: vec!["plan_state_projects".into()],
+        }],
+        reconciliation: None,
+        deterministic_in: vec![],
+        gap_action: None,
+        tags: vec!["plan-state".into()],
+        description: Some("Portfolio plan state by project".into()),
+        created_by: "self-host".into(),
+    }
+}
+
+fn card_queue_spec() -> ProjectionSpec {
+    ProjectionSpec {
+        id: ProjectionRef::new("proj:card-queue"),
+        name: "Card Queue".into(),
+        version: SemVer::new("1.0.0"),
+        kind: ProjectionKind::CachedProjection,
+        sources: vec![SourceDecl {
+            source: SourceRef::Supplemental,
+            filter_schemas: vec![],
+            filter_derivations: vec![
+                "reply-draft@1".into(),
+                "reply-approval@1".into(),
+                "send-record@1".into(),
+            ],
+        }],
+        read_modes: vec![ReadModePolicy {
+            mode: ReadMode::OperationalLatest,
+            source_policy: "supplemental-latest".into(),
+        }],
+        build: BuildSpec {
+            build_type: "rust".into(),
+            entrypoint: None,
+            projector: "card-queue".into(),
+        },
+        outputs: vec![OutputSpec {
+            format: "json".into(),
+            tables: vec!["reply_cards".into(), "card_queue_audit_log".into()],
+        }],
+        reconciliation: None,
+        deterministic_in: vec![],
+        gap_action: None,
+        tags: vec!["card-queue".into(), "reply".into()],
+        description: Some("Reply draft approval and send state machine".into()),
         created_by: "self-host".into(),
     }
 }

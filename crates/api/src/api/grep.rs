@@ -215,7 +215,6 @@ impl GrepEngine {
         };
         let regex =
             Regex::new(&pattern).map_err(|err| GrepError::InvalidPattern(err.to_string()))?;
-        let start = Instant::now();
         let filtered = records
             .iter()
             .filter(|record| filters_match(record, &request.filters))
@@ -246,6 +245,7 @@ impl GrepEngine {
             }),
         }
 
+        let start = Instant::now();
         let mut matches = Vec::new();
         for record in candidates {
             if start.elapsed() > self.timeout {

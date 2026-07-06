@@ -1,0 +1,12 @@
+[package]
+name = "lethe-projection-cognition"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chrono.workspace = true
+lethe-core = { path = "../../core" }
+lethe-engine = { path = "../../engine" }
+lethe-projection-claim-queue = { path = "../claim-queue" }
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "lethe-adapter-chatgpt"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chrono.workspace = true
+lethe-adapter-api = { path = "../api" }
+lethe-core = { path = "../../core" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true

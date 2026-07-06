@@ -4,17 +4,19 @@ use std::path::PathBuf;
 
 use lethe_adapter_claude::claude::importer::ClaudeAiImporter;
 use lethe_core::domain::SemVer;
-use lethe_selfhost::self_host::app::AppService;
-use lethe_selfhost::self_host::config::SelfHostConfig;
+use lethe_selfhost::self_host::import_client::ImportApiConfig;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = parse_options(env::args().skip(1))?;
     let bytes = fs::read(&options.zip_path)?;
     let importer = ClaudeAiImporter::new(SemVer::new("1.0.0"));
     let drafts = importer.import_zip(&bytes)?;
-    let config = SelfHostConfig::from_env()?;
-    let service = AppService::bootstrap(config)?;
-    let report = service.ingest_observation_drafts(drafts, &options.source_instance)?;
+    let report = ImportApiConfig {
+        base_url: options.base_url,
+        api_token_env: options.api_token_env,
+    }
+    .connect()?
+    .ingest_observation_drafts(drafts, &options.source_instance)?;
 
     println!(
         "claude import complete: ingested={}, duplicates={}, quarantined={}",
@@ -26,6 +28,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct CliOptions {
     zip_path: PathBuf,
     source_instance: String,
+    base_url: String,
+    api_token_env: String,
 }
 
 fn parse_options(
@@ -33,6 +37,8 @@ fn parse_options(
 ) -> Result<CliOptions, Box<dyn std::error::Error>> {
     let mut zip_path = None;
     let mut source_instance = None;
+    let mut base_url = None;
+    let mut api_token_env = None;
 
     for arg in args {
         if let Some(raw) = arg.strip_prefix("--zip=") {
@@ -42,6 +48,16 @@ fn parse_options(
                 return Err("--source-instance must not be blank".into());
             }
             source_instance = Some(raw.to_owned());
+        } else if let Some(raw) = arg.strip_prefix("--base-url=") {
+            if raw.trim().is_empty() {
+                return Err("--base-url must not be blank".into());
+            }
+            base_url = Some(raw.to_owned());
+        } else if let Some(raw) = arg.strip_prefix("--api-token-env=") {
+            if raw.trim().is_empty() {
+                return Err("--api-token-env must not be blank".into());
+            }
+            api_token_env = Some(raw.to_owned());
         } else {
             return Err(format!("unknown argument: {arg}").into());
         }
@@ -50,5 +66,7 @@ fn parse_options(
     Ok(CliOptions {
         zip_path: zip_path.ok_or("--zip=<path> is required")?,
         source_instance: source_instance.ok_or("--source-instance=<id> is required")?,
+        base_url: base_url.ok_or("--base-url=<url> is required")?,
+        api_token_env: api_token_env.ok_or("--api-token-env=<name> is required")?,
     })
 }

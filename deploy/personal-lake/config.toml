@@ -1,11 +1,28 @@
+# Communication channels are explicit ops records. This personal config enables
+# the Discord channel served by the runtime supervisor connection
+# discord-primary-tera. Do not keep channels = [] alongside [[channels]].
+[[channels]]
+id = "chan:discord-primary:1507676023314059275"
+kind = "discord"
+source_instance_id = "discord-primary"
+external_id = "1507676023314059275"
+connection_ref = "discord-primary-tera"
+default_consent_scope = "personal"
+reply_slo_seconds = 1800
+freshness_threshold_seconds = 1800
+break_glass_channel = false
+break_glass_senders = []
+enabled = true
+
 [server]
 bind_addr = "0.0.0.0:8080"
 mcp_bind_addr = "0.0.0.0:8090"
 
+
 [mcp]
 resource_url = "https://yujiws.tail474356.ts.net/mcp"
 protected_resource_metadata_url = "https://yujiws.tail474356.ts.net/.well-known/oauth-protected-resource"
-oauth_issuer = "https://lethe-mcp.jp.auth0.com/"
+oauth_issuer = "https://dev-muwlx2h3vvs2z7xt.us.auth0.com/"
 oauth_audience = "https://yujiws.tail474356.ts.net/mcp"
 oauth_jwks_path = "/etc/lethe/mcp-jwks.json"
 
@@ -31,6 +48,16 @@ retention_days = 3650
 [corpus]
 mode = "personal_all_text"
 
+[freshness.threshold_seconds]
+"sys:claude-ai" = 129600
+"sys:chatgpt" = 129600
+"sys:claude-code" = 172800
+"sys:codex" = 172800
+"chan:discord-primary:1507676023314059275" = 1800
+
+[ops]
+backfill_nightly_budget_items = 10000
+
 [supplemental]
 reject_unregistered_kinds = true
 
@@ -40,7 +67,7 @@ scopes = ["read:persons", "read:timeline", "read:corpus"]
 
 [[api_tokens]]
 token_env = "LETHE_API_WRITE_TOKEN"
-scopes = ["write:supplemental"]
+scopes = ["write:supplemental", "write:observations"]
 
 [[api_tokens]]
 token_env = "LETHE_API_SYNC_TOKEN"

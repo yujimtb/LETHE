@@ -155,72 +155,89 @@ impl SqlitePersistence {
         &self,
         observation: &Observation,
     ) -> Result<DurableAppendOutcome, PersistenceError> {
+        let mut outcomes =
+            self.append_observations_idempotent(std::slice::from_ref(observation))?;
+        Ok(outcomes.remove(0))
+    }
+
+    pub fn append_observations_idempotent(
+        &self,
+        observations: &[Observation],
+    ) -> Result<Vec<DurableAppendOutcome>, PersistenceError> {
         let tree = self.load_partition_tree()?;
-        let routing_key =
-            routing_key_from_observation_for_order(self.routing_key_order, observation)
-                .map_err(|err| PersistenceError::SchemaInvariant(err.to_string()))?;
-        let leaf_id = tree.route(&routing_key);
-        let identity_key = &observation.idempotency_key;
-        let canonical_json = observation
-            .meta
-            .get(CANONICAL_JSON_META_KEY)
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                PersistenceError::SchemaInvariant(
-                    "observation.meta.canonical_json is required for durable ingest".to_owned(),
-                )
-            })?;
-        let json = serde_json::to_string(observation)?;
-        let inserted = self.conn.execute(
-            "INSERT INTO observations (
-                id,
-                leaf_id,
-                routing_key,
-                identity_key,
-                canonical_json,
-                recorded_at,
-                observation_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                observation.id.as_str(),
-                leaf_id,
-                routing_key.encoded(),
-                identity_key.as_str(),
-                canonical_json,
-                observation.recorded_at.to_rfc3339(),
-                json,
-            ],
-        );
+        let transaction = self.conn.unchecked_transaction()?;
+        let mut outcomes = Vec::with_capacity(observations.len());
 
-        match inserted {
-            Ok(_) => Ok(DurableAppendOutcome::Appended(observation.id.clone())),
-            Err(insert_err) => {
-                let existing = self
-                    .conn
-                    .query_row(
-                        "SELECT id, canonical_json FROM observations
-                         WHERE leaf_id = ?1 AND identity_key = ?2",
-                        params![leaf_id, identity_key.as_str()],
-                        |row| {
-                            Ok((
-                                ObservationId::new(row.get::<_, String>(0)?),
-                                row.get::<_, String>(1)?,
-                            ))
-                        },
+        for observation in observations {
+            let routing_key =
+                routing_key_from_observation_for_order(self.routing_key_order, observation)
+                    .map_err(|err| PersistenceError::SchemaInvariant(err.to_string()))?;
+            let leaf_id = tree.route(&routing_key);
+            let identity_key = &observation.idempotency_key;
+            let canonical_json = observation
+                .meta
+                .get(CANONICAL_JSON_META_KEY)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    PersistenceError::SchemaInvariant(
+                        "observation.meta.canonical_json is required for durable ingest".to_owned(),
                     )
-                    .optional()?;
+                })?;
+            let json = serde_json::to_string(observation)?;
+            let inserted = transaction.execute(
+                "INSERT INTO observations (
+                    id,
+                    leaf_id,
+                    routing_key,
+                    identity_key,
+                    canonical_json,
+                    recorded_at,
+                    observation_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    observation.id.as_str(),
+                    leaf_id,
+                    routing_key.encoded(),
+                    identity_key.as_str(),
+                    canonical_json,
+                    observation.recorded_at.to_rfc3339(),
+                    json,
+                ],
+            );
 
-                if let Some((existing_id, existing_canonical_json)) = existing {
-                    if existing_canonical_json == canonical_json {
-                        Ok(DurableAppendOutcome::Duplicate(existing_id))
+            let outcome = match inserted {
+                Ok(_) => DurableAppendOutcome::Appended(observation.id.clone()),
+                Err(insert_err) => {
+                    let existing = transaction
+                        .query_row(
+                            "SELECT id, canonical_json FROM observations
+                             WHERE leaf_id = ?1 AND identity_key = ?2",
+                            params![leaf_id, identity_key.as_str()],
+                            |row| {
+                                Ok((
+                                    ObservationId::new(row.get::<_, String>(0)?),
+                                    row.get::<_, String>(1)?,
+                                ))
+                            },
+                        )
+                        .optional()?;
+
+                    if let Some((existing_id, existing_canonical_json)) = existing {
+                        if existing_canonical_json == canonical_json {
+                            DurableAppendOutcome::Duplicate(existing_id)
+                        } else {
+                            DurableAppendOutcome::CanonicalCollision(existing_id)
+                        }
                     } else {
-                        Ok(DurableAppendOutcome::CanonicalCollision(existing_id))
+                        return Err(PersistenceError::Sqlite(insert_err));
                     }
-                } else {
-                    Err(PersistenceError::Sqlite(insert_err))
                 }
-            }
+            };
+            outcomes.push(outcome);
         }
+
+        transaction.commit()?;
+        Ok(outcomes)
     }
 
     pub fn rehome_observation(
@@ -1190,6 +1207,15 @@ impl ObservationStorePort for SqlitePersistence {
     fn append_observation(&self, observation: &Observation) -> StorageResult<PortAppendOutcome> {
         self.append_observation_idempotent(observation)
             .map(port_outcome)
+            .map_err(storage_error)
+    }
+
+    fn append_observations(
+        &self,
+        observations: &[Observation],
+    ) -> StorageResult<Vec<PortAppendOutcome>> {
+        self.append_observations_idempotent(observations)
+            .map(|outcomes| outcomes.into_iter().map(port_outcome).collect())
             .map_err(storage_error)
     }
 

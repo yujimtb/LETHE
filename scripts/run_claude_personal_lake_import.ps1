@@ -12,10 +12,13 @@ param(
     [string]$CommitMessage,
 
     [Parameter(Mandatory = $true)]
-    [string]$ConfigPath,
+    [string]$DatabasePath,
 
     [Parameter(Mandatory = $true)]
-    [string]$DatabasePath,
+    [string]$BaseUrl,
+
+    [Parameter(Mandatory = $true)]
+    [string]$ApiTokenEnv,
 
     [Parameter(Mandatory = $true)]
     [string]$SourceInstance
@@ -60,33 +63,28 @@ function Parse-ImportReport {
 Require-Command "cargo"
 Require-Command "git"
 Require-Command "python"
-Require-Env "LETHE_STORAGE_ENCRYPTION_KEY"
-Require-Env "LETHE_API_READ_TOKEN"
-Require-Env "LETHE_API_SYNC_TOKEN"
+Require-Env $ApiTokenEnv
 
 if (-not (Test-Path -LiteralPath $ZipPath -PathType Leaf)) {
     throw "Claude export zip not found: $ZipPath"
 }
-if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
-    throw "ConfigPath not found: $ConfigPath"
-}
 if ([string]::IsNullOrWhiteSpace($SourceInstance)) {
     throw "SourceInstance must not be blank"
 }
-
-$resolvedConfig = Resolve-Path -LiteralPath $ConfigPath
-$env:LETHE_CONFIG_PATH = $resolvedConfig.Path
+if ([string]::IsNullOrWhiteSpace($BaseUrl)) {
+    throw "BaseUrl must not be blank"
+}
+if ([string]::IsNullOrWhiteSpace($ApiTokenEnv)) {
+    throw "ApiTokenEnv must not be blank"
+}
 
 & (Join-Path $PSScriptRoot "archive_claude_export.ps1") `
     -ZipPath $ZipPath `
     -ArchiveRepo $ArchiveRepo `
     -ConversationDir $ConversationDir `
     -CommitMessage $CommitMessage
-if ($LASTEXITCODE -ne 0) {
-    throw "archive_claude_export.ps1 failed"
-}
 
-$firstOutput = cargo run -q -p lethe-import-claude -- "--zip=$ZipPath" "--source-instance=$SourceInstance" | Out-String
+$firstOutput = cargo run -q -p lethe-import-claude -- "--zip=$ZipPath" "--source-instance=$SourceInstance" "--base-url=$BaseUrl" "--api-token-env=$ApiTokenEnv" | Out-String
 if ($LASTEXITCODE -ne 0) {
     throw "first lethe-import-claude failed"
 }
@@ -95,7 +93,7 @@ if ($firstReport.quarantined -ne 0) {
     throw "first import quarantined $($firstReport.quarantined) observations"
 }
 
-$secondOutput = cargo run -q -p lethe-import-claude -- "--zip=$ZipPath" "--source-instance=$SourceInstance" | Out-String
+$secondOutput = cargo run -q -p lethe-import-claude -- "--zip=$ZipPath" "--source-instance=$SourceInstance" "--base-url=$BaseUrl" "--api-token-env=$ApiTokenEnv" | Out-String
 if ($LASTEXITCODE -ne 0) {
     throw "second lethe-import-claude failed"
 }

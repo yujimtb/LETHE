@@ -418,6 +418,9 @@ fn to_slack_message(
         .or_else(|| fallback_profile.and_then(|profile| profile.real_name.clone()))
         .unwrap_or_else(|| user_id.clone());
 
+    let text = raw.text.unwrap_or_default();
+    let mentions = slack_mentions(&text);
+
     SlackMessage {
         channel_id: String::new(),
         channel_name: channel_name.to_string(),
@@ -426,7 +429,9 @@ fn to_slack_message(
         user_id,
         user_name,
         email: profile.and_then(|profile| profile.email.clone()),
-        text: raw.text.unwrap_or_default(),
+        text,
+        ingress_kind: None,
+        mentions,
         message_type: map_message_type(raw.subtype.as_deref()),
         edited: raw.edited.map(|edited| SlackEdited {
             user: edited.user,
@@ -456,6 +461,33 @@ fn to_slack_message(
         reply_count: raw.reply_count.unwrap_or(0),
         reply_users_count: raw.reply_users_count.unwrap_or(0),
     }
+}
+
+fn slack_mentions(text: &str) -> Vec<String> {
+    let mut mentions = Vec::new();
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index + 3 < bytes.len() {
+        if bytes[index] == b'<' && bytes[index + 1] == b'@' {
+            let start = index + 2;
+            let mut end = start;
+            while end < bytes.len() && bytes[end] != b'>' && bytes[end] != b'|' {
+                end += 1;
+            }
+            if end > start
+                && let Ok(user_id) = std::str::from_utf8(&bytes[start..end])
+            {
+                mentions.push(user_id.to_owned());
+            }
+            while end < bytes.len() && bytes[end] != b'>' {
+                end += 1;
+            }
+            index = end.saturating_add(1);
+        } else {
+            index += 1;
+        }
+    }
+    mentions
 }
 
 fn map_message_type(subtype: Option<&str>) -> SlackMessageType {

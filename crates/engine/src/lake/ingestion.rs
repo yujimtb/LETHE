@@ -42,6 +42,12 @@ pub struct IngestRequest {
     pub meta: serde_json::Value,
 }
 
+pub const COMM_CHANNEL_ID_META_KEY: &str = "communication_channel_id";
+pub const COMM_CHANNEL_KIND_META_KEY: &str = "communication_channel_kind";
+pub const COMM_CHANNEL_EXTERNAL_ID_META_KEY: &str = "communication_channel_external_id";
+pub const COMM_SENDER_ID_META_KEY: &str = "communication_sender_id";
+pub const COMM_THREAD_REF_META_KEY: &str = "communication_thread_ref";
+
 /// The Ingestion Gate coordinates validation → dedup → append.
 pub struct IngestionGate<'a> {
     pub registry: &'a RegistryStore,
@@ -72,7 +78,7 @@ impl IngestionGate<'_> {
         }
     }
 
-    pub fn prepare_observation(&self, req: IngestRequest) -> Result<Observation, IngestResult> {
+    pub fn prepare_observation(&self, mut req: IngestRequest) -> Result<Observation, IngestResult> {
         let recorded_at = Utc::now();
 
         // Step 1: Authenticate observer (must be registered).
@@ -223,6 +229,11 @@ impl IngestionGate<'_> {
             });
         }
 
+        let consent = match self.apply_channel_context(&mut req) {
+            Ok(consent) => consent,
+            Err(ticket) => return Err(IngestResult::Quarantined { ticket }),
+        };
+
         // Step 9: Build Observation and append.
         let obs = Observation {
             id: Observation::new_id(),
@@ -239,12 +250,209 @@ impl IngestionGate<'_> {
             attachments: req.attachments,
             published: req.published,
             recorded_at,
-            consent: None,
+            consent,
             idempotency_key: req.idempotency_key,
             meta: req.meta,
         };
 
         Ok(obs)
+    }
+
+    fn apply_channel_context(
+        &self,
+        req: &mut IngestRequest,
+    ) -> Result<Option<lethe_core::domain::ConsentRef>, QuarantineTicket> {
+        let Some(source_system) = req.source_system.as_ref() else {
+            return Ok(None);
+        };
+        let Some(kind) = lethe_registry::registry::ChannelKind::from_source_system(source_system)
+        else {
+            return Ok(None);
+        };
+        if !is_communication_message_schema(req.schema.as_str()) {
+            return Ok(None);
+        }
+
+        let mut meta = req.meta.as_object().cloned().unwrap_or_default();
+        let source_instance_id = meta
+            .get("source_instance")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                channel_quarantine("communication observation missing source_instance")
+            })?;
+        let external_id = meta
+            .get(COMM_CHANNEL_EXTERNAL_ID_META_KEY)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| communication_external_id(kind, &req.payload))
+            .ok_or_else(|| {
+                channel_quarantine("communication observation missing channel external id")
+            })?;
+        let channel = if let Some(channel_id) = meta
+            .get(COMM_CHANNEL_ID_META_KEY)
+            .and_then(serde_json::Value::as_str)
+        {
+            self.registry.get_channel(channel_id)
+        } else {
+            self.registry
+                .get_channel_by_source(kind, &source_instance_id, &external_id)
+        }
+        .ok_or_else(|| {
+            channel_quarantine(format!(
+                "unregistered communication channel: kind={kind} source_instance={source_instance_id} external_id={external_id}"
+            ))
+        })?;
+
+        if !channel.enabled {
+            return Err(channel_quarantine(format!(
+                "disabled communication channel: {}",
+                channel.id
+            )));
+        }
+        if channel.kind != kind
+            || channel.source_instance_id != source_instance_id
+            || channel.external_id != external_id
+        {
+            return Err(channel_quarantine(format!(
+                "communication channel {} does not match kind/source_instance/external_id",
+                channel.id
+            )));
+        }
+
+        let sender = meta
+            .get(COMM_SENDER_ID_META_KEY)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| communication_sender(kind, &req.payload))
+            .ok_or_else(|| channel_quarantine("communication observation missing sender"))?;
+        let thread_ref = meta
+            .get(COMM_THREAD_REF_META_KEY)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| communication_thread_ref(kind, &req.payload))
+            .ok_or_else(|| {
+                channel_quarantine("communication observation missing thread context")
+            })?;
+        let reply_due_at =
+            req.published + chrono::TimeDelta::seconds(channel.reply_slo_seconds as i64);
+
+        meta.insert(
+            COMM_CHANNEL_ID_META_KEY.to_owned(),
+            serde_json::Value::String(channel.id.clone()),
+        );
+        meta.insert(
+            COMM_CHANNEL_KIND_META_KEY.to_owned(),
+            serde_json::Value::String(channel.kind.as_str().to_owned()),
+        );
+        meta.insert(
+            COMM_CHANNEL_EXTERNAL_ID_META_KEY.to_owned(),
+            serde_json::Value::String(channel.external_id.clone()),
+        );
+        meta.insert(
+            COMM_SENDER_ID_META_KEY.to_owned(),
+            serde_json::Value::String(sender.clone()),
+        );
+        meta.insert(
+            COMM_THREAD_REF_META_KEY.to_owned(),
+            serde_json::Value::String(thread_ref.clone()),
+        );
+        meta.insert(
+            "communication".to_owned(),
+            serde_json::json!({
+                "channel_id": channel.id,
+                "kind": channel.kind,
+                "source_instance": channel.source_instance_id,
+                "external_id": channel.external_id,
+                "sender": sender,
+                "thread_ref": thread_ref,
+                "reply_slo_seconds": channel.reply_slo_seconds,
+                "reply_due_at": reply_due_at,
+                "freshness_threshold_seconds": channel.freshness_threshold_seconds,
+                "break_glass_channel": channel.break_glass_channel,
+                "break_glass_senders": channel.break_glass_senders,
+            }),
+        );
+        req.meta = serde_json::Value::Object(meta);
+
+        Ok(Some(lethe_core::domain::ConsentRef::new(
+            channel.default_consent_scope.clone(),
+        )))
+    }
+}
+
+fn is_communication_message_schema(schema: &str) -> bool {
+    matches!(
+        schema,
+        "schema:slack-message" | "schema:gmail-message" | "schema:discord-message"
+    )
+}
+
+fn communication_external_id(
+    kind: lethe_registry::registry::ChannelKind,
+    payload: &serde_json::Value,
+) -> Option<String> {
+    let field = match kind {
+        lethe_registry::registry::ChannelKind::Slack => "channel_id",
+        lethe_registry::registry::ChannelKind::Gmail => "account_id",
+        lethe_registry::registry::ChannelKind::Discord => "channel_id",
+    };
+    payload
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+fn communication_sender(
+    kind: lethe_registry::registry::ChannelKind,
+    payload: &serde_json::Value,
+) -> Option<String> {
+    match kind {
+        lethe_registry::registry::ChannelKind::Slack => payload
+            .get("user_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        lethe_registry::registry::ChannelKind::Gmail => payload
+            .get("from")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        lethe_registry::registry::ChannelKind::Discord => payload
+            .get("author_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    }
+}
+
+fn communication_thread_ref(
+    kind: lethe_registry::registry::ChannelKind,
+    payload: &serde_json::Value,
+) -> Option<String> {
+    match kind {
+        lethe_registry::registry::ChannelKind::Slack => payload
+            .get("thread_ts")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| payload.get("ts").and_then(serde_json::Value::as_str))
+            .map(|value| format!("slack:thread:{value}")),
+        lethe_registry::registry::ChannelKind::Gmail => payload
+            .get("thread_id")
+            .and_then(serde_json::Value::as_str)
+            .map(|value| format!("gmail:thread:{value}")),
+        lethe_registry::registry::ChannelKind::Discord => payload
+            .get("referenced_message_id")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                payload
+                    .get("message_id")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .map(|value| format!("discord:thread:{value}")),
+    }
+}
+
+fn channel_quarantine(message: impl Into<String>) -> QuarantineTicket {
+    QuarantineTicket {
+        id: uuid::Uuid::now_v7().to_string(),
+        reason: message.into(),
     }
 }
 
@@ -303,6 +511,20 @@ mod tests {
             registered_at: None,
         })
         .unwrap();
+        reg.register_channel(ChannelRecord {
+            id: "chan:slack:test:C01".into(),
+            kind: ChannelKind::Slack,
+            source_instance_id: "slack-test".into(),
+            external_id: "C01".into(),
+            connection_ref: "source:slack-test".into(),
+            default_consent_scope: "personal".into(),
+            reply_slo_seconds: 1800,
+            freshness_threshold_seconds: 1800,
+            break_glass_channel: false,
+            break_glass_senders: vec![],
+            enabled: true,
+        })
+        .unwrap();
         reg
     }
 
@@ -322,12 +544,19 @@ mod tests {
             capture_model: CaptureModel::Event,
             subject: EntityRef::new("message:slack:C01-999"),
             target: None,
-            payload: serde_json::json!({"text": "hello"}),
+            payload: serde_json::json!({
+                "text": "hello",
+                "channel_id": "C01",
+                "user_id": "U01",
+                "ts": "999.000000",
+                "thread_ts": "999.000000",
+            }),
             attachments: vec![],
             published: Utc::now(),
             idempotency_key: IdempotencyKey::new("slack:C01:999"),
             meta: serde_json::json!({
                 "canonical_json": canonical_json,
+                "source_instance": "slack-test",
             }),
         }
     }
@@ -346,6 +575,14 @@ mod tests {
         let result = gate.ingest(valid_request());
         assert!(matches!(result, IngestResult::Ingested { .. }));
         assert_eq!(lake.len(), 1);
+        assert_eq!(
+            lake.list()[0].consent.as_ref().unwrap().as_str(),
+            "personal"
+        );
+        assert_eq!(
+            lake.list()[0].meta[COMM_CHANNEL_ID_META_KEY],
+            "chan:slack:test:C01"
+        );
     }
 
     #[test]
@@ -527,6 +764,20 @@ mod tests {
             registered_at: None,
         })
         .unwrap();
+        reg.register_channel(ChannelRecord {
+            id: "chan:slack:test:C01".into(),
+            kind: ChannelKind::Slack,
+            source_instance_id: "slack-test".into(),
+            external_id: "C01".into(),
+            connection_ref: "source:slack-test".into(),
+            default_consent_scope: "personal".into(),
+            reply_slo_seconds: 1800,
+            freshness_threshold_seconds: 1800,
+            break_glass_channel: false,
+            break_glass_senders: vec![],
+            enabled: true,
+        })
+        .unwrap();
 
         let mut lake = LakeStore::new();
         let blobs = BlobStore::new();
@@ -538,6 +789,25 @@ mod tests {
 
         let result = gate.ingest(valid_request());
         assert!(matches!(result, IngestResult::Rejected { .. }));
+    }
+
+    #[test]
+    fn unregistered_communication_channel_is_quarantined() {
+        let reg = setup_registry();
+        let mut lake = LakeStore::new();
+        let blobs = BlobStore::new();
+        let mut gate = IngestionGate {
+            registry: &reg,
+            lake: &mut lake,
+            blobs: &blobs,
+        };
+
+        let mut req = valid_request();
+        req.payload["channel_id"] = serde_json::json!("C99");
+
+        let result = gate.ingest(req);
+
+        assert!(matches!(result, IngestResult::Quarantined { .. }));
     }
 
     #[test]
@@ -629,6 +899,16 @@ mod tests {
         // Ingest second with different key.
         let mut req2 = valid_request();
         req2.idempotency_key = IdempotencyKey::new("slack:C01:1000");
+        req2.subject = EntityRef::new("message:slack:C01-1000");
+        req2.payload["ts"] = serde_json::json!("1000.000000");
+        req2.payload["thread_ts"] = serde_json::json!("1000.000000");
+        req2.meta["canonical_json"] = serde_json::json!({
+            "source": "slack",
+            "object_id": "channel:C01:ts:1000",
+            "body": "hello"
+        })
+        .to_string()
+        .into();
         let mut gate = IngestionGate {
             registry: &reg,
             lake: &mut lake,

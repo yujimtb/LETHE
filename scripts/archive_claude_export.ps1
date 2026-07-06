@@ -36,9 +36,6 @@ if (-not (Test-Path -LiteralPath $gitDir -PathType Container)) {
 
 $targetDir = Join-Path $ArchiveRepo $ConversationDir
 & (Join-Path $PSScriptRoot "expand_claude_export.ps1") -ZipPath $ZipPath -OutputDir $targetDir
-if ($LASTEXITCODE -ne 0) {
-    throw "expand_claude_export.ps1 failed"
-}
 
 $status = git -C $ArchiveRepo status --porcelain | Out-String
 if ([string]::IsNullOrWhiteSpace($status)) {
