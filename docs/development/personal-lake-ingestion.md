@@ -156,8 +156,9 @@ Live client setup and verification:
 - Codex: configure MCP server `lethe-personal-lake` with URL
   `https://yujiws.tail474356.ts.net/mcp` and complete the OAuth flow.
 - Claude Code: use the claude.ai-scoped connector `LETHE Personal Lake`. The
-  installed CLI currently has no `claude mcp login` command, so a separate
-  user-scope Claude Code MCP entry may still show `Needs authentication`.
+  installed CLI currently has no `claude mcp login` command; the stale
+  user-scope Claude Code MCP entry was removed on 2026-07-06 to avoid using an
+  unauthenticated duplicate.
 
 The 2026-07-06 live verification query for all four clients was:
 
@@ -173,9 +174,13 @@ All five MCP tools advertise read-only annotations:
 `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`, and
 `openWorldHint=false`.
 
-Operational note: Auth0 currently warns when a tenant uses Auth0-provided Google
-development keys. Configure a tenant-owned Google OAuth client before treating
-the identity setup as production-grade.
+Production identity note: on 2026-07-06, the Auth0 `google-oauth2` connection
+was updated with tenant-owned Google OAuth credentials from Google Cloud project
+`skcollege-dictionary`, client `LETHE MCP Auth0 Google`. The authorized redirect
+URI is `https://lethe-mcp.jp.auth0.com/login/callback`, and the Auth0 connection
+now has a configured client ID and client secret instead of Auth0 development
+keys. The secret is stored only in Auth0 and must not be copied into the
+repository.
 
 ## Claude.ai
 
