@@ -7,7 +7,7 @@
 ## Dependencies
 
 - M01 Domain Kernel — 既存 `openspec/specs/domain-kernel.md`(System Laws L1〜L8、Closed Algebras、Observation 型)は中核を **不変** とする
-- 正典: [Domain algebra](../../../../../docs/architecture/domain-algebra.md) §7.1 System Laws、[Sharding design](../../../../../docs/architecture/sharding.md) §1.1 System Laws 対照表
+- 正典: [Domain algebra](../../../../../../docs/architecture/domain-algebra.md) §7.1 System Laws、[Sharding design](../../../../../../docs/architecture/sharding.md) §1.1 System Laws 対照表
 
 > 本 delta は L1〜L7 を **変更しない**。L8 Idempotency Law の precision を「同一 key の再送は二重化しない」から「**完全(決定的)冪等** — per-leaf exact index による正規判定、silent drop なし」へ強化する。`Observation.idempotencyKey` の optional → 必須・高エントロピー・解決可能への格上げも併せて規定する。意味論は破らず、precision のみを上げる(`sharding_refactor.md` R7「中核方針は妥当 = 上書きでなく精緻化」)。
 

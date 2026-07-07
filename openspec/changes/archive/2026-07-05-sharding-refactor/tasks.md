@@ -5,11 +5,11 @@
 
 実施順は `proposal.md` の Rollout に従う。各 Phase の完了が次 Phase の merge gate となる。要件 ID は `specs/*/spec.md` の SHARD-* / SHARD-PROP-* / SHARD-ADAPT-* / SHARD-RT-* を参照。各 Gate の受け入れ基準は対応する Scenario をテスト化したものとする。
 
-横断不変条件は [sharding_refactor.md §1](../../../docs/architecture/sharding.md) を正典とし、本 change の全 Phase で破ってはならない(不変条件1〜10)。
+横断不変条件は [sharding_refactor.md §1](../../../../docs/architecture/sharding.md) を正典とし、本 change の全 Phase で破ってはならない(不変条件1〜10)。
 
 ## Phase 0 — Keyspec Freeze (single leaf=root)
 
-> 前提: `design.md` U1「現行コードとの差分マッピング」を先に実施し、SHARD-04(exact dedup)と現行 [crates/engine/src/lake/ingestion.rs](../../../crates/engine/src/lake/ingestion.rs) の `IngestResult` 同型性を確認してから 0.1 に着手する。
+> 前提: `design.md` U1「現行コードとの差分マッピング」を先に実施し、SHARD-04(exact dedup)と現行 [crates/engine/src/lake/ingestion.rs](../../../../crates/engine/src/lake/ingestion.rs) の `IngestResult` 同型性を確認してから 0.1 に着手する。
 
 - [x] 0.1 `routing_keyspec` と `identity_keyspec` の version pin スキーマを定義(SHARD-RT-01 / SHARD-01)
 - [x] 0.2 partition log の `initialize` event 形式を定義(両 keyspec を pin)、SQLite テーブル `partition_log` を追加(SHARD-RT-04)
@@ -127,7 +127,7 @@
 | --- | ------------------------- | --------------------------------- | -------------------------------------------------------- | ---- |
 | —   | (既存 M03 / M06 / M09 / M15) | observation-lake.md / dag-propagation.md / adapter-policy.md / runtime.md | 本 change により sharding 関連要件(SHARD-*)を取り込み | ✓    |
 
-依存関係追記: SHARD-* は M03 / M06 / M09 / M15 を横断する。意味論の正典は依然として [Domain algebra](../../../docs/architecture/domain-algebra.md) / [System overview](../../../docs/architecture/system-overview.md) / [Runtime reference](../../../docs/architecture/runtime-reference.md) / [ADR backlog](../../../docs/decisions/adr-backlog.md)、本 change の sharding 観点上の正典は [Sharding design](../../../docs/architecture/sharding.md)。
+依存関係追記: SHARD-* は M03 / M06 / M09 / M15 を横断する。意味論の正典は依然として [Domain algebra](../../../../docs/architecture/domain-algebra.md) / [System overview](../../../../docs/architecture/system-overview.md) / [Runtime reference](../../../../docs/architecture/runtime-reference.md) / [ADR backlog](../../../../docs/decisions/adr-backlog.md)、本 change の sharding 観点上の正典は [Sharding design](../../../../docs/architecture/sharding.md)。
 
 ## Frozen During This Change
 

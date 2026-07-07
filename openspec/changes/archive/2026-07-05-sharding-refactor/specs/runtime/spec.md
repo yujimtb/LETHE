@@ -10,7 +10,7 @@
 - M03 Observation Lake — per-leaf SQLite / `append_seq` / rehome primitive(本 change の `observation-lake` delta SHARD-05〜07)
 - M09 Adapter Policy — adapter が source / container を canonical タプル経由で宣言(本 change の `adapter-policy` delta SHARD-ADAPT-01)
 - M15 Runtime — 既存 `openspec/specs/runtime.md` の中核(topology / sandbox / health / 参照技術選定)は **不変**
-- 正典: [Sharding design](../../../../../docs/architecture/sharding.md) §2 D4〜D8 / D11
+- 正典: [Sharding design](../../../../../../docs/architecture/sharding.md) §2 D4〜D8 / D11
 
 > 本 delta は M15 の topology / sandbox / health 概念を **変更しない**。物理 Lake の分割(routing key / Patricia trie / split protocol / partition log / failover / logical→physical resolver)を runtime の責務として ADDED で規定する。
 

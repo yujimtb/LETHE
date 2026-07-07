@@ -4,7 +4,7 @@
 **Date:** 2026-06-17
 **Status:** Proposed
 **Type:** Architectural refactor (System Laws 強化、契約は不変)
-**Source:** [Sharding design](../../../docs/architecture/sharding.md) — D0〜D12 すべて LOCKED の決定台帳
+**Source:** [Sharding design](../../../../docs/architecture/sharding.md) — D0〜D12 すべて LOCKED の決定台帳
 
 ---
 
@@ -14,16 +14,16 @@ LETHE を大きめのワークスペース(寮 Slack)に投入するにあたり
 
 | 固定化 | 現状 | 問題 |
 | --- | --- | --- |
-| dedup 意味論 | `idempotencyKey` は free-form / optional ([crates/engine/src/lake/ingestion.rs](../../../crates/engine/src/lake/ingestion.rs))、確率的(SimHash + Bloom)前提が draft に残存 | 同 channel:ts の編集が silent drop / 偽 merge を起こす |
-| identity key 構成 | content hash 非含有([crates/adapters/slack/src/slack/mapper.rs](../../../crates/adapters/slack/src/slack/mapper.rs)) | Slack 編集を「duplicate」で捨てる(silent 欠損) |
-| 衝突判定 | full observation(reactions / meta 含む)を比較([crates/engine/src/lake/store.rs](../../../crates/engine/src/lake/store.rs)) | reactions の独立変化で偽 `Conflict` |
-| 永続層 | in-memory `LakeStore`(Vec + HashMap)が authoritative ([crates/engine/src/lake/store.rs](../../../crates/engine/src/lake/store.rs))、SQLite は補償ロールバック | 多 leaf で RAM に収まらず破綻 |
-| watermark cursor | グローバル Vec への `usize` position([crates/engine/src/propagation/watermark.rs](../../../crates/engine/src/propagation/watermark.rs)) | 分割するとグローバル position が消える |
-| leaf 解決 | 単一 Vec の線形 filter([crates/engine/src/lake/store.rs](../../../crates/engine/src/lake/store.rs))、resolver 未実装 | 分割不能 |
+| dedup 意味論 | `idempotencyKey` は free-form / optional ([crates/engine/src/lake/ingestion.rs](../../../../crates/engine/src/lake/ingestion.rs))、確率的(SimHash + Bloom)前提が draft に残存 | 同 channel:ts の編集が silent drop / 偽 merge を起こす |
+| identity key 構成 | content hash 非含有([crates/adapters/slack/src/slack/mapper.rs](../../../../crates/adapters/slack/src/slack/mapper.rs)) | Slack 編集を「duplicate」で捨てる(silent 欠損) |
+| 衝突判定 | full observation(reactions / meta 含む)を比較([crates/engine/src/lake/store.rs](../../../../crates/engine/src/lake/store.rs)) | reactions の独立変化で偽 `Conflict` |
+| 永続層 | in-memory `LakeStore`(Vec + HashMap)が authoritative ([crates/engine/src/lake/store.rs](../../../../crates/engine/src/lake/store.rs))、SQLite は補償ロールバック | 多 leaf で RAM に収まらず破綻 |
+| watermark cursor | グローバル Vec への `usize` position([crates/engine/src/propagation/watermark.rs](../../../../crates/engine/src/propagation/watermark.rs)) | 分割するとグローバル position が消える |
+| leaf 解決 | 単一 Vec の線形 filter([crates/engine/src/lake/store.rs](../../../../crates/engine/src/lake/store.rs))、resolver 未実装 | 分割不能 |
 | placement | 固定ビット trie / SimHash routing(draft) | route がタイミング依存になり dedup が割れる |
-| migration primitive | fresh ingest が `new_id()` + 新 `recordedAt` を毎回付与([crates/engine/src/lake/ingestion.rs](../../../crates/engine/src/lake/ingestion.rs)) | split / failover drain / blue-green で identity と propagation cursor が壊れる |
+| migration primitive | fresh ingest が `new_id()` + 新 `recordedAt` を毎回付与([crates/engine/src/lake/ingestion.rs](../../../../crates/engine/src/lake/ingestion.rs)) | split / failover drain / blue-green で identity と propagation cursor が壊れる |
 
-本 change は、[Sharding design](../../../docs/architecture/sharding.md) §2 の D0〜D12 を normative な仕様要件として確定し、**System Laws(特に Idempotency / Replay / Append-Only)を強化**するためのリファクタリング要件を定義する。
+本 change は、[Sharding design](../../../../docs/architecture/sharding.md) §2 の D0〜D12 を normative な仕様要件として確定し、**System Laws(特に Idempotency / Replay / Append-Only)を強化**するためのリファクタリング要件を定義する。
 
 ## What Changes
 
@@ -87,4 +87,4 @@ Phase 7: CDC/Merkle(内部編集される大型文書専用、別 content-model)
 - **Append-Only Law**(保存): 各 leaf も append-only、split は再配置(更新でない)、blue/green は旧 retire。rehome は内部 append であり mutation ではない。
 - **Effect Isolation Law**(保存): resolver は Imperative Shell、Kernel は論理 lake のみを見る(D11.3)。
 
-詳細根拠は [Sharding design](../../../docs/architecture/sharding.md) §1.1 の対照表を参照。
+詳細根拠は [Sharding design](../../../../docs/architecture/sharding.md) §1.1 の対照表を参照。
