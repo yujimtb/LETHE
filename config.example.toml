@@ -1,3 +1,8 @@
+# Example selfhost configuration. Keep secret values out of this file; reference
+# environment variable names with *_env keys and set the real values outside Git.
+
+# Communication channels declare source instances and operational thresholds.
+# Use stable LETHE ids, and keep source_instance_id aligned with [sources.*].id.
 [[channels]]
 id = "chan:slack-primary:C01234567"
 kind = "slack"
@@ -11,6 +16,8 @@ break_glass_channel = false
 break_glass_senders = []
 enabled = true
 
+# Direct-message or private channels can use personal consent and break-glass
+# sender allowlists when urgent replies must be visible in operations views.
 [[channels]]
 id = "chan:slack-primary:D01234567"
 kind = "slack"
@@ -50,10 +57,14 @@ break_glass_channel = false
 break_glass_senders = []
 enabled = true
 
+# Internal API and MCP use separate listeners. Expose only the MCP listener when
+# publishing a personal lake connector.
 [server]
 bind_addr = "127.0.0.1:8080"
 mcp_bind_addr = "127.0.0.1:8090"
 
+# MCP is an OAuth resource server. The audience must match the managed identity
+# provider API identifier, and oauth_jwks_path must point to the issuer JWKS copy.
 [mcp]
 resource_url = "https://replace-with-tailnet-name.ts.net/mcp"
 protected_resource_metadata_url = "https://replace-with-tailnet-name.ts.net/.well-known/oauth-protected-resource"
@@ -61,17 +72,22 @@ oauth_issuer = "https://replace-with-managed-idp.example/"
 oauth_audience = "lethe-mcp"
 oauth_jwks_path = "./mcp-jwks.json"
 
+# Local durable stores. encryption_key_env names the environment variable that
+# contains the storage key; the key itself must not be written into TOML.
 [storage]
 database_path = "./data/lethe.sqlite3"
 blob_dir = "./data/blobs"
 encryption_key_env = "LETHE_STORAGE_ENCRYPTION_KEY"
 
+# Routing controls the partition key order for append-only lake leaves.
 [routing]
 key_order = "month_year_source_container_published"
 
+# Poll interval for configured live sources.
 [runtime]
 poll_seconds = 300
 
+# Resource limits fail fast when incoming payloads or pages exceed safe bounds.
 [limits]
 max_blob_bytes = 10485760
 max_payload_bytes = 1048576
@@ -80,21 +96,28 @@ max_page_size = 100
 max_leaf_observations = 100000
 retention_days = 30
 
+# Corpus mode controls which text-bearing observations are exposed to grep/MCP.
 [corpus]
 mode = "workspace_filtered"
 
+# Per-source freshness thresholds in seconds. Keys must match configured channel
+# ids or source system ids used by imported observations.
 [freshness.threshold_seconds]
 "chan:slack-primary:C01234567" = 1800
 "chan:slack-primary:D01234567" = 1800
 "chan:gmail-primary:primary" = 1800
 "chan:discord-primary:123456789012345678" = 1800
 
+# Operations budgets bound nightly or bulk maintenance work.
 [ops]
 backfill_nightly_budget_items = 10000
 
+# Supplemental writes are schema-registered by default; unknown kinds are
+# rejected instead of being accepted into ambiguous state.
 [supplemental]
 reject_unregistered_kinds = true
 
+# API tokens are read from environment variables and mapped to explicit scopes.
 [[api_tokens]]
 token_env = "LETHE_API_READ_TOKEN"
 scopes = ["read:persons", "read:timeline", "read:corpus"]
@@ -107,8 +130,10 @@ scopes = ["write:supplemental"]
 token_env = "LETHE_API_SYNC_TOKEN"
 scopes = ["admin:sync", "admin:health"]
 
+# Source connector configuration. Leave arrays empty for import-only instances.
 [sources]
 
+# Slack source instances use bot credentials and explicit channel allowlists.
 [[sources.slack]]
 id = "slack-primary"
 bot_token_env = "LETHE_SLACK_PRIMARY_BOT_TOKEN"
@@ -116,11 +141,13 @@ thread_token_env = "LETHE_SLACK_PRIMARY_THREAD_TOKEN"
 channel_ids = ["C01234567", "C08999999"]
 mention_user_ids = ["U01234567"]
 
+# Google Slides sources read configured presentation snapshots.
 [[sources.google_slides]]
 id = "gslides-primary"
 access_token_env = "LETHE_GOOGLE_PRIMARY_ACCESS_TOKEN"
 presentation_ids = ["replace-with-presentation-id"]
 
+# Derivation provider configuration for slide analysis.
 [derivation]
 gemini_api_key_env = "LETHE_GEMINI_API_KEY"
 gemini_model = "gemini-3-flash-preview"

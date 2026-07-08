@@ -11,7 +11,9 @@ pub struct ImportApiConfig {
 pub enum ImportClientError {
     #[error("{0} must not be blank")]
     BlankField(&'static str),
-    #[error("environment variable {0} must be set")]
+    #[error(
+        "missing environment variable {0}. Set {0} to an API token with write:observations, or pass --api-token-env=<name> for the variable you already set"
+    )]
     MissingTokenEnv(String),
     #[error("HTTP client error: {0}")]
     Http(#[from] reqwest::Error),

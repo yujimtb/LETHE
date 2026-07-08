@@ -158,6 +158,9 @@ MCP read port は別 listener で提供します。
 - `GET /.well-known/oauth-protected-resource/mcp`
 - `POST /mcp` (Streamable HTTP / JSON-RPC)
 
+MCP read tools that accept `limit` cap it at 20 and report clamp metadata in
+`_meta["lethe/response_limit"]`; `search_lake` snippets are capped at 240
+characters and `matched_ranges` at 20 per record.
 公開する場合は Tailscale Funnel の対象を MCP host port のみに限定してください。
 内部 API port、`/admin/*`、管理面を Funnel に晒してはいけません。この self-host
 構成の MCP endpoint は本 PC が起動し、selfhost プロセスと Funnel が稼働している

@@ -7,6 +7,24 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub const HELP: &str = "\
+Extract and verify OpenSpec requirement coverage evidence.
+
+Usage: lethe-review-harness <extract|generate|verify|diff> [options]
+
+Required arguments:
+  extract  --spec-root=<path>
+  generate --spec-root=<path> --evidence-root=<path> --tasks-root=<path>
+  verify   --spec-root=<path> --evidence-root=<path> --tasks-root=<path>
+  diff     --base=<path> --head=<path>
+
+Required environment:
+  none
+
+Example:
+  lethe-review-harness verify --spec-root=openspec\\specs --evidence-root=. --tasks-root=openspec\\changes
+";
+
 #[derive(Debug, Error)]
 pub enum HarnessError {
     #[error("failed to access {path}: {source}")]
@@ -23,9 +41,9 @@ pub enum HarnessError {
     },
     #[error("failed to serialize JSON: {0}")]
     JsonWrite(#[from] serde_json::Error),
-    #[error("invalid command: {0}")]
+    #[error("invalid command: {0}. Run with --help for usage")]
     InvalidCommand(String),
-    #[error("missing required argument: {0}")]
+    #[error("missing required argument: {0}. Run with --help for usage")]
     MissingArgument(String),
     #[error("missing requirement ID at {source_path}:{line}: {text}")]
     MissingRequirementId {
@@ -130,6 +148,9 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<String, Harness
     let Some(command) = args.first() else {
         return Err(HarnessError::MissingArgument("command".to_string()));
     };
+    if command == "--help" || command == "-h" {
+        return Ok(HELP.to_owned());
+    }
     let options = parse_options(&args[1..])?;
 
     match command.as_str() {
@@ -760,6 +781,16 @@ mod tests {
 
         let json: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(json["requirements"][0]["id"], "RVH-01");
+    }
+
+    // covers: RVH-01
+    #[test]
+    fn cli_help_emits_usage() {
+        let output = run_cli(vec!["--help".to_string()]).unwrap();
+
+        assert!(output.contains("Extract and verify"));
+        assert!(output.contains("Required arguments"));
+        assert!(output.contains("--spec-root=<path>"));
     }
 
     // covers: RVH-02

@@ -175,15 +175,12 @@ impl ClaimQueueProjection {
 
     pub fn search_decisions(&self, query: &str, limit: usize) -> Vec<DecisionView> {
         let query = normalize_search_text(query);
+        let terms = split_query_terms(&query);
         self.decisions
             .iter()
-            .filter(|decision| {
-                normalize_search_text(&format!(
-                    "{}\n{}",
-                    decision.statement,
-                    decision.rationale.as_deref().unwrap_or("")
-                ))
-                .contains(&query)
+            .filter(|decision| match terms.as_slice() {
+                [_, _, ..] => terms.iter().all(|term| decision.search_text.contains(term)),
+                _ => decision.search_text.contains(&query),
             })
             .take(limit)
             .cloned()
@@ -820,6 +817,14 @@ fn normalize_search_text(value: &str) -> String {
     normalize_text(value).to_lowercase()
 }
 
+fn split_query_terms(query: &str) -> Vec<String> {
+    query
+        .split(|ch| matches!(ch, ' ' | '\t' | '\u{3000}'))
+        .filter(|term| !term.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn sha256_hex(value: &str) -> String {
     hex::encode(sha2::Sha256::digest(value.as_bytes()))
 }
@@ -1158,5 +1163,58 @@ mod tests {
             old.superseded_by.as_ref().map(SupplementalId::as_str),
             Some("sup:decision-b")
         );
+    }
+
+    #[test]
+    fn decision_search_requires_all_compound_terms() {
+        let records = vec![
+            decision(
+                "sup:nanihold-roadmap",
+                "obs:conversation",
+                "Adopt Nanihold OS storage model",
+                "The roadmap keeps the sync layer simple",
+                vec![],
+                at(1),
+            ),
+            decision(
+                "sup:nanihold-only",
+                "obs:conversation",
+                "Adopt Nanihold OS storage model",
+                "No schedule decision yet",
+                vec![],
+                at(2),
+            ),
+            decision(
+                "sup:roadmap-only",
+                "obs:conversation",
+                "Publish the roadmap",
+                "No product name is attached",
+                vec![],
+                at(3),
+            ),
+        ];
+
+        let projection = ClaimQueueProjector.project_records(&records);
+        let matches = projection.search_decisions("Nanihold roadmap", 10);
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id.as_str(), "sup:nanihold-roadmap");
+    }
+
+    #[test]
+    fn decision_search_splits_fullwidth_space() {
+        let records = vec![decision(
+            "sup:nanihold-roadmap",
+            "obs:conversation",
+            "Adopt Nanihold OS storage model",
+            "ロードマップを先に固定する",
+            vec![],
+            at(1),
+        )];
+
+        let projection = ClaimQueueProjector.project_records(&records);
+        let matches = projection.search_decisions("Nanihold　ロードマップ", 10);
+
+        assert_eq!(matches.len(), 1);
     }
 }

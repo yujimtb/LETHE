@@ -22,16 +22,15 @@ use crate::self_host::mcp_contract::{
 };
 use lethe_projection_claim_queue::ClaimState;
 
-const SEARCH_LAKE_DESCRIPTION: &str =
-    "Search projected corpus text across lake records; returns record IDs and snippets.";
+const MCP_RESPONSE_LIMIT: usize = 20;
+const MCP_DEFAULT_LIMIT: usize = 20;
+const SEARCH_LAKE_DESCRIPTION: &str = "Search projected corpus text across lake records; returns record IDs and hit-centered snippets. Query syntax: one term works as before; space, tab, or fullwidth-space separated terms require every term to appear in any order (AND). Terms may be Rust regex; invalid regex terms in compound queries are matched literally. limit is capped at 20 for MCP response safety; snippets are capped at 240 chars and matched_ranges at 20 per record.";
 const GET_RECORD_DESCRIPTION: &str =
     "Fetch one projected corpus record by record_id; returns RecordNotFound if absent.";
 const GET_THREAD_DESCRIPTION: &str =
     "Fetch projected thread context for a corpus record or thread key.";
-const CLAIM_QUEUE_DESCRIPTION: &str =
-    "List folded claim groups from the claim queue projection, filterable by state.";
-const SEARCH_DECISIONS_DESCRIPTION: &str =
-    "Search the folded decision ledger with supersedes resolution.";
+const CLAIM_QUEUE_DESCRIPTION: &str = "List folded claim groups from the claim queue projection, filterable by state. limit is capped at 20 for MCP response safety.";
+const SEARCH_DECISIONS_DESCRIPTION: &str = "Search the folded decision ledger with supersedes resolution. Query syntax: one term uses partial match; space, tab, or fullwidth-space separated terms require every term to appear in any order (AND). limit is capped at 20 for MCP response safety.";
 const WRITE_SUPPLEMENTAL_DESCRIPTION: &str = "Write one supplemental record as post-processing for an observation already ingested into the lake. This is not for live self-enrichment during the same conversation. Kinds with anchor_required=true require resolved anchors; system-event kinds with anchor_required=false require payload.origin.";
 const MCP_READ_SCOPE: &str = "mcp:read";
 const MCP_WRITE_SUPPLEMENTAL_SCOPE: &str = "write:supplemental";
@@ -191,7 +190,7 @@ fn tools_list_result() -> Value {
                     "properties": {
                         "query": { "type": "string" },
                         "source_types": { "type": "array", "items": { "type": "string" } },
-                        "limit": { "type": "integer", "minimum": 1 },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 20 },
                         "cursor": { "type": "string" }
                     }
                 })
@@ -232,7 +231,7 @@ fn tools_list_result() -> Value {
                             "enum": ["open", "dispatched", "verified", "refuted", "inconclusive", "terminated", "parked"]
                         },
                         "verification_mode": { "type": "string", "enum": ["check", "generate"] },
-                        "limit": { "type": "integer", "minimum": 1 },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 20 },
                         "cursor": { "type": "string" }
                     }
                 })
@@ -246,7 +245,7 @@ fn tools_list_result() -> Value {
                     "additionalProperties": false,
                     "properties": {
                         "query": { "type": "string" },
-                        "limit": { "type": "integer", "minimum": 1 }
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 20 }
                     }
                 })
             ),
@@ -337,17 +336,18 @@ fn call_tool(
             }
             let args: SearchLakeArguments = parse_arguments(params.arguments)?;
             ensure_not_blank("query", &args.query)?;
+            let limit = mcp_limit(args.limit)?;
             let response = service.corpus_grep_response(&lethe_api::api::grep::GrepRequest {
                 pattern: args.query,
                 filters: lethe_api::api::grep::GrepFilters {
                     types: args.source_types,
                     ..lethe_api::api::grep::GrepFilters::default()
                 },
-                limit: args.limit,
+                limit: Some(limit.effective_limit),
                 cursor: args.cursor,
                 ..lethe_api::api::grep::GrepRequest::default()
             })?;
-            tool_result(response)
+            tool_result_with_limit(response, limit)
         }
         "get_record" => {
             if let Some(result) = missing_scope_result(token, MCP_READ_SCOPE, metadata_url) {
@@ -372,14 +372,15 @@ fn call_tool(
                 return Ok(result);
             }
             let args: ClaimQueueArguments = parse_arguments(params.arguments)?;
+            let limit = mcp_limit(args.limit)?;
             let response = service.claim_queue_response_filtered(
                 parse_claim_state(args.state.as_deref())?,
                 args.verification_mode.as_deref(),
                 None,
-                args.limit.unwrap_or(20),
+                limit.effective_limit,
                 args.cursor.as_deref(),
             )?;
-            tool_result(response)
+            tool_result_with_limit(response, limit)
         }
         "search_decisions" => {
             if let Some(result) = missing_scope_result(token, MCP_READ_SCOPE, metadata_url) {
@@ -387,9 +388,10 @@ fn call_tool(
             }
             let args: SearchDecisionsArguments = parse_arguments(params.arguments)?;
             ensure_not_blank("query", &args.query)?;
+            let limit = mcp_limit(args.limit)?;
             let response = service
-                .decision_search_response(Some(args.query.as_str()), args.limit.unwrap_or(20))?;
-            tool_result(response)
+                .decision_search_response(Some(args.query.as_str()), limit.effective_limit)?;
+            tool_result_with_limit(response, limit)
         }
         "write_supplemental" => {
             if let Some(result) =
@@ -462,6 +464,51 @@ fn tool_result<T: Serialize>(value: T) -> Result<Value, JsonRpcAppError> {
             { "type": "text", "text": text }
         ],
         "structuredContent": structured,
+        "isError": false,
+    }))
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct McpLimitInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_limit: Option<usize>,
+    effective_limit: usize,
+    max_limit: usize,
+    limit_clamped: bool,
+}
+
+fn mcp_limit(requested_limit: Option<usize>) -> Result<McpLimitInfo, JsonRpcAppError> {
+    let requested = requested_limit.unwrap_or(MCP_DEFAULT_LIMIT);
+    if requested == 0 {
+        return Err(JsonRpcAppError::invalid_params(format!(
+            "limit must be between 1 and {MCP_RESPONSE_LIMIT}"
+        )));
+    }
+    let effective_limit = requested.min(MCP_RESPONSE_LIMIT);
+    Ok(McpLimitInfo {
+        requested_limit,
+        effective_limit,
+        max_limit: MCP_RESPONSE_LIMIT,
+        limit_clamped: requested > MCP_RESPONSE_LIMIT,
+    })
+}
+
+fn tool_result_with_limit<T: Serialize>(
+    value: T,
+    limit: McpLimitInfo,
+) -> Result<Value, JsonRpcAppError> {
+    let structured = serde_json::to_value(value)
+        .map_err(|error| JsonRpcAppError::internal(error.to_string()))?;
+    let text = serde_json::to_string_pretty(&structured)
+        .map_err(|error| JsonRpcAppError::internal(error.to_string()))?;
+    Ok(json!({
+        "content": [
+            { "type": "text", "text": text }
+        ],
+        "structuredContent": structured,
+        "_meta": {
+            "lethe/response_limit": limit
+        },
         "isError": false,
     }))
 }

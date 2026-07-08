@@ -66,7 +66,7 @@ Grep API はソース種別 (types)、日時範囲 (from/to)、チャンネル (
 - **THEN** その範囲内のレコードのみが検索対象になる
 
 ### Requirement: GREP-07 レスポンス形状
-Grep API のレスポンスは以下のフィールドを含む SHALL する: `matches[]` (record_id, source_type, anchor_url, source_title, source_location, timestamp, snippet, matched_ranges, metadata)、`next_cursor`、`complete`、`projection_watermark`。
+Grep API のレスポンスは以下のフィールドを含む SHALL する: `matches[]` (record_id, source_type, anchor_url, source_title, source_location, timestamp, snippet, matched_ranges, metadata)、`next_cursor`、`complete`、`projection_watermark`。snippet は省略記号を含めて最大 240 文字、`matched_ranges` は 1 レコードあたり最大 20 件に制限する。
 
 #### Scenario: match レスポンスのフィールド
 - **WHEN** grep 検索で match が見つかる
@@ -75,6 +75,14 @@ Grep API のレスポンスは以下のフィールドを含む SHALL する: `m
 #### Scenario: projection_watermark の付与
 - **WHEN** grep 検索結果が返される
 - **THEN** レスポンスに projection_watermark が含まれ、同じ watermark では同じ入力に対して同じ結果が再現可能である
+
+#### Scenario: snippet はヒット位置を含む
+- **WHEN** 一致箇所が長い本文の先頭240文字より後ろにある
+- **THEN** snippet は最初のヒット位置を中心にした窓を返し、前後が省略された場合は `...` を付ける
+
+#### Scenario: レコード単位の応答サイズ上限
+- **WHEN** 1 レコード内で同一 pattern が多数一致する
+- **THEN** snippet は最大 240 文字、`matched_ranges` は最大 20 件に制限される
 
 ### Requirement: GREP-08 Trigram Index による高速化
 実装上の高速化として trigram index を持ってよい SHALL する。ただし trigram index は候補絞り込みにのみ使用し、最終判定は regex の意味論とする。
@@ -94,7 +102,18 @@ Grep API は regex 実行時間に上限を設ける SHALL する。既定は 50
 - **WHEN** regex の実行が設定されたタイムアウトを超える
 - **THEN** 実行が打ち切られ、エラーレスポンスが返される
 
-### Requirement: GREP-10 get_record エンドポイント
+### Requirement: GREP-10 複合語 AND 検索
+Grep API は pattern を半角スペース・全角スペース・タブで複数 term に分割できる SHALL する。複数 term が存在する場合、term の順序や距離に関係なく、全 term に一致するレコードのみを返す。各 term は regex として解釈し、複合語検索中の不正 regex term はリテラル部分一致として扱う。単一 term の pattern は従来通り単一 regex として扱い、不正 regex はエラーとする。
+
+#### Scenario: 複合語 AND
+- **WHEN** `pattern: "Nanihold OS ロードマップ"` で grep API が呼び出される
+- **THEN** `Nanihold`、`OS`、`ロードマップ` の全てを含むレコードだけが返る
+
+#### Scenario: 全角スペース区切り
+- **WHEN** `pattern: "Nanihold　ロードマップ"` で grep API が呼び出される
+- **THEN** 半角スペースと同じく複数 term AND として検索される
+
+### Requirement: GREP-11 get_record エンドポイント
 LETHE は record_id から露出可能な全文または詳細を取得する API を提供 SHALL する。Corpus Projection に含まれないレコードはアクセス拒否する。
 
 #### Scenario: 露出可能なレコードの取得
@@ -105,14 +124,14 @@ LETHE は record_id から露出可能な全文または詳細を取得する AP
 - **WHEN** Corpus Projection に含まれない record_id で get_record が呼び出される
 - **THEN** 403 またはレコード不在として拒否される
 
-### Requirement: GREP-11 get_thread エンドポイント
+### Requirement: GREP-12 get_thread エンドポイント
 LETHE は Slack thread の文脈を取得する API を提供 SHALL する。Corpus Projection に含まれるメッセージのみ返す。
 
 #### Scenario: スレッド文脈の取得
 - **WHEN** parent permalink または thread_ts で get_thread が呼び出される
 - **THEN** そのスレッド内の Corpus Projection に含まれるメッセージ一覧が返される
 
-### Requirement: GREP-12 resolve_link エンドポイント
+### Requirement: GREP-13 resolve_link エンドポイント
 LETHE は Slack permalink、Drive URL、Docs URL などの外部 URL を LETHE record_id に解決する API を提供 SHALL する。
 
 #### Scenario: Slack permalink の解決
@@ -122,4 +141,3 @@ LETHE は Slack permalink、Drive URL、Docs URL などの外部 URL を LETHE r
 #### Scenario: Google Drive URL の解決
 - **WHEN** Google Docs/Sheets/Forms/Slides/Drive の URL で resolve_link が呼び出される
 - **THEN** 対応する Corpus Projection 内の record_id が返される
-

@@ -7,11 +7,39 @@ use lethe_selfhost::attribute_inventory::{
     summarize_documents, write_json_file,
 };
 use lethe_selfhost::self_host::app::AppService;
-use lethe_selfhost::self_host::config::SelfHostConfig;
+use lethe_selfhost::self_host::config::{ConfigError, SelfHostConfig};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let options = parse_options(env::args().skip(1))?;
-    let config = SelfHostConfig::from_env()?;
+const HELP: &str = "\
+Review and export the attribute inventory against a configured LETHE selfhost snapshot.
+
+Usage: lethe-attribute-inventory [--refresh-data] [--interactive] [--state=<path>] [--offset=<n>] [--limit=<n>] [--export-discovered=<path>] [--export-aliases=<path>] [--import-aliases=<path>]
+
+Required arguments:
+  none
+
+Required environment:
+  LETHE_CONFIG_PATH must point to a selfhost TOML config. Every environment variable referenced by that config must also be set.
+
+Example:
+  lethe-attribute-inventory --state=.\\data\\attribute_inventory_state.json --limit=50 --interactive
+";
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if help_requested(&args) {
+        print!("{HELP}");
+        return Ok(());
+    }
+
+    let options = parse_options(args.into_iter())?;
+    let config = SelfHostConfig::from_env().map_err(friendly_config_error)?;
     let service = AppService::bootstrap(config)?;
 
     if options.refresh_data {
@@ -246,6 +274,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn help_requested(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--help" || arg == "-h")
+}
+
+fn friendly_config_error(error: ConfigError) -> Box<dyn std::error::Error> {
+    match error {
+        ConfigError::MissingEnv(name) => format!(
+            "missing environment variable {name}. Set LETHE_CONFIG_PATH to the selfhost TOML config and set every environment variable referenced by that config before running."
+        )
+        .into(),
+        other => format!("configuration error: {other}").into(),
+    }
+}
+
 struct CliOptions {
     refresh_data: bool,
     state_path: PathBuf,
@@ -299,4 +341,18 @@ fn parse_options(
         import_aliases_path,
         interactive,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_flags_are_detected() {
+        assert!(help_requested(&["--help".to_owned()]));
+        assert!(help_requested(&["-h".to_owned()]));
+        assert!(HELP.contains("Review and export"));
+        assert!(HELP.contains("Required arguments"));
+        assert!(HELP.contains("LETHE_CONFIG_PATH"));
+    }
 }

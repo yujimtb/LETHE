@@ -6,8 +6,39 @@ use lethe_adapter_github::github::mapper::GitHubDumpMapper;
 use lethe_core::domain::SemVer;
 use lethe_selfhost::self_host::import_client::ImportApiConfig;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let options = parse_options(env::args().skip(1))?;
+const HELP: &str = "\
+Import a GitHub JSON dump into LETHE through the online import API.
+
+Usage: lethe-import-github --dump=<path> --source-instance=<id> --base-url=<url> --api-token-env=<name>
+
+Required arguments:
+  --dump=<path>             GitHub dump JSON file
+  --source-instance=<id>    Stable source instance id, for example github-personal
+  --base-url=<url>          LETHE internal API base URL
+  --api-token-env=<name>    Environment variable that holds the API token
+
+Required environment:
+  The variable named by --api-token-env must be set to a token with write:observations.
+
+Example:
+  lethe-import-github --dump=data\\github-scratch\\github-dump.json --source-instance=github-personal --base-url=http://127.0.0.1:8080 --api-token-env=LETHE_API_WRITE_TOKEN
+";
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if help_requested(&args) {
+        print!("{HELP}");
+        return Ok(());
+    }
+
+    let options = parse_options(args.into_iter())?;
     let json = fs::read_to_string(&options.dump_path)?;
     let mapper = GitHubDumpMapper::new(SemVer::new("1.0.0"));
     let drafts = mapper.import_json_str(&json)?;
@@ -23,6 +54,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         report.ingested, report.duplicates, report.quarantined
     );
     Ok(())
+}
+
+fn help_requested(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--help" || arg == "-h")
 }
 
 struct CliOptions {
@@ -45,28 +80,67 @@ fn parse_options(
             dump_path = Some(PathBuf::from(raw));
         } else if let Some(raw) = arg.strip_prefix("--source-instance=") {
             if raw.trim().is_empty() {
-                return Err("--source-instance must not be blank".into());
+                return Err(
+                    "--source-instance must not be blank. Pass --source-instance=<id>.".into(),
+                );
             }
             source_instance = Some(raw.to_owned());
         } else if let Some(raw) = arg.strip_prefix("--base-url=") {
             if raw.trim().is_empty() {
-                return Err("--base-url must not be blank".into());
+                return Err("--base-url must not be blank. Pass --base-url=<url>.".into());
             }
             base_url = Some(raw.to_owned());
         } else if let Some(raw) = arg.strip_prefix("--api-token-env=") {
             if raw.trim().is_empty() {
-                return Err("--api-token-env must not be blank".into());
+                return Err(
+                    "--api-token-env must not be blank. Pass --api-token-env=<name>.".into(),
+                );
             }
             api_token_env = Some(raw.to_owned());
         } else {
-            return Err(format!("unknown argument: {arg}").into());
+            return Err(format!("unknown argument: {arg}. Run with --help for usage.").into());
         }
     }
 
     Ok(CliOptions {
-        dump_path: dump_path.ok_or("--dump=<path> is required")?,
-        source_instance: source_instance.ok_or("--source-instance=<id> is required")?,
-        base_url: base_url.ok_or("--base-url=<url> is required")?,
-        api_token_env: api_token_env.ok_or("--api-token-env=<name> is required")?,
+        dump_path: dump_path.ok_or_else(|| {
+            missing_argument(
+                "--dump=<path>",
+                "Pass --dump=data\\github-scratch\\github-dump.json.",
+            )
+        })?,
+        source_instance: source_instance.ok_or_else(|| {
+            missing_argument(
+                "--source-instance=<id>",
+                "Pass --source-instance=github-personal.",
+            )
+        })?,
+        base_url: base_url.ok_or_else(|| {
+            missing_argument("--base-url=<url>", "Pass --base-url=http://127.0.0.1:8080.")
+        })?,
+        api_token_env: api_token_env.ok_or_else(|| {
+            missing_argument(
+                "--api-token-env=<name>",
+                "Pass --api-token-env=LETHE_API_WRITE_TOKEN and set that environment variable.",
+            )
+        })?,
     })
+}
+
+fn missing_argument(name: &str, fix: &str) -> Box<dyn std::error::Error> {
+    format!("missing required argument {name}. {fix} Run with --help for usage.").into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_flags_are_detected() {
+        assert!(help_requested(&["--help".to_owned()]));
+        assert!(help_requested(&["-h".to_owned()]));
+        assert!(HELP.contains("Import a GitHub"));
+        assert!(HELP.contains("--dump=<path>"));
+        assert!(HELP.contains("--api-token-env=<name>"));
+    }
 }

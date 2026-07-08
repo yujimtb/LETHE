@@ -97,6 +97,9 @@ dedupe, audit, projection rebuild, and materialization inside the running
 service. Do not write directly to `deploy/personal-lake/data/lethe.sqlite3` while
 the container is running; direct SQLite access is reserved for explicit offline
 maintenance or recovery.
+Each import CLI supports `--help` / `-h`; use it before running a new source to
+confirm the required arguments and the token environment variable expected by
+`--api-token-env`.
 
 The 2026-07-06 production rebuild used:
 
@@ -128,6 +131,15 @@ Deep health:
 ```powershell
 Invoke-RestMethod -Headers @{ Authorization = "Bearer $env:LETHE_API_SYNC_TOKEN" } `
   http://127.0.0.1:8080/health/deep
+```
+
+Human-readable status summary:
+
+```powershell
+./scripts/lethe_status.ps1 `
+  -BaseUrl http://127.0.0.1:8080 `
+  -TokenEnv LETHE_API_SYNC_TOKEN `
+  -ReadTokenEnv LETHE_API_READ_TOKEN
 ```
 
 Gate W0 check:
@@ -261,6 +273,11 @@ The five read tools advertise read-only annotations:
 schema and anchor validation path as `POST /supplementals`. The tool is only for
 post-processing records already ingested into the lake. It must reject missing
 or unresolved anchors for anchor-required kinds.
+MCP read tools that accept `limit` cap it at 20 for response-size safety. When a
+client requests a larger value, the tool result includes
+`_meta["lethe/response_limit"]` with requested, effective, max, and clamped
+fields. `search_lake` snippets are capped at 240 characters including ellipses,
+and `matched_ranges` is capped at 20 ranges per record.
 
 Browser-use production verification on 2026-07-06 confirmed that the public
 protected-resource metadata advertises both `mcp:read` and

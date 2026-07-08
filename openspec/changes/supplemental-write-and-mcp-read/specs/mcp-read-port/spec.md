@@ -55,7 +55,7 @@ MCP サーバはリソースサーバとして振る舞い SHALL する: (1) `/.
 | `search_decisions` | read | `mcp:read` | 決定台帳の検索(supersedes 解決済み) | claim-queue-projection |
 | `write_supplemental` | write | `write:supplemental` | 既存 observation/blob/supplemental anchor から派生した supplemental record を 1 件作成 | supplemental store + projection refresh |
 
-read ツールは Projection のみを読み、生 supplemental・生 observation ストアへ直接アクセスして SHALL NOT ならない(Filtering-before-Exposure)。`write_supplemental` は HTTP `POST /supplementals` と同じ検証・永続化・projection refresh 経路を使い、anchor 未解決または未登録 kind は明示的に拒否 SHALL する。ツール説明文・annotations・`securitySchemes` は AI の選択精度とクライアント側確認 UI を左右する契約物として spec レビュー対象に含める。
+read ツールは Projection のみを読み、生 supplemental・生 observation ストアへ直接アクセスして SHALL NOT ならない(Filtering-before-Exposure)。`search_lake` と `search_decisions` の tool description は、1語検索と空白・タブ・全角スペース区切りの複数語AND検索を明示する。`limit` を持つ MCP read ツールは MCP 応答サイズ保護のため `limit` を最大 20 にクランプし、tool result `_meta["lethe/response_limit"]` に requested/effective/max/clamped を含める。`search_lake` は snippet 最大 240 文字、`matched_ranges` 最大 20 件/record の上限も tool description に明示する。`write_supplemental` は HTTP `POST /supplementals` と同じ検証・永続化・projection refresh 経路を使い、anchor 未解決または未登録 kind は明示的に拒否 SHALL する。ツール説明文・annotations・`securitySchemes` は AI の選択精度とクライアント側確認 UI を左右する契約物として spec レビュー対象に含める。
 
 #### Scenario: ChatGPT write action discovery
 - **WHEN** ChatGPT.com が `tools/list` を取得する
@@ -68,6 +68,10 @@ read ツールは Projection のみを読み、生 supplemental・生 observatio
 #### Scenario: エージェントの claim 取得
 - **WHEN** 接続済みの Claude が「いま未検証の主張は何か」に answering するため claim_queue を verification_mode = generate フィルタで呼ぶ
 - **THEN** 同源グループ形の open claim 一覧が返る
+
+#### Scenario: MCP read limit の安全クランプ
+- **WHEN** MCP client が `search_lake` / `claim_queue` / `search_decisions` に `limit > 20` を指定する
+- **THEN** サーバは実効 `limit = 20` で応答し、tool result `_meta["lethe/response_limit"].limit_clamped = true` を返す
 
 ### Requirement: MCPR-05 個人 lake の検索範囲
 

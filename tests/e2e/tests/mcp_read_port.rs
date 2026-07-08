@@ -255,6 +255,21 @@ fn service_with_records(oauth: McpOAuthConfig) -> (PathBuf, AppService) {
     (root, service)
 }
 
+fn service_with_matching_records(oauth: McpOAuthConfig, count: usize) -> (PathBuf, AppService) {
+    let (root, db, blobs) = temp_paths();
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    for index in 0..count {
+        persistence
+            .persist_observation(&observation(
+                &format!("needle record {index}"),
+                &format!("bulk-{index}"),
+            ))
+            .unwrap();
+    }
+    let service = AppService::bootstrap(test_config(db, blobs, oauth)).unwrap();
+    (root, service)
+}
+
 fn service_with_records_and_first_id(
     oauth: McpOAuthConfig,
 ) -> (PathBuf, AppService, lethe_core::domain::ObservationId) {
@@ -591,7 +606,29 @@ fn six_mcp_tools_have_contracts_and_read_via_projection() {
                 "write:supplemental"
             );
         } else {
-            assert!(description.len() <= 100);
+            match tool["name"].as_str().unwrap() {
+                "search_lake" => {
+                    assert!(description.contains("AND"));
+                    assert!(description.contains("fullwidth-space"));
+                    assert!(description.contains("regex"));
+                    assert!(description.contains("capped at 20"));
+                    assert!(description.contains("240 chars"));
+                    assert!(description.contains("matched_ranges"));
+                    assert_eq!(tool["inputSchema"]["properties"]["limit"]["maximum"], 20);
+                }
+                "search_decisions" => {
+                    assert!(description.contains("AND"));
+                    assert!(description.contains("partial match"));
+                    assert!(description.contains("fullwidth-space"));
+                    assert!(description.contains("capped at 20"));
+                    assert_eq!(tool["inputSchema"]["properties"]["limit"]["maximum"], 20);
+                }
+                "claim_queue" => {
+                    assert!(description.contains("capped at 20"));
+                    assert_eq!(tool["inputSchema"]["properties"]["limit"]["maximum"], 20);
+                }
+                _ => assert!(description.len() <= 100),
+            }
             assert!(!description.to_ascii_lowercase().contains("write"));
             assert_eq!(tool["annotations"]["readOnlyHint"], true);
             assert_eq!(tool["securitySchemes"][0]["scopes"][0], "mcp:read");
@@ -727,6 +764,41 @@ fn six_mcp_tools_have_contracts_and_read_via_projection() {
             .as_str()
             .is_some_and(|message| message.contains("RecordNotFound"))
     );
+}
+
+#[test]
+fn search_lake_clamps_mcp_limit_and_reports_effective_limit() {
+    let (signer, oauth) = signer_and_oauth();
+    let (_root, service) = service_with_matching_records(oauth, 25);
+    let app = build_mcp_router(service);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let token = valid_token(&signer);
+
+    let response = runtime
+        .block_on(async {
+            app.oneshot(mcp_request(
+                &token,
+                tool_call(
+                    "search_lake",
+                    serde_json::json!({"query": "needle", "limit": 50}),
+                ),
+            ))
+            .await
+        })
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(&runtime, response);
+    let matches = json["result"]["structuredContent"]["data"]["matches"]
+        .as_array()
+        .unwrap();
+    assert_eq!(matches.len(), 20);
+    assert!(json["result"]["structuredContent"]["data"]["next_cursor"].is_string());
+    let limit = &json["result"]["_meta"]["lethe/response_limit"];
+    assert_eq!(limit["requested_limit"], 50);
+    assert_eq!(limit["effective_limit"], 20);
+    assert_eq!(limit["max_limit"], 20);
+    assert_eq!(limit["limit_clamped"], true);
 }
 
 #[test]

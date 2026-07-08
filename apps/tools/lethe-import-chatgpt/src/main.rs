@@ -6,8 +6,39 @@ use lethe_adapter_chatgpt::{ChatGptImportFilter, ChatGptImporter};
 use lethe_core::domain::SemVer;
 use lethe_selfhost::self_host::import_client::ImportApiConfig;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let options = parse_options(env::args().skip(1))?;
+const HELP: &str = "\
+Import ChatGPT export files into LETHE through the online import API.
+
+Usage: lethe-import-chatgpt --archive-root=<path> --source-instance=<id> --base-url=<url> --api-token-env=<name> [--backfill] [--from=<rfc3339>] [--to=<rfc3339>] [--conversation-id=<id>] [--json]
+
+Required arguments:
+  --archive-root=<path>     Archive working copy containing chatgpt/ JSON files
+  --source-instance=<id>    Stable source instance id, for example chatgpt-personal
+  --base-url=<url>          LETHE internal API base URL
+  --api-token-env=<name>    Environment variable that holds the API token
+
+Required environment:
+  The variable named by --api-token-env must be set to a token with write:observations.
+
+Example:
+  lethe-import-chatgpt --archive-root=D:\\archive --source-instance=chatgpt-personal --base-url=http://127.0.0.1:8080 --api-token-env=LETHE_API_WRITE_TOKEN --backfill
+";
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if help_requested(&args) {
+        print!("{HELP}");
+        return Ok(());
+    }
+
+    let options = parse_options(args.into_iter())?;
     let importer = ChatGptImporter::new(SemVer::new("1.0.0"));
     let batch = importer.import_archive_root(&options.archive_root, &options.filter)?;
 
@@ -57,6 +88,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn help_requested(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--help" || arg == "-h")
+}
+
 struct CliOptions {
     archive_root: PathBuf,
     source_instance: String,
@@ -100,14 +135,31 @@ fn parse_options(
         } else if arg == "--json" {
             json = true;
         } else {
-            return Err(format!("unknown argument: {arg}").into());
+            return Err(format!("unknown argument: {arg}. Run with --help for usage.").into());
         }
     }
     Ok(CliOptions {
-        archive_root: archive_root.ok_or("--archive-root=<path> is required")?,
-        source_instance: source_instance.ok_or("--source-instance=<id> is required")?,
-        base_url: base_url.ok_or("--base-url=<url> is required")?,
-        api_token_env: api_token_env.ok_or("--api-token-env=<name> is required")?,
+        archive_root: archive_root.ok_or_else(|| {
+            missing_argument(
+                "--archive-root=<path>",
+                "Pass --archive-root=D:\\path\\to\\archive.",
+            )
+        })?,
+        source_instance: source_instance.ok_or_else(|| {
+            missing_argument(
+                "--source-instance=<id>",
+                "Pass --source-instance=chatgpt-personal.",
+            )
+        })?,
+        base_url: base_url.ok_or_else(|| {
+            missing_argument("--base-url=<url>", "Pass --base-url=http://127.0.0.1:8080.")
+        })?,
+        api_token_env: api_token_env.ok_or_else(|| {
+            missing_argument(
+                "--api-token-env=<name>",
+                "Pass --api-token-env=LETHE_API_WRITE_TOKEN and set that environment variable.",
+            )
+        })?,
         filter,
         json,
     })
@@ -115,13 +167,37 @@ fn parse_options(
 
 fn parse_rfc3339(name: &str, raw: &str) -> Result<DateTime<Utc>, Box<dyn std::error::Error>> {
     require_non_blank(name, raw)?;
-    Ok(DateTime::parse_from_rfc3339(raw)?.to_utc())
+    Ok(DateTime::parse_from_rfc3339(raw)
+        .map_err(|error| {
+            format!(
+                "{name} must be an RFC3339 timestamp, for example 2026-07-01T00:00:00Z: {error}"
+            )
+        })?
+        .to_utc())
 }
 
 fn require_non_blank(name: &str, raw: &str) -> Result<(), Box<dyn std::error::Error>> {
     if raw.trim().is_empty() {
-        Err(format!("{name} must not be blank").into())
+        Err(format!("{name} must not be blank. Pass {name}=<value>.").into())
     } else {
         Ok(())
+    }
+}
+
+fn missing_argument(name: &str, fix: &str) -> Box<dyn std::error::Error> {
+    format!("missing required argument {name}. {fix} Run with --help for usage.").into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_flags_are_detected() {
+        assert!(help_requested(&["--help".to_owned()]));
+        assert!(help_requested(&["-h".to_owned()]));
+        assert!(HELP.contains("Import ChatGPT"));
+        assert!(HELP.contains("--archive-root=<path>"));
+        assert!(HELP.contains("--api-token-env=<name>"));
     }
 }

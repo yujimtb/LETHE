@@ -10,6 +10,9 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
+pub const SNIPPET_MAX_CHARS: usize = 240;
+pub const MATCHED_RANGES_LIMIT: usize = 20;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GrepRequest {
     pub pattern: String,
@@ -213,8 +216,7 @@ impl GrepEngine {
             NormalizationMode::Nfkc => normalize(&request.pattern),
             NormalizationMode::None => request.pattern.clone(),
         };
-        let regex =
-            Regex::new(&pattern).map_err(|err| GrepError::InvalidPattern(err.to_string()))?;
+        let matcher = QueryMatcher::compile(pattern)?;
         let filtered = records
             .iter()
             .filter(|record| filters_match(record, &request.filters))
@@ -224,7 +226,7 @@ impl GrepEngine {
             .then(|| TrigramIndex::build_refs(&filtered));
         let candidate_indices = index
             .as_ref()
-            .and_then(|index| index.candidate_indices(&pattern))
+            .and_then(|index| index.candidate_indices_for_matcher(&matcher))
             .unwrap_or_else(|| (0..filtered.len()).collect());
 
         let mut candidates = candidate_indices
@@ -257,7 +259,7 @@ impl GrepEngine {
             {
                 continue;
             }
-            if let Some(matched) = match_record(record, &regex, request.normalization) {
+            if let Some(matched) = match_record(record, &matcher, request.normalization) {
                 matches.push(matched);
                 if matches.len() > limit {
                     break;
@@ -358,6 +360,30 @@ impl TrigramIndex {
         result.sort_unstable();
         Some(result)
     }
+
+    fn candidate_indices_for_matcher(&self, matcher: &QueryMatcher) -> Option<Vec<usize>> {
+        match matcher {
+            QueryMatcher::Single(term) => self.candidate_indices(term.candidate_text()),
+            QueryMatcher::Multi(terms) => {
+                let mut candidates = None::<HashSet<usize>>;
+                for term in terms {
+                    let Some(indices) = self.candidate_indices(term.candidate_text()) else {
+                        continue;
+                    };
+                    let indices = indices.into_iter().collect::<HashSet<_>>();
+                    candidates = Some(match candidates {
+                        Some(existing) => existing.intersection(&indices).copied().collect(),
+                        None => indices,
+                    });
+                }
+                candidates.map(|indices| {
+                    let mut indices = indices.into_iter().collect::<Vec<_>>();
+                    indices.sort_unstable();
+                    indices
+                })
+            }
+        }
+    }
 }
 
 fn plain_literal_trigrams(pattern: &str) -> Option<Vec<String>> {
@@ -422,25 +448,114 @@ fn filters_match(record: &GrepRecord, filters: &GrepFilters) -> bool {
     true
 }
 
+#[derive(Debug)]
+enum QueryMatcher {
+    Single(TermMatcher),
+    Multi(Vec<TermMatcher>),
+}
+
+impl QueryMatcher {
+    fn compile(pattern: String) -> Result<Self, GrepError> {
+        let terms = split_query_terms(&pattern);
+        if terms.len() > 1 {
+            Ok(Self::Multi(
+                terms
+                    .into_iter()
+                    .map(|term| TermMatcher::compile_lossy(&term))
+                    .collect(),
+            ))
+        } else {
+            let regex =
+                Regex::new(&pattern).map_err(|err| GrepError::InvalidPattern(err.to_string()))?;
+            Ok(Self::Single(TermMatcher::Regex { pattern, regex }))
+        }
+    }
+
+    fn find_ranges(&self, haystack: &str) -> Option<Vec<MatchedRange>> {
+        match self {
+            Self::Single(term) => term.find_ranges(haystack),
+            Self::Multi(terms) => {
+                let mut ranges = Vec::new();
+                for term in terms {
+                    let term_ranges = term.find_ranges(haystack)?;
+                    ranges.extend(term_ranges);
+                }
+                ranges.sort_by(|left, right| {
+                    left.start
+                        .cmp(&right.start)
+                        .then_with(|| left.end.cmp(&right.end))
+                });
+                ranges.dedup();
+                Some(ranges)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum TermMatcher {
+    Regex { pattern: String, regex: Regex },
+    Literal(String),
+}
+
+impl TermMatcher {
+    fn compile_lossy(pattern: &str) -> Self {
+        Regex::new(pattern)
+            .map(|regex| Self::Regex {
+                pattern: pattern.to_owned(),
+                regex,
+            })
+            .unwrap_or_else(|_| Self::Literal(pattern.to_owned()))
+    }
+
+    fn candidate_text(&self) -> &str {
+        match self {
+            Self::Regex { pattern, .. } => pattern,
+            Self::Literal(pattern) => pattern,
+        }
+    }
+
+    fn find_ranges(&self, haystack: &str) -> Option<Vec<MatchedRange>> {
+        let ranges = match self {
+            Self::Regex { regex, .. } => regex
+                .find_iter(haystack)
+                .map(|matched| MatchedRange {
+                    start: matched.start(),
+                    end: matched.end(),
+                })
+                .collect::<Vec<_>>(),
+            Self::Literal(pattern) => haystack
+                .match_indices(pattern)
+                .map(|(start, matched)| MatchedRange {
+                    start,
+                    end: start + matched.len(),
+                })
+                .collect::<Vec<_>>(),
+        };
+        (!ranges.is_empty()).then_some(ranges)
+    }
+}
+
+fn split_query_terms(query: &str) -> Vec<String> {
+    query
+        .split(|ch| matches!(ch, ' ' | '\t' | '\u{3000}'))
+        .filter(|term| !term.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn match_record(
     record: &GrepRecord,
-    regex: &Regex,
+    matcher: &QueryMatcher,
     normalization: NormalizationMode,
 ) -> Option<GrepMatch> {
     let haystack = match normalization {
         NormalizationMode::Nfkc => record.normalized_text.as_str(),
         NormalizationMode::None => record.text.as_str(),
     };
-    let ranges = regex
-        .find_iter(haystack)
-        .map(|matched| MatchedRange {
-            start: matched.start(),
-            end: matched.end(),
-        })
-        .collect::<Vec<_>>();
-    if ranges.is_empty() {
-        return None;
-    }
+    let mut ranges = matcher.find_ranges(haystack)?;
+    let first_match_char = byte_to_char_index(haystack, ranges[0].start);
+    ranges.truncate(MATCHED_RANGES_LIMIT);
     Some(GrepMatch {
         record_id: record.record_id.clone(),
         source_type: record.source_type.clone(),
@@ -448,21 +563,54 @@ fn match_record(
         source_title: record.source_title.clone(),
         source_location: record.source_location.clone(),
         timestamp: record.timestamp,
-        snippet: snippet(&record.text),
+        snippet: snippet(&record.text, first_match_char),
         matched_ranges: ranges,
         metadata: record.metadata.clone(),
     })
 }
 
-fn snippet(text: &str) -> String {
-    const MAX_CHARS: usize = 240;
-    let mut chars = text.chars();
-    let snippet = chars.by_ref().take(MAX_CHARS).collect::<String>();
-    if chars.next().is_some() {
-        format!("{snippet}...")
-    } else {
-        snippet
+fn snippet(text: &str, hit_char_index: usize) -> String {
+    let total_chars = text.chars().count();
+    if total_chars <= SNIPPET_MAX_CHARS {
+        return text.to_owned();
     }
+
+    let hit_char_index = hit_char_index.min(total_chars.saturating_sub(1));
+    let mut has_prefix = hit_char_index > SNIPPET_MAX_CHARS / 2;
+    let mut has_suffix = total_chars.saturating_sub(hit_char_index) > SNIPPET_MAX_CHARS / 2;
+    let (start, end) = loop {
+        let marker_chars = usize::from(has_prefix) * 3 + usize::from(has_suffix) * 3;
+        let body_chars = SNIPPET_MAX_CHARS.saturating_sub(marker_chars).max(1);
+        let mut start = hit_char_index.saturating_sub(body_chars / 2);
+        let mut end = start + body_chars;
+        if end > total_chars {
+            end = total_chars;
+            start = total_chars - body_chars;
+        }
+        let actual_prefix = start > 0;
+        let actual_suffix = end < total_chars;
+        if actual_prefix == has_prefix && actual_suffix == has_suffix {
+            break (start, end);
+        }
+        has_prefix = actual_prefix;
+        has_suffix = actual_suffix;
+    };
+
+    let body = text
+        .chars()
+        .skip(start)
+        .take(end - start)
+        .collect::<String>();
+    match (start > 0, end < total_chars) {
+        (true, true) => format!("...{body}..."),
+        (true, false) => format!("...{body}"),
+        (false, true) => format!("{body}..."),
+        (false, false) => body,
+    }
+}
+
+fn byte_to_char_index(value: &str, byte_index: usize) -> usize {
+    value[..byte_index].chars().count()
 }
 
 #[cfg(test)]
@@ -548,6 +696,113 @@ mod tests {
             .search(&records, &request, "wm".into())
             .unwrap();
         assert_eq!(indexed.matches, full_scan.matches);
+    }
+
+    #[test]
+    fn compound_query_requires_all_terms_and_returns_all_ranges() {
+        let engine = GrepEngine::new(100);
+        let records = vec![
+            record("r1", "Nanihold OS notes. ロードマップ is stable."),
+            record("r2", "Nanihold OS notes only."),
+            record("r3", "ロードマップ only."),
+        ];
+        let response = engine
+            .search(
+                &records,
+                &GrepRequest {
+                    pattern: "Nanihold OS ロードマップ".into(),
+                    ..GrepRequest::default()
+                },
+                "wm".into(),
+            )
+            .unwrap();
+
+        assert_eq!(response.matches.len(), 1);
+        assert_eq!(response.matches[0].record_id, "r1");
+        let matched_text = response.matches[0]
+            .matched_ranges
+            .iter()
+            .map(|range| &records[0].normalized_text[range.start..range.end])
+            .collect::<Vec<_>>();
+        assert_eq!(matched_text, vec!["Nanihold", "OS", "ロードマップ"]);
+    }
+
+    #[test]
+    fn compound_query_splits_on_fullwidth_space() {
+        let engine = GrepEngine::new(100);
+        let response = engine
+            .search(
+                &[record("r1", "Nanihold planning includes ロードマップ")],
+                &GrepRequest {
+                    pattern: "Nanihold　ロードマップ".into(),
+                    ..GrepRequest::default()
+                },
+                "wm".into(),
+            )
+            .unwrap();
+
+        assert_eq!(response.matches.len(), 1);
+    }
+
+    #[test]
+    fn compound_query_uses_literal_term_when_term_regex_is_invalid() {
+        let engine = GrepEngine::new(100);
+        let response = engine
+            .search(
+                &[record("r1", "Nanihold literal [ロードマップ")],
+                &GrepRequest {
+                    pattern: "Nanihold [ロードマップ".into(),
+                    ..GrepRequest::default()
+                },
+                "wm".into(),
+            )
+            .unwrap();
+
+        assert_eq!(response.matches.len(), 1);
+        assert_eq!(response.matches[0].matched_ranges.len(), 2);
+    }
+
+    #[test]
+    fn snippet_is_centered_on_first_hit() {
+        let engine = GrepEngine::new(100);
+        let text = format!("{} needle {}", "a".repeat(300), "b".repeat(300));
+        let response = engine
+            .search(
+                &[record("r1", &text)],
+                &GrepRequest {
+                    pattern: "needle".into(),
+                    ..GrepRequest::default()
+                },
+                "wm".into(),
+            )
+            .unwrap();
+
+        let snippet = &response.matches[0].snippet;
+        assert!(snippet.starts_with("..."));
+        assert!(snippet.contains("needle"));
+        assert!(snippet.ends_with("..."));
+        assert!(snippet.chars().count() <= SNIPPET_MAX_CHARS);
+    }
+
+    #[test]
+    fn matched_ranges_are_capped_per_record() {
+        let engine = GrepEngine::new(100);
+        let text = "needle ".repeat(MATCHED_RANGES_LIMIT + 15);
+        let response = engine
+            .search(
+                &[record("r1", &text)],
+                &GrepRequest {
+                    pattern: "needle".into(),
+                    ..GrepRequest::default()
+                },
+                "wm".into(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            response.matches[0].matched_ranges.len(),
+            MATCHED_RANGES_LIMIT
+        );
     }
 
     #[test]
