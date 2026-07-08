@@ -160,7 +160,15 @@ MCP read port は別 listener で提供します。
 
 MCP read tools that accept `limit` cap it at 20 and report clamp metadata in
 `_meta["lethe/response_limit"]`; `search_lake` snippets are capped at 240
-characters and `matched_ranges` at 20 per record.
+characters and `matched_ranges` at 20 per record. `search_lake` accepts
+`from` / `to` ISO 8601 timestamps and `order = "newest_first" | "oldest_first"`;
+unknown `source_types` are rejected with the valid list, while
+`_meta["lethe/available_source_types"]` reports live source_type counts.
+`search_lake` matches expose `thread_key` at top level and omit internal
+plumbing metadata from the MCP search response; call `get_record` for full
+record metadata. `matched_ranges.start/end` are UTF-8 byte offsets.
+MCP `get_thread` defaults to 20 records and returns `next_cursor` when a thread
+continues.
 公開する場合は Tailscale Funnel の対象を MCP host port のみに限定してください。
 内部 API port、`/admin/*`、管理面を Funnel に晒してはいけません。この self-host
 構成の MCP endpoint は本 PC が起動し、selfhost プロセスと Funnel が稼働している

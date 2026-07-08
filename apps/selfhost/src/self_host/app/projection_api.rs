@@ -4,6 +4,12 @@ use lethe_projection_cognition::{CardState, ReplyCard};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, serde::Serialize)]
+pub struct CorpusSourceTypeSummary {
+    pub source_type: String,
+    pub records: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ClaimQueuePage {
     pub groups: Vec<ClaimGroup>,
     pub total: usize,
@@ -344,6 +350,23 @@ impl AppService {
         })
     }
 
+    pub fn corpus_source_type_summaries(
+        &self,
+    ) -> Result<Vec<CorpusSourceTypeSummary>, SelfHostError> {
+        let core = self.core_lock()?;
+        let mut counts = BTreeMap::<String, usize>::new();
+        for record in &core.snapshot.corpus {
+            *counts.entry(record.source_type.clone()).or_insert(0) += 1;
+        }
+        Ok(counts
+            .into_iter()
+            .map(|(source_type, records)| CorpusSourceTypeSummary {
+                source_type,
+                records,
+            })
+            .collect())
+    }
+
     pub fn corpus_record_response(
         &self,
         record_id: &str,
@@ -382,6 +405,39 @@ impl AppService {
     ) -> Result<ResponseEnvelope<lethe_api::api::grep::ThreadResponse>, SelfHostError> {
         let core = self.core_lock()?;
         let response = build_corpus_thread_response(&core.snapshot.corpus, thread_ref)?;
+        let lineage = build_projection_lineage(
+            "proj:corpus",
+            core.lake.list(),
+            core.snapshot.corpus.len(),
+            core.snapshot.built_at,
+        );
+        Ok(ResponseEnvelope {
+            data: response,
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:corpus",
+                ReadMode::OperationalLatest,
+                core.snapshot.built_at,
+                &lineage,
+            )?,
+        })
+    }
+
+    pub fn corpus_thread_response_paged(
+        &self,
+        thread_ref: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ResponseEnvelope<lethe_api::api::grep::ThreadResponse>, SelfHostError> {
+        if limit == 0 || limit > self.config.resource_limits.max_page_size {
+            return Err(SelfHostError::ReadMode(format!(
+                "page limit must be between 1 and {}",
+                self.config.resource_limits.max_page_size
+            )));
+        }
+        let core = self.core_lock()?;
+        let response = build_corpus_thread_response(&core.snapshot.corpus, thread_ref)?;
+        let response = page_thread_response(response, limit, cursor)?;
         let lineage = build_projection_lineage(
             "proj:corpus",
             core.lake.list(),
@@ -829,6 +885,9 @@ fn build_corpus_thread_response(
         return Ok(lethe_api::api::grep::ThreadResponse {
             thread_ts: record.record_id.clone(),
             records: vec![grep_record_from_corpus(record.clone())],
+            complete: true,
+            limit: 1,
+            next_cursor: None,
             structure: None,
         });
     }
@@ -876,9 +935,13 @@ fn generic_thread_response(
             .cmp(&right.timestamp)
             .then_with(|| left.record_id.cmp(&right.record_id))
     });
+    let limit = records.len();
     Ok(lethe_api::api::grep::ThreadResponse {
         thread_ts: thread_ref.to_owned(),
         records: records.into_iter().map(grep_record_from_corpus).collect(),
+        complete: true,
+        limit,
+        next_cursor: None,
         structure: Some(lethe_api::api::grep::ThreadStructure {
             thread_key: thread_ref.to_owned(),
             source_type: source_type.to_owned(),
@@ -904,7 +967,10 @@ fn slack_thread_response(
     }
     Ok(lethe_api::api::grep::ThreadResponse {
         thread_ts: thread_ref.to_owned(),
+        limit: records.len(),
         records,
+        complete: true,
+        next_cursor: None,
         structure: None,
     })
 }
@@ -983,10 +1049,13 @@ fn coding_agent_thread_response(
 
     Ok(lethe_api::api::grep::ThreadResponse {
         thread_ts: thread_key.clone(),
+        limit: thread_records.len(),
         records: thread_records
             .into_iter()
             .map(grep_record_from_corpus)
             .collect(),
+        complete: true,
+        next_cursor: None,
         structure: Some(lethe_api::api::grep::ThreadStructure {
             thread_key,
             source_type,
@@ -994,6 +1063,49 @@ fn coding_agent_thread_response(
             sidechains,
         }),
     })
+}
+
+fn page_thread_response(
+    mut response: lethe_api::api::grep::ThreadResponse,
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<lethe_api::api::grep::ThreadResponse, SelfHostError> {
+    let offset = parse_cursor(cursor)?;
+    let total = response.records.len();
+    let start = offset.min(total);
+    let end = (start + limit).min(total);
+    let page_records = response.records[start..end].to_vec();
+    let page_ids = page_records
+        .iter()
+        .map(|record| record.record_id.clone())
+        .collect::<BTreeSet<_>>();
+
+    response.records = page_records;
+    response.limit = limit;
+    response.complete = end >= total;
+    response.next_cursor = (!response.complete).then(|| end.to_string());
+    if let Some(structure) = response.structure.as_mut() {
+        retain_thread_structure_page(structure, &page_ids);
+    }
+    Ok(response)
+}
+
+fn retain_thread_structure_page(
+    structure: &mut lethe_api::api::grep::ThreadStructure,
+    page_ids: &BTreeSet<String>,
+) {
+    if let Some(root) = structure.root_session.as_mut() {
+        root.record_ids
+            .retain(|record_id| page_ids.contains(record_id));
+    }
+    for sidechain in &mut structure.sidechains {
+        sidechain
+            .record_ids
+            .retain(|record_id| page_ids.contains(record_id));
+    }
+    structure
+        .sidechains
+        .retain(|sidechain| !sidechain.record_ids.is_empty());
 }
 
 fn parent_session_map(

@@ -66,7 +66,7 @@ Grep API はソース種別 (types)、日時範囲 (from/to)、チャンネル (
 - **THEN** その範囲内のレコードのみが検索対象になる
 
 ### Requirement: GREP-07 レスポンス形状
-Grep API のレスポンスは以下のフィールドを含む SHALL する: `matches[]` (record_id, source_type, anchor_url, source_title, source_location, timestamp, snippet, matched_ranges, metadata)、`next_cursor`、`complete`、`projection_watermark`。snippet は省略記号を含めて最大 240 文字、`matched_ranges` は 1 レコードあたり最大 20 件に制限する。
+Grep API のレスポンスは以下のフィールドを含む SHALL する: `matches[]` (record_id, source_type, anchor_url, source_title, source_location, timestamp, thread_key, snippet, matched_ranges, metadata)、`next_cursor`、`complete`、`projection_watermark`。`thread_key` は該当スレッドがある場合のみ含む。snippet は省略記号を含めて最大 240 文字、`matched_ranges` は 1 レコードあたり最大 20 件に制限する。`matched_ranges.start/end` は検索対象テキスト内の UTF-8 byte offset である。
 
 #### Scenario: match レスポンスのフィールド
 - **WHEN** grep 検索で match が見つかる

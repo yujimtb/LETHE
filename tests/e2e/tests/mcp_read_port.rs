@@ -5,7 +5,7 @@ use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE};
 use axum::http::{Request, StatusCode};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use lethe_adapter_api::traits::ObservationDraft;
 use lethe_adapter_chatgpt::{ChatGptImportBatch, ChatGptImportFilter, ChatGptImporter};
 use lethe_core::domain::supplemental::InputAnchorSet;
@@ -114,6 +114,10 @@ fn encode_json(value: &serde_json::Value) -> String {
 }
 
 fn observation(text: &str, key: &str) -> Observation {
+    observation_at(text, key, Utc::now())
+}
+
+fn observation_at(text: &str, key: &str, published: DateTime<Utc>) -> Observation {
     Observation {
         id: Observation::new_id(),
         schema: SchemaRef::new("schema:slack-message"),
@@ -139,7 +143,7 @@ fn observation(text: &str, key: &str) -> Observation {
             "permalink": format!("https://slack.example/123_event/{key}"),
         }),
         attachments: vec![],
-        published: Utc::now(),
+        published,
         recorded_at: Utc::now(),
         consent: None,
         idempotency_key: IdempotencyKey::new(format!("mcp:{key}")),
@@ -265,6 +269,19 @@ fn service_with_matching_records(oauth: McpOAuthConfig, count: usize) -> (PathBu
                 &format!("bulk-{index}"),
             ))
             .unwrap();
+    }
+    let service = AppService::bootstrap(test_config(db, blobs, oauth)).unwrap();
+    (root, service)
+}
+
+fn service_with_observations(
+    oauth: McpOAuthConfig,
+    observations: Vec<Observation>,
+) -> (PathBuf, AppService) {
+    let (root, db, blobs) = temp_paths();
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    for observation in observations {
+        persistence.persist_observation(&observation).unwrap();
     }
     let service = AppService::bootstrap(test_config(db, blobs, oauth)).unwrap();
     (root, service)
@@ -614,6 +631,25 @@ fn six_mcp_tools_have_contracts_and_read_via_projection() {
                     assert!(description.contains("capped at 20"));
                     assert!(description.contains("240 chars"));
                     assert!(description.contains("matched_ranges"));
+                    assert!(description.contains("UTF-8 byte offsets"));
+                    assert!(description.contains("Valid source_types"));
+                    assert!(description.contains("slack"));
+                    assert_eq!(
+                        tool["inputSchema"]["properties"]["order"]["enum"][0],
+                        "newest_first"
+                    );
+                    assert_eq!(
+                        tool["inputSchema"]["properties"]["order"]["enum"][1],
+                        "oldest_first"
+                    );
+                    assert_eq!(
+                        tool["inputSchema"]["properties"]["from"]["format"],
+                        "date-time"
+                    );
+                    assert_eq!(
+                        tool["inputSchema"]["properties"]["to"]["format"],
+                        "date-time"
+                    );
                     assert_eq!(tool["inputSchema"]["properties"]["limit"]["maximum"], 20);
                 }
                 "search_decisions" => {
@@ -625,6 +661,10 @@ fn six_mcp_tools_have_contracts_and_read_via_projection() {
                 }
                 "claim_queue" => {
                     assert!(description.contains("capped at 20"));
+                    assert_eq!(tool["inputSchema"]["properties"]["limit"]["maximum"], 20);
+                }
+                "get_thread" => {
+                    assert!(description.contains("cursor"));
                     assert_eq!(tool["inputSchema"]["properties"]["limit"]["maximum"], 20);
                 }
                 _ => assert!(description.len() <= 100),
@@ -655,6 +695,16 @@ fn six_mcp_tools_have_contracts_and_read_via_projection() {
         .as_array()
         .unwrap();
     assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0]["thread_key"], "1.000000");
+    assert!(matches[0]["metadata"]["observation_id"].is_null());
+    assert!(matches[0]["metadata"]["channel_id"].is_string());
+    assert!(
+        search_json["result"]["_meta"]["lethe/available_source_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| source["source_type"] == "slack" && source["records"] == 2)
+    );
     let record_id = matches[0]["record_id"].as_str().unwrap();
 
     let record_response = runtime
@@ -692,6 +742,10 @@ fn six_mcp_tools_have_contracts_and_read_via_projection() {
             .unwrap()
             .len(),
         2
+    );
+    assert_eq!(
+        thread_json["result"]["structuredContent"]["data"]["complete"],
+        true
     );
 
     let claim_response = runtime
@@ -799,6 +853,200 @@ fn search_lake_clamps_mcp_limit_and_reports_effective_limit() {
     assert_eq!(limit["effective_limit"], 20);
     assert_eq!(limit["max_limit"], 20);
     assert_eq!(limit["limit_clamped"], true);
+}
+
+#[test]
+fn search_lake_accepts_time_filters_and_order() {
+    let (signer, oauth) = signer_and_oauth();
+    let observations = vec![
+        observation_at(
+            "needle before range",
+            "old",
+            DateTime::parse_from_rfc3339("2026-06-30T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        ),
+        observation_at(
+            "needle first in range",
+            "first",
+            DateTime::parse_from_rfc3339("2026-07-02T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        ),
+        observation_at(
+            "needle second in range",
+            "second",
+            DateTime::parse_from_rfc3339("2026-07-03T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        ),
+    ];
+    let (_root, service) = service_with_observations(oauth, observations);
+    let app = build_mcp_router(service);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    let response = runtime
+        .block_on(async {
+            app.oneshot(mcp_request(
+                &valid_token(&signer),
+                tool_call(
+                    "search_lake",
+                    serde_json::json!({
+                        "query": "needle",
+                        "from": "2026-07-01T00:00:00Z",
+                        "to": "2026-07-31T23:59:59Z",
+                        "order": "oldest_first",
+                        "limit": 5
+                    }),
+                ),
+            ))
+            .await
+        })
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(&runtime, response);
+    let matches = json["result"]["structuredContent"]["data"]["matches"]
+        .as_array()
+        .unwrap();
+    let snippets = matches
+        .iter()
+        .map(|matched| matched["snippet"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        snippets,
+        vec!["needle first in range", "needle second in range"]
+    );
+}
+
+#[test]
+fn search_lake_rejects_unknown_source_type_with_valid_values() {
+    let (signer, oauth) = signer_and_oauth();
+    let (_root, service) = service_with_records(oauth);
+    let app = build_mcp_router(service);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    let response = runtime
+        .block_on(async {
+            app.oneshot(mcp_request(
+                &valid_token(&signer),
+                tool_call(
+                    "search_lake",
+                    serde_json::json!({"query": "忘れ物", "source_types": ["gpt"]}),
+                ),
+            ))
+            .await
+        })
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(&runtime, response);
+    assert_eq!(json["error"]["code"], -32602);
+    let message = json["error"]["message"].as_str().unwrap();
+    assert!(message.contains("unknown source_type"));
+    assert!(message.contains("'gpt'"));
+    assert!(message.contains("chatgpt"));
+    assert!(message.contains("slack"));
+}
+
+#[test]
+fn search_lake_accepts_known_source_type_absent_from_current_corpus() {
+    let (signer, oauth) = signer_and_oauth();
+    let (_root, service) = service_with_records(oauth);
+    let app = build_mcp_router(service);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    let response = runtime
+        .block_on(async {
+            app.oneshot(mcp_request(
+                &valid_token(&signer),
+                tool_call(
+                    "search_lake",
+                    serde_json::json!({"query": "忘れ物", "source_types": ["codex"]}),
+                ),
+            ))
+            .await
+        })
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(&runtime, response);
+    assert_eq!(
+        json["result"]["structuredContent"]["data"]["matches"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn get_thread_defaults_to_safe_page_and_uses_cursor() {
+    let (signer, oauth) = signer_and_oauth();
+    let (_root, service) = service_with_matching_records(oauth, 25);
+    let app = build_mcp_router(service);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let token = valid_token(&signer);
+
+    let first_response = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(mcp_request(
+                    &token,
+                    tool_call("get_thread", serde_json::json!({"record_id": "1.000000"})),
+                ))
+                .await
+        })
+        .unwrap();
+
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first_json = response_json(&runtime, first_response);
+    assert_eq!(
+        first_json["result"]["structuredContent"]["data"]["records"]
+            .as_array()
+            .unwrap()
+            .len(),
+        20
+    );
+    assert_eq!(
+        first_json["result"]["structuredContent"]["data"]["complete"],
+        false
+    );
+    assert_eq!(
+        first_json["result"]["structuredContent"]["data"]["next_cursor"],
+        "20"
+    );
+    assert_eq!(
+        first_json["result"]["_meta"]["lethe/response_limit"]["effective_limit"],
+        20
+    );
+
+    let second_response = runtime
+        .block_on(async {
+            app.oneshot(mcp_request(
+                &token,
+                tool_call(
+                    "get_thread",
+                    serde_json::json!({"record_id": "1.000000", "cursor": "20"}),
+                ),
+            ))
+            .await
+        })
+        .unwrap();
+    assert_eq!(second_response.status(), StatusCode::OK);
+    let second_json = response_json(&runtime, second_response);
+    assert_eq!(
+        second_json["result"]["structuredContent"]["data"]["records"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+    assert_eq!(
+        second_json["result"]["structuredContent"]["data"]["complete"],
+        true
+    );
+    assert!(second_json["result"]["structuredContent"]["data"]["next_cursor"].is_null());
 }
 
 #[test]

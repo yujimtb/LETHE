@@ -55,7 +55,7 @@ MCP サーバはリソースサーバとして振る舞い SHALL する: (1) `/.
 | `search_decisions` | read | `mcp:read` | 決定台帳の検索(supersedes 解決済み) | claim-queue-projection |
 | `write_supplemental` | write | `write:supplemental` | 既存 observation/blob/supplemental anchor から派生した supplemental record を 1 件作成 | supplemental store + projection refresh |
 
-read ツールは Projection のみを読み、生 supplemental・生 observation ストアへ直接アクセスして SHALL NOT ならない(Filtering-before-Exposure)。`search_lake` と `search_decisions` の tool description は、1語検索と空白・タブ・全角スペース区切りの複数語AND検索を明示する。`limit` を持つ MCP read ツールは MCP 応答サイズ保護のため `limit` を最大 20 にクランプし、tool result `_meta["lethe/response_limit"]` に requested/effective/max/clamped を含める。`search_lake` は snippet 最大 240 文字、`matched_ranges` 最大 20 件/record の上限も tool description に明示する。`write_supplemental` は HTTP `POST /supplementals` と同じ検証・永続化・projection refresh 経路を使い、anchor 未解決または未登録 kind は明示的に拒否 SHALL する。ツール説明文・annotations・`securitySchemes` は AI の選択精度とクライアント側確認 UI を左右する契約物として spec レビュー対象に含める。
+read ツールは Projection のみを読み、生 supplemental・生 observation ストアへ直接アクセスして SHALL NOT ならない(Filtering-before-Exposure)。`search_lake` と `search_decisions` の tool description は、1語検索と空白・タブ・全角スペース区切りの複数語AND検索を明示する。`search_lake` は任意引数 `from` / `to`(ISO 8601/RFC3339 timestamp)と `order`(`newest_first` / `oldest_first`、省略時は既存通り `newest_first`)を提供し、GrepFilters.from/to と GrepOrder に配線する。`search_lake` の tool description は有効な `source_types` 語彙と現在 corpus に存在する source_type 件数を提示し、未知の `source_types` 指定は有効値一覧付きで明示的に拒否する。`limit` を持つ MCP read ツールは MCP 応答サイズ保護のため `limit` を最大 20 にクランプし、tool result `_meta["lethe/response_limit"]` に requested/effective/max/clamped を含める。`search_lake` は snippet 最大 240 文字、`matched_ranges` 最大 20 件/record の上限と、`matched_ranges.start/end` が検索対象テキスト内の UTF-8 byte offset であることを tool description に明示する。`search_lake` の各 match は `thread_key` をトップレベルに昇格し、MCP search 応答の `metadata` から内部配管フィールド `observation_id`, `schema`, `source_system`, `source_type`, `thread_key`, `session_id`, `parent_session_id`, `is_sidechain`, `message_id`, `parent_message_id` を除去する。全 metadata は `get_record` 側に保持する。`get_thread` は MCP 引数 `limit` / `cursor` を提供し、省略時 `limit = 20` で返し、超過時は `next_cursor` で継続取得できる。`write_supplemental` は HTTP `POST /supplementals` と同じ検証・永続化・projection refresh 経路を使い、anchor 未解決または未登録 kind は明示的に拒否 SHALL する。ツール説明文・annotations・`securitySchemes` は AI の選択精度とクライアント側確認 UI を左右する契約物として spec レビュー対象に含める。
 
 #### Scenario: ChatGPT write action discovery
 - **WHEN** ChatGPT.com が `tools/list` を取得する
@@ -72,6 +72,22 @@ read ツールは Projection のみを読み、生 supplemental・生 observatio
 #### Scenario: MCP read limit の安全クランプ
 - **WHEN** MCP client が `search_lake` / `claim_queue` / `search_decisions` に `limit > 20` を指定する
 - **THEN** サーバは実効 `limit = 20` で応答し、tool result `_meta["lethe/response_limit"].limit_clamped = true` を返す
+
+#### Scenario: search_lake の時間範囲と時系列順
+- **WHEN** MCP client が `search_lake` を `from = "2026-07-01T00:00:00Z"`、`to = "2026-07-31T23:59:59Z"`、`order = "oldest_first"` で呼ぶ
+- **THEN** サーバはその日時範囲内の match だけを timestamp 昇順で返す
+
+#### Scenario: 未知 source_type の明示拒否
+- **WHEN** MCP client が `search_lake` に未知の `source_types = ["gpt"]` を指定する
+- **THEN** サーバは静かな 0 件ではなく、有効な source_type 値一覧を含むエラーを返す
+
+#### Scenario: search_lake match の継続キーと軽量 metadata
+- **WHEN** MCP client が coding-agent または会話 source の match を受け取る
+- **THEN** match はトップレベル `thread_key` を持ち、`metadata` には内部配管フィールドが含まれず、必要な全 metadata は `get_record` で取得できる
+
+#### Scenario: get_thread の安全ページング
+- **WHEN** MCP client が長い thread に対して `get_thread` を引数省略で呼ぶ
+- **THEN** サーバは最大 20 レコードと `next_cursor` を返し、クライアントは cursor を指定して続きのページを取得できる
 
 ### Requirement: MCPR-05 個人 lake の検索範囲
 

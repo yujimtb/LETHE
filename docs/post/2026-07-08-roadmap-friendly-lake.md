@@ -26,9 +26,23 @@
 
 注意: 上記はコード変更のみで、**本番 selfhost にはまだデプロイしていない**(再ビルド・再起動はオーナー判断)。
 
+## UX強化 第2弾 (2026-07-08 午後、企画: `_overnight_20260708/reports/ux_lethe.md`)
+
+AIクライアントとしての一次体験調査(MCP実使用)で選定した「界面の次の一歩」:
+1. **時間フィルタと並び順の露出** — エンジン(GrepFilters)と仕様(GREP-05/06)は既対応。search_lake に from / to / order を配線するだけで「直近3日」「古い順」が言えるようになる(完全後方互換)
+2. **source_types の発見可能性** — 有効値を tool description に列挙し、未知値は静かに0件でなく明示エラーに(AI誤答の地雷除去)
+3. **応答の読みやすさ** — thread_key のトップレベル昇格(「このスレッドの続き」動線の1ホップ化)、レコードあたりメタデータの減量、matched_ranges がUTF-8バイトオフセットである旨の明記
+4. **get_thread の安全化** — limit / cursor の導入(現状は長セッション全件を無制限返却)
+
+2026-07-09 追記: 上記 1〜4 は MCP read port に実装済み。`search_lake` は
+`from` / `to` / `order`、source_type 発見性、未知 source_type の明示エラー、
+トップレベル `thread_key`、MCP search metadata の減量を備え、`get_thread` は
+既定 20 件 + cursor 継続になった。既存の `search_lake` / `get_thread` 呼び出しは
+引数省略時も動き、全 metadata は `get_record` に残す。
+
 ## 次の一歩(短期: 〜2週間)
 
-1. **今夜の変更のレビューとデプロイ** — 差分確認 → コミット → selfhost 再ビルド・再起動(MCP 経由で複合語検索が効くのはデプロイ後)
+1. ~~今夜の変更のレビューとデプロイ~~ → **完了(2026-07-08 昼)**: selfhost 再ビルド・再起動済み。複合語検索は Claude Code / Codex の両クライアントで動作確認済み
 2. **取り込みパイプラインを閉じる** — 現状「仕様上は日次、実運用は半接続」:
    - claude.ai 日次エクスポート(03:30 タスク)が `claude_export_browser.mjs failed` で失敗中 → 修理
    - Codex / Claude Code は 03:10 の archive 同期までは成功しているが、Lake への日次 import が未登録 → タスク登録で接続

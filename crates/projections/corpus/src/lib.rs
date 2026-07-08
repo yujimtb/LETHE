@@ -10,6 +10,29 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
 pub const CORPUS_PROJECTION_ID: &str = "proj:corpus";
+const SUPPORTED_SOURCE_TYPES: &[&str] = &[
+    "chatgpt",
+    "claude-ai",
+    "claude-code",
+    "codex",
+    "discord",
+    "docs",
+    "drive",
+    "forms",
+    "github-comment",
+    "github-commit",
+    "github-event",
+    "github-issue",
+    "github-pr",
+    "gmail",
+    "sheets",
+    "slack",
+    "slides",
+];
+
+pub fn supported_source_types() -> &'static [&'static str] {
+    SUPPORTED_SOURCE_TYPES
+}
 
 #[derive(Debug, Clone)]
 pub struct CorpusConfig {

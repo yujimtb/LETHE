@@ -277,7 +277,16 @@ MCP read tools that accept `limit` cap it at 20 for response-size safety. When a
 client requests a larger value, the tool result includes
 `_meta["lethe/response_limit"]` with requested, effective, max, and clamped
 fields. `search_lake` snippets are capped at 240 characters including ellipses,
-and `matched_ranges` is capped at 20 ranges per record.
+and `matched_ranges` is capped at 20 ranges per record. `search_lake` also
+accepts `from` / `to` ISO 8601 timestamps and `order =
+"newest_first" | "oldest_first"`; invalid time ranges and unknown
+`source_types` fail fast. The tool description lists valid source_types, and
+successful search results include `_meta["lethe/available_source_types"]` with
+live corpus counts. Search matches expose `thread_key` at top level and trim
+internal plumbing fields from MCP search metadata; use `get_record` when full
+record metadata is needed. `matched_ranges.start/end` are UTF-8 byte offsets.
+MCP `get_thread` defaults to 20 records and returns `next_cursor` for
+continuation.
 
 Browser-use production verification on 2026-07-06 confirmed that the public
 protected-resource metadata advertises both `mcp:read` and

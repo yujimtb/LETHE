@@ -86,6 +86,8 @@ pub struct GrepMatch {
     #[serde(default)]
     pub source_location: Option<String>,
     pub timestamp: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_key: Option<String>,
     pub snippet: String,
     pub matched_ranges: Vec<MatchedRange>,
     #[serde(default)]
@@ -116,6 +118,10 @@ pub struct RecordDetailResponse {
 pub struct ThreadResponse {
     pub thread_ts: String,
     pub records: Vec<GrepRecord>,
+    pub complete: bool,
+    pub limit: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structure: Option<ThreadStructure>,
 }
@@ -563,10 +569,20 @@ fn match_record(
         source_title: record.source_title.clone(),
         source_location: record.source_location.clone(),
         timestamp: record.timestamp,
+        thread_key: thread_key(record),
         snippet: snippet(&record.text, first_match_char),
         matched_ranges: ranges,
         metadata: record.metadata.clone(),
     })
+}
+
+fn thread_key(record: &GrepRecord) -> Option<String> {
+    record
+        .metadata
+        .get("thread_key")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| record.thread_ts.clone())
 }
 
 fn snippet(text: &str, hit_char_index: usize) -> String {
@@ -802,6 +818,30 @@ mod tests {
         assert_eq!(
             response.matches[0].matched_ranges.len(),
             MATCHED_RANGES_LIMIT
+        );
+    }
+
+    #[test]
+    fn match_promotes_thread_key_from_metadata() {
+        let engine = GrepEngine::new(100);
+        let mut record = record("r1", "needle in thread");
+        record.thread_ts = Some("thread-ts".into());
+        record.metadata = serde_json::json!({"thread_key": "codex:session:main"});
+
+        let response = engine
+            .search(
+                &[record],
+                &GrepRequest {
+                    pattern: "needle".into(),
+                    ..GrepRequest::default()
+                },
+                "wm".into(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            response.matches[0].thread_key.as_deref(),
+            Some("codex:session:main")
         );
     }
 

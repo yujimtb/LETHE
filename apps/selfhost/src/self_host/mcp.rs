@@ -7,28 +7,40 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use lethe_api::api::envelope::ErrorResponse;
+use lethe_api::api::grep::GrepOrder;
 use ring::signature;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 
 use crate::self_host::app::SupplementalWriteRequest;
-use crate::self_host::app::{AppService, SelfHostError};
+use crate::self_host::app::{AppService, CorpusSourceTypeSummary, SelfHostError};
 use crate::self_host::config::{JsonWebKey, JsonWebKeySet, McpOAuthConfig};
 use crate::self_host::mcp_contract::{
     ClaimQueueArguments, GetRecordArguments, GetThreadArguments, SearchDecisionsArguments,
-    SearchLakeArguments,
+    SearchLakeArguments, SearchLakeOrder,
 };
 use lethe_projection_claim_queue::ClaimState;
 
 const MCP_RESPONSE_LIMIT: usize = 20;
 const MCP_DEFAULT_LIMIT: usize = 20;
-const SEARCH_LAKE_DESCRIPTION: &str = "Search projected corpus text across lake records; returns record IDs and hit-centered snippets. Query syntax: one term works as before; space, tab, or fullwidth-space separated terms require every term to appear in any order (AND). Terms may be Rust regex; invalid regex terms in compound queries are matched literally. limit is capped at 20 for MCP response safety; snippets are capped at 240 chars and matched_ranges at 20 per record.";
+const SEARCH_LAKE_METADATA_REMOVED_FIELDS: &[&str] = &[
+    "observation_id",
+    "schema",
+    "source_system",
+    "source_type",
+    "thread_key",
+    "session_id",
+    "parent_session_id",
+    "is_sidechain",
+    "message_id",
+    "parent_message_id",
+];
 const GET_RECORD_DESCRIPTION: &str =
     "Fetch one projected corpus record by record_id; returns RecordNotFound if absent.";
-const GET_THREAD_DESCRIPTION: &str =
-    "Fetch projected thread context for a corpus record or thread key.";
+const GET_THREAD_DESCRIPTION: &str = "Fetch projected thread context for a corpus record or thread key. limit defaults to 20 and is capped at 20 for MCP response safety; use cursor from the previous response to continue.";
 const CLAIM_QUEUE_DESCRIPTION: &str = "List folded claim groups from the claim queue projection, filterable by state. limit is capped at 20 for MCP response safety.";
 const SEARCH_DECISIONS_DESCRIPTION: &str = "Search the folded decision ledger with supersedes resolution. Query syntax: one term uses partial match; space, tab, or fullwidth-space separated terms require every term to appear in any order (AND). limit is capped at 20 for MCP response safety.";
 const WRITE_SUPPLEMENTAL_DESCRIPTION: &str = "Write one supplemental record as post-processing for an observation already ingested into the lake. This is not for live self-enrichment during the same conversation. Kinds with anchor_required=true require resolved anchors; system-event kinds with anchor_required=false require payload.origin.";
@@ -161,7 +173,9 @@ async fn handle_json_rpc(
                 "version": env!("CARGO_PKG_VERSION"),
             }
         })),
-        "tools/list" => Ok(tools_list_result()),
+        "tools/list" => Ok(tools_list_result(
+            &state.service.corpus_source_type_summaries()?,
+        )),
         "tools/call" => {
             let params: ToolCallParams = parse_params(request.params)?;
             call_tool(
@@ -177,19 +191,38 @@ async fn handle_json_rpc(
     }
 }
 
-fn tools_list_result() -> Value {
+fn tools_list_result(source_types: &[CorpusSourceTypeSummary]) -> Value {
     json!({
         "tools": [
             tool_definition(
                 "search_lake",
-                SEARCH_LAKE_DESCRIPTION,
+                &search_lake_description(source_types),
                 json!({
                     "type": "object",
                     "required": ["query"],
                     "additionalProperties": false,
                     "properties": {
                         "query": { "type": "string" },
-                        "source_types": { "type": "array", "items": { "type": "string" } },
+                        "source_types": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Optional source_type filter. Unknown values are rejected with the valid source_type list."
+                        },
+                        "from": {
+                            "type": "string",
+                            "format": "date-time",
+                            "description": "Inclusive lower timestamp bound as ISO 8601/RFC3339, e.g. 2026-07-01T00:00:00Z."
+                        },
+                        "to": {
+                            "type": "string",
+                            "format": "date-time",
+                            "description": "Inclusive upper timestamp bound as ISO 8601/RFC3339, e.g. 2026-07-08T23:59:59Z."
+                        },
+                        "order": {
+                            "type": "string",
+                            "enum": ["newest_first", "oldest_first"],
+                            "description": "Result time order. Default is newest_first, matching existing behavior."
+                        },
                         "limit": { "type": "integer", "minimum": 1, "maximum": 20 },
                         "cursor": { "type": "string" }
                     }
@@ -215,7 +248,9 @@ fn tools_list_result() -> Value {
                     "required": ["record_id"],
                     "additionalProperties": false,
                     "properties": {
-                        "record_id": { "type": "string" }
+                        "record_id": { "type": "string" },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 20 },
+                        "cursor": { "type": "string" }
                     }
                 })
             ),
@@ -281,6 +316,25 @@ fn tools_list_result() -> Value {
     })
 }
 
+fn search_lake_description(source_types: &[CorpusSourceTypeSummary]) -> String {
+    let valid_source_types = valid_source_types(source_types)
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let available_source_types = if source_types.is_empty() {
+        "none currently present".to_owned()
+    } else {
+        source_types
+            .iter()
+            .map(|source| format!("{} ({})", source.source_type, source.records))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "Search projected corpus text across lake records; returns record IDs and hit-centered snippets. Query syntax: one term works as before; space, tab, or fullwidth-space separated terms require every term to appear in any order (AND). Terms may be Rust regex; invalid regex terms in compound queries are matched literally. Optional from/to are ISO 8601/RFC3339 timestamps, e.g. from=\"2026-07-01T00:00:00Z\". order is newest_first (default) or oldest_first. Valid source_types: {valid_source_types}. Currently available source_types with record counts: {available_source_types}. limit is capped at 20 for MCP response safety; snippets are capped at 240 chars and matched_ranges at 20 per record. matched_ranges start/end are UTF-8 byte offsets in the searched text."
+    )
+}
+
 fn tool_definition(name: &str, description: &str, input_schema: Value) -> Value {
     let security_schemes = oauth2_security_schemes(MCP_READ_SCOPE);
     json!({
@@ -337,17 +391,28 @@ fn call_tool(
             let args: SearchLakeArguments = parse_arguments(params.arguments)?;
             ensure_not_blank("query", &args.query)?;
             let limit = mcp_limit(args.limit)?;
+            let source_type_summaries = service.corpus_source_type_summaries()?;
+            validate_source_types(&args.source_types, &source_type_summaries)?;
+            validate_time_range(args.from.as_ref(), args.to.as_ref())?;
             let response = service.corpus_grep_response(&lethe_api::api::grep::GrepRequest {
                 pattern: args.query,
                 filters: lethe_api::api::grep::GrepFilters {
                     types: args.source_types,
+                    from: args.from,
+                    to: args.to,
                     ..lethe_api::api::grep::GrepFilters::default()
                 },
+                order: args.order.map(search_lake_order).unwrap_or_default(),
                 limit: Some(limit.effective_limit),
                 cursor: args.cursor,
                 ..lethe_api::api::grep::GrepRequest::default()
             })?;
-            tool_result_with_limit(response, limit)
+            let response = mcp_search_lake_response(response);
+            tool_result_with_limit_and_available_source_types(
+                response,
+                limit,
+                &source_type_summaries,
+            )
         }
         "get_record" => {
             if let Some(result) = missing_scope_result(token, MCP_READ_SCOPE, metadata_url) {
@@ -364,8 +429,13 @@ fn call_tool(
             }
             let args: GetThreadArguments = parse_arguments(params.arguments)?;
             ensure_not_blank("record_id", &args.record_id)?;
-            let response = service.corpus_thread_response(&args.record_id)?;
-            tool_result(response)
+            let limit = mcp_limit(args.limit)?;
+            let response = service.corpus_thread_response_paged(
+                &args.record_id,
+                limit.effective_limit,
+                args.cursor.as_deref(),
+            )?;
+            tool_result_with_limit(response, limit)
         }
         "claim_queue" => {
             if let Some(result) = missing_scope_result(token, MCP_READ_SCOPE, metadata_url) {
@@ -454,6 +524,79 @@ fn parse_claim_state(value: Option<&str>) -> Result<Option<ClaimState>, JsonRpcA
         .transpose()
 }
 
+fn search_lake_order(order: SearchLakeOrder) -> GrepOrder {
+    match order {
+        SearchLakeOrder::NewestFirst => GrepOrder::DateDesc,
+        SearchLakeOrder::OldestFirst => GrepOrder::DateAsc,
+    }
+}
+
+fn validate_source_types(
+    requested: &[String],
+    source_type_summaries: &[CorpusSourceTypeSummary],
+) -> Result<(), JsonRpcAppError> {
+    let valid = valid_source_types(source_type_summaries);
+    let unknown = requested
+        .iter()
+        .filter(|source_type| !valid.contains(*source_type))
+        .cloned()
+        .collect::<Vec<_>>();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let unknown = unknown
+        .iter()
+        .map(|source_type| format!("'{source_type}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let valid = valid.into_iter().collect::<Vec<_>>().join(", ");
+    Err(JsonRpcAppError::invalid_params(format!(
+        "unknown source_type(s): {unknown}. Valid source_types: {valid}"
+    )))
+}
+
+fn validate_time_range(
+    from: Option<&DateTime<Utc>>,
+    to: Option<&DateTime<Utc>>,
+) -> Result<(), JsonRpcAppError> {
+    if matches!((from, to), (Some(from), Some(to)) if from > to) {
+        return Err(JsonRpcAppError::invalid_params(
+            "from must be earlier than or equal to to".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn valid_source_types(source_type_summaries: &[CorpusSourceTypeSummary]) -> BTreeSet<String> {
+    let mut source_types = lethe_projection_corpus::supported_source_types()
+        .iter()
+        .map(|source_type| (*source_type).to_owned())
+        .collect::<BTreeSet<_>>();
+    source_types.extend(
+        source_type_summaries
+            .iter()
+            .map(|source| source.source_type.clone()),
+    );
+    source_types
+}
+
+fn mcp_search_lake_response(
+    mut response: lethe_api::api::envelope::ResponseEnvelope<lethe_api::api::grep::GrepResponse>,
+) -> lethe_api::api::envelope::ResponseEnvelope<lethe_api::api::grep::GrepResponse> {
+    for matched in &mut response.data.matches {
+        trim_search_lake_match_metadata(matched);
+    }
+    response
+}
+
+fn trim_search_lake_match_metadata(matched: &mut lethe_api::api::grep::GrepMatch) {
+    if let Value::Object(metadata) = &mut matched.metadata {
+        for field in SEARCH_LAKE_METADATA_REMOVED_FIELDS {
+            metadata.remove(*field);
+        }
+    }
+}
+
 fn tool_result<T: Serialize>(value: T) -> Result<Value, JsonRpcAppError> {
     let structured = serde_json::to_value(value)
         .map_err(|error| JsonRpcAppError::internal(error.to_string()))?;
@@ -497,18 +640,49 @@ fn tool_result_with_limit<T: Serialize>(
     value: T,
     limit: McpLimitInfo,
 ) -> Result<Value, JsonRpcAppError> {
+    tool_result_with_limit_meta(value, limit, Vec::new())
+}
+
+fn tool_result_with_limit_and_available_source_types<T: Serialize>(
+    value: T,
+    limit: McpLimitInfo,
+    source_types: &[CorpusSourceTypeSummary],
+) -> Result<Value, JsonRpcAppError> {
+    tool_result_with_limit_meta(
+        value,
+        limit,
+        vec![(
+            "lethe/available_source_types",
+            serde_json::to_value(source_types)
+                .map_err(|error| JsonRpcAppError::internal(error.to_string()))?,
+        )],
+    )
+}
+
+fn tool_result_with_limit_meta<T: Serialize>(
+    value: T,
+    limit: McpLimitInfo,
+    extra_meta: Vec<(&'static str, Value)>,
+) -> Result<Value, JsonRpcAppError> {
     let structured = serde_json::to_value(value)
         .map_err(|error| JsonRpcAppError::internal(error.to_string()))?;
     let text = serde_json::to_string_pretty(&structured)
         .map_err(|error| JsonRpcAppError::internal(error.to_string()))?;
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "lethe/response_limit".to_owned(),
+        serde_json::to_value(limit)
+            .map_err(|error| JsonRpcAppError::internal(error.to_string()))?,
+    );
+    for (key, value) in extra_meta {
+        meta.insert(key.to_owned(), value);
+    }
     Ok(json!({
         "content": [
             { "type": "text", "text": text }
         ],
         "structuredContent": structured,
-        "_meta": {
-            "lethe/response_limit": limit
-        },
+        "_meta": meta,
         "isError": false,
     }))
 }

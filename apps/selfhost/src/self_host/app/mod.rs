@@ -908,6 +908,7 @@ mod sync;
 mod sync_support;
 
 use media_support::*;
+pub use projection_api::CorpusSourceTypeSummary;
 #[cfg(test)]
 use service_support::classify_slack_ingress;
 use service_support::{
