@@ -28,8 +28,8 @@ occurred-at, and context identifier metadata.
 ### Requirement: Cognition Supplemental Kinds
 The system SHALL register `reply-draft@1`, `reply-approval@1`,
 `send-record@1`, `nudge-event@1`, `eos-state-transition@1`,
-`mode-transition@1`, and `briefing-issue@1` with JSON Schema validation for
-required fields and enum values.
+`mode-transition@1`, `briefing-issue@1`, and `briefing-feedback@1` with JSON
+Schema validation for required fields and enum values.
 
 #### Scenario: New kind schema rejects invalid payloads
 - **GIVEN** each new cognition supplemental kind

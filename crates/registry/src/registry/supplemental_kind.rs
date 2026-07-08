@@ -603,6 +603,39 @@ pub fn base_supplemental_kind_schemas() -> Vec<SupplementalKindSchema> {
             registered_by: Some("system:initial-supplemental-kind-registry".into()),
             registered_at: None,
         },
+        SupplementalKindSchema {
+            kind: "briefing-feedback".into(),
+            version: SemVer::new("1.0.0"),
+            anchor_required: false,
+            payload_schema: serde_json::json!({
+                "type": "object",
+                "required": [
+                    "origin",
+                    "feedback_id",
+                    "rating",
+                    "note",
+                    "briefing_date",
+                    "briefing_id",
+                    "submitted_at",
+                    "surface",
+                    "project"
+                ],
+                "properties": {
+                    "origin": origin_schema(),
+                    "feedback_id": { "type": "string" },
+                    "rating": { "type": "string", "enum": ["good", "bad"] },
+                    "note": { "type": "string" },
+                    "briefing_date": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+                    "briefing_id": { "type": "string" },
+                    "submitted_at": { "type": "string", "format": "date-time" },
+                    "surface": { "type": "string", "enum": ["cli", "serve-web"] },
+                    "project": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            registered_by: Some("system:initial-supplemental-kind-registry".into()),
+            registered_at: None,
+        },
     ]
 }
 
@@ -735,6 +768,31 @@ mod tests {
     use lethe_core::domain::supplemental::InputAnchorSet;
     use lethe_core::domain::{ActorRef, Mutability};
 
+    fn briefing_feedback_schema() -> SupplementalKindSchema {
+        base_supplemental_kind_schemas()
+            .into_iter()
+            .find(|schema| schema.kind == "briefing-feedback")
+            .unwrap()
+    }
+
+    fn briefing_feedback_payload(rating: &str, surface: &str) -> serde_json::Value {
+        serde_json::json!({
+            "origin": {
+                "actor": "eos",
+                "occurred_at": "2026-07-09T00:00:00Z",
+                "context_id": "briefing-feedback"
+            },
+            "feedback_id": "feedback-1",
+            "rating": rating,
+            "note": "",
+            "briefing_date": "2026-07-09",
+            "briefing_id": "briefing-2026-07-09",
+            "submitted_at": "2026-07-09T00:00:00Z",
+            "surface": surface,
+            "project": "eos"
+        })
+    }
+
     #[test]
     fn payload_violation_fields_include_required_type_and_enum() {
         let schema = base_supplemental_kind_schemas()
@@ -775,6 +833,92 @@ mod tests {
             panic!("expected payload violation");
         };
         assert!(violations.iter().any(|v| v.field == "verification_mode"));
+    }
+
+    #[test]
+    fn base_supplemental_kind_schemas_include_briefing_feedback() {
+        let schema = briefing_feedback_schema();
+        assert_eq!(schema.kind, "briefing-feedback");
+        assert_eq!(schema.version, SemVer::new("1.0.0"));
+        assert!(!schema.anchor_required);
+    }
+
+    #[test]
+    fn briefing_feedback_allows_empty_anchor_with_origin() {
+        let schema = briefing_feedback_schema();
+        let record = SupplementalRecord {
+            id: SupplementalId::new("sup:briefing-feedback"),
+            kind: "briefing-feedback@1".into(),
+            derived_from: InputAnchorSet::default(),
+            payload: briefing_feedback_payload("good", "cli"),
+            created_by: ActorRef::new("actor:test"),
+            created_at: Utc::now(),
+            mutability: Mutability::AppendOnly,
+            record_version: None,
+            model_version: None,
+            consent_metadata: None,
+            lineage: None,
+        };
+
+        validate_supplemental_payload(&schema, &record.payload).unwrap();
+        validate_supplemental_anchor_policy(&schema, &record).unwrap();
+
+        let missing_origin = SupplementalRecord {
+            payload: serde_json::json!({
+                "feedback_id": "feedback-1",
+                "rating": "good",
+                "note": "",
+                "briefing_date": "2026-07-09",
+                "briefing_id": "briefing-2026-07-09",
+                "submitted_at": "2026-07-09T00:00:00Z",
+                "surface": "cli",
+                "project": "eos"
+            }),
+            ..record
+        };
+        let payload_err =
+            validate_supplemental_payload(&schema, &missing_origin.payload).unwrap_err();
+        let SupplementalKindError::PayloadSchemaViolation { violations, .. } = payload_err else {
+            panic!("expected payload violation");
+        };
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.field == "origin")
+        );
+
+        let anchor_err = validate_supplemental_anchor_policy(&schema, &missing_origin).unwrap_err();
+        assert!(matches!(
+            anchor_err,
+            SupplementalKindError::MissingOriginMetadata { .. }
+        ));
+    }
+
+    #[test]
+    fn briefing_feedback_rejects_rating_and_surface_enum_violations() {
+        let schema = briefing_feedback_schema();
+
+        let err = validate_supplemental_payload(&schema, &briefing_feedback_payload("ok", "cli"))
+            .unwrap_err();
+        let SupplementalKindError::PayloadSchemaViolation { violations, .. } = err else {
+            panic!("expected rating payload violation");
+        };
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.field == "rating")
+        );
+
+        let err = validate_supplemental_payload(&schema, &briefing_feedback_payload("good", "web"))
+            .unwrap_err();
+        let SupplementalKindError::PayloadSchemaViolation { violations, .. } = err else {
+            panic!("expected surface payload violation");
+        };
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.field == "surface")
+        );
     }
 
     #[test]
@@ -909,6 +1053,7 @@ mod tests {
             "eos-state-transition",
             "mode-transition",
             "briefing-issue",
+            "briefing-feedback",
         ];
         for kind in cognition_kinds {
             let schema = schemas.iter().find(|schema| schema.kind == kind).unwrap();
@@ -996,6 +1141,25 @@ mod tests {
                     "briefing_id": "briefing-1",
                     "issued_at": "2026-07-06T00:00:00Z",
                     "surface": "paper"
+                }),
+            ),
+            (
+                "briefing-feedback",
+                "rating",
+                serde_json::json!({
+                    "origin": serde_json::json!({
+                        "actor": "eos",
+                        "occurred_at": "2026-07-06T00:00:00Z",
+                        "context_id": "briefing-feedback"
+                    }),
+                    "feedback_id": "feedback-1",
+                    "rating": "ok",
+                    "note": "",
+                    "briefing_date": "2026-07-06",
+                    "briefing_id": "briefing-1",
+                    "submitted_at": "2026-07-06T00:00:00Z",
+                    "surface": "cli",
+                    "project": "eos"
                 }),
             ),
         ];

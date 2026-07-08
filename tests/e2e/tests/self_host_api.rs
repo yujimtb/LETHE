@@ -562,6 +562,36 @@ fn decision_supplemental_body(
     })
 }
 
+fn briefing_feedback_supplemental_body(id: &SupplementalId, rating: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id.as_str(),
+        "kind": "briefing-feedback@1",
+        "derived_from": {
+            "observations": [],
+            "blobs": [],
+            "supplementals": []
+        },
+        "payload": {
+            "origin": {
+                "actor": "eos",
+                "occurred_at": "2026-07-09T00:00:00Z",
+                "context_id": "briefing-feedback"
+            },
+            "feedback_id": "feedback-1",
+            "rating": rating,
+            "note": "",
+            "briefing_date": "2026-07-09",
+            "briefing_id": "briefing-2026-07-09",
+            "submitted_at": "2026-07-09T00:00:00Z",
+            "surface": "cli",
+            "project": "eos"
+        },
+        "created_by": "actor:eos",
+        "mutability": "append_only",
+        "model_version": null
+    })
+}
+
 fn post_supplemental(
     app: axum::Router,
     token: &str,
@@ -1710,6 +1740,32 @@ fn supplemental_post_rejects_claim_missing_verification_mode_before_write() {
             .unwrap()
             .iter()
             .any(|violation| violation["field"] == "verification_mode")
+    );
+    assert!(persistence.load_supplementals().unwrap().is_empty());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn supplemental_post_validates_registered_briefing_feedback_schema() {
+    let (root, db, blobs) = temp_paths();
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let app = build_router(
+        AppService::bootstrap(supplemental_write_config(db.clone(), blobs.clone())).unwrap(),
+    );
+    let body = briefing_feedback_supplemental_body(&supplemental_id(), "ok");
+
+    let (status, json) = post_supplemental(app, "write-token", body);
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(json["error"], "payload_schema_violation");
+    assert_eq!(json["details"]["kind"], "briefing-feedback");
+    assert!(
+        json["details"]["violations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|violation| violation["field"] == "rating")
     );
     assert!(persistence.load_supplementals().unwrap().is_empty());
 

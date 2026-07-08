@@ -26,8 +26,9 @@ Track C(MCP write)               Track D(projection 4本)           │
 
 - [x] A1 `anchor_required` を kind schema に追加し、false 時の origin 必須検証を実装する
   - Spec: SKIND-05 / 受け入れ: 空アンカー受理+origin 欠落拒否 test、既存 6 kind の後方互換 test
-- [x] A2 新 7 kind(reply-draft@1 / reply-approval@1 / send-record@1 / nudge-event@1 / eos-state-transition@1 / mode-transition@1 / briefing-issue@1)の JSON Schema を定義・登録する
+- [x] A2 新 8 kind(reply-draft@1 / reply-approval@1 / send-record@1 / nudge-event@1 / eos-state-transition@1 / mode-transition@1 / briefing-issue@1 / briefing-feedback@1)の JSON Schema を定義・登録する
   - Spec: SKIND-06 / 受け入れ: 各 kind の必須欠落・enum 違反拒否 test
+  - 2026-07-09: Eos ブリーフィング満足度フィードバック用に `briefing-feedback@1` を追加。anchor は任意、`origin` は必須、`rating=good|bad` と `surface=cli|serve-web` を schema で検証する。
 
 ## Track B. ChatGPT 取り込み
 

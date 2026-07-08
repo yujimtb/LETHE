@@ -40,6 +40,6 @@ Supplemental Kind Registry に `anchor_required`(既定 true)を追加する SHA
 
 ## SKIND-06(registry 拡張): 新 kind 登録
 
-次の kind を登録する SHALL: reply-draft@1(anchor= 着信観測、必須)/ reply-approval@1(anchor= 対象 draft、必須。payload に承認インターフェース識別子)/ send-record@1(anchor= 対象 draft、必須。payload に自動送信か承認送信かの別と、自動送信時は三条件審査の記録)/ nudge-event@1・eos-state-transition@1・mode-transition@1・briefing-issue@1(anchor 任意、origin 必須)。
+次の kind を登録する SHALL: reply-draft@1(anchor= 着信観測、必須)/ reply-approval@1(anchor= 対象 draft、必須。payload に承認インターフェース識別子)/ send-record@1(anchor= 対象 draft、必須。payload に自動送信か承認送信かの別と、自動送信時は三条件審査の記録)/ nudge-event@1・eos-state-transition@1・mode-transition@1・briefing-issue@1・briefing-feedback@1(anchor 任意、origin 必須)。
 
 受け入れ: 各 kind のスキーマ検証 test(必須欠落・enum 違反の拒否)。

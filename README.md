@@ -147,6 +147,10 @@ cargo run -p lethe-selfhost
 selfhost が設定します。`derived_from` は空にできず、未解決の observation /
 supplemental 参照は 422 と詳細で拒否されます。同一 ID の再 POST は 409 です。
 内容ベースの重複排除は書き込み側では行いません。
+ただし Registry で `anchor_required=false` として登録済みの system-event kind
+は、`payload.origin` が schema を満たす場合に限り空の `derived_from` を許可します。
+`briefing-feedback@1` は Eos ブリーフィング満足度フィードバック用の登録済み kind
+で、`rating=good|bad`、`surface=cli|serve-web` の payload schema で検証されます。
 
 `created_by` には `actor:codex-import` のような安定した pipeline/client actor を
 入れ、使用モデル名は `model_version` に記録します。モデル名を `created_by` に
