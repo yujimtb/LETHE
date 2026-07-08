@@ -2,7 +2,7 @@
 
 **Change:** supplemental-write-and-mcp-read
 **Module:** (new) mcp-read-port(M14 API Serving と同居、別リスナー)
-**Scope:** 公開 MCP 読み取りサーバ(OAuth 2.1 リソースサーバ、Streamable HTTP、厳選 5 ツール)
+**Scope:** 公開 MCP サーバ(OAuth 2.1 リソースサーバ、Streamable HTTP、read 5 ツール + write 1 ツール)
 **Dependencies:** M05 Projection Engine, M14 API Serving, corpus-projection(既存), claim-queue-projection
 **Agent:** Spec Designer(ツール契約)→ Implementer(リスナー+authz+ツール)→ Reviewer(公開面・認可検証)
 
@@ -28,29 +28,42 @@ MCP エンドポイントは Streamable HTTP トランスポートを実装 SHAL
 
 ### Requirement: MCPR-03 OAuth 2.1 リソースサーバ
 
-MCP サーバはリソースサーバとして振る舞い SHALL する: (1) `/.well-known/oauth-protected-resource` で保護リソースメタデータを公開し、認可サーバ(マネージド ID 基盤)を指す。(2) 受信リクエストの Bearer トークン(JWT)を認可サーバの公開鍵で検証する(署名・有効期限・audience)。(3) トークン発行・動的クライアント登録・同意画面は実装しない(認可サーバ側の責務)。固定 API キー認証を実装して SHALL NOT ならない。
+MCP サーバはリソースサーバとして振る舞い SHALL する: (1) `/.well-known/oauth-protected-resource` と `/.well-known/oauth-protected-resource/mcp` で保護リソースメタデータを公開し、認可サーバ(マネージド ID 基盤)を指す。(2) 受信リクエストの Bearer トークン(JWT)を認可サーバの公開鍵で検証する(署名・有効期限・issuer・audience・権限 grant)。(3) 権限 grant は JWT の `scope` claim と Auth0 RBAC/API permission 用の `permissions` claim から読む。(4) トークン発行・動的クライアント登録・同意画面・refresh token exchange は実装しない(認可サーバ側の責務)。固定 API キー認証を実装して SHALL NOT ならない。
 
 #### Scenario: 無効トークンの拒否
 - **WHEN** 期限切れまたは audience 不一致の JWT でツール呼び出しが届く
-- **THEN** 401 と WWW-Authenticate ヘッダ(保護リソースメタデータへの誘導)が返る
+- **THEN** 401 と WWW-Authenticate ヘッダ(保護リソースメタデータへの誘導と必要 scope)が返る
 
 #### Scenario: メタデータ発見
 - **WHEN** クライアントが `/.well-known/oauth-protected-resource` を取得する
 - **THEN** 認可サーバの issuer URL を含む有効なメタデータが返る
 
-### Requirement: MCPR-04 ツールセット(読み取り専用・5 種)
+#### Scenario: Auth0 RBAC permission claim
+- **WHEN** Auth0 が refresh token flow などで `permissions = ["mcp:read", ...]` を持つ access token を発行する
+- **THEN** MCP サーバは `permissions` の grant を `scope` と同じ認可入力として扱い、該当 tool の scope check に使用する
 
-提供ツールは以下の 5 種と SHALL し、書き込みツールを提供して SHALL NOT ならない:
+### Requirement: MCPR-04 ツールセット(read 5 種 + write 1 種)
 
-| ツール | 内容 | 背後の Projection |
-|--------|------|------------------|
-| `search_lake` | 全文検索(クエリ、ソース種別フィルタ任意) | corpus-projection |
-| `get_record` | レコード ID 指定の本文取得 | corpus-projection |
-| `get_thread` | レコードの前後文脈(同一会話/スレッド)取得 | corpus-projection |
-| `claim_queue` | 未終端 claim の一覧(状態フィルタ、同源グループ形) | claim-queue-projection |
-| `search_decisions` | 決定台帳の検索(supersedes 解決済み) | claim-queue-projection |
+提供ツールは以下の 6 種と SHALL する:
 
-全ツールは Projection のみを読み、生 supplemental・生 observation ストアへ直接アクセスして SHALL NOT ならない(Filtering-before-Exposure)。ツール説明文は AI の選択精度を左右する契約物として spec レビュー対象に含める。
+| ツール | 種別 | 必須 scope | 内容 | 背後の Projection / Store |
+|--------|------|------------|------|---------------------------|
+| `search_lake` | read | `mcp:read` | 全文検索(クエリ、ソース種別フィルタ任意) | corpus-projection |
+| `get_record` | read | `mcp:read` | レコード ID 指定の本文取得 | corpus-projection |
+| `get_thread` | read | `mcp:read` | レコードの前後文脈(同一会話/スレッド)取得 | corpus-projection |
+| `claim_queue` | read | `mcp:read` | 未終端 claim の一覧(状態フィルタ、同源グループ形) | claim-queue-projection |
+| `search_decisions` | read | `mcp:read` | 決定台帳の検索(supersedes 解決済み) | claim-queue-projection |
+| `write_supplemental` | write | `write:supplemental` | 既存 observation/blob/supplemental anchor から派生した supplemental record を 1 件作成 | supplemental store + projection refresh |
+
+read ツールは Projection のみを読み、生 supplemental・生 observation ストアへ直接アクセスして SHALL NOT ならない(Filtering-before-Exposure)。`write_supplemental` は HTTP `POST /supplementals` と同じ検証・永続化・projection refresh 経路を使い、anchor 未解決または未登録 kind は明示的に拒否 SHALL する。ツール説明文・annotations・`securitySchemes` は AI の選択精度とクライアント側確認 UI を左右する契約物として spec レビュー対象に含める。
+
+#### Scenario: ChatGPT write action discovery
+- **WHEN** ChatGPT.com が `tools/list` を取得する
+- **THEN** `write_supplemental` は `annotations.readOnlyHint = false`, `annotations.destructiveHint = false`, `annotations.openWorldHint = false`, `securitySchemes = [{ type = "oauth2", scopes = ["write:supplemental"] }]`, `_meta.securitySchemes` mirror を持つ
+
+#### Scenario: tool-level 再認可要求
+- **WHEN** `mcp:read` のみを持つ access token で `write_supplemental` が呼ばれる
+- **THEN** JSON-RPC error ではなく MCP tool result として `isError = true` と `_meta["mcp/www_authenticate"]` を返し、`error="insufficient_scope"` と `scope="write:supplemental"` を含む challenge で ChatGPT の再認可 UI を起動できる
 
 #### Scenario: エージェントの claim 取得
 - **WHEN** 接続済みの Claude が「いま未検証の主張は何か」に answering するため claim_queue を verification_mode = generate フィルタで呼ぶ

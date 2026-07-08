@@ -226,8 +226,26 @@ fn parse_session_meta(row: &Value) -> Result<CodexSessionMeta, AdapterError> {
         session_id: required_string(payload, "/session_id")?,
         transcript_id: required_string(payload, "/id")?,
         parent_thread_id: optional_string(payload, "/parent_thread_id"),
-        thread_source: required_string(payload, "/thread_source")?,
+        thread_source: session_thread_source(payload)?,
     })
+}
+
+fn session_thread_source(payload: &Value) -> Result<String, AdapterError> {
+    if let Some(thread_source) =
+        optional_string(payload, "/thread_source").filter(|value| !value.trim().is_empty())
+    {
+        return Ok(thread_source);
+    }
+    if optional_string(payload, "/parent_thread_id")
+        .filter(|value| !value.trim().is_empty())
+        .is_none()
+        && string_at(payload, "/source") == Some("vscode")
+    {
+        return Ok("user".to_owned());
+    }
+    Err(malformed(
+        "/thread_source must be a non-empty string".to_owned(),
+    ))
 }
 
 fn map_row(
@@ -705,6 +723,53 @@ mod tests {
         assert_eq!(draft.payload["session_id"], "pre-session-id");
         assert_eq!(draft.payload["transcript_id"], "pre-session-id");
         assert_eq!(draft.payload["thread_source"], "user");
+    }
+
+    #[test]
+    fn session_id_vscode_meta_without_thread_source_is_user_thread() {
+        let meta = serde_json::json!({
+            "session_id": "desktop-session",
+            "id": "desktop-session",
+            "timestamp": "2026-07-07T13:04:00.000Z",
+            "cwd": "D:\\repo",
+            "originator": "Codex Desktop",
+            "cli_version": "0.142.5",
+            "source": "vscode",
+            "model_provider": "openai"
+        });
+        let draft = import_one_legacy_message(meta);
+
+        assert_eq!(draft.payload["session_id"], "desktop-session");
+        assert_eq!(draft.payload["transcript_id"], "desktop-session");
+        assert_eq!(draft.payload["thread_source"], "user");
+    }
+
+    #[test]
+    fn session_id_sidechain_without_thread_source_is_rejected() {
+        let jsonl = serde_json::json!({
+            "timestamp": "2026-07-07T13:04:00.000Z",
+            "type": "session_meta",
+            "payload": {
+                "session_id": "child-session",
+                "id": "child-session",
+                "parent_thread_id": "parent-session",
+                "timestamp": "2026-07-07T13:04:00.000Z",
+                "cwd": "D:\\repo",
+                "originator": "codex-tui",
+                "source": {"subagent": {}},
+                "model_provider": "openai"
+            }
+        })
+        .to_string();
+
+        let error = importer()
+            .import_jsonl_str(&jsonl, "sidechain-missing-thread-source.jsonl")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("/thread_source must be a non-empty string")
+        );
     }
 
     fn import_one_legacy_message(meta: serde_json::Value) -> ObservationDraft {

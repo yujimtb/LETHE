@@ -45,14 +45,16 @@ Track C(MCP write)               Track D(projection 4本)           │
   - Spec: MCPW-01, MCPW-02 / 受け入れ: 全 kind contract test、HTTP/MCP エラー対照 test
 - [x] C2 scope 検証(`write:supplemental` 保持トークンのみ許可)とツール説明文(事後処理ワークフロー明記)を実装する
   - Spec: MCPW-03, MCPW-04 / 受け入れ: read-only トークン拒否 test、未解決アンカー拒否 test、説明文レビュー
-- [ ] C3 claude.ai / ChatGPT の実クライアントから公開 endpoint 経由の write → projection 反映を手動疎通し evidence を記録する
+- [x] C3 claude.ai / ChatGPT の実クライアントから公開 endpoint 経由の write → projection 反映を手動疎通し evidence を記録する
   - Spec: MCPW-05 / 受け入れ: 両クライアントの E2E evidence
   - 2026-07-06: ローカル MCP e2e は完了。公開 claude.ai / ChatGPT custom app の手動 write evidence は未実施。
-  - 2026-07-06 本番: `https://yujiws.tail474356.ts.net/.well-known/oauth-protected-resource` は browser-use で到達し、`scopes_supported=["mcp:read","write:supplemental"]` を確認。Claude 実クライアントでは `write_supplemental` が表示されたが、単発許可後の実行は `{"error":"Error occurred during tool execution","request_id":"req_011CckfUfezTrCZsvuUWXyN5"}` で失敗し、公開クライアント由来の supplemental は作成されなかった。ChatGPT custom app は `write_supplemental unavailable in LETHE_Personal_Lake read-only tool` と返した。よって C3 は未完了。
+  - 2026-07-06 本番: `https://yujiws.tail474356.ts.net/.well-known/oauth-protected-resource` は browser-use で到達し、`scopes_supported=["mcp:read","write:supplemental"]` を確認。Claude 実クライアントでは `write_supplemental` が表示されたが、単発許可後の実行は `{"error":"Error occurred during tool execution","request_id":"req_011CckfUfezTrCZsvuUWXyN5"}` で失敗し、公開クライアント由来の supplemental は作成されなかった。ChatGPT custom app は当時 `write_supplemental unavailable in LETHE_Personal_Lake read-only tool` と返し、公開クライアントの write scope/tool 公開設定が残件だった。
   - 2026-07-06 本番切り分け: 同一 payload は内部 HTTP `POST /supplementals` で成功し、`sup:71591976-99db-4c29-bf71-c2c756d41c5f` を作成後、`sup:cd488fa0-248e-4d0a-a4e3-b29c44853332` で `terminated` へ遷移。`/projections/claim-queue?state=terminated` は `terminated_matches=1`、`state=open` は `open_matches=0`。実装/API/Projection 側は通っており、残件は公開クライアントの write scope/tool 公開設定。
   - 2026-07-07 本番再認可: browser-use で Auth0 管理画面へ `mitobex7@gmail.com` と `y.mitobe@hlab.college` の両方でログインしたが、どちらも `https://auth0.com/profile` の新規 profile flow に落ち、`lethe-mcp` tenant dashboard へ入れなかった。Claude の LETHE connector は切断→再接続し、Auth0 consent 画面で要求 scope が `mcp:read` と `offline_access` のみで `write:supplemental` を含まないことを確認。再接続後の単発許可 write も `{"error":"Error occurred during tool execution","request_id":"req_011Ccm3mgpE61o4wkzmpVUSy"}` で失敗し、`sup:a93e1874-5a8f-4e70-90b1-da235627185d` は本番 SQLite に作成されなかった。Anthropic 公式 docs は `401 WWW-Authenticate` に scope が無い場合 `scopes_supported` を要求するとしているため、現時点の実ブロッカーは Auth0 resource server/API permission 側で `write:supplemental` が発行されていないこと、または Claude/Auth0 間で当該 scope が落ちていること。Auth0 tenant 管理権限または Management API 資格情報が必要。
-  - 2026-07-07 本番解消(Claude 側): Auth0 tenant `dev-muwlx2h3vvs2z7xt` を作成し、API `LETHE MCP`(identifier `https://yujiws.tail474356.ts.net/mcp`)に `mcp:read` / `write:supplemental` を定義。Dynamic Client Registration を有効化し、`google-oauth2` connection を domain-level に昇格。Claude DCR client `tpc_11NbEAfZ19vHyL5bGG1eL6` に API Access grant `cgr_qOVeYy4ndc50ZjnQ` で 2/2 permissions を付与した。
-  - 2026-07-07 本番解消(Claude 側): Claude connector から実 tool call で `sup:86eea51a-03d4-4fa8-b241-3de111ed0ffb` を `claim@1` として作成し、`claim_queue(state="open")` で反映を確認後、`sup:ad779751-43ec-4172-99b6-7b63040b4941` の `claim-transition@1` で `terminated` へ遷移。`claim_queue(state="terminated")`、SQLite `supplementals`、HTTP `/projections/claim-queue?state=terminated&limit=20` で state=`terminated`, transition=`sup:ad779751-43ec-4172-99b6-7b63040b4941`, stale=`false`, built_at=`2026-07-06T16:33:19.160389651Z` を確認。ChatGPT 側 write はユーザー指示どおり ChatGPT export/app 後回しのため、C3 チェック自体は未完了のまま残す。
+  - 2026-07-07 本番解消(Claude 側): Auth0 tenant `lethe-mcp.jp.auth0.com` の API `LETHE MCP Read Port`(identifier `https://yujiws.tail474356.ts.net/mcp`)に `mcp:read` / `write:supplemental` を定義し、Allow Offline Access と Dynamic Client Registration を有効化した。Claude DCR client `tpc_11NbEAfZ19vHyL5bGG1eL6` は 2/2 permissions を要求する構成に揃えた。
+  - 2026-07-07 本番解消(Claude 側): Claude connector から実 tool call で `sup:86eea51a-03d4-4fa8-b241-3de111ed0ffb` を `claim@1` として作成し、`claim_queue(state="open")` で反映を確認後、`sup:ad779751-43ec-4172-99b6-7b63040b4941` の `claim-transition@1` で `terminated` へ遷移。`claim_queue(state="terminated")`、SQLite `supplementals`、HTTP `/projections/claim-queue?state=terminated&limit=20` で state=`terminated`, transition=`sup:ad779751-43ec-4172-99b6-7b63040b4941`, stale=`false`, built_at=`2026-07-06T16:33:19.160389651Z` を確認。この時点では ChatGPT 側 write が未確認だった。
+  - 2026-07-08: Auth0 `Default Permissions for third-party applications` を `mcp:read` / `write:supplemental` の 2/2 に更新し、以後の Claude.ai / ChatGPT.com / Codex DCR consent で `write:supplemental` が落ちない構成にした。claude.ai、ChatGPT.com、Claude Code、Codex CLI の read MCP 疎通は全て再確認済み。
+  - 2026-07-08: ChatGPT.com custom app の Draft app details で `Refresh` を実行し、`write_supplemental` が `WRITE` action、required scope `write:supplemental`、`_meta.securitySchemes` mirror 付きで登録されることを確認。`Reconnect` 後の Auth0 consent は `mcp:read` / `write:supplemental` / `offline_access` を表示した。ChatGPT 実会話から `write_supplemental` で `sup:beaf7489-61dd-48bb-8015-068390fb5cc5` を作成し、同会話の `search_decisions` と Codex MCP 検証の両方で statement `ChatGPT write_supplemental smoke 2026-07-07T16:03:29Z` を取得した。C3 は完了。
 
 ## Track D. Projection 4本
 
@@ -131,8 +133,10 @@ Track C(MCP write)               Track D(projection 4本)           │
   - protected resource metadata advertised `mcp:read` and `write:supplemental`
   - public `/health/deep` returned 404, confirming the internal API router is not exposed on Funnel
   - Claude public broad query passed as recorded in F3
-  - Auth0 issuer switched to `https://dev-muwlx2h3vvs2z7xt.us.auth0.com/`; public and local protected-resource metadata advertise the new issuer and `["mcp:read","write:supplemental"]`.
+  - Auth0 issuer is `https://lethe-mcp.jp.auth0.com/`; public and local protected-resource metadata advertise that issuer and `["mcp:read","write:supplemental"]`.
   - Claude public write passed after DCR/API grant repair: `sup:86eea51a-03d4-4fa8-b241-3de111ed0ffb` -> `sup:ad779751-43ec-4172-99b6-7b63040b4941`, claim queue terminated projection `stale=false`.
+  - 2026-07-08 client refresh repair: Auth0 third-party default grant is 2/2, unused failed-attempt DCR clients were removed, and claude.ai / ChatGPT.com / Claude Code / Codex CLI all returned `corpus:github-commit:019f35ff-3750-7721-8748-326adacde778` from the public MCP endpoint.
+  - 2026-07-08 ChatGPT.com write passed after app `Refresh` and `Reconnect`: `sup:beaf7489-61dd-48bb-8015-068390fb5cc5` was created through `write_supplemental` and returned by `search_decisions` with statement `ChatGPT write_supplemental smoke 2026-07-07T16:03:29Z`.
 - 2026-07-07 final verification:
   - `cargo test --workspace` passed.
   - `openspec validate cognition-substrate --strict` passed.
@@ -141,5 +145,5 @@ Track C(MCP write)               Track D(projection 4本)           │
 ### SHALL 被覆メモ
 
 - SRCH-01: public broad query evidence recorded; no FTS follow-up required.
-- MCPW-05: claude.ai public write is complete after Auth0 DCR/API grant repair. ChatGPT public write remains deferred with the ChatGPT export/app work, so C3 remains open for the ChatGPT half only.
+- MCPW-05: claude.ai and ChatGPT.com public write are complete after Auth0 DCR/API grant repair, ChatGPT app `Refresh`, and ChatGPT app `Reconnect`.
 - CEXP-01/CEXP-05 operational export jobs: ChatGPT export is explicitly deferred; E1 is complete, E2 remains open, and E3 remains open until the Slack webhook approval/secret exists and a real failure notification is observed.

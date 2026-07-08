@@ -22,7 +22,7 @@ mcp_bind_addr = "0.0.0.0:8090"
 [mcp]
 resource_url = "https://yujiws.tail474356.ts.net/mcp"
 protected_resource_metadata_url = "https://yujiws.tail474356.ts.net/.well-known/oauth-protected-resource"
-oauth_issuer = "https://dev-muwlx2h3vvs2z7xt.us.auth0.com/"
+oauth_issuer = "https://lethe-mcp.jp.auth0.com/"
 oauth_audience = "https://yujiws.tail474356.ts.net/mcp"
 oauth_jwks_path = "/etc/lethe/mcp-jwks.json"
 

@@ -102,15 +102,18 @@ Track H(MCP port)                   │
   - Spec: MCPR-01, MCPR-02 / 受け入れ: 内部 API ポートと MCP ポートの分離を確認する test
 - [x] H2 OAuth リソースサーバ(JWT 検証: 署名・exp・audience。`/.well-known/oauth-protected-resource` 公開。401+WWW-Authenticate)を実装する。認可サーバはマネージド基盤(DCR 有効)を選定し issuer を config 化
   - Spec: MCPR-03 / 受け入れ: 期限切れ・audience 不一致・正常トークンの 3 パス test(認可サーバはモック鍵で)
-- [x] H3 5 ツール(search_lake / get_record / get_thread / claim_queue / search_decisions)を実装する。claim 系 2 ツールは C4 完了までは CLQ-06 契約へのスタブで進めてよい
+  - 2026-07-07: refresh token flow 後の Auth0 access token を受け入れやすくするため、JWT の `permissions` claim を `scope` と同じ grant 入力として検証し、401 `WWW-Authenticate` に `scope="mcp:read write:supplemental"` を含めた。LETHE は引き続き token endpoint / refresh token exchange / DCR / consent UI を実装せず、Auth0 を認可サーバとして使う。
+- [x] H3 6 ツール(read: search_lake / get_record / get_thread / claim_queue / search_decisions、write: write_supplemental)を実装する。claim 系 2 ツールは C4 完了までは CLQ-06 契約へのスタブで進めてよい
   - Spec: MCPR-04 / 受け入れ: ツール説明文が spec レビューを通過、各ツールの contract test
   - `claim_queue` / `search_decisions` は Track C4 の実 Projection API に接続済み。生 supplemental は読まない。
 - [x] H4 Tailscale Funnel で MCP ポートのみを公開し、実際の claude.ai カスタムコネクタ登録 → OAuth フロー → ツール呼び出しの手動疎通を行う
   - Spec: MCPR-01, MCPR-06 / 受け入れ: ブラウザ版 claude.ai から search_lake が実データを返す
-  - 2026-07-06: Tailscale Funnel は `https://yujiws.tail474356.ts.net/ -> http://127.0.0.1:8090` で MCP ポートのみ公開済み。Auth0 tenant `lethe-mcp.jp.auth0.com` に API `LETHE MCP Read Port` (`identifier = https://yujiws.tail474356.ts.net/mcp`, scope `mcp:read`, RS256, DCR enabled) を作成し、JWKS を `deploy/personal-lake/mcp-jwks.json` へ反映。公開 metadata、401 challenge、DCR smoke、Auth0 発行 JWT による `tools/list` は pass。
+  - 2026-07-06: Tailscale Funnel は `https://yujiws.tail474356.ts.net/ -> http://127.0.0.1:8090` で MCP ポートのみ公開済み。Auth0 tenant `lethe-mcp.jp.auth0.com` に API `LETHE MCP Read Port` (`identifier = https://yujiws.tail474356.ts.net/mcp`, scopes `mcp:read` / `write:supplemental`, Allow Offline Access, RS256, DCR enabled) を作成し、JWKS を `deploy/personal-lake/mcp-jwks.json` へ反映。公開 metadata、401 challenge、DCR smoke、Auth0 発行 JWT による `tools/list` は pass。
   - 2026-07-06: claude.ai custom connector `LETHE Personal Lake` を登録し、Auth0 OAuth を完了。Claude Opus 4.8 Max で `search_lake(query="aquisition", source_types=["github-commit"], limit=3)` が `result_count=1`, `first_record_id=corpus:github-commit:019f2dea-4cf8-7e53-9f1c-863986634345` を返すことを確認。
   - 2026-07-06: ChatGPT custom app `LETHE Personal Lake` を Developer mode で登録し、Auth0 OAuth を完了。ChatGPT の tool call で同じ `search_lake` が `result_count=1`, `first_record_id=corpus:github-commit:019f2dea-4cf8-7e53-9f1c-863986634345` を返すことを確認。
   - 2026-07-06: Codex CLI と Claude Code でも同じ MCP query を実行し、同じ record id を返すことを確認。Claude Code は `--model opus` を使用し、Fable 系モデルは使用していない。
+  - 2026-07-08: Auth0 `Default Permissions for third-party applications` を `mcp:read` / `write:supplemental` の 2/2 に更新し、失敗した consent 試行で作られた未使用 DCR client を削除。claude.ai、ChatGPT.com、Claude Code、Codex CLI から `search_lake(query="aquisition", source_types=["github-commit"], limit=1)` を再実行し、全て `corpus:github-commit:019f35ff-3750-7721-8748-326adacde778` を返すことを確認。Claude Code は `claude mcp list` で `Connected`、Codex は `codex exec` で `lethe-personal-lake/search_lake` 実行を確認。
+  - 2026-07-08: ChatGPT.com custom app の Draft app details で `Refresh` を実行し、`write_supplemental` が `WRITE` action、required scope `write:supplemental`、`_meta.securitySchemes` mirror 付きで登録されることを確認。`Reconnect` 後の Auth0 consent は `mcp:read` / `write:supplemental` / `offline_access` を表示した。ChatGPT 実会話から `write_supplemental` で `sup:beaf7489-61dd-48bb-8015-068390fb5cc5` を作成し、同会話の `search_decisions` と Codex MCP 検証の両方で statement `ChatGPT write_supplemental smoke 2026-07-07T16:03:29Z` を取得した。
 
 ## Track I. 統合
 
@@ -124,5 +127,7 @@ Track H(MCP port)                   │
   - 受け入れ: 全 SHALL に judgement+evidence が存在
   - 2026-07-06: `requirements-coverage.md` を生成。local code/test と実公開面の両方で検証できる項目は evidence を記録済み。
   - 2026-07-06: synthetic personal lake import smoke と一時 selfhost に対する W0 check は pass。
-  - 2026-07-06: 実公開面の最終確認を追加実施。Funnel status は HTTPS 443 `/` -> `http://127.0.0.1:8090` のみで、公開 `GET https://yujiws.tail474356.ts.net/.well-known/oauth-protected-resource` は Auth0 issuer/resource を返す。公開 `POST /mcp` は token なしで 401 + `WWW-Authenticate`、公開 `/health/deep` は 404。Auth0 発行 JWT(aud=`https://yujiws.tail474356.ts.net/mcp`)で公開 `POST /mcp` `tools/list` が 5 ツールを返すことを確認。
+  - 2026-07-06: 実公開面の最終確認を追加実施。Funnel status は HTTPS 443 `/` -> `http://127.0.0.1:8090` のみで、公開 `GET https://yujiws.tail474356.ts.net/.well-known/oauth-protected-resource` は Auth0 issuer/resource を返す。公開 `POST /mcp` は token なしで 401 + `WWW-Authenticate`、公開 `/health/deep` は 404。Auth0 発行 JWT(aud=`https://yujiws.tail474356.ts.net/mcp`)で公開 `POST /mcp` `tools/list` が 6 ツールを返すことを確認。
   - 2026-07-06: claude.ai、ChatGPT、Claude Code、Codex の各クライアントから実公開 MCP endpoint に接続し、`search_lake(query="aquisition", source_types=["github-commit"], limit=3)` が `corpus:github-commit:019f2dea-4cf8-7e53-9f1c-863986634345` を返すことを確認。
+  - 2026-07-08: refresh-token 再認可後に同 4 クライアントを再検証。Auth0 issuer は旧 tenant `lethe-mcp.jp.auth0.com` のまま、third-party default grant は 2/2、DCR client は refresh token grant を持つ。全クライアントが `limit=1` の GitHub commit query で `corpus:github-commit:019f35ff-3750-7721-8748-326adacde778` を返した。
+  - 2026-07-08: ChatGPT.com から公開 endpoint 経由で `write_supplemental` を実行し、`sup:beaf7489-61dd-48bb-8015-068390fb5cc5` が projection に反映され `search_decisions` で取得できることを確認。

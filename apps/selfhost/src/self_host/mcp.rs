@@ -33,6 +33,9 @@ const CLAIM_QUEUE_DESCRIPTION: &str =
 const SEARCH_DECISIONS_DESCRIPTION: &str =
     "Search the folded decision ledger with supersedes resolution.";
 const WRITE_SUPPLEMENTAL_DESCRIPTION: &str = "Write one supplemental record as post-processing for an observation already ingested into the lake. This is not for live self-enrichment during the same conversation. Kinds with anchor_required=true require resolved anchors; system-event kinds with anchor_required=false require payload.origin.";
+const MCP_READ_SCOPE: &str = "mcp:read";
+const MCP_WRITE_SUPPLEMENTAL_SCOPE: &str = "write:supplemental";
+const MCP_AUTH_CHALLENGE_SCOPE: &str = "mcp:read write:supplemental";
 
 #[derive(Debug, Clone)]
 struct VerifiedToken {
@@ -93,6 +96,10 @@ pub fn build_mcp_router(service: AppService) -> Router {
             "/.well-known/oauth-protected-resource",
             get(protected_resource_metadata),
         )
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
+            get(protected_resource_metadata),
+        )
         .route("/mcp", post(mcp_post))
         .with_state(McpState::new(service))
 }
@@ -103,7 +110,7 @@ async fn protected_resource_metadata(State(state): State<McpState>) -> Json<Valu
         "authorization_servers": [state.oauth.issuer],
         "issuer": state.oauth.issuer,
         "bearer_methods_supported": ["header"],
-        "scopes_supported": ["mcp:read", "write:supplemental"],
+        "scopes_supported": [MCP_READ_SCOPE, MCP_WRITE_SUPPLEMENTAL_SCOPE],
     }))
 }
 
@@ -123,7 +130,7 @@ async fn mcp_post(
     let Some(id) = request.id.clone() else {
         return Ok(StatusCode::ACCEPTED.into_response());
     };
-    let response = match handle_json_rpc(&state.service, &token, request).await {
+    let response = match handle_json_rpc(&state, &token, request).await {
         Ok(result) => json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -142,7 +149,7 @@ async fn mcp_post(
 }
 
 async fn handle_json_rpc(
-    service: &AppService,
+    state: &McpState,
     token: &VerifiedToken,
     request: JsonRpcRequest,
 ) -> Result<Value, JsonRpcAppError> {
@@ -158,7 +165,12 @@ async fn handle_json_rpc(
         "tools/list" => Ok(tools_list_result()),
         "tools/call" => {
             let params: ToolCallParams = parse_params(request.params)?;
-            call_tool(service, token, params)
+            call_tool(
+                &state.service,
+                &state.oauth.protected_resource_metadata_url,
+                token,
+                params,
+            )
         }
         other => Err(JsonRpcAppError::method_not_found(format!(
             "unsupported MCP method: {other}"
@@ -271,10 +283,15 @@ fn tools_list_result() -> Value {
 }
 
 fn tool_definition(name: &str, description: &str, input_schema: Value) -> Value {
+    let security_schemes = oauth2_security_schemes(MCP_READ_SCOPE);
     json!({
         "name": name,
         "description": description,
         "inputSchema": input_schema,
+        "securitySchemes": security_schemes.clone(),
+        "_meta": {
+            "securitySchemes": security_schemes
+        },
         "annotations": {
             "readOnlyHint": true,
             "destructiveHint": false,
@@ -285,10 +302,15 @@ fn tool_definition(name: &str, description: &str, input_schema: Value) -> Value 
 }
 
 fn write_tool_definition(name: &str, description: &str, input_schema: Value) -> Value {
+    let security_schemes = oauth2_security_schemes(MCP_WRITE_SUPPLEMENTAL_SCOPE);
     json!({
         "name": name,
         "description": description,
         "inputSchema": input_schema,
+        "securitySchemes": security_schemes.clone(),
+        "_meta": {
+            "securitySchemes": security_schemes
+        },
         "annotations": {
             "readOnlyHint": false,
             "destructiveHint": false,
@@ -298,14 +320,21 @@ fn write_tool_definition(name: &str, description: &str, input_schema: Value) -> 
     })
 }
 
+fn oauth2_security_schemes(scope: &str) -> Value {
+    json!([{ "type": "oauth2", "scopes": [scope] }])
+}
+
 fn call_tool(
     service: &AppService,
+    metadata_url: &str,
     token: &VerifiedToken,
     params: ToolCallParams,
 ) -> Result<Value, JsonRpcAppError> {
     match params.name.as_str() {
         "search_lake" => {
-            ensure_scope(token, "mcp:read")?;
+            if let Some(result) = missing_scope_result(token, MCP_READ_SCOPE, metadata_url) {
+                return Ok(result);
+            }
             let args: SearchLakeArguments = parse_arguments(params.arguments)?;
             ensure_not_blank("query", &args.query)?;
             let response = service.corpus_grep_response(&lethe_api::api::grep::GrepRequest {
@@ -321,21 +350,27 @@ fn call_tool(
             tool_result(response)
         }
         "get_record" => {
-            ensure_scope(token, "mcp:read")?;
+            if let Some(result) = missing_scope_result(token, MCP_READ_SCOPE, metadata_url) {
+                return Ok(result);
+            }
             let args: GetRecordArguments = parse_arguments(params.arguments)?;
             ensure_not_blank("record_id", &args.record_id)?;
             let response = service.corpus_record_response(&args.record_id)?;
             tool_result(response)
         }
         "get_thread" => {
-            ensure_scope(token, "mcp:read")?;
+            if let Some(result) = missing_scope_result(token, MCP_READ_SCOPE, metadata_url) {
+                return Ok(result);
+            }
             let args: GetThreadArguments = parse_arguments(params.arguments)?;
             ensure_not_blank("record_id", &args.record_id)?;
             let response = service.corpus_thread_response(&args.record_id)?;
             tool_result(response)
         }
         "claim_queue" => {
-            ensure_scope(token, "mcp:read")?;
+            if let Some(result) = missing_scope_result(token, MCP_READ_SCOPE, metadata_url) {
+                return Ok(result);
+            }
             let args: ClaimQueueArguments = parse_arguments(params.arguments)?;
             let response = service.claim_queue_response_filtered(
                 parse_claim_state(args.state.as_deref())?,
@@ -347,7 +382,9 @@ fn call_tool(
             tool_result(response)
         }
         "search_decisions" => {
-            ensure_scope(token, "mcp:read")?;
+            if let Some(result) = missing_scope_result(token, MCP_READ_SCOPE, metadata_url) {
+                return Ok(result);
+            }
             let args: SearchDecisionsArguments = parse_arguments(params.arguments)?;
             ensure_not_blank("query", &args.query)?;
             let response = service
@@ -355,7 +392,11 @@ fn call_tool(
             tool_result(response)
         }
         "write_supplemental" => {
-            ensure_scope(token, "write:supplemental")?;
+            if let Some(result) =
+                missing_scope_result(token, MCP_WRITE_SUPPLEMENTAL_SCOPE, metadata_url)
+            {
+                return Ok(result);
+            }
             let args: SupplementalWriteRequest = parse_arguments(params.arguments)?;
             let response = service.write_supplemental(args)?;
             tool_result(WriteSupplementalResult { record: response })
@@ -371,14 +412,34 @@ struct WriteSupplementalResult {
     record: lethe_core::domain::SupplementalRecord,
 }
 
-fn ensure_scope(token: &VerifiedToken, required: &str) -> Result<(), JsonRpcAppError> {
+fn missing_scope_result(
+    token: &VerifiedToken,
+    required: &str,
+    metadata_url: &str,
+) -> Option<Value> {
     if token.has_scope(required) {
-        Ok(())
+        None
     } else {
-        Err(JsonRpcAppError::permission_denied(format!(
-            "token lacks required scope {required}"
-        )))
+        Some(authorization_required_tool_result(metadata_url, required))
     }
+}
+
+fn authorization_required_tool_result(metadata_url: &str, required: &str) -> Value {
+    let challenge = format!(
+        "Bearer resource_metadata=\"{metadata_url}\", error=\"insufficient_scope\", error_description=\"Token lacks required scope {required}\", scope=\"{required}\""
+    );
+    json!({
+        "content": [
+            {
+                "type": "text",
+                "text": format!("Authentication required: token lacks required scope {required}.")
+            }
+        ],
+        "_meta": {
+            "mcp/www_authenticate": [challenge]
+        },
+        "isError": true
+    })
 }
 
 fn parse_claim_state(value: Option<&str>) -> Result<Option<ClaimState>, JsonRpcAppError> {
@@ -477,13 +538,6 @@ impl JsonRpcAppError {
             message,
         }
     }
-
-    fn permission_denied(message: String) -> Self {
-        Self {
-            code: -32003,
-            message,
-        }
-    }
 }
 
 impl From<SelfHostError> for JsonRpcAppError {
@@ -522,7 +576,7 @@ impl McpHttpError {
                 retry_after: None,
             },
             authenticate: Some(format!(
-                "Bearer error=\"invalid_token\", resource_metadata=\"{metadata_url}\""
+                "Bearer error=\"invalid_token\", resource_metadata=\"{metadata_url}\", scope=\"{MCP_AUTH_CHALLENGE_SCOPE}\""
             )),
         }
     }
@@ -572,6 +626,8 @@ enum JwtError {
     AudienceMismatch,
     #[error("JWT is expired")]
     Expired,
+    #[error("JWT contains no authorization grants")]
+    MissingAuthorizationGrant,
 }
 
 #[derive(Debug, Deserialize)]
@@ -586,7 +642,10 @@ struct JwtClaims {
     iss: String,
     exp: i64,
     aud: AudienceClaim,
-    scope: ScopeClaim,
+    #[serde(default)]
+    scope: Option<ScopeClaim>,
+    #[serde(default)]
+    permissions: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -611,7 +670,11 @@ impl ScopeClaim {
                 .filter(|scope| !scope.is_empty())
                 .map(ToOwned::to_owned)
                 .collect(),
-            Self::List(values) => values,
+            Self::List(values) => values
+                .into_iter()
+                .map(|scope| scope.trim().to_owned())
+                .filter(|scope| !scope.is_empty())
+                .collect(),
         }
     }
 }
@@ -653,8 +716,28 @@ fn verify_jwt(token: &str, oauth: &McpOAuthConfig) -> Result<VerifiedToken, JwtE
         return Err(JwtError::AudienceMismatch);
     }
     Ok(VerifiedToken {
-        scopes: claims.scope.into_scopes(),
+        scopes: authorization_grants(claims.scope, claims.permissions)?,
     })
+}
+
+fn authorization_grants(
+    scope: Option<ScopeClaim>,
+    permissions: Vec<String>,
+) -> Result<Vec<String>, JwtError> {
+    let mut grants = scope.map(ScopeClaim::into_scopes).unwrap_or_default();
+    grants.extend(
+        permissions
+            .into_iter()
+            .map(|permission| permission.trim().to_owned())
+            .filter(|permission| !permission.is_empty()),
+    );
+    grants.sort();
+    grants.dedup();
+    if grants.is_empty() {
+        Err(JwtError::MissingAuthorizationGrant)
+    } else {
+        Ok(grants)
+    }
 }
 
 fn find_jwk<'a>(jwks: &'a JsonWebKeySet, kid: &str) -> Result<&'a JsonWebKey, JwtError> {

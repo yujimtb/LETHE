@@ -151,8 +151,20 @@ listener. Do not add `/mcp` to the internal API port.
 
 OAuth is delegated to a managed ID provider. LETHE is only the resource server:
 it publishes `/.well-known/oauth-protected-resource` and validates Bearer JWT
-signature, `exp`, issuer, and audience against `oauth_jwks_path`. It does not
-issue tokens, implement DCR, show consent screens, or accept fixed API keys.
+signature, `exp`, issuer, audience, and authorization grants against
+`oauth_jwks_path`. Grants are read from the JWT `scope` claim and from Auth0's
+RBAC/API `permissions` claim. It does not issue tokens, implement DCR, exchange
+refresh tokens, show consent screens, or accept fixed API keys.
+
+Expired or rejected access tokens return a `WWW-Authenticate` challenge with
+the protected resource metadata URL and `scope="mcp:read write:supplemental"`.
+MCP clients that already hold a refresh token should use the Auth0 token
+endpoint to obtain a new access token. To make that possible, enable Allow
+Offline Access on the Auth0 API, enable the Refresh Token grant and rotation for
+the client/application, and ensure the client requests `offline_access` during
+authorization. Do not add `offline_access` to LETHE's protected resource
+`scopes_supported`; it is an authorization-server scope, not a LETHE resource
+permission.
 
 Create `deploy/personal-lake/mcp-jwks.json` from the provider JWKS before
 starting the Docker stack. `deploy/personal-lake/mcp-jwks.example.json` shows
@@ -163,14 +175,15 @@ Current production values for this personal lake:
 
 - MCP URL: `https://yujiws.tail474356.ts.net/mcp`
 - protected resource metadata: `https://yujiws.tail474356.ts.net/.well-known/oauth-protected-resource`
-- Auth0 issuer: `https://dev-muwlx2h3vvs2z7xt.us.auth0.com/`
+- path-specific protected resource metadata: `https://yujiws.tail474356.ts.net/.well-known/oauth-protected-resource/mcp`
+- Auth0 issuer: `https://lethe-mcp.jp.auth0.com/`
 - Auth0 API identifier / LETHE `oauth_audience`: `https://yujiws.tail474356.ts.net/mcp`
 - scopes: `mcp:read` for read tools; `write:supplemental` is additionally
   required for `write_supplemental`
 
 `deploy/personal-lake/mcp-jwks.json` is generated local configuration and is
 gitignored. Refresh it from
-`https://dev-muwlx2h3vvs2z7xt.us.auth0.com/.well-known/jwks.json` whenever Auth0 rotates
+`https://lethe-mcp.jp.auth0.com/.well-known/jwks.json` whenever Auth0 rotates
 signing keys, then restart selfhost so the in-process verifier reloads the
 JWKS.
 
@@ -198,13 +211,15 @@ Live client setup and verification:
   connector in a conversation.
 - ChatGPT: enable Developer mode, create custom app `LETHE Personal Lake` with
   MCP URL `https://yujiws.tail474356.ts.net/mcp`, select OAuth, acknowledge the
-  custom-action risk prompt, and complete the Auth0 OAuth flow.
+  custom-action risk prompt, and complete the Auth0 OAuth flow. After MCP tool
+  descriptors or scopes change, open the app settings, select the draft app
+  details, run `Refresh`, then `Reconnect`; the Auth0 consent page must include
+  `mcp:read`, `write:supplemental`, and `offline_access`.
 - Codex: configure MCP server `lethe-personal-lake` with URL
   `https://yujiws.tail474356.ts.net/mcp` and complete the OAuth flow.
-- Claude Code: use the claude.ai-scoped connector `LETHE Personal Lake`. The
-  installed CLI currently has no `claude mcp login` command; the stale
-  user-scope Claude Code MCP entry was removed on 2026-07-06 to avoid using an
-  unauthenticated duplicate.
+- Claude Code: use the claude.ai-scoped connector `LETHE Personal Lake`.
+  `claude mcp login "claude.ai LETHE Personal Lake"` can reauthorize it from the
+  CLI; `claude mcp list` must show that connector as `Connected`.
 
 The 2026-07-06 live verification query for all four clients was:
 
@@ -215,6 +230,29 @@ search_lake(query="aquisition", source_types=["github-commit"], limit=3)
 Each client returned `result_count=1` and
 `first_record_id=corpus:github-commit:019f2dea-4cf8-7e53-9f1c-863986634345`.
 Claude Code was tested with `--model opus`; Fable was not used.
+
+The 2026-07-08 live reauthorization and verification query was:
+
+```text
+search_lake(query="aquisition", source_types=["github-commit"], limit=1)
+```
+
+Auth0 `Default Permissions for third-party applications` was updated to grant
+both `mcp:read` and `write:supplemental`, so newly registered DCR clients request
+both resource scopes before `offline_access`. Unused DCR clients created during
+failed consent attempts were deleted, leaving the tenant at 9/10 applications.
+Live evidence:
+
+- claude.ai web connector returned
+  `corpus:github-commit:019f35ff-3750-7721-8748-326adacde778`.
+- ChatGPT.com custom app returned
+  `corpus:github-commit:019f35ff-3750-7721-8748-326adacde778`.
+- Claude Code `claude mcp list` showed
+  `claude.ai LETHE Personal Lake ... Connected`, and
+  `claude -p --model sonnet --allowedTools mcp__claude_ai_LETHE_Personal_Lake__search_lake`
+  returned `corpus:github-commit:019f35ff-3750-7721-8748-326adacde778`.
+- Codex CLI `codex exec` called `lethe-personal-lake/search_lake` and returned
+  `corpus:github-commit:019f35ff-3750-7721-8748-326adacde778`.
 
 The five read tools advertise read-only annotations:
 `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`, and
@@ -243,11 +281,12 @@ Public write status:
   `LETHE_Personal_Lake` read-only tool. The same payload succeeded through the
   internal HTTP API, creating `sup:71591976-99db-4c29-bf71-c2c756d41c5f` and
   terminating it with `sup:cd488fa0-248e-4d0a-a4e3-b29c44853332`.
-- 2026-07-07: the inaccessible old Auth0 tenant was replaced by tenant
-  `dev-muwlx2h3vvs2z7xt`. API `LETHE MCP` uses identifier
+- 2026-07-07: the Auth0 tenant in use is `lethe-mcp.jp.auth0.com`. API
+  `LETHE MCP Read Port` uses identifier
   `https://yujiws.tail474356.ts.net/mcp`, exposes `mcp:read` and
-  `write:supplemental`, has Dynamic Client Registration enabled, and uses a
-  domain-level `google-oauth2` connection for third-party Claude clients.
+  `write:supplemental`, has Dynamic Client Registration enabled, allows
+  offline access, and uses a domain-level `google-oauth2` connection for
+  third-party Claude clients.
 - 2026-07-07: Claude DCR created client `tpc_11NbEAfZ19vHyL5bGG1eL6`; Auth0
   API Access grant `cgr_qOVeYy4ndc50ZjnQ` gives that client 2/2 user-delegated
   LETHE MCP permissions. Auth0 consent showed `mcp:read` and
@@ -261,10 +300,58 @@ Public write status:
   the claim as `terminated`, transition
   `sup:ad779751-43ec-4172-99b6-7b63040b4941`, `stale=false`, and
   `built_at=2026-07-06T16:33:19.160389651Z`.
+- 2026-07-07: rebuilt and restarted the Docker selfhost image after adding
+  refresh-token support glue on the resource server side, then switched runtime
+  config and JWKS back to `lethe-mcp.jp.auth0.com`. Local and public
+  `/.well-known/oauth-protected-resource/mcp` return issuer
+  `https://lethe-mcp.jp.auth0.com/`, resource
+  `https://yujiws.tail474356.ts.net/mcp`, and scopes `mcp:read` /
+  `write:supplemental`. Local and public tokenless `POST /mcp` return 401 with
+  `WWW-Authenticate: Bearer ... scope="mcp:read write:supplemental"`. Auth0
+  OIDC discovery advertises `offline_access` and `refresh_token`; the Auth0 API
+  has `allow_offline_access=true` and scopes `mcp:read` / `write:supplemental`.
+- 2026-07-08: Auth0 third-party default permissions were changed from
+  `mcp:read` only to `mcp:read` plus `write:supplemental`; this prevents new
+  Claude.ai / Codex DCR consent flows from silently dropping the write scope.
+  Claude.ai, ChatGPT.com, Claude Code, and Codex CLI were rechecked against the
+  public MCP endpoint and all returned live `search_lake` data.
+- 2026-07-08: ChatGPT.com app settings `Refresh` returned six actions including
+  `write_supplemental` as a write action with required OAuth scope
+  `write:supplemental`. Because ChatGPT warned that enabled actions may require
+  reconnecting before they are callable, `Reconnect` was completed and Auth0
+  consent showed `mcp:read`, `write:supplemental`, and `offline_access`.
+  A live ChatGPT smoke wrote decision
+  `sup:beaf7489-61dd-48bb-8015-068390fb5cc5`, anchored to observation
+  `019f35ff-3750-7721-8748-326adacde778`, with statement
+  `ChatGPT write_supplemental smoke 2026-07-07T16:03:29Z`; the same ChatGPT
+  conversation then found it through `search_decisions`, and Codex MCP
+  verification also returned the persisted decision.
 
-ChatGPT browser write remains deferred with the ChatGPT export/app follow-up.
-Do not weaken LETHE's `write:supplemental` check to `mcp:read`; MCPW-03
-requires read-only tokens to be rejected for writes.
+ChatGPT.com write is now verified. Do not weaken LETHE's
+`write:supplemental` check to `mcp:read`; MCPW-03 requires read-only tokens to
+be rejected for writes.
+
+Scheduled reauthentication:
+
+- `scripts/reauthorize_lethe_mcp.ps1` opens a reauthentication note, ChatGPT,
+  Claude connector settings, and a visible PowerShell terminal that starts
+  `codex mcp login lethe-personal-lake` and
+  `claude mcp login "claude.ai LETHE Personal Lake"`.
+- Windows Task Scheduler task `LETHE MCP Reauth Idle Precheck` is registered for
+  2026-07-22 09:00 JST, one day before the expected ChatGPT/Codex idle
+  refresh-token expiry on 2026-07-23 JST.
+- Windows Task Scheduler task `LETHE MCP Reauth Absolute Renewal` is registered
+  for 2026-08-06 09:00 JST, one day before the expected ChatGPT/Codex absolute
+  refresh-token expiry on 2026-08-07 JST.
+- The tasks run only in the interactive user session because Auth0 consent must
+  be reviewed by the user. They do not attempt to click consent automatically.
+- Re-register the same tasks with:
+
+```powershell
+.\scripts\register_lethe_mcp_reauth_tasks.ps1 `
+  -IdlePrecheckAt '2026-07-22T09:00:00' `
+  -AbsoluteRenewalAt '2026-08-06T09:00:00'
+```
 
 ## Claude.ai
 
@@ -451,6 +538,13 @@ Claude Code messages. The 2026-07-06 real archive E2E against a temporary lake
 used 13 JSONL files and reported first import `ingested=639`, `duplicates=0`,
 `quarantined=0`; second import `ingested=0`, `duplicates=639`, `quarantined=0`.
 
+The 2026-07-08 immediate production import followed archive commit `48dcd66`
+and reported `ingested=272`, `duplicates=639`, `quarantined=0`, `files=26`,
+`lines=2951`, `skipped_malformed=0`, `skipped_unknown=0`,
+`excluded_known=1160`, and `excluded_tool_results=552`. The production lake then
+reported `sys:claude-code=911`, latest published
+`2026-07-07T16:40:24.508Z`, and freshness `fresh`.
+
 ## Codex
 
 Codex raw JSONL is preserved by the private source archive under
@@ -483,6 +577,16 @@ After the online import endpoint was deployed on 2026-07-06, Codex was re-run
 against the running service without stopping Docker. The API import was a no-op
 with `ingested=0`, `duplicates=11644`, `quarantined=0`, and the subsequent deep
 health and SQLite integrity checks passed.
+
+The 2026-07-08 immediate production import followed archive commit `48dcd66`.
+One Codex Desktop transcript used `source="vscode"` with `session_id` metadata
+and no `thread_source`; the importer now treats only parentless `source="vscode"`
+session metadata as the main user thread and still rejects missing
+`thread_source` for sidechain or unknown session metadata. The import then
+reported `ingested=4654`, `duplicates=11644`, `quarantined=0`, `files=235`,
+`transcripts=235`, `skipped_malformed=0`, `skipped_unknown=2950`, and
+`excluded_known=36320`. The production lake then reported `sys:codex=16298`,
+latest published `2026-07-07T16:48:07.649Z`, and freshness `fresh`.
 
 Import performance note: `AppService::ingest_observation_drafts` prepares the
 batch once, appends observations through the storage bulk API inside one SQLite

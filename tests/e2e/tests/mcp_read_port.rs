@@ -79,11 +79,6 @@ fn signer_and_oauth() -> (JwtSigner, McpOAuthConfig) {
 }
 
 fn sign_jwt(signer: &JwtSigner, audience: &str, exp: i64, scope: &str) -> String {
-    let header = serde_json::json!({
-        "alg": "ES256",
-        "kid": TEST_KID,
-        "typ": "JWT"
-    });
     let claims = serde_json::json!({
         "iss": TEST_ISSUER,
         "sub": "user:test",
@@ -91,6 +86,15 @@ fn sign_jwt(signer: &JwtSigner, audience: &str, exp: i64, scope: &str) -> String
         "exp": exp,
         "iat": Utc::now().timestamp(),
         "scope": scope
+    });
+    sign_jwt_claims(signer, claims)
+}
+
+fn sign_jwt_claims(signer: &JwtSigner, claims: serde_json::Value) -> String {
+    let header = serde_json::json!({
+        "alg": "ES256",
+        "kid": TEST_KID,
+        "typ": "JWT"
     });
     let signing_input = format!("{}.{}", encode_json(&header), encode_json(&claims));
     let rng = SystemRandom::new();
@@ -335,6 +339,20 @@ fn scoped_token(signer: &JwtSigner, scope: &str) -> String {
     )
 }
 
+fn permissions_token(signer: &JwtSigner, permissions: Vec<&str>) -> String {
+    sign_jwt_claims(
+        signer,
+        serde_json::json!({
+            "iss": TEST_ISSUER,
+            "sub": "user:test",
+            "aud": TEST_AUDIENCE,
+            "exp": (Utc::now() + Duration::hours(1)).timestamp(),
+            "iat": Utc::now().timestamp(),
+            "permissions": permissions
+        }),
+    )
+}
+
 fn mcp_request(token: &str, body: serde_json::Value) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -380,23 +398,26 @@ fn protected_resource_metadata_contract_is_public() {
     let (_root, service) = service_with_records(oauth);
     let app = build_mcp_router(service);
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let response = runtime
-        .block_on(async {
-            app.oneshot(
-                Request::builder()
-                    .uri("/.well-known/oauth-protected-resource")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-        })
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let json = response_json(&runtime, response);
-    assert_eq!(json["resource"], "https://mcp.example.test/mcp");
-    assert_eq!(json["authorization_servers"][0], TEST_ISSUER);
-    assert_eq!(json["issuer"], TEST_ISSUER);
-    assert_eq!(json["bearer_methods_supported"][0], "header");
+    for uri in [
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/mcp",
+    ] {
+        let response = runtime
+            .block_on(async {
+                app.clone()
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+            })
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(&runtime, response);
+        assert_eq!(json["resource"], "https://mcp.example.test/mcp");
+        assert_eq!(json["authorization_servers"][0], TEST_ISSUER);
+        assert_eq!(json["issuer"], TEST_ISSUER);
+        assert_eq!(json["bearer_methods_supported"][0], "header");
+        assert_eq!(json["scopes_supported"][0], "mcp:read");
+        assert_eq!(json["scopes_supported"][1], "write:supplemental");
+    }
 }
 
 #[test]
@@ -428,6 +449,13 @@ fn mcp_jwt_validation_rejects_expired_and_wrong_audience_and_accepts_valid() {
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.contains("resource_metadata="))
     );
+    assert!(
+        expired_response
+            .headers()
+            .get(WWW_AUTHENTICATE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("scope=\"mcp:read write:supplemental\""))
+    );
 
     let wrong_audience = sign_jwt(
         &signer,
@@ -453,6 +481,31 @@ fn mcp_jwt_validation_rejects_expired_and_wrong_audience_and_accepts_valid() {
     assert_eq!(ok_response.status(), StatusCode::OK);
     let json = response_json(&runtime, ok_response);
     assert_eq!(json["result"]["serverInfo"]["name"], "lethe-mcp-read-port");
+}
+
+#[test]
+fn mcp_jwt_validation_accepts_auth0_permissions_claim_for_refreshed_tokens() {
+    let (signer, oauth) = signer_and_oauth();
+    let (_root, service) = service_with_records(oauth);
+    let app = build_mcp_router(service);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let token = permissions_token(&signer, vec!["mcp:read"]);
+
+    let response = runtime
+        .block_on(async {
+            app.oneshot(mcp_request(
+                &token,
+                tool_call("search_lake", serde_json::json!({"query": "忘れ物"})),
+            ))
+            .await
+        })
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(&runtime, response);
+    let matches = json["result"]["structuredContent"]["data"]["matches"]
+        .as_array()
+        .unwrap();
+    assert_eq!(matches.len(), 1);
 }
 
 #[test]
@@ -533,11 +586,18 @@ fn six_mcp_tools_have_contracts_and_read_via_projection() {
         if tool["name"] == "write_supplemental" {
             assert!(description.contains("post-processing"));
             assert_eq!(tool["annotations"]["readOnlyHint"], false);
+            assert_eq!(
+                tool["securitySchemes"][0]["scopes"][0],
+                "write:supplemental"
+            );
         } else {
             assert!(description.len() <= 100);
             assert!(!description.to_ascii_lowercase().contains("write"));
             assert_eq!(tool["annotations"]["readOnlyHint"], true);
+            assert_eq!(tool["securitySchemes"][0]["scopes"][0], "mcp:read");
         }
+        assert_eq!(tool["securitySchemes"][0]["type"], "oauth2");
+        assert_eq!(tool["_meta"]["securitySchemes"], tool["securitySchemes"]);
         assert_eq!(tool["annotations"]["destructiveHint"], false);
         assert_eq!(tool["annotations"]["openWorldHint"], false);
     }
@@ -703,7 +763,12 @@ fn write_supplemental_requires_write_scope_and_refreshes_projection() {
         .unwrap();
     assert_eq!(read_only_response.status(), StatusCode::OK);
     let read_only_json = response_json(&runtime, read_only_response);
-    assert_eq!(read_only_json["error"]["code"], -32003);
+    assert_eq!(read_only_json["result"]["isError"], true);
+    let challenge = read_only_json["result"]["_meta"]["mcp/www_authenticate"][0]
+        .as_str()
+        .unwrap();
+    assert!(challenge.contains("error=\"insufficient_scope\""));
+    assert!(challenge.contains("scope=\"write:supplemental\""));
 
     let unresolved_arguments = serde_json::json!({
         "id": "sup:00000000-0000-7000-8000-000000000002",
