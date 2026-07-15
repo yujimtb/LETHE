@@ -94,7 +94,17 @@ ResolvedPerson =
   }
 ```
 
-### 4.4 Ambiguity Handling
+### 4.4 Stable Component Person ID
+
+`resolved_persons.person_id` は append order 上でcomponentの最初に存在するidentity
+node seedから `person:component-{seed}` として決定する。append-only inputでは新nodeを
+末尾にだけ追加するため、component mergeは小さいseed側のIDをsurvivorとし、mergeに
+参加しないcomponentのperson IDを変更してはならない。
+
+merge loserの旧IDに対するalias/redirectは作らない。derived materialization formatの
+更新時はcanonical Observationから全件を一度replayし、新IDだけをpublishする。
+
+### 4.5 Ambiguity Handling
 
 | Case | Action |
 |---|---|
@@ -219,6 +229,7 @@ spec:
 | 5 | medium confidence は承認前に `resolved_persons` へ入れない | candidate / person split check |
 | 6 | incremental apply で結果が安定 | replay test |
 | 7 | 同一入力では candidate ID と配列順が一致する | deterministic replay test |
+| 8 | component mergeで無関係componentのperson IDは変化しない | late-bridge regression |
 
 ---
 

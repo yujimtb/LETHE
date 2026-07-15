@@ -355,9 +355,9 @@ impl IdentityProjector {
         }
         grouped_members.sort_by_key(|members| members[0]);
 
-        for (group_index, members) in grouped_members.iter().enumerate() {
-            let person_seq = group_index + 1;
-            let person_id = EntityRef::new(format!("person:resolved-{person_seq}"));
+        for members in &grouped_members {
+            let component_seed = members[0];
+            let person_id = EntityRef::new(format!("person:component-{component_seed}"));
 
             let mut all_identifiers = Vec::new();
             let mut all_sources = Vec::new();
@@ -408,12 +408,12 @@ impl IdentityProjector {
                 ConfidenceLevel::High // Single source, auto-resolve.
             };
 
-            let canonical = canonical_name.unwrap_or_else(|| format!("person-{person_seq}"));
+            let canonical = canonical_name.unwrap_or_else(|| format!("person-{component_seed}"));
 
             // Build identifier rows.
             for (idx, ident) in all_identifiers.iter().enumerate() {
                 person_identifiers.push(PersonIdentifierRow {
-                    identifier_id: format!("pi:{person_seq}:{idx}"),
+                    identifier_id: format!("pi:{component_seed}:{idx}"),
                     person_id: person_id.clone(),
                     source: ident.source.clone(),
                     identifier_type: ident.identifier_type,
@@ -578,6 +578,56 @@ mod tests {
 
         // Different emails → 2 separate persons.
         assert_eq!(output.resolved_persons.len(), 2);
+    }
+
+    #[test]
+    fn component_person_id_does_not_renumber_unrelated_component_after_merge() {
+        let mut first_slack = IdentityProjector::extract_candidates(&[slack_obs(
+            "U-A",
+            "Alice",
+            Some("alice@example.com"),
+            "s1",
+        )])
+        .remove(0);
+        let google = IdentityProjector::extract_candidates(&[gslides_obs(
+            &["bridge@example.com"],
+            "bridge@example.com",
+            "g1",
+        )])
+        .remove(0);
+        let unrelated = IdentityProjector::extract_candidates(&[slack_obs(
+            "U-C",
+            "Carol",
+            Some("carol@example.com"),
+            "s2",
+        )])
+        .remove(0);
+        let candidates = vec![first_slack.clone(), google.clone(), unrelated.clone()];
+        let initial_matches = IdentityProjector::cross_source_match(&candidates);
+        let initial = IdentityProjector::new("1.0.0").resolve(&candidates, &initial_matches);
+        assert_eq!(
+            initial.resolved_persons[2].person_id.as_str(),
+            "person:component-2"
+        );
+
+        first_slack.identifiers.push(SourceIdentifier {
+            source: "slack".to_owned(),
+            identifier_type: IdentifierType::Email,
+            value: "bridge@example.com".to_owned(),
+        });
+        let merged_candidates = vec![first_slack, google, unrelated];
+        let merged_matches = IdentityProjector::cross_source_match(&merged_candidates);
+        let merged = IdentityProjector::new("1.0.0").resolve(&merged_candidates, &merged_matches);
+
+        assert_eq!(merged.resolved_persons.len(), 2);
+        assert_eq!(
+            merged.resolved_persons[1].person_id.as_str(),
+            "person:component-2"
+        );
+        assert_eq!(
+            serde_json::to_value(&initial.resolved_persons[2]).unwrap(),
+            serde_json::to_value(&merged.resolved_persons[1]).unwrap()
+        );
     }
 
     #[test]

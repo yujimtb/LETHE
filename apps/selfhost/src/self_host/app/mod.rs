@@ -32,8 +32,9 @@ use lethe_core::domain::{
 };
 use lethe_derivation_gemini::{GeminiSlideAnalyzer, SlideAnalysisProjector};
 use lethe_engine::identity::projector::IdentityProjector;
+use lethe_engine::identity::state::{IdentityApplyResult, IdentityNodeId, IdentityState};
 use lethe_engine::identity::types::{
-    IdentifierType, IdentityResolutionOutput, PersonCandidate, SourceIdentifier,
+    IdentifierKey, IdentifierType, IdentityResolutionOutput, PersonCandidate, ResolvedPerson,
 };
 #[cfg(test)]
 use lethe_engine::lake::LakeStore;
@@ -205,8 +206,10 @@ pub struct ProjectionSnapshot {
     pub lineage: LineageManifest,
 }
 
-const NON_CORPUS_MATERIALIZATION_VERSION: u32 = 5;
+const NON_CORPUS_MATERIALIZATION_VERSION: u32 = 7;
 const REPLY_SLO_ITEM_OWNER: &str = "__reply_slo__";
+const IDENTITY_EVENT_ITEM_OWNER: &str = "__identity_events__";
+const PERSON_COMPONENT_ITEM_OWNER: &str = "__person_components__";
 const NON_CORPUS_REBUILD_STAGING_PROJECTION_ID: &str = "proj:person-page:rebuild-staging";
 const CANONICAL_OBSERVATION_FINGERPRINT_DOMAIN: &[u8] =
     b"lethe:canonical-observation-fingerprint:v1\0";
@@ -223,18 +226,12 @@ enum NonCorpusDeltaKind {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CompactProjectionState {
-    next_identity_ordinal: u64,
-    identity_candidates: Vec<CompactIdentityCandidate>,
-    consent_decisions: Vec<CompactConsentDecision>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CompactIdentityCandidate {
-    first_ordinal: u64,
-    slack_user_id: Option<String>,
-    observation_ids: Vec<String>,
-    candidate: PersonCandidate,
+    identity: IdentityState,
+    observation_ids_by_node: Vec<Vec<String>>,
+    nodes_by_observation_id: BTreeMap<String, BTreeSet<IdentityNodeId>>,
+    nodes_by_identifier_value: BTreeMap<String, BTreeSet<IdentityNodeId>>,
+    consent_by_subject: BTreeMap<String, CompactConsentDecision>,
+    consent_by_identifier: BTreeMap<String, CompactConsentDecision>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -248,17 +245,73 @@ struct CompactConsentDecision {
     recorded_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentityReplayEvent {
+    append_seq: u64,
+    observation_id: String,
+    candidates: Vec<PersonCandidate>,
+    consent_decision: Option<CompactConsentDecision>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersonComponentAggregate {
+    person: ResolvedPerson,
+    consent: ConsentStatus,
+    fact_weight: u64,
+    active_channels: BTreeSet<String>,
+    slide_blob_refs: BTreeSet<String>,
+    frontend_profile_rank: Option<FrontendProfileRank>,
+    frontend_profile: Option<FrontendProfile>,
+    profile: Option<PersonProfile>,
+    activity: Option<PersonActivity>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrontendProfileRank {
+    richness_score: usize,
+    created_at: DateTime<Utc>,
+    stable_id: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredPersonMessage {
+    node_id: IdentityNodeId,
+    id: String,
+    source_observation_id: String,
+    channel: String,
+    text: String,
+    ts: DateTime<Utc>,
+    thread_ts: Option<String>,
+    has_attachments: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredPersonSlide {
+    node_id: IdentityNodeId,
+    id: String,
+    source_observation_id: String,
+    document_id: String,
+    title: String,
+    role: String,
+    last_seen_revision: Option<String>,
+    slide_count: Option<u32>,
+    thumbnail_ref: Option<String>,
+    last_modified: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone)]
 struct PendingProjectionItemCommit {
-    base_person_message_count: u64,
-    base_reply_slo_count: u64,
-    replaced_person_owners: BTreeSet<String>,
     commit: ProjectionItemCommit,
 }
 
-struct CompactIdentityResolution {
-    identity: IdentityResolutionOutput,
-    members_by_person: BTreeMap<String, BTreeSet<u64>>,
+struct CompactApplyResult {
+    touched_nodes: BTreeSet<IdentityNodeId>,
+    affected_person_ids: BTreeSet<String>,
 }
 
 trait ComponentProjectionLookup {
@@ -287,11 +340,6 @@ impl ComponentProjectionLookup for StorageComponentProjectionLookup<'_> {
             .storage
             .projection_items_by_owner(&ProjectionRef::new("proj:person-page"), owner_key)?)
     }
-}
-
-struct SupplementalMaterializedDelta {
-    materialized: MaterializedProjectionSnapshot,
-    item_commit: ProjectionItemCommit,
 }
 
 #[derive(Debug)]
@@ -426,8 +474,7 @@ fn affects_claim_queue(kind: &str) -> bool {
 
 type FrontendProfileSelections = BTreeMap<String, (usize, DateTime<Utc>, FrontendProfile)>;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 struct MaterializedProjectionSnapshot {
     format_version: u32,
     last_append_seq: u64,
@@ -436,26 +483,108 @@ struct MaterializedProjectionSnapshot {
     supplemental_fingerprint: String,
     compact_state: CompactProjectionState,
     person_consents: BTreeMap<String, ConsentStatus>,
+    person_components: BTreeMap<String, PersonComponentAggregate>,
+    identity_event_count: u64,
+    person_slide_count: u64,
     person_message_count: u64,
     reply_slo_count: u64,
     snapshot: ProjectionSnapshot,
-    #[serde(skip)]
     pending_item_commit: Option<PendingProjectionItemCommit>,
 }
 
+#[derive(serde::Serialize)]
+struct MaterializedProjectionManifestRef<'a> {
+    format_version: u32,
+    last_append_seq: u64,
+    observation_count: u64,
+    canonical_observation_fingerprint: &'a str,
+    supplemental_fingerprint: &'a str,
+    identity_event_count: u64,
+    person_component_count: u64,
+    person_slide_count: u64,
+    person_message_count: u64,
+    reply_slo_count: u64,
+    snapshot: AuxiliaryProjectionSnapshotRef<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct AuxiliaryProjectionSnapshotRef<'a> {
+    answer_log: &'a [AnswerLogRecord],
+    claim_queue: &'a ClaimQueueProjection,
+    freshness: &'a FreshnessProjection,
+    resume_snapshot: &'a ResumeSnapshotProjection,
+    plan_state: &'a PlanStateProjection,
+    card_queue: &'a CardQueueProjection,
+    break_glass: &'a BreakGlassProjection,
+    built_at: DateTime<Utc>,
+    lineage: &'a LineageManifest,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaterializedProjectionManifest {
+    format_version: u32,
+    last_append_seq: u64,
+    observation_count: u64,
+    canonical_observation_fingerprint: String,
+    supplemental_fingerprint: String,
+    identity_event_count: u64,
+    person_component_count: u64,
+    person_slide_count: u64,
+    person_message_count: u64,
+    reply_slo_count: u64,
+    snapshot: AuxiliaryProjectionSnapshot,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuxiliaryProjectionSnapshot {
+    answer_log: Vec<AnswerLogRecord>,
+    claim_queue: ClaimQueueProjection,
+    freshness: FreshnessProjection,
+    resume_snapshot: ResumeSnapshotProjection,
+    plan_state: PlanStateProjection,
+    card_queue: CardQueueProjection,
+    break_glass: BreakGlassProjection,
+    built_at: DateTime<Utc>,
+    lineage: LineageManifest,
+}
+
 impl MaterializedProjectionSnapshot {
+    fn manifest_value(&self) -> Result<serde_json::Value, SelfHostError> {
+        let person_component_count = u64::try_from(self.person_components.len()).map_err(|_| {
+            SelfHostError::Ingestion("person component count does not fit u64".to_owned())
+        })?;
+        Ok(serde_json::to_value(MaterializedProjectionManifestRef {
+            format_version: self.format_version,
+            last_append_seq: self.last_append_seq,
+            observation_count: self.observation_count,
+            canonical_observation_fingerprint: &self.canonical_observation_fingerprint,
+            supplemental_fingerprint: &self.supplemental_fingerprint,
+            identity_event_count: self.identity_event_count,
+            person_component_count,
+            person_slide_count: self.person_slide_count,
+            person_message_count: self.person_message_count,
+            reply_slo_count: self.reply_slo_count,
+            snapshot: AuxiliaryProjectionSnapshotRef {
+                answer_log: &self.snapshot.answer_log,
+                claim_queue: &self.snapshot.claim_queue,
+                freshness: &self.snapshot.freshness,
+                resume_snapshot: &self.snapshot.resume_snapshot,
+                plan_state: &self.snapshot.plan_state,
+                card_queue: &self.snapshot.card_queue,
+                break_glass: &self.snapshot.break_glass,
+                built_at: self.snapshot.built_at,
+                lineage: &self.snapshot.lineage,
+            },
+        })?)
+    }
+
     fn observation_stats(&self) -> ObservationStats {
         ObservationStats {
             count: self.observation_count,
             max_append_seq: self.last_append_seq,
         }
-    }
-
-    fn matches(&self, stats: ObservationStats, supplemental_fingerprint: &str) -> bool {
-        self.format_version == NON_CORPUS_MATERIALIZATION_VERSION
-            && self.last_append_seq == stats.max_append_seq
-            && self.observation_count == stats.count
-            && self.supplemental_fingerprint == supplemental_fingerprint
     }
 
     fn validate(&self) -> Result<(), SelfHostError> {
@@ -482,6 +611,7 @@ impl MaterializedProjectionSnapshot {
         if let Some(pending) = &self.pending_item_commit {
             validate_pending_projection_item_commit(
                 pending,
+                &self.compact_state,
                 self.person_message_count,
                 self.reply_slo_count,
                 &self.snapshot.person_page.activities,
@@ -564,6 +694,9 @@ pub struct AppCore {
     claim_queue_dirty: bool,
     compact_state: CompactProjectionState,
     person_consents: BTreeMap<String, ConsentStatus>,
+    person_components: BTreeMap<String, PersonComponentAggregate>,
+    identity_event_count: u64,
+    person_slide_count: u64,
     person_message_count: u64,
     reply_slo_count: u64,
     pub snapshot: ProjectionSnapshot,
@@ -573,6 +706,35 @@ pub struct AppCore {
 }
 
 impl AppCore {
+    fn manifest_value(&self) -> Result<serde_json::Value, SelfHostError> {
+        let person_component_count = u64::try_from(self.person_components.len()).map_err(|_| {
+            SelfHostError::Ingestion("person component count does not fit u64".to_owned())
+        })?;
+        Ok(serde_json::to_value(MaterializedProjectionManifestRef {
+            format_version: NON_CORPUS_MATERIALIZATION_VERSION,
+            last_append_seq: self.observation_stats.max_append_seq,
+            observation_count: self.observation_stats.count,
+            canonical_observation_fingerprint: &self.canonical_observation_fingerprint,
+            supplemental_fingerprint: &self.supplemental_fingerprint,
+            identity_event_count: self.identity_event_count,
+            person_component_count,
+            person_slide_count: self.person_slide_count,
+            person_message_count: self.person_message_count,
+            reply_slo_count: self.reply_slo_count,
+            snapshot: AuxiliaryProjectionSnapshotRef {
+                answer_log: &self.snapshot.answer_log,
+                claim_queue: &self.snapshot.claim_queue,
+                freshness: &self.snapshot.freshness,
+                resume_snapshot: &self.snapshot.resume_snapshot,
+                plan_state: &self.snapshot.plan_state,
+                card_queue: &self.snapshot.card_queue,
+                break_glass: &self.snapshot.break_glass,
+                built_at: self.snapshot.built_at,
+                lineage: &self.snapshot.lineage,
+            },
+        })?)
+    }
+
     fn from_materialized(
         mut materialized: MaterializedProjectionSnapshot,
         persisted_blobs: Vec<Vec<u8>>,
@@ -656,6 +818,8 @@ impl AppCore {
 
         let resident_supplemental_fingerprint = materialized.supplemental_fingerprint.clone();
         let supplemental_count = supplemental_projection_cache.count();
+        materialized.snapshot.identity = IdentityResolutionOutput::default();
+        materialized.snapshot.person_page = PersonPageOutput::default();
         let mut core = Self {
             registry,
             catalog: seed_projection_catalog(),
@@ -671,6 +835,9 @@ impl AppCore {
             claim_queue_dirty: false,
             compact_state: materialized.compact_state,
             person_consents: materialized.person_consents,
+            person_components: materialized.person_components,
+            identity_event_count: materialized.identity_event_count,
+            person_slide_count: materialized.person_slide_count,
             person_message_count: materialized.person_message_count,
             reply_slo_count: materialized.reply_slo_count,
             snapshot: materialized.snapshot,
@@ -682,7 +849,9 @@ impl AppCore {
         Ok(core)
     }
 
-    fn install_materialized(&mut self, materialized: MaterializedProjectionSnapshot) {
+    fn install_materialized(&mut self, mut materialized: MaterializedProjectionSnapshot) {
+        materialized.snapshot.identity = IdentityResolutionOutput::default();
+        materialized.snapshot.person_page = PersonPageOutput::default();
         self.observation_stats = materialized.observation_stats();
         self.canonical_observation_fingerprint = materialized.canonical_observation_fingerprint;
         self.supplemental_fingerprint = materialized.supplemental_fingerprint;
@@ -691,6 +860,9 @@ impl AppCore {
         self.claim_queue_dirty = false;
         self.compact_state = materialized.compact_state;
         self.person_consents = materialized.person_consents;
+        self.person_components = materialized.person_components;
+        self.identity_event_count = materialized.identity_event_count;
+        self.person_slide_count = materialized.person_slide_count;
         self.person_message_count = materialized.person_message_count;
         self.reply_slo_count = materialized.reply_slo_count;
         self.snapshot = materialized.snapshot;
@@ -1026,54 +1198,53 @@ struct BuiltProjectionSnapshot {
 impl CompactProjectionState {
     fn build(observations: &[Observation]) -> Result<Self, SelfHostError> {
         let mut state = Self {
-            next_identity_ordinal: 0,
-            identity_candidates: Vec::new(),
-            consent_decisions: Vec::new(),
+            identity: IdentityState::default(),
+            observation_ids_by_node: Vec::new(),
+            nodes_by_observation_id: BTreeMap::new(),
+            nodes_by_identifier_value: BTreeMap::new(),
+            consent_by_subject: BTreeMap::new(),
+            consent_by_identifier: BTreeMap::new(),
         };
-        let mut slack_candidate_index = BTreeMap::new();
         for observation in observations {
             state.capture_consent_decision(observation);
             for candidate in
                 IdentityProjector::extract_candidates(std::slice::from_ref(observation))
             {
-                state.add_identity_candidate(
-                    candidate,
-                    observation.id.as_str(),
-                    &mut slack_candidate_index,
-                )?;
+                state.add_identity_candidate(candidate, observation.id.as_str())?;
             }
         }
         state.validate()?;
         Ok(state)
     }
 
-    fn with_observation_delta(
-        &self,
-        observations: &[Observation],
-    ) -> Result<(Self, BTreeSet<u64>), SelfHostError> {
-        let mut state = self.clone();
-        let touched_members = state.apply_observation_page(observations)?;
-        Ok((state, touched_members))
-    }
-
     fn apply_observation_page(
         &mut self,
         observations: &[Observation],
-    ) -> Result<BTreeSet<u64>, SelfHostError> {
-        let mut slack_candidate_index = self
-            .identity_candidates
-            .iter()
-            .enumerate()
-            .filter_map(|(index, candidate)| {
-                candidate
-                    .slack_user_id
-                    .as_ref()
-                    .map(|user_id| (user_id.clone(), index))
-            })
-            .collect::<BTreeMap<_, _>>();
+    ) -> Result<CompactApplyResult, SelfHostError> {
         let mut touched_members = BTreeSet::new();
+        let mut affected_person_ids = BTreeSet::new();
         for observation in observations {
-            self.capture_consent_decision(observation);
+            if let Some(decision) = compact_consent_decision_from_observation(observation) {
+                let mut consent_nodes = self
+                    .identity
+                    .component_members_for_person(&decision.subject)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                if let Some(identifier) = &decision.identifier
+                    && let Some(nodes) = self.nodes_by_identifier_value.get(identifier)
+                {
+                    consent_nodes.extend(nodes);
+                }
+                for node_id in consent_nodes {
+                    if let Some(person_id) = self.identity.person_id_for_node(node_id) {
+                        affected_person_ids.insert(person_id);
+                    }
+                    touched_members.insert(node_id);
+                }
+                self.record_consent_decision(decision);
+            }
             let candidates =
                 IdentityProjector::extract_candidates(std::slice::from_ref(observation));
             if observation.schema.as_str() == "schema:slack-message" && candidates.len() != 1 {
@@ -1083,86 +1254,361 @@ impl CompactProjectionState {
                 )));
             }
             for candidate in candidates {
-                touched_members.insert(self.add_identity_candidate(
-                    candidate,
-                    observation.id.as_str(),
-                    &mut slack_candidate_index,
-                )?);
+                let applied = self.add_identity_candidate(candidate, observation.id.as_str())?;
+                touched_members.insert(applied.node_id);
+                affected_person_ids.extend(applied.affected_person_ids);
             }
         }
-        self.validate()?;
-        Ok(touched_members)
+        self.validate_delta(&touched_members)?;
+        Ok(CompactApplyResult {
+            touched_nodes: touched_members,
+            affected_person_ids,
+        })
     }
 
     fn add_identity_candidate(
         &mut self,
-        mut candidate: PersonCandidate,
+        candidate: PersonCandidate,
         observation_id: &str,
-        slack_candidate_index: &mut BTreeMap<String, usize>,
-    ) -> Result<u64, SelfHostError> {
-        let ordinal = self.next_identity_ordinal;
-        self.next_identity_ordinal =
-            self.next_identity_ordinal.checked_add(1).ok_or_else(|| {
-                SelfHostError::Ingestion("identity candidate ordinal overflow".to_owned())
-            })?;
-        sort_identity_identifiers(&mut candidate.identifiers);
-
-        let slack_user_id = slack_user_id_for_candidate(&candidate);
+    ) -> Result<IdentityApplyResult, SelfHostError> {
+        let mut existing_node = None;
         if candidate.source == "slack" {
-            let slack_user_id = slack_user_id.ok_or_else(|| {
-                SelfHostError::Ingestion(
-                    "Slack identity candidate is missing its source user_id".to_owned(),
-                )
-            })?;
-            if let Some(existing_index) = slack_candidate_index.get(&slack_user_id).copied() {
-                let existing = self
-                    .identity_candidates
-                    .get_mut(existing_index)
-                    .ok_or_else(|| {
-                        SelfHostError::Ingestion(format!(
-                            "compact Slack candidate index is invalid for user {slack_user_id}"
-                        ))
-                    })?;
-                merge_source_internal_candidate(&mut existing.candidate, candidate);
-                if existing
-                    .observation_ids
-                    .iter()
-                    .any(|existing_id| existing_id == observation_id)
-                {
-                    return Err(SelfHostError::Ingestion(format!(
-                        "identity candidate {} repeats observation {observation_id}",
-                        existing.first_ordinal
-                    )));
-                }
-                existing.observation_ids.push(observation_id.to_owned());
-                return Ok(existing.first_ordinal);
-            }
-            let candidate_index = self.identity_candidates.len();
-            self.identity_candidates.push(CompactIdentityCandidate {
-                first_ordinal: ordinal,
-                slack_user_id: Some(slack_user_id.clone()),
-                observation_ids: vec![observation_id.to_owned()],
-                candidate,
-            });
-            slack_candidate_index.insert(slack_user_id, candidate_index);
-        } else {
-            self.identity_candidates.push(CompactIdentityCandidate {
-                first_ordinal: ordinal,
-                slack_user_id: None,
-                observation_ids: vec![observation_id.to_owned()],
-                candidate,
-            });
+            let user_identifier = candidate
+                .identifiers
+                .iter()
+                .find(|identifier| identifier.identifier_type == IdentifierType::UserId)
+                .ok_or_else(|| {
+                    SelfHostError::Ingestion(
+                        "Slack identity candidate is missing its source user_id".to_owned(),
+                    )
+                })?;
+            let key =
+                IdentifierKey::from_identifier(user_identifier).map_err(identity_state_error)?;
+            existing_node = self.identity.node_for_key(&key);
         }
-        Ok(ordinal)
+        let applied = match existing_node {
+            Some(node_id) => self
+                .identity
+                .apply_update(node_id, candidate)
+                .map_err(identity_state_error)?,
+            None => self
+                .identity
+                .apply_new(candidate)
+                .map_err(identity_state_error)?,
+        };
+        let node_index = usize::try_from(applied.node_id).map_err(|_| {
+            SelfHostError::Ingestion(format!(
+                "identity node {} does not fit usize",
+                applied.node_id
+            ))
+        })?;
+        if node_index == self.observation_ids_by_node.len() {
+            self.observation_ids_by_node.push(Vec::new());
+        }
+        let observation_ids = self
+            .observation_ids_by_node
+            .get_mut(node_index)
+            .ok_or_else(|| {
+                SelfHostError::Ingestion(format!(
+                    "identity node {} has no observation index",
+                    applied.node_id
+                ))
+            })?;
+        if observation_ids.iter().any(|id| id == observation_id) {
+            return Err(SelfHostError::Ingestion(format!(
+                "identity node {} repeats observation {observation_id}",
+                applied.node_id
+            )));
+        }
+        observation_ids.push(observation_id.to_owned());
+        self.nodes_by_observation_id
+            .entry(observation_id.to_owned())
+            .or_default()
+            .insert(applied.node_id);
+        for identifier in &self
+            .identity
+            .node(applied.node_id)
+            .ok_or_else(|| {
+                SelfHostError::Ingestion(format!(
+                    "identity node {} disappeared after candidate apply",
+                    applied.node_id
+                ))
+            })?
+            .candidate
+            .identifiers
+        {
+            self.nodes_by_identifier_value
+                .entry(identifier.value.clone())
+                .or_default()
+                .insert(applied.node_id);
+        }
+        Ok(applied)
     }
 
     fn capture_consent_decision(&mut self, observation: &Observation) {
-        if observation.schema.as_str()
-            != lethe_projection_person::person_page::projector::CONSENT_DECISION_SCHEMA
-        {
-            return;
+        if let Some(decision) = compact_consent_decision_from_observation(observation) {
+            self.record_consent_decision(decision);
         }
-        self.consent_decisions.push(CompactConsentDecision {
+    }
+
+    fn record_consent_decision(&mut self, decision: CompactConsentDecision) {
+        update_latest_consent(
+            &mut self.consent_by_subject,
+            decision.subject.clone(),
+            decision.clone(),
+        );
+        if let Some(identifier) = &decision.identifier {
+            update_latest_consent(
+                &mut self.consent_by_identifier,
+                identifier.clone(),
+                decision,
+            );
+        }
+    }
+
+    fn apply_replay_event(&mut self, event: &IdentityReplayEvent) -> Result<(), SelfHostError> {
+        if event.observation_id.trim().is_empty() || event.append_seq == 0 {
+            return Err(SelfHostError::Ingestion(
+                "identity replay event has blank provenance or zero append sequence".to_owned(),
+            ));
+        }
+        if let Some(decision) = &event.consent_decision {
+            if decision.observation_id != event.observation_id {
+                return Err(SelfHostError::Ingestion(format!(
+                    "identity replay event {} contains consent provenance {}",
+                    event.observation_id, decision.observation_id
+                )));
+            }
+            self.record_consent_decision(decision.clone());
+        }
+        for candidate in &event.candidates {
+            self.add_identity_candidate(candidate.clone(), &event.observation_id)?;
+        }
+        Ok(())
+    }
+
+    fn resolve_identity(&self) -> IdentityResolutionOutput {
+        self.identity.resolution("1.0.0")
+    }
+
+    fn fact_node(
+        &self,
+        observation_id: &str,
+        person_id: &str,
+    ) -> Result<IdentityNodeId, SelfHostError> {
+        self.nodes_by_observation_id
+            .get(observation_id)
+            .ok_or_else(|| {
+                SelfHostError::Ingestion(format!(
+                    "person fact references identity-free observation {observation_id}"
+                ))
+            })?
+            .iter()
+            .copied()
+            .find(|node_id| {
+                self.identity.person_id_for_node(*node_id).as_deref() == Some(person_id)
+            })
+            .ok_or_else(|| {
+                SelfHostError::Ingestion(format!(
+                    "person fact observation {observation_id} has no identity node in {person_id}"
+                ))
+            })
+    }
+
+    fn person_id_for_node(&self, node_id: IdentityNodeId) -> Result<String, SelfHostError> {
+        self.identity.person_id_for_node(node_id).ok_or_else(|| {
+            SelfHostError::Ingestion(format!(
+                "identity node {node_id} has no resolved public person ID"
+            ))
+        })
+    }
+
+    fn person_consents(
+        &self,
+        identity: &IdentityResolutionOutput,
+    ) -> BTreeMap<String, ConsentStatus> {
+        identity
+            .resolved_persons
+            .iter()
+            .map(|person| {
+                (
+                    person.person_id.as_str().to_owned(),
+                    self.person_consent(person),
+                )
+            })
+            .collect()
+    }
+
+    fn person_consent(&self, person: &ResolvedPerson) -> ConsentStatus {
+        let decision = self
+            .consent_by_subject
+            .get(person.person_id.as_str())
+            .into_iter()
+            .chain(
+                person
+                    .identifiers
+                    .iter()
+                    .filter_map(|identifier| self.consent_by_identifier.get(&identifier.value)),
+            )
+            .max_by(|left, right| consent_decision_order(left).cmp(&consent_decision_order(right)));
+        decision
+            .and_then(|decision| decision.status.as_deref())
+            .and_then(compact_consent_status)
+            .unwrap_or_default()
+    }
+
+    fn validate_delta(
+        &self,
+        touched_nodes: &BTreeSet<IdentityNodeId>,
+    ) -> Result<(), SelfHostError> {
+        for node_id in touched_nodes {
+            let node_index = usize::try_from(*node_id).map_err(|_| {
+                SelfHostError::Ingestion(format!("identity node {node_id} does not fit usize"))
+            })?;
+            let observation_ids =
+                self.observation_ids_by_node
+                    .get(node_index)
+                    .ok_or_else(|| {
+                        SelfHostError::Ingestion(format!(
+                            "identity node {node_id} has no observation index"
+                        ))
+                    })?;
+            if observation_ids.is_empty() {
+                return Err(SelfHostError::Ingestion(format!(
+                    "identity node {node_id} has no source observation"
+                )));
+            }
+            for observation_id in observation_ids {
+                if !self
+                    .nodes_by_observation_id
+                    .get(observation_id)
+                    .is_some_and(|nodes| nodes.contains(node_id))
+                {
+                    return Err(SelfHostError::Ingestion(format!(
+                        "identity observation reverse index is missing {observation_id}/{node_id}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), SelfHostError> {
+        self.identity.validate().map_err(identity_state_error)?;
+        if self.identity.nodes().len() != self.observation_ids_by_node.len() {
+            return Err(SelfHostError::Ingestion(
+                "identity nodes and observation indexes have different lengths".to_owned(),
+            ));
+        }
+        for (node_id, observation_ids) in self.observation_ids_by_node.iter().enumerate() {
+            if observation_ids.is_empty() {
+                return Err(SelfHostError::Ingestion(format!(
+                    "identity node {node_id} has no source observation"
+                )));
+            }
+            let mut observation_ids = BTreeSet::new();
+            for observation_id in &self.observation_ids_by_node[node_id] {
+                if observation_id.trim().is_empty() {
+                    return Err(SelfHostError::Ingestion(format!(
+                        "identity node {node_id} has a blank source observation"
+                    )));
+                }
+                if !observation_ids.insert(observation_id) {
+                    return Err(SelfHostError::Ingestion(format!(
+                        "identity node {node_id} repeats source observation {observation_id}"
+                    )));
+                }
+            }
+        }
+        let indexed_observation_ids = self
+            .observation_ids_by_node
+            .iter()
+            .enumerate()
+            .flat_map(|(node_id, observation_ids)| {
+                observation_ids.iter().map(move |observation_id| {
+                    (
+                        observation_id.clone(),
+                        u64::try_from(node_id).expect("validated identity node index fits u64"),
+                    )
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        let reverse_observation_ids = self
+            .nodes_by_observation_id
+            .iter()
+            .flat_map(|(observation_id, node_ids)| {
+                node_ids
+                    .iter()
+                    .map(move |node_id| (observation_id.clone(), *node_id))
+            })
+            .collect::<BTreeSet<_>>();
+        if indexed_observation_ids != reverse_observation_ids {
+            return Err(SelfHostError::Ingestion(
+                "identity observation forward and reverse indexes differ".to_owned(),
+            ));
+        }
+        let indexed_identifier_nodes = self
+            .identity
+            .nodes()
+            .iter()
+            .flat_map(|node| {
+                node.candidate
+                    .identifiers
+                    .iter()
+                    .map(move |identifier| (identifier.value.clone(), node.node_id))
+            })
+            .collect::<BTreeSet<_>>();
+        let reverse_identifier_nodes = self
+            .nodes_by_identifier_value
+            .iter()
+            .flat_map(|(identifier, nodes)| {
+                nodes
+                    .iter()
+                    .map(move |node_id| (identifier.clone(), *node_id))
+            })
+            .collect::<BTreeSet<_>>();
+        if indexed_identifier_nodes != reverse_identifier_nodes {
+            return Err(SelfHostError::Ingestion(
+                "identity identifier-value forward and reverse indexes differ".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn consent_decision_order(
+    decision: &CompactConsentDecision,
+) -> (DateTime<Utc>, DateTime<Utc>, &str) {
+    (
+        decision.published,
+        decision.recorded_at,
+        decision.observation_id.as_str(),
+    )
+}
+
+fn update_latest_consent(
+    index: &mut BTreeMap<String, CompactConsentDecision>,
+    key: String,
+    decision: CompactConsentDecision,
+) {
+    match index.get(&key) {
+        Some(current) if consent_decision_order(current) >= consent_decision_order(&decision) => {}
+        _ => {
+            index.insert(key, decision);
+        }
+    }
+}
+
+fn identity_state_error(error: String) -> SelfHostError {
+    SelfHostError::Ingestion(format!("identity state invariant failed: {error}"))
+}
+
+fn compact_consent_decision_from_observation(
+    observation: &Observation,
+) -> Option<CompactConsentDecision> {
+    (observation.schema.as_str()
+        == lethe_projection_person::person_page::projector::CONSENT_DECISION_SCHEMA)
+        .then(|| CompactConsentDecision {
             observation_id: observation.id.as_str().to_owned(),
             subject: observation.subject.as_str().to_owned(),
             identifier: observation
@@ -1177,144 +1623,139 @@ impl CompactProjectionState {
                 .map(ToOwned::to_owned),
             published: observation.published,
             recorded_at: observation.recorded_at,
-        });
-    }
+        })
+}
 
-    fn resolve_identity(&self) -> IdentityResolutionOutput {
-        self.resolve_identity_with_components().identity
+fn person_component_aggregates(
+    identity: &IdentityResolutionOutput,
+    person_page: &PersonPageOutput,
+    person_consents: &BTreeMap<String, ConsentStatus>,
+) -> Result<BTreeMap<String, PersonComponentAggregate>, SelfHostError> {
+    let mut profiles_by_person = BTreeMap::new();
+    for profile in &person_page.profiles {
+        if profiles_by_person
+            .insert(profile.person_id.as_str().to_owned(), profile.clone())
+            .is_some()
+        {
+            return Err(SelfHostError::Ingestion(format!(
+                "duplicate person profile for {}",
+                profile.person_id
+            )));
+        }
     }
-
-    fn resolve_identity_with_components(&self) -> CompactIdentityResolution {
-        let mut entries = self.identity_candidates.iter().collect::<Vec<_>>();
-        entries.sort_by_key(|entry| entry.first_ordinal);
-        let candidates = entries
-            .iter()
-            .map(|entry| entry.candidate.clone())
-            .collect::<Vec<_>>();
-        let matches = IdentityProjector::cross_source_match(&candidates);
-        let (identity, grouped_members) =
-            IdentityProjector::new("1.0.0").resolve_with_component_members(&candidates, &matches);
-        let members_by_person = identity
-            .resolved_persons
-            .iter()
-            .zip(grouped_members)
-            .map(|(person, members)| {
-                let members = members
-                    .into_iter()
-                    .map(|member_index| entries[member_index].first_ordinal)
-                    .collect();
-                (person.person_id.as_str().to_owned(), members)
-            })
-            .collect();
-        CompactIdentityResolution {
-            identity,
-            members_by_person,
+    let mut activities_by_person = BTreeMap::new();
+    for activity in &person_page.activities {
+        if activities_by_person
+            .insert(activity.person_id.as_str().to_owned(), activity.clone())
+            .is_some()
+        {
+            return Err(SelfHostError::Ingestion(format!(
+                "duplicate person activity for {}",
+                activity.person_id
+            )));
+        }
+    }
+    let mut slide_blob_refs_by_person = BTreeMap::<String, BTreeSet<String>>::new();
+    for slide in &person_page.slides {
+        let refs = slide_blob_refs_by_person
+            .entry(slide.person_id.as_str().to_owned())
+            .or_default();
+        if let Some(blob_ref) = &slide.thumbnail_ref {
+            refs.insert(blob_ref.clone());
         }
     }
 
-    fn person_consents(
-        &self,
-        identity: &IdentityResolutionOutput,
-    ) -> BTreeMap<String, ConsentStatus> {
-        identity
-            .resolved_persons
-            .iter()
-            .map(|person| {
-                let decision = self
-                    .consent_decisions
-                    .iter()
-                    .filter(|decision| {
-                        decision.subject == person.person_id.as_str()
-                            || decision.identifier.as_ref().is_some_and(|identifier| {
-                                person
-                                    .identifiers
-                                    .iter()
-                                    .any(|candidate| candidate.value == *identifier)
-                            })
-                    })
-                    .max_by(|left, right| {
-                        (
-                            left.published,
-                            left.recorded_at,
-                            left.observation_id.as_str(),
-                        )
-                            .cmp(&(
-                                right.published,
-                                right.recorded_at,
-                                right.observation_id.as_str(),
-                            ))
-                    });
-                let status = decision
-                    .and_then(|decision| decision.status.as_deref())
-                    .and_then(compact_consent_status)
-                    .unwrap_or_default();
-                (person.person_id.as_str().to_owned(), status)
-            })
-            .collect()
-    }
-
-    fn validate(&self) -> Result<(), SelfHostError> {
-        let mut previous_ordinal = None;
-        let mut slack_user_ids = BTreeSet::new();
-        for entry in &self.identity_candidates {
-            if entry.first_ordinal >= self.next_identity_ordinal {
-                return Err(SelfHostError::Ingestion(format!(
-                    "identity candidate ordinal {} is outside next ordinal {}",
-                    entry.first_ordinal, self.next_identity_ordinal
-                )));
-            }
-            if previous_ordinal.is_some_and(|previous| previous >= entry.first_ordinal) {
-                return Err(SelfHostError::Ingestion(
-                    "compact identity candidates are not in first-observation order".to_owned(),
-                ));
-            }
-            previous_ordinal = Some(entry.first_ordinal);
-            if entry.observation_ids.is_empty() {
-                return Err(SelfHostError::Ingestion(format!(
-                    "identity candidate {} has no source observation",
-                    entry.first_ordinal
-                )));
-            }
-            let mut observation_ids = BTreeSet::new();
-            for observation_id in &entry.observation_ids {
-                if observation_id.trim().is_empty() {
-                    return Err(SelfHostError::Ingestion(format!(
-                        "identity candidate {} has a blank source observation",
-                        entry.first_ordinal
-                    )));
-                }
-                if !observation_ids.insert(observation_id) {
-                    return Err(SelfHostError::Ingestion(format!(
-                        "identity candidate {} repeats source observation {observation_id}",
-                        entry.first_ordinal
-                    )));
-                }
-            }
-            match (&entry.slack_user_id, entry.candidate.source.as_str()) {
-                (Some(user_id), "slack") => {
-                    if slack_user_id_for_candidate(&entry.candidate).as_deref()
-                        != Some(user_id.as_str())
-                    {
-                        return Err(SelfHostError::Ingestion(format!(
-                            "compact Slack identity candidate does not match user {user_id}"
-                        )));
-                    }
-                    if !slack_user_ids.insert(user_id.clone()) {
-                        return Err(SelfHostError::Ingestion(format!(
-                            "compact identity state contains duplicate Slack user {user_id}"
-                        )));
-                    }
-                }
-                (None, source) if source != "slack" => {}
-                _ => {
-                    return Err(SelfHostError::Ingestion(
-                        "compact identity candidate source/key invariant failed".to_owned(),
-                    ));
-                }
-            }
+    let mut components = BTreeMap::new();
+    for person in &identity.resolved_persons {
+        let person_id = person.person_id.as_str();
+        let consent = person_consents.get(person_id).cloned().unwrap_or_default();
+        let profile = profiles_by_person.remove(person_id);
+        let activity = activities_by_person.remove(person_id);
+        let slide_blob_refs = slide_blob_refs_by_person
+            .remove(person_id)
+            .unwrap_or_default();
+        if (profile.is_some() != activity.is_some())
+            || (consent == ConsentStatus::OptedOut && profile.is_some())
+            || (consent != ConsentStatus::OptedOut && profile.is_none())
+        {
+            return Err(SelfHostError::Ingestion(format!(
+                "person component {person_id} profile/activity visibility is inconsistent with consent"
+            )));
         }
-        Ok(())
+        let frontend_profile_rank = match profile.as_ref().and_then(|profile| {
+            profile
+                .frontend_profile
+                .as_ref()
+                .map(|frontend| (profile, frontend))
+        }) {
+            Some((profile, frontend)) => Some(FrontendProfileRank {
+                richness_score: frontend.profile.richness_score(),
+                created_at: profile.frontend_profile_created_at.ok_or_else(|| {
+                    SelfHostError::Ingestion(format!(
+                        "person component {person_id} frontend profile has no created_at"
+                    ))
+                })?,
+                stable_id: frontend.source_document_id.clone(),
+            }),
+            None => None,
+        };
+        let slide_blob_refs = if consent == ConsentStatus::OptedOut {
+            BTreeSet::new()
+        } else {
+            slide_blob_refs
+        };
+        let component = PersonComponentAggregate {
+            person: person.clone(),
+            consent,
+            fact_weight: activity
+                .as_ref()
+                .map(component_activity_fact_weight)
+                .transpose()?
+                .unwrap_or(0),
+            active_channels: activity
+                .as_ref()
+                .map(|activity| activity.active_channels.iter().cloned().collect())
+                .unwrap_or_default(),
+            slide_blob_refs,
+            frontend_profile_rank,
+            frontend_profile: profile
+                .as_ref()
+                .and_then(|profile| profile.frontend_profile.clone()),
+            profile,
+            activity,
+        };
+        if components.insert(person_id.to_owned(), component).is_some() {
+            return Err(SelfHostError::Ingestion(format!(
+                "duplicate person component {person_id}"
+            )));
+        }
     }
+    if let Some(person_id) = profiles_by_person
+        .keys()
+        .chain(activities_by_person.keys())
+        .chain(slide_blob_refs_by_person.keys())
+        .next()
+    {
+        return Err(SelfHostError::Ingestion(format!(
+            "person-page row references unknown person {person_id}"
+        )));
+    }
+    Ok(components)
+}
+
+#[cfg(test)]
+fn identity_replay_event_count(observations: &[Observation]) -> Result<u64, SelfHostError> {
+    let count = observations
+        .iter()
+        .filter(|observation| {
+            observation.schema.as_str()
+                == lethe_projection_person::person_page::projector::CONSENT_DECISION_SCHEMA
+                || !IdentityProjector::extract_candidates(std::slice::from_ref(observation))
+                    .is_empty()
+        })
+        .count();
+    u64::try_from(count)
+        .map_err(|_| SelfHostError::Ingestion("identity event count does not fit u64".to_owned()))
 }
 
 fn compact_consent_status(value: &str) -> Option<ConsentStatus> {
@@ -1323,53 +1764,6 @@ fn compact_consent_status(value: &str) -> Option<ConsentStatus> {
         "restricted_capture" => Some(ConsentStatus::RestrictedCapture),
         "opted_out" => Some(ConsentStatus::OptedOut),
         _ => None,
-    }
-}
-
-fn slack_user_id_for_candidate(candidate: &PersonCandidate) -> Option<String> {
-    candidate
-        .identifiers
-        .iter()
-        .find(|identifier| {
-            identifier.source == "slack" && identifier.identifier_type == IdentifierType::UserId
-        })
-        .map(|identifier| identifier.value.clone())
-}
-
-fn merge_source_internal_candidate(target: &mut PersonCandidate, incoming: PersonCandidate) {
-    target.observed_at = target.observed_at.max(incoming.observed_at);
-    if target.display_name.is_none() {
-        target.display_name = incoming.display_name;
-    }
-    for identifier in incoming.identifiers {
-        if !target.identifiers.contains(&identifier) {
-            target.identifiers.push(identifier);
-        }
-    }
-    sort_identity_identifiers(&mut target.identifiers);
-}
-
-fn sort_identity_identifiers(identifiers: &mut Vec<SourceIdentifier>) {
-    identifiers.sort_by(|left, right| {
-        left.source
-            .cmp(&right.source)
-            .then(
-                identity_identifier_rank(left.identifier_type)
-                    .cmp(&identity_identifier_rank(right.identifier_type)),
-            )
-            .then(left.value.cmp(&right.value))
-    });
-    identifiers.dedup();
-}
-
-fn identity_identifier_rank(identifier_type: IdentifierType) -> u8 {
-    match identifier_type {
-        IdentifierType::Email => 0,
-        IdentifierType::SlackId => 1,
-        IdentifierType::ExternalId => 2,
-        IdentifierType::ArbitraryKey => 3,
-        IdentifierType::UserId => 4,
-        IdentifierType::DisplayName => 5,
     }
 }
 
@@ -1401,6 +1795,18 @@ impl MaterializedProjectionSnapshot {
         stats: ObservationStats,
         built_at: DateTime<Utc>,
     ) -> Result<Self, SelfHostError> {
+        let fact_append_sequences = observation_append_sequences(&observations, stats)?;
+        let identity_event_count = identity_replay_event_count(&observations)?;
+        let identity_event_items = observations
+            .iter()
+            .filter_map(|observation| {
+                let append_seq = fact_append_sequences
+                    .get(observation.id.as_str())
+                    .copied()?;
+                identity_replay_event(observation, append_seq)
+            })
+            .map(|event| identity_replay_event_projection_item(&event))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut built = ProjectionSnapshot::build_with_state(
             observations,
             persisted_supplementals,
@@ -1409,8 +1815,23 @@ impl MaterializedProjectionSnapshot {
             stats,
             built_at,
         )?;
+        normalize_person_fact_ids(&mut built.snapshot.person_page, &fact_append_sequences)?;
+        let person_components = person_component_aggregates(
+            &built.snapshot.identity,
+            &built.snapshot.person_page,
+            &built.person_consents,
+        )?;
+        let person_slide_count =
+            u64::try_from(built.snapshot.person_page.slides.len()).map_err(|_| {
+                SelfHostError::Ingestion("person slide count does not fit u64".to_owned())
+            })?;
         let (projection_item_commit, person_message_count, reply_slo_count) =
-            detach_projection_items(&mut built.snapshot)?;
+            detach_projection_items(
+                &mut built.snapshot,
+                &built.compact_state,
+                &person_components,
+                identity_event_items,
+            )?;
         let materialized = Self {
             format_version: NON_CORPUS_MATERIALIZATION_VERSION,
             last_append_seq: stats.max_append_seq,
@@ -1419,210 +1840,613 @@ impl MaterializedProjectionSnapshot {
             supplemental_fingerprint: built.supplemental_fingerprint,
             compact_state: built.compact_state,
             person_consents: built.person_consents,
+            person_components,
+            identity_event_count,
+            person_slide_count,
             person_message_count,
             reply_slo_count,
             snapshot: built.snapshot,
             pending_item_commit: Some(PendingProjectionItemCommit {
-                base_person_message_count: 0,
-                base_reply_slo_count: 0,
-                replaced_person_owners: BTreeSet::new(),
                 commit: projection_item_commit,
             }),
         };
         materialized.validate()?;
         Ok(materialized)
     }
+}
 
-    fn compact_incremental_delta(
-        core: &AppCore,
-        appended_observations: &[Observation],
-        stats: ObservationStats,
-        built_at: DateTime<Utc>,
-        lookup: &dyn ComponentProjectionLookup,
-    ) -> Result<Box<MaterializedProjectionSnapshot>, SelfHostError> {
-        if appended_observations.is_empty() {
-            return Err(SelfHostError::Ingestion(
-                "compact materialization delta must contain an appended observation".to_owned(),
-            ));
-        }
-        let appended_count = u64::try_from(appended_observations.len()).map_err(|_| {
-            SelfHostError::Ingestion("appended observation count does not fit u64".to_owned())
-        })?;
-        let expected_count = core
-            .observation_stats
-            .count
-            .checked_add(appended_count)
-            .ok_or_else(|| {
-                SelfHostError::Ingestion(
-                    "canonical observation count overflow during incremental materialization"
-                        .to_owned(),
-                )
-            })?;
-        if stats.count != expected_count {
-            return Err(SelfHostError::Ingestion(format!(
-                "incremental materialization expected {expected_count} canonical observations, but storage reports {}",
-                stats.count
-            )));
-        }
-        if stats.max_append_seq <= core.observation_stats.max_append_seq {
-            return Err(SelfHostError::Ingestion(format!(
-                "incremental materialization append sequence did not advance beyond {}",
-                core.observation_stats.max_append_seq
-            )));
-        }
-
-        if core.supplemental_projection_cache.count() != core.supplemental_count {
-            return Err(SelfHostError::Ingestion(
-                "resident supplemental reducer count diverged from supplemental store".to_owned(),
-            ));
-        }
-        let current_supplemental_fingerprint = core.resident_supplemental_fingerprint.clone();
-
-        let canonical_observation_fingerprint = append_canonical_observation_fingerprint(
-            &core.canonical_observation_fingerprint,
-            appended_observations,
-        )?;
-        let (compact_state, touched_members) = core
-            .compact_state
-            .with_observation_delta(appended_observations)?;
-        let current_resolution = core.compact_state.resolve_identity_with_components();
-        let next_resolution = compact_state.resolve_identity_with_components();
-        let identity = next_resolution.identity.clone();
-        let person_consents = compact_state.person_consents(&identity);
-        let mut snapshot = core.snapshot.clone();
-        let mut message_inserts = Vec::new();
-        let mut message_updates = Vec::new();
-        let mut message_deletes = Vec::new();
-        let mut replaced_person_owners = BTreeSet::new();
-        if appended_observations
-            .iter()
-            .any(|observation| observation.schema.as_str() == "schema:slack-message")
-        {
-            let person_page_delta = match increment_person_page_for_slack(
-                &snapshot.identity,
-                &identity,
-                &snapshot.person_page,
-                &core.person_consents,
-                &person_consents,
-                appended_observations,
-            )? {
-                Some(person_page) => person_page,
-                None => reproject_affected_person_components(
-                    &compact_state,
-                    &current_resolution,
-                    &next_resolution,
-                    &snapshot.person_page,
-                    &core.person_consents,
-                    &person_consents,
-                    &touched_members,
-                    &core.supplemental_projection_cache.records,
-                    stats.max_append_seq,
-                    lookup,
-                )?,
-            };
-            snapshot.identity = identity;
-            snapshot.person_page = person_page_delta.person_page;
-            message_inserts = person_page_delta.message_inserts;
-            message_updates = person_page_delta.message_updates;
-            message_deletes = person_page_delta.message_deletes;
-            replaced_person_owners = person_page_delta.replaced_person_owners;
-        }
-        let inserted_person_message_count = u64::try_from(message_inserts.len()).map_err(|_| {
-            SelfHostError::Ingestion("incremental person message count does not fit u64".to_owned())
-        })?;
-        let deleted_person_message_count = u64::try_from(message_deletes.len()).map_err(|_| {
-            SelfHostError::Ingestion("deleted person message count does not fit u64".to_owned())
-        })?;
-        let person_message_count = core
-            .person_message_count
-            .checked_add(inserted_person_message_count)
-            .and_then(|count| count.checked_sub(deleted_person_message_count))
-            .ok_or_else(|| {
-                SelfHostError::Ingestion(
-                    "person message count overflow or underflow during incremental materialization"
-                        .to_owned(),
-                )
-            })?;
-        snapshot.freshness = freshness_projection_after_delta(
-            &snapshot.freshness,
-            &core.freshness_thresholds,
-            appended_observations,
-            built_at,
-        )?;
-
-        if core.claim_queue_dirty {
-            snapshot.claim_queue = core.supplemental_projection_cache.claim_queue();
-        }
-        (snapshot.resume_snapshot, snapshot.plan_state) = core
-            .supplemental_projection_cache
-            .cognition(&snapshot.claim_queue, built_at);
-        snapshot.card_queue = core
-            .supplemental_projection_cache
-            .card_queue
-            .projection(built_at);
-        let reply_slo_delta = ReplySloProjector::new(built_at).project_observations(
-            appended_observations,
-            &core.supplemental_projection_cache.reply_slo,
-        );
-        let reply_slo_upserts = reply_slo_delta
-            .rows
-            .iter()
-            .map(reply_slo_projection_item)
-            .collect::<Result<Vec<_>, _>>()?;
-        let appended_reply_slo_count = u64::try_from(reply_slo_upserts.len()).map_err(|_| {
-            SelfHostError::Ingestion("incremental reply SLO count does not fit u64".to_owned())
-        })?;
-        let reply_slo_count = core
-            .reply_slo_count
-            .checked_add(appended_reply_slo_count)
-            .ok_or_else(|| {
-                SelfHostError::Ingestion(
-                    "reply SLO count overflow during incremental materialization".to_owned(),
-                )
-            })?;
-        if !snapshot.reply_slo.rows.is_empty() || !snapshot.reply_slo.overdue.is_empty() {
-            return Err(SelfHostError::Ingestion(
-                "incremental materialization received resident reply SLO rows".to_owned(),
-            ));
-        }
-        snapshot.built_at = built_at;
-        snapshot.lineage = build_person_page_lineage(
-            &canonical_observation_fingerprint,
-            stats,
-            &current_supplemental_fingerprint,
-            core.supplemental_count,
-            person_page_output_count(&snapshot.person_page, person_message_count)?,
-            built_at,
-        );
-
-        let materialized = Self {
-            format_version: NON_CORPUS_MATERIALIZATION_VERSION,
-            last_append_seq: stats.max_append_seq,
-            observation_count: stats.count,
-            canonical_observation_fingerprint,
-            supplemental_fingerprint: current_supplemental_fingerprint,
-            compact_state,
-            person_consents,
-            person_message_count,
-            reply_slo_count,
-            snapshot,
-            pending_item_commit: Some(PendingProjectionItemCommit {
-                base_person_message_count: core.person_message_count,
-                base_reply_slo_count: core.reply_slo_count,
-                replaced_person_owners,
-                commit: ProjectionItemCommit::Delta {
-                    inserts: message_inserts
-                        .into_iter()
-                        .chain(reply_slo_upserts)
-                        .collect(),
-                    updates: message_updates,
-                    deletes: message_deletes,
-                },
-            }),
-        };
-        materialized.validate()?;
-        Ok(Box::new(materialized))
+fn apply_compact_incremental_delta(
+    core: &mut AppCore,
+    appended_observations: &[Observation],
+    stats: ObservationStats,
+    built_at: DateTime<Utc>,
+    lookup: &dyn ComponentProjectionLookup,
+) -> Result<ProjectionItemCommit, SelfHostError> {
+    if appended_observations.is_empty() {
+        return Err(SelfHostError::Ingestion(
+            "compact materialization delta must contain an appended observation".to_owned(),
+        ));
     }
+    let appended_count = u64::try_from(appended_observations.len()).map_err(|_| {
+        SelfHostError::Ingestion("appended observation count does not fit u64".to_owned())
+    })?;
+    let expected_count = core
+        .observation_stats
+        .count
+        .checked_add(appended_count)
+        .ok_or_else(|| {
+            SelfHostError::Ingestion(
+                "canonical observation count overflow during incremental materialization"
+                    .to_owned(),
+            )
+        })?;
+    if stats.count != expected_count {
+        return Err(SelfHostError::Ingestion(format!(
+            "incremental materialization expected {expected_count} canonical observations, but storage reports {}",
+            stats.count
+        )));
+    }
+    if stats.max_append_seq <= core.observation_stats.max_append_seq {
+        return Err(SelfHostError::Ingestion(format!(
+            "incremental materialization append sequence did not advance beyond {}",
+            core.observation_stats.max_append_seq
+        )));
+    }
+
+    if core.supplemental_projection_cache.count() != core.supplemental_count {
+        return Err(SelfHostError::Ingestion(
+            "resident supplemental reducer count diverged from supplemental store".to_owned(),
+        ));
+    }
+    let current_supplemental_fingerprint = core.resident_supplemental_fingerprint.clone();
+    if current_supplemental_fingerprint != core.supplemental_fingerprint {
+        return Err(SelfHostError::Ingestion(
+            "resident supplemental state does not match materialized supplemental fingerprint"
+                .to_owned(),
+        ));
+    }
+    let canonical_observation_fingerprint = append_canonical_observation_fingerprint(
+        &core.canonical_observation_fingerprint,
+        appended_observations,
+    )?;
+    let fact_observations = appended_observations
+        .iter()
+        .filter(|observation| {
+            observation.schema.as_str() == "schema:slack-message"
+                || identity_replay_event(observation, 1).is_some()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let appended_fact_sequences =
+        stored_observation_append_sequences(lookup, &fact_observations, stats.max_append_seq)?;
+
+    let compact_apply = core
+        .compact_state
+        .apply_observation_page(appended_observations)?;
+    let mut affected_person_ids = compact_apply.affected_person_ids;
+    let mut next_person_ids = BTreeSet::new();
+    for node_id in &compact_apply.touched_nodes {
+        let person_id = core.compact_state.person_id_for_node(*node_id)?;
+        affected_person_ids.insert(person_id.clone());
+        next_person_ids.insert(person_id);
+    }
+
+    let mut previous_components = BTreeMap::new();
+    for person_id in &affected_person_ids {
+        if let Some(component) = core.person_components.remove(person_id) {
+            previous_components.insert(person_id.clone(), component);
+        }
+        core.person_consents.remove(person_id);
+    }
+    let previous_component_rows = previous_components
+        .iter()
+        .map(|(person_id, component)| {
+            Ok((
+                person_id.clone(),
+                person_component_projection_item(component)?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, SelfHostError>>()?;
+    let previous_visible_rows = previous_components
+        .values()
+        .map(component_visible_row_count)
+        .sum::<usize>();
+
+    let mut previous_by_next = BTreeMap::<String, Vec<PersonComponentAggregate>>::new();
+    for (previous_id, component) in previous_components {
+        let seed = identity_component_seed(&previous_id)?;
+        let next_id = core.compact_state.person_id_for_node(seed)?;
+        next_person_ids.insert(next_id.clone());
+        previous_by_next.entry(next_id).or_default().push(component);
+    }
+
+    let mut next_components = BTreeMap::new();
+    let mut newly_opted_out = BTreeSet::new();
+    for person_id in &next_person_ids {
+        let person = core
+            .compact_state
+            .identity
+            .resolved_person(person_id, "1.0.0")
+            .ok_or_else(|| {
+                SelfHostError::Ingestion(format!(
+                    "affected identity component {person_id} has no aggregate"
+                ))
+            })?;
+        let consent = core.compact_state.person_consent(&person);
+        let previous = previous_by_next.remove(person_id).unwrap_or_default();
+        if consent == ConsentStatus::OptedOut
+            && previous
+                .iter()
+                .any(|component| component.consent != ConsentStatus::OptedOut)
+        {
+            newly_opted_out.insert(person_id.clone());
+        }
+        let component = merge_person_component(person, consent, previous)?;
+        core.person_consents.insert(person_id.clone(), consent);
+        next_components.insert(person_id.clone(), component);
+    }
+    if !previous_by_next.is_empty() {
+        return Err(SelfHostError::Ingestion(
+            "affected component aggregate was not assigned to a current identity component"
+                .to_owned(),
+        ));
+    }
+
+    let mut message_inserts = Vec::new();
+    for observation in appended_observations
+        .iter()
+        .filter(|observation| observation.schema.as_str() == "schema:slack-message")
+    {
+        let node_id = slack_identity_node_for_observation(&core.compact_state, observation)?;
+        let person_id = core.compact_state.person_id_for_node(node_id)?;
+        let component = next_components.get_mut(&person_id).ok_or_else(|| {
+            SelfHostError::Ingestion(format!(
+                "Slack observation {} resolved to unaffected component {person_id}",
+                observation.id
+            ))
+        })?;
+        if component.consent == ConsentStatus::OptedOut {
+            continue;
+        }
+        let append_seq = appended_fact_sequences
+            .get(observation.id.as_str())
+            .copied()
+            .ok_or_else(|| {
+                SelfHostError::Ingestion(format!(
+                    "Slack message {} has no append sequence",
+                    observation.id
+                ))
+            })?;
+        let mut message = person_message_from_slack(observation, &person_id);
+        message.id = materialized_message_id(append_seq, &observation.id);
+        add_message_to_component(component, &message)?;
+        message_inserts.push(person_message_projection_item(
+            &message,
+            &core.compact_state,
+        )?);
+    }
+
+    let identity_event_inserts = appended_observations
+        .iter()
+        .filter_map(|observation| {
+            let append_seq = appended_fact_sequences
+                .get(observation.id.as_str())
+                .copied()?;
+            identity_replay_event(observation, append_seq)
+        })
+        .map(|event| identity_replay_event_projection_item(&event))
+        .collect::<Result<Vec<_>, _>>()?;
+    let reply_slo_delta = ReplySloProjector::new(built_at).project_observations(
+        appended_observations,
+        &core.supplemental_projection_cache.reply_slo,
+    );
+    let reply_slo_inserts = reply_slo_delta
+        .rows
+        .iter()
+        .map(reply_slo_projection_item)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut component_inserts = Vec::new();
+    let mut component_updates = Vec::new();
+    let mut component_deletes = previous_component_rows
+        .keys()
+        .filter(|person_id| !next_components.contains_key(*person_id))
+        .map(|person_id| format!("person-component:{person_id}"))
+        .collect::<Vec<_>>();
+    for (person_id, component) in &next_components {
+        let desired = person_component_projection_item(component)?;
+        match previous_component_rows.get(person_id) {
+            Some(previous) if previous == &desired => {}
+            Some(_) => component_updates.push(desired),
+            None => component_inserts.push(desired),
+        }
+    }
+
+    let mut fact_deletes = Vec::new();
+    let mut deleted_message_count = 0_u64;
+    let mut deleted_slide_count = 0_u64;
+    for component in next_components.values() {
+        if !newly_opted_out.contains(component.person.person_id.as_str()) {
+            continue;
+        }
+        let members = core
+            .compact_state
+            .identity
+            .component_members_for_person(component.person.person_id.as_str())
+            .ok_or_else(|| {
+                SelfHostError::Ingestion(format!(
+                    "opted-out component {} has no identity members",
+                    component.person.person_id
+                ))
+            })?;
+        for node_id in members {
+            for item in lookup.person_message_items(&identity_node_owner(*node_id))? {
+                if item.item_key.starts_with("pm:") {
+                    deleted_message_count =
+                        deleted_message_count.checked_add(1).ok_or_else(|| {
+                            SelfHostError::Ingestion(
+                                "person message delete count overflow".to_owned(),
+                            )
+                        })?;
+                    fact_deletes.push(item.item_key);
+                } else if item.item_key.starts_with("ps:") {
+                    deleted_slide_count = deleted_slide_count.checked_add(1).ok_or_else(|| {
+                        SelfHostError::Ingestion("person slide delete count overflow".to_owned())
+                    })?;
+                    fact_deletes.push(item.item_key);
+                }
+            }
+        }
+    }
+    component_deletes.append(&mut fact_deletes);
+
+    let inserted_message_count = u64::try_from(message_inserts.len()).map_err(|_| {
+        SelfHostError::Ingestion("person message insert count does not fit u64".to_owned())
+    })?;
+    core.person_message_count = core
+        .person_message_count
+        .checked_add(inserted_message_count)
+        .and_then(|count| count.checked_sub(deleted_message_count))
+        .ok_or_else(|| {
+            SelfHostError::Ingestion(
+                "person message count overflow or underflow during incremental materialization"
+                    .to_owned(),
+            )
+        })?;
+    core.person_slide_count = core
+        .person_slide_count
+        .checked_sub(deleted_slide_count)
+        .ok_or_else(|| {
+            SelfHostError::Ingestion(
+                "person slide count underflow during incremental materialization".to_owned(),
+            )
+        })?;
+    core.identity_event_count = core
+        .identity_event_count
+        .checked_add(u64::try_from(identity_event_inserts.len()).map_err(|_| {
+            SelfHostError::Ingestion("identity event delta count does not fit u64".to_owned())
+        })?)
+        .ok_or_else(|| SelfHostError::Ingestion("identity event count overflow".to_owned()))?;
+    core.reply_slo_count = core
+        .reply_slo_count
+        .checked_add(u64::try_from(reply_slo_inserts.len()).map_err(|_| {
+            SelfHostError::Ingestion("reply SLO delta count does not fit u64".to_owned())
+        })?)
+        .ok_or_else(|| SelfHostError::Ingestion("reply SLO count overflow".to_owned()))?;
+
+    let next_visible_rows = next_components
+        .values()
+        .map(component_visible_row_count)
+        .sum::<usize>();
+    for (person_id, component) in next_components {
+        core.person_components.insert(person_id, component);
+    }
+    let output_count = core
+        .snapshot
+        .lineage
+        .output_count
+        .checked_sub(previous_visible_rows)
+        .and_then(|count| count.checked_add(next_visible_rows))
+        .and_then(|count| count.checked_add(usize::try_from(inserted_message_count).ok()?))
+        .and_then(|count| count.checked_sub(usize::try_from(deleted_message_count).ok()?))
+        .and_then(|count| count.checked_sub(usize::try_from(deleted_slide_count).ok()?))
+        .ok_or_else(|| {
+            SelfHostError::Ingestion("person-page output count overflow or underflow".to_owned())
+        })?;
+
+    core.snapshot.freshness = freshness_projection_after_delta(
+        &core.snapshot.freshness,
+        &core.freshness_thresholds,
+        appended_observations,
+        built_at,
+    )?;
+    if core.claim_queue_dirty {
+        core.snapshot.claim_queue = core.supplemental_projection_cache.claim_queue();
+    }
+    (core.snapshot.resume_snapshot, core.snapshot.plan_state) = core
+        .supplemental_projection_cache
+        .cognition(&core.snapshot.claim_queue, built_at);
+    core.snapshot.card_queue = core
+        .supplemental_projection_cache
+        .card_queue
+        .projection(built_at);
+    core.snapshot.identity = IdentityResolutionOutput::default();
+    core.snapshot.person_page = PersonPageOutput::default();
+    core.snapshot.reply_slo = ReplySloProjection::default();
+    core.snapshot.built_at = built_at;
+    core.snapshot.lineage = build_person_page_lineage(
+        &canonical_observation_fingerprint,
+        stats,
+        &current_supplemental_fingerprint,
+        core.supplemental_count,
+        output_count,
+        built_at,
+    );
+    core.observation_stats = stats;
+    core.canonical_observation_fingerprint = canonical_observation_fingerprint;
+
+    let commit = ProjectionItemCommit::Delta {
+        inserts: message_inserts
+            .into_iter()
+            .chain(reply_slo_inserts)
+            .chain(identity_event_inserts)
+            .chain(component_inserts)
+            .collect(),
+        updates: component_updates,
+        deletes: component_deletes,
+    };
+    commit.validate()?;
+    Ok(commit)
+}
+
+fn identity_component_seed(person_id: &str) -> Result<IdentityNodeId, SelfHostError> {
+    person_id
+        .strip_prefix("person:component-")
+        .ok_or_else(|| {
+            SelfHostError::Ingestion(format!("invalid person component ID {person_id}"))
+        })?
+        .parse::<IdentityNodeId>()
+        .map_err(|error| {
+            SelfHostError::Ingestion(format!("invalid person component ID {person_id}: {error}"))
+        })
+}
+
+fn component_visible_row_count(component: &PersonComponentAggregate) -> usize {
+    usize::from(component.profile.is_some()) + usize::from(component.activity.is_some())
+}
+
+fn component_activity_fact_weight(activity: &PersonActivity) -> Result<u64, SelfHostError> {
+    u64::try_from(activity.total_slides_related)
+        .ok()
+        .and_then(|slides| {
+            u64::try_from(activity.total_messages)
+                .ok()
+                .and_then(|messages| slides.checked_add(messages))
+        })
+        .ok_or_else(|| SelfHostError::Ingestion("component fact weight overflow".to_owned()))
+}
+
+fn merge_person_component(
+    person: ResolvedPerson,
+    consent: ConsentStatus,
+    previous: Vec<PersonComponentAggregate>,
+) -> Result<PersonComponentAggregate, SelfHostError> {
+    let mut activity = PersonActivity {
+        person_id: person.person_id.clone(),
+        total_slides_related: 0,
+        total_messages: 0,
+        first_activity: None,
+        last_activity: None,
+        active_channels: Vec::new(),
+    };
+    let mut fact_weight = 0_u64;
+    let mut active_channels = BTreeSet::new();
+    let mut slide_blob_refs = BTreeSet::new();
+    let mut selected_frontend = None::<(FrontendProfileRank, FrontendProfile)>;
+    for mut component in previous {
+        fact_weight = fact_weight
+            .checked_add(component.fact_weight)
+            .ok_or_else(|| SelfHostError::Ingestion("component fact weight overflow".to_owned()))?;
+        if active_channels.len() < component.active_channels.len() {
+            std::mem::swap(&mut active_channels, &mut component.active_channels);
+        }
+        active_channels.extend(component.active_channels);
+        if slide_blob_refs.len() < component.slide_blob_refs.len() {
+            std::mem::swap(&mut slide_blob_refs, &mut component.slide_blob_refs);
+        }
+        slide_blob_refs.extend(component.slide_blob_refs);
+        if let Some(previous_activity) = component.activity {
+            merge_person_activity(&mut activity, previous_activity)?;
+        }
+        if let (Some(rank), Some(frontend)) =
+            (component.frontend_profile_rank, component.frontend_profile)
+        {
+            let replace = selected_frontend.as_ref().is_none_or(|(current, _)| {
+                (
+                    current.richness_score,
+                    current.created_at,
+                    current.stable_id.as_str(),
+                ) < (
+                    rank.richness_score,
+                    rank.created_at,
+                    rank.stable_id.as_str(),
+                )
+            });
+            if replace {
+                selected_frontend = Some((rank, frontend));
+            }
+        }
+    }
+    activity.person_id = person.person_id.clone();
+    activity.active_channels = active_channels.iter().cloned().collect();
+    let frontend_profile_rank = selected_frontend.as_ref().map(|(rank, _)| rank.clone());
+    let frontend_profile = selected_frontend.map(|(_, profile)| profile);
+    let profile_updated_at = activity
+        .last_activity
+        .into_iter()
+        .chain(activity.first_activity)
+        .chain(frontend_profile_rank.as_ref().map(|rank| rank.created_at))
+        .max()
+        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
+    let profile = PersonProfile {
+        person_id: person.person_id.clone(),
+        display_name: person.canonical_name.clone(),
+        self_intro_text: frontend_profile
+            .as_ref()
+            .and_then(|profile| profile.profile.bio_text.clone()),
+        self_intro_slide_id: frontend_profile
+            .as_ref()
+            .map(|profile| profile.source_document_id.clone()),
+        self_intro_thumbnail: frontend_profile.as_ref().and_then(|profile| {
+            profile
+                .thumbnail_url
+                .clone()
+                .or_else(|| profile.thumbnail_ref.clone())
+        }),
+        identities: person_identity_info(&person),
+        source_count: person.sources.len(),
+        last_activity: activity.last_activity,
+        profile_updated_at,
+        frontend_profile: frontend_profile.clone(),
+        frontend_profile_created_at: frontend_profile_rank.as_ref().map(|rank| rank.created_at),
+    };
+    let visible = consent != ConsentStatus::OptedOut;
+    Ok(PersonComponentAggregate {
+        person,
+        consent,
+        fact_weight: if visible { fact_weight } else { 0 },
+        active_channels: if visible {
+            active_channels
+        } else {
+            BTreeSet::new()
+        },
+        slide_blob_refs: if visible {
+            slide_blob_refs
+        } else {
+            BTreeSet::new()
+        },
+        frontend_profile_rank: visible.then_some(frontend_profile_rank).flatten(),
+        frontend_profile: visible.then_some(frontend_profile.clone()).flatten(),
+        profile: visible.then_some(profile),
+        activity: visible.then_some(activity),
+    })
+}
+
+fn merge_person_activity(
+    target: &mut PersonActivity,
+    source: PersonActivity,
+) -> Result<(), SelfHostError> {
+    target.total_slides_related = target
+        .total_slides_related
+        .checked_add(source.total_slides_related)
+        .ok_or_else(|| SelfHostError::Ingestion("person slide aggregate overflow".to_owned()))?;
+    target.total_messages = target
+        .total_messages
+        .checked_add(source.total_messages)
+        .ok_or_else(|| SelfHostError::Ingestion("person message aggregate overflow".to_owned()))?;
+    target.first_activity = target
+        .first_activity
+        .into_iter()
+        .chain(source.first_activity)
+        .min();
+    target.last_activity = target
+        .last_activity
+        .into_iter()
+        .chain(source.last_activity)
+        .max();
+    Ok(())
+}
+
+fn add_message_to_component(
+    component: &mut PersonComponentAggregate,
+    message: &PersonMessage,
+) -> Result<(), SelfHostError> {
+    component.fact_weight = component
+        .fact_weight
+        .checked_add(1)
+        .ok_or_else(|| SelfHostError::Ingestion("component fact weight overflow".to_owned()))?;
+    component.active_channels.insert(message.channel.clone());
+    let activity = component.activity.as_mut().ok_or_else(|| {
+        SelfHostError::Ingestion(format!(
+            "visible message {} has no component activity",
+            message.id
+        ))
+    })?;
+    let profile = component.profile.as_mut().ok_or_else(|| {
+        SelfHostError::Ingestion(format!(
+            "visible message {} has no component profile",
+            message.id
+        ))
+    })?;
+    add_message_to_profile_activity(profile, activity, message)?;
+    activity.active_channels = component.active_channels.iter().cloned().collect();
+    Ok(())
+}
+
+fn add_message_to_profile_activity(
+    profile: &mut PersonProfile,
+    activity: &mut PersonActivity,
+    message: &PersonMessage,
+) -> Result<(), SelfHostError> {
+    activity.total_messages = activity
+        .total_messages
+        .checked_add(1)
+        .ok_or_else(|| SelfHostError::Ingestion("person message aggregate overflow".to_owned()))?;
+    activity.first_activity = Some(
+        activity
+            .first_activity
+            .map(|current| current.min(message.ts))
+            .unwrap_or(message.ts),
+    );
+    activity.last_activity = Some(
+        activity
+            .last_activity
+            .map(|current| current.max(message.ts))
+            .unwrap_or(message.ts),
+    );
+    if !activity.active_channels.contains(&message.channel) {
+        activity.active_channels.push(message.channel.clone());
+        activity.active_channels.sort();
+    }
+    profile.last_activity = activity.last_activity;
+    profile.profile_updated_at = profile.profile_updated_at.max(message.ts);
+    Ok(())
+}
+
+fn slack_identity_node_for_observation(
+    state: &CompactProjectionState,
+    observation: &Observation,
+) -> Result<IdentityNodeId, SelfHostError> {
+    let user_id = observation
+        .payload
+        .get("user_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            SelfHostError::Ingestion(format!(
+                "Slack message {} has no identity node user_id",
+                observation.id
+            ))
+        })?;
+    state
+        .nodes_by_observation_id
+        .get(observation.id.as_str())
+        .into_iter()
+        .flatten()
+        .copied()
+        .find(|node_id| {
+            state.identity.node(*node_id).is_some_and(|node| {
+                node.candidate.identifiers.iter().any(|identifier| {
+                    identifier.identifier_type == IdentifierType::UserId
+                        && identifier.value == user_id
+                })
+            })
+        })
+        .ok_or_else(|| {
+            SelfHostError::Ingestion(format!(
+                "Slack message {} has no matching identity node",
+                observation.id
+            ))
+        })
 }
 
 fn classify_non_corpus_delta(observations: &[Observation]) -> NonCorpusDeltaKind {
@@ -1687,12 +2511,163 @@ fn contributes_to_reply_slo(observation: &Observation) -> bool {
             .is_some()
 }
 
-struct IncrementalPersonPageResult {
-    person_page: PersonPageOutput,
-    message_inserts: Vec<ProjectionItem>,
-    message_updates: Vec<ProjectionItem>,
-    message_deletes: Vec<String>,
-    replaced_person_owners: BTreeSet<String>,
+#[cfg(test)]
+fn observation_append_sequences(
+    observations: &[Observation],
+    stats: ObservationStats,
+) -> Result<BTreeMap<String, u64>, SelfHostError> {
+    let count = u64::try_from(observations.len())
+        .map_err(|_| SelfHostError::Ingestion("observation count does not fit u64".to_owned()))?;
+    if count != stats.count {
+        return Err(SelfHostError::Ingestion(format!(
+            "fact provenance expected {} observations, received {count}",
+            stats.count
+        )));
+    }
+    if count == 0 {
+        if stats.max_append_seq != 0 {
+            return Err(SelfHostError::Ingestion(format!(
+                "empty fact provenance has non-zero high-water {}",
+                stats.max_append_seq
+            )));
+        }
+        return Ok(BTreeMap::new());
+    }
+    let first_append_seq = stats
+        .max_append_seq
+        .checked_sub(count - 1)
+        .filter(|first| *first > 0)
+        .ok_or_else(|| {
+            SelfHostError::Ingestion(format!(
+                "canonical high-water {} cannot identify {count} fact sequences",
+                stats.max_append_seq
+            ))
+        })?;
+    observations
+        .iter()
+        .enumerate()
+        .map(|(index, observation)| {
+            let offset = u64::try_from(index).map_err(|_| {
+                SelfHostError::Ingestion("fact sequence offset does not fit u64".to_owned())
+            })?;
+            let append_seq = first_append_seq.checked_add(offset).ok_or_else(|| {
+                SelfHostError::Ingestion("fact append sequence overflow".to_owned())
+            })?;
+            Ok((observation.id.as_str().to_owned(), append_seq))
+        })
+        .collect()
+}
+
+fn stored_observation_append_sequences(
+    lookup: &dyn ComponentProjectionLookup,
+    observations: &[Observation],
+    canonical_high_water: u64,
+) -> Result<BTreeMap<String, u64>, SelfHostError> {
+    let mut sequences = BTreeMap::new();
+    let mut seen_append_sequences = BTreeSet::new();
+    for observation in observations {
+        let stored = lookup.stored_observation(&observation.id)?.ok_or_else(|| {
+            SelfHostError::Ingestion(format!(
+                "fact provenance references missing observation {}",
+                observation.id
+            ))
+        })?;
+        if stored.observation.id != observation.id {
+            return Err(SelfHostError::Ingestion(format!(
+                "fact provenance lookup returned {} for {}",
+                stored.observation.id, observation.id
+            )));
+        }
+        if stored.append_seq == 0 || stored.append_seq > canonical_high_water {
+            return Err(SelfHostError::Ingestion(format!(
+                "fact observation {} has append sequence {} outside high-water {canonical_high_water}",
+                observation.id, stored.append_seq
+            )));
+        }
+        if !seen_append_sequences.insert(stored.append_seq) {
+            return Err(SelfHostError::Ingestion(format!(
+                "fact provenance repeats append sequence {}",
+                stored.append_seq
+            )));
+        }
+        sequences.insert(observation.id.as_str().to_owned(), stored.append_seq);
+    }
+    Ok(sequences)
+}
+
+fn materialized_message_id(append_seq: u64, observation_id: &ObservationId) -> String {
+    format!("pm:{append_seq:020}:{observation_id}")
+}
+
+fn materialized_slide_id(append_seq: u64, observation_id: &str, claim: &str) -> String {
+    format!("ps:{append_seq:020}:{observation_id}:{claim}")
+}
+
+fn normalize_person_fact_ids(
+    person_page: &mut PersonPageOutput,
+    append_sequences: &BTreeMap<String, u64>,
+) -> Result<(), SelfHostError> {
+    let mut message_ids = BTreeSet::new();
+    for message in &mut person_page.messages {
+        let observation_id = message.source_observation_id.as_str();
+        if observation_id.is_empty() || message.id != format!("pm:{observation_id}") {
+            return Err(SelfHostError::Ingestion(format!(
+                "person message {} has invalid source provenance",
+                message.id
+            )));
+        }
+        let append_seq = append_sequences
+            .get(observation_id)
+            .copied()
+            .ok_or_else(|| {
+                SelfHostError::Ingestion(format!(
+                    "person message {} references observation outside fact provenance",
+                    message.id
+                ))
+            })?;
+        message.id = materialized_message_id(append_seq, &ObservationId::new(observation_id));
+        if !message_ids.insert(message.id.clone()) {
+            return Err(SelfHostError::Ingestion(format!(
+                "person-page produced duplicate stable message id {}",
+                message.id
+            )));
+        }
+    }
+
+    let mut slide_ids = BTreeSet::new();
+    for slide in &mut person_page.slides {
+        let observation_id = slide.source_observation_id.as_str();
+        let prefix = format!("ps:{observation_id}:");
+        let claim = slide.id.strip_prefix(&prefix).ok_or_else(|| {
+            SelfHostError::Ingestion(format!(
+                "person slide {} has invalid source provenance",
+                slide.id
+            ))
+        })?;
+        if observation_id.is_empty() || claim.is_empty() {
+            return Err(SelfHostError::Ingestion(format!(
+                "person slide {} has blank source provenance",
+                slide.id
+            )));
+        }
+        let append_seq = append_sequences
+            .get(observation_id)
+            .copied()
+            .ok_or_else(|| {
+                SelfHostError::Ingestion(format!(
+                    "person slide {} references observation outside fact provenance",
+                    slide.id
+                ))
+            })?;
+        slide.id = materialized_slide_id(append_seq, observation_id, claim);
+        if !slide_ids.insert(slide.id.clone()) {
+            return Err(SelfHostError::Ingestion(format!(
+                "person-page produced duplicate stable slide id {}",
+                slide.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn merge_non_slack_person_page(
@@ -1712,7 +2687,7 @@ fn merge_non_slack_person_page(
         .map(|(index, activity)| (activity.person_id.as_str().to_owned(), index))
         .collect::<BTreeMap<_, _>>();
 
-    for mut slide in page.slides {
+    for slide in page.slides {
         let person_id = slide.person_id.as_str();
         if person_consents.get(person_id) == Some(&ConsentStatus::OptedOut) {
             continue;
@@ -1730,7 +2705,6 @@ fn merge_non_slack_person_page(
                 .ok_or_else(|| {
                     SelfHostError::Ingestion(format!("person slide count overflow for {person_id}"))
                 })?;
-        slide.id = format!("ps:{}:{}", slide.person_id, activity.total_slides_related);
         if let Some(last_modified) = slide.last_modified {
             activity.first_activity = Some(
                 activity
@@ -1768,575 +2742,6 @@ fn merge_non_slack_person_page(
     Ok(())
 }
 
-fn increment_person_page_for_slack(
-    current_identity: &IdentityResolutionOutput,
-    next_identity: &IdentityResolutionOutput,
-    current: &PersonPageOutput,
-    current_consents: &BTreeMap<String, ConsentStatus>,
-    next_consents: &BTreeMap<String, ConsentStatus>,
-    appended_observations: &[Observation],
-) -> Result<Option<IncrementalPersonPageResult>, SelfHostError> {
-    if !current.messages.is_empty() {
-        return Err(SelfHostError::Ingestion(
-            "incremental person-page received resident historical messages".to_owned(),
-        ));
-    }
-    let current_identifier_owners = identity_identifier_owners(current_identity);
-    let next_identifier_owners = identity_identifier_owners(next_identity);
-    if current_identifier_owners
-        .iter()
-        .any(|(identifier, owner)| next_identifier_owners.get(identifier) != Some(owner))
-    {
-        return Ok(None);
-    }
-    for person in &current_identity.resolved_persons {
-        let person_id = person.person_id.as_str();
-        if !next_identity
-            .resolved_persons
-            .iter()
-            .any(|candidate| candidate.person_id == person.person_id)
-            || current_consents.get(person_id) != next_consents.get(person_id)
-        {
-            return Ok(None);
-        }
-    }
-
-    let mut profiles_by_person = current
-        .profiles
-        .iter()
-        .cloned()
-        .map(|profile| (profile.person_id.as_str().to_owned(), profile))
-        .collect::<BTreeMap<_, _>>();
-    let mut slides_by_person = BTreeMap::<String, Vec<_>>::new();
-    for slide in &current.slides {
-        slides_by_person
-            .entry(slide.person_id.as_str().to_owned())
-            .or_default()
-            .push(slide.clone());
-    }
-    let mut activities_by_person = BTreeMap::new();
-    for activity in &current.activities {
-        if activities_by_person
-            .insert(activity.person_id.as_str().to_owned(), activity.clone())
-            .is_some()
-        {
-            return Err(SelfHostError::Ingestion(format!(
-                "resident person-page contains duplicate activity for {}",
-                activity.person_id
-            )));
-        }
-    }
-
-    let mut message_upserts = Vec::new();
-    for observation in appended_observations
-        .iter()
-        .filter(|observation| observation.schema.as_str() == "schema:slack-message")
-    {
-        let mut person_ids = BTreeSet::new();
-        for identifier in ["user_id", "email"] {
-            if let Some(value) = observation
-                .payload
-                .get(identifier)
-                .and_then(serde_json::Value::as_str)
-                && let Some(person_id) = next_identifier_owners.get(value)
-            {
-                person_ids.insert(person_id.clone());
-            }
-        }
-        for person_id in person_ids {
-            if next_consents.get(&person_id) == Some(&ConsentStatus::OptedOut) {
-                continue;
-            }
-            let person_ref = EntityRef::new(&person_id);
-            let activity = activities_by_person
-                .entry(person_id.clone())
-                .or_insert_with(|| PersonActivity {
-                    person_id: person_ref.clone(),
-                    total_slides_related: 0,
-                    total_messages: 0,
-                    first_activity: None,
-                    last_activity: None,
-                    active_channels: Vec::new(),
-                });
-            activity.total_messages = activity.total_messages.checked_add(1).ok_or_else(|| {
-                SelfHostError::Ingestion(format!("person message count overflow for {person_id}"))
-            })?;
-            let ordinal = u64::try_from(activity.total_messages).map_err(|_| {
-                SelfHostError::Ingestion(format!(
-                    "person message ordinal does not fit u64 for {person_id}"
-                ))
-            })?;
-            let mut message = person_message_from_slack(observation, &person_id);
-            message.id = format!("pm:{person_id}:{ordinal}");
-            activity.first_activity = Some(
-                activity
-                    .first_activity
-                    .map(|current| current.min(message.ts))
-                    .unwrap_or(message.ts),
-            );
-            activity.last_activity = Some(
-                activity
-                    .last_activity
-                    .map(|current| current.max(message.ts))
-                    .unwrap_or(message.ts),
-            );
-            if !activity.active_channels.contains(&message.channel) {
-                activity.active_channels.push(message.channel.clone());
-                activity.active_channels.sort();
-            }
-            message_upserts.push(person_message_projection_item(&message)?);
-        }
-    }
-
-    let mut profiles = Vec::new();
-    let mut slides = Vec::new();
-    let mut activities = Vec::new();
-    for person in &next_identity.resolved_persons {
-        let person_id = person.person_id.as_str();
-        if next_consents.get(person_id) == Some(&ConsentStatus::OptedOut) {
-            continue;
-        }
-        let mut person_slides = slides_by_person.remove(person_id).unwrap_or_default();
-        for (index, slide) in person_slides.iter_mut().enumerate() {
-            slide.person_id = person.person_id.clone();
-            slide.id = format!("ps:{}:{}", person.person_id, index + 1);
-        }
-        let mut activity = activities_by_person
-            .remove(person_id)
-            .unwrap_or_else(|| person_activity(&person.person_id, &person_slides, &[]));
-        if activity.total_slides_related != person_slides.len() {
-            return Err(SelfHostError::Ingestion(format!(
-                "resident activity slide count for {person_id} is {}, expected {}",
-                activity.total_slides_related,
-                person_slides.len()
-            )));
-        }
-        activity.person_id = person.person_id.clone();
-        let profile = match profiles_by_person.remove(person_id) {
-            Some(mut profile) => {
-                profile.display_name = person.canonical_name.clone();
-                profile.identities = person_identity_info(person);
-                profile.source_count = person.sources.len();
-                profile.last_activity = activity.last_activity;
-                if let Some(last_activity) = activity.last_activity {
-                    profile.profile_updated_at = profile.profile_updated_at.max(last_activity);
-                }
-                profile
-            }
-            None => PersonProfile {
-                person_id: person.person_id.clone(),
-                display_name: person.canonical_name.clone(),
-                self_intro_text: None,
-                self_intro_slide_id: None,
-                self_intro_thumbnail: None,
-                identities: person_identity_info(person),
-                source_count: person.sources.len(),
-                last_activity: activity.last_activity,
-                profile_updated_at: activity
-                    .last_activity
-                    .or(activity.first_activity)
-                    .unwrap_or(DateTime::<Utc>::UNIX_EPOCH),
-                frontend_profile: None,
-            },
-        };
-        profiles.push(profile);
-        slides.extend(person_slides);
-        activities.push(activity);
-    }
-
-    if !profiles_by_person.is_empty()
-        || !slides_by_person.is_empty()
-        || !activities_by_person.is_empty()
-    {
-        return Err(SelfHostError::Ingestion(
-            "resident person-page contains records not represented by compact identity state"
-                .to_owned(),
-        ));
-    }
-    Ok(Some(IncrementalPersonPageResult {
-        person_page: PersonPageOutput {
-            profiles,
-            slides,
-            messages: Vec::new(),
-            activities,
-        },
-        message_inserts: message_upserts,
-        message_updates: Vec::new(),
-        message_deletes: Vec::new(),
-        replaced_person_owners: BTreeSet::new(),
-    }))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn reproject_affected_person_components(
-    next_state: &CompactProjectionState,
-    current_resolution: &CompactIdentityResolution,
-    next_resolution: &CompactIdentityResolution,
-    current_page: &PersonPageOutput,
-    current_consents: &BTreeMap<String, ConsentStatus>,
-    next_consents: &BTreeMap<String, ConsentStatus>,
-    touched_members: &BTreeSet<u64>,
-    supplemental_records: &[lethe_core::domain::SupplementalRecord],
-    canonical_high_water: u64,
-    lookup: &dyn ComponentProjectionLookup,
-) -> Result<IncrementalPersonPageResult, SelfHostError> {
-    if !current_page.messages.is_empty() {
-        return Err(SelfHostError::Ingestion(
-            "component re-projection received resident historical messages".to_owned(),
-        ));
-    }
-
-    let affected_members = affected_identity_members(
-        current_resolution,
-        next_resolution,
-        current_consents,
-        next_consents,
-        touched_members,
-    );
-    if affected_members.is_empty() {
-        return Err(SelfHostError::Ingestion(
-            "identity delta did not identify an affected component".to_owned(),
-        ));
-    }
-
-    let affected_current_people =
-        component_people_intersecting(&current_resolution.members_by_person, &affected_members);
-    let affected_next_people =
-        component_people_intersecting(&next_resolution.members_by_person, &affected_members);
-
-    let mut source_observation_ids = BTreeSet::new();
-    for entry in &next_state.identity_candidates {
-        if affected_members.contains(&entry.first_ordinal) {
-            source_observation_ids.extend(entry.observation_ids.iter().cloned());
-        }
-    }
-    if source_observation_ids.is_empty() {
-        return Err(SelfHostError::Ingestion(
-            "affected identity components have no source observations".to_owned(),
-        ));
-    }
-
-    let mut observations_by_append_seq = BTreeMap::new();
-    for observation_id in &source_observation_ids {
-        let observation_ref = ObservationId::new(observation_id);
-        let stored = lookup
-            .stored_observation(&observation_ref)?
-            .ok_or_else(|| {
-                SelfHostError::Ingestion(format!(
-                    "affected component references missing observation {observation_id}"
-                ))
-            })?;
-        if stored.observation.id != observation_ref {
-            return Err(SelfHostError::Ingestion(format!(
-                "affected component lookup returned {} for {observation_id}",
-                stored.observation.id
-            )));
-        }
-        if stored.append_seq == 0 || stored.append_seq > canonical_high_water {
-            return Err(SelfHostError::Ingestion(format!(
-                "affected observation {observation_id} has append sequence {} outside high-water {canonical_high_water}",
-                stored.append_seq
-            )));
-        }
-        if let Some(previous) =
-            observations_by_append_seq.insert(stored.append_seq, stored.observation)
-        {
-            return Err(SelfHostError::Ingestion(format!(
-                "affected observations {} and {observation_id} share append sequence {}",
-                previous.id, stored.append_seq
-            )));
-        }
-    }
-    let observations = observations_by_append_seq.into_values().collect::<Vec<_>>();
-
-    let affected_identity = IdentityResolutionOutput {
-        resolved_persons: next_resolution
-            .identity
-            .resolved_persons
-            .iter()
-            .filter(|person| affected_next_people.contains(person.person_id.as_str()))
-            .cloned()
-            .collect(),
-        candidates: Vec::new(),
-        person_identifiers: next_resolution
-            .identity
-            .person_identifiers
-            .iter()
-            .filter(|row| affected_next_people.contains(row.person_id.as_str()))
-            .cloned()
-            .collect(),
-    };
-    let affected_supplementals = supplemental_records
-        .iter()
-        .filter(|record| {
-            record
-                .derived_from
-                .observations
-                .iter()
-                .any(|observation_id| source_observation_ids.contains(observation_id.as_str()))
-        })
-        .collect::<Vec<_>>();
-    let mut reprojected =
-        PersonPageProjector::project(&affected_identity, &observations, &affected_supplementals);
-    reprojected.profiles.retain(|profile| {
-        next_consents.get(profile.person_id.as_str()) != Some(&ConsentStatus::OptedOut)
-    });
-    reprojected.slides.retain(|slide| {
-        next_consents.get(slide.person_id.as_str()) != Some(&ConsentStatus::OptedOut)
-    });
-    reprojected.messages.retain(|message| {
-        next_consents.get(message.person_id.as_str()) != Some(&ConsentStatus::OptedOut)
-    });
-    reprojected.activities.retain(|activity| {
-        next_consents.get(activity.person_id.as_str()) != Some(&ConsentStatus::OptedOut)
-    });
-
-    let mut existing_items = BTreeMap::new();
-    for owner in &affected_current_people {
-        for item in lookup.person_message_items(owner)? {
-            let message = person_message_from_projection_item(&item)?;
-            if item.owner_key != *owner || message.person_id.as_str() != owner {
-                return Err(SelfHostError::Ingestion(format!(
-                    "projection item {} was returned for the wrong owner {owner}",
-                    item.item_key
-                )));
-            }
-            if existing_items.insert(item.item_key.clone(), item).is_some() {
-                return Err(SelfHostError::Ingestion(format!(
-                    "affected component contains duplicate person message item {}",
-                    message.id
-                )));
-            }
-        }
-    }
-
-    let reprojected_messages = std::mem::take(&mut reprojected.messages);
-    let mut desired_items = BTreeMap::new();
-    for message in &reprojected_messages {
-        let item = person_message_projection_item(message)?;
-        if desired_items.insert(item.item_key.clone(), item).is_some() {
-            return Err(SelfHostError::Ingestion(format!(
-                "component re-projection produced duplicate message {}",
-                message.id
-            )));
-        }
-    }
-
-    let mut message_inserts = Vec::new();
-    let mut message_updates = Vec::new();
-    for (item_key, item) in desired_items {
-        if existing_items.remove(&item_key).is_some() {
-            // Replaced owners publish their complete desired row set. Keeping
-            // equal rows in `updates` lets validation prove ordinal coverage
-            // without loading unrelated owners.
-            message_updates.push(item);
-        } else {
-            message_inserts.push(item);
-        }
-    }
-    let message_deletes = existing_items.into_keys().collect::<Vec<_>>();
-
-    let mut person_page = current_page.clone();
-    person_page
-        .profiles
-        .retain(|profile| !affected_current_people.contains(profile.person_id.as_str()));
-    person_page
-        .slides
-        .retain(|slide| !affected_current_people.contains(slide.person_id.as_str()));
-    person_page
-        .activities
-        .retain(|activity| !affected_current_people.contains(activity.person_id.as_str()));
-    person_page.profiles.extend(reprojected.profiles);
-    person_page.slides.extend(reprojected.slides);
-    person_page.activities.extend(reprojected.activities);
-
-    sort_person_page_for_identity(&mut person_page, &next_resolution.identity)?;
-
-    let next_person_ids = next_resolution
-        .identity
-        .resolved_persons
-        .iter()
-        .map(|person| person.person_id.as_str())
-        .collect::<BTreeSet<_>>();
-    for owner in person_page
-        .profiles
-        .iter()
-        .map(|profile| profile.person_id.as_str())
-        .chain(
-            person_page
-                .slides
-                .iter()
-                .map(|slide| slide.person_id.as_str()),
-        )
-        .chain(
-            person_page
-                .activities
-                .iter()
-                .map(|activity| activity.person_id.as_str()),
-        )
-    {
-        if !next_person_ids.contains(owner) {
-            return Err(SelfHostError::Ingestion(format!(
-                "component re-projection retained row for removed person {owner}"
-            )));
-        }
-    }
-
-    let replaced_person_owners = affected_current_people
-        .union(&affected_next_people)
-        .cloned()
-        .collect();
-    Ok(IncrementalPersonPageResult {
-        person_page,
-        message_inserts,
-        message_updates,
-        message_deletes,
-        replaced_person_owners,
-    })
-}
-
-fn affected_identity_members(
-    current: &CompactIdentityResolution,
-    next: &CompactIdentityResolution,
-    current_consents: &BTreeMap<String, ConsentStatus>,
-    next_consents: &BTreeMap<String, ConsentStatus>,
-    touched_members: &BTreeSet<u64>,
-) -> BTreeSet<u64> {
-    let mut affected = touched_members.clone();
-
-    let current_by_signature = component_people_by_signature(&current.members_by_person);
-    let next_by_signature = component_people_by_signature(&next.members_by_person);
-    for (signature, current_person) in &current_by_signature {
-        if let Some(next_person) = next_by_signature.get(signature)
-            && (current_person != next_person
-                || current_consents.get(current_person) != next_consents.get(next_person))
-        {
-            affected.extend(signature.iter().copied());
-        }
-    }
-
-    let current_owners = identity_identifier_owners(&current.identity);
-    let next_owners = identity_identifier_owners(&next.identity);
-    for identifier in current_owners.keys().chain(next_owners.keys()) {
-        let current_owner = current_owners.get(identifier);
-        let next_owner = next_owners.get(identifier);
-        if current_owner != next_owner {
-            if let Some(owner) = current_owner
-                && let Some(members) = current.members_by_person.get(owner)
-            {
-                affected.extend(members.iter().copied());
-            }
-            if let Some(owner) = next_owner
-                && let Some(members) = next.members_by_person.get(owner)
-            {
-                affected.extend(members.iter().copied());
-            }
-        }
-    }
-
-    loop {
-        let before = affected.len();
-        for members in current
-            .members_by_person
-            .values()
-            .chain(next.members_by_person.values())
-        {
-            if members.iter().any(|member| affected.contains(member)) {
-                affected.extend(members.iter().copied());
-            }
-        }
-        if affected.len() == before {
-            break;
-        }
-    }
-    affected
-}
-
-fn component_people_by_signature(
-    members_by_person: &BTreeMap<String, BTreeSet<u64>>,
-) -> BTreeMap<Vec<u64>, String> {
-    members_by_person
-        .iter()
-        .map(|(person_id, members)| {
-            (
-                members.iter().copied().collect::<Vec<_>>(),
-                person_id.clone(),
-            )
-        })
-        .collect()
-}
-
-fn component_people_intersecting(
-    members_by_person: &BTreeMap<String, BTreeSet<u64>>,
-    affected_members: &BTreeSet<u64>,
-) -> BTreeSet<String> {
-    members_by_person
-        .iter()
-        .filter(|(_, members)| {
-            members
-                .iter()
-                .any(|member| affected_members.contains(member))
-        })
-        .map(|(person_id, _)| person_id.clone())
-        .collect()
-}
-
-fn sort_person_page_for_identity(
-    person_page: &mut PersonPageOutput,
-    identity: &IdentityResolutionOutput,
-) -> Result<(), SelfHostError> {
-    let identity_order = identity
-        .resolved_persons
-        .iter()
-        .enumerate()
-        .map(|(index, person)| (person.person_id.as_str().to_owned(), index))
-        .collect::<BTreeMap<_, _>>();
-    let rank = |person_id: &str| {
-        identity_order.get(person_id).copied().ok_or_else(|| {
-            SelfHostError::Ingestion(format!(
-                "person-page row references unknown person {person_id}"
-            ))
-        })
-    };
-    person_page
-        .profiles
-        .sort_by_key(|profile| rank(profile.person_id.as_str()).unwrap_or(usize::MAX));
-    person_page
-        .activities
-        .sort_by_key(|activity| rank(activity.person_id.as_str()).unwrap_or(usize::MAX));
-
-    let mut slide_sort_keys = BTreeMap::new();
-    for slide in &person_page.slides {
-        let key = (
-            rank(slide.person_id.as_str())?,
-            person_slide_ordinal(slide)?,
-        );
-        if slide_sort_keys.insert(slide.id.clone(), key).is_some() {
-            return Err(SelfHostError::Ingestion(format!(
-                "person-page contains duplicate slide id {}",
-                slide.id
-            )));
-        }
-    }
-    person_page
-        .slides
-        .sort_by_key(|slide| slide_sort_keys[&slide.id]);
-    Ok(())
-}
-
-fn identity_identifier_owners(identity: &IdentityResolutionOutput) -> BTreeMap<String, String> {
-    let mut owners = BTreeMap::new();
-    for person in &identity.resolved_persons {
-        for identifier in &person.identifiers {
-            owners.insert(
-                identifier.value.clone(),
-                person.person_id.as_str().to_owned(),
-            );
-        }
-    }
-    owners
-}
-
 fn person_message_activity_count(activities: &[PersonActivity]) -> Result<u64, SelfHostError> {
     let mut count = 0_u64;
     let mut person_ids = BTreeSet::new();
@@ -2362,82 +2767,94 @@ fn person_message_activity_count(activities: &[PersonActivity]) -> Result<u64, S
     Ok(count)
 }
 
-fn person_message_ordinal(message: &PersonMessage) -> Result<u64, SelfHostError> {
-    let prefix = format!("pm:{}:", message.person_id);
-    let suffix = message.id.strip_prefix(&prefix).ok_or_else(|| {
+fn stable_fact_append_seq(id: &str, prefix: &str) -> Result<u64, SelfHostError> {
+    let suffix = id.strip_prefix(prefix).ok_or_else(|| {
+        SelfHostError::Ingestion(format!("stable fact id {id} does not start with {prefix}"))
+    })?;
+    let (append_seq, provenance) = suffix.split_once(':').ok_or_else(|| {
+        SelfHostError::Ingestion(format!("stable fact id {id} has no provenance"))
+    })?;
+    let parsed = append_seq.parse::<u64>().map_err(|_| {
         SelfHostError::Ingestion(format!(
-            "person message {} does not belong to {}",
-            message.id, message.person_id
+            "stable fact id {id} has an invalid append sequence"
         ))
     })?;
-    let ordinal = suffix.parse::<u64>().map_err(|_| {
-        SelfHostError::Ingestion(format!(
-            "person message {} has an invalid ordinal",
-            message.id
-        ))
-    })?;
-    if ordinal == 0 || message.id != format!("{prefix}{ordinal}") {
+    if parsed == 0 || append_seq != format!("{parsed:020}") || provenance.is_empty() {
         return Err(SelfHostError::Ingestion(format!(
-            "person message {} has a non-canonical ordinal",
-            message.id
+            "stable fact id {id} is not canonical"
         )));
     }
-    Ok(ordinal)
+    Ok(parsed)
 }
 
-fn person_slide_ordinal(slide: &PersonSlide) -> Result<u64, SelfHostError> {
-    let prefix = format!("ps:{}:", slide.person_id);
-    let suffix = slide.id.strip_prefix(&prefix).ok_or_else(|| {
-        SelfHostError::Ingestion(format!(
-            "person slide {} does not belong to {}",
-            slide.id, slide.person_id
-        ))
-    })?;
-    let ordinal = suffix.parse::<u64>().map_err(|_| {
-        SelfHostError::Ingestion(format!("person slide {} has an invalid ordinal", slide.id))
-    })?;
-    if ordinal == 0 || slide.id != format!("{prefix}{ordinal}") {
-        return Err(SelfHostError::Ingestion(format!(
-            "person slide {} has a non-canonical ordinal",
-            slide.id
-        )));
-    }
-    Ok(ordinal)
+fn person_message_append_seq(message: &PersonMessage) -> Result<u64, SelfHostError> {
+    stable_fact_append_seq(&message.id, "pm:")
 }
 
-fn person_message_sort_key(ordinal: u64) -> String {
-    format!("{ordinal:020}")
+fn person_slide_append_seq(slide: &PersonSlide) -> Result<u64, SelfHostError> {
+    stable_fact_append_seq(&slide.id, "ps:")
+}
+
+fn person_message_sort_key(message: &PersonMessage) -> Result<String, SelfHostError> {
+    Ok(format!(
+        "{:020}:{}",
+        person_message_append_seq(message)?,
+        message.id
+    ))
 }
 
 fn person_message_projection_item(
     message: &PersonMessage,
+    compact_state: &CompactProjectionState,
 ) -> Result<ProjectionItem, SelfHostError> {
-    let ordinal = person_message_ordinal(message)?;
+    let node_id =
+        compact_state.fact_node(&message.source_observation_id, message.person_id.as_str())?;
+    let stored = StoredPersonMessage {
+        node_id,
+        id: message.id.clone(),
+        source_observation_id: message.source_observation_id.clone(),
+        channel: message.channel.clone(),
+        text: message.text.clone(),
+        ts: message.ts,
+        thread_ts: message.thread_ts.clone(),
+        has_attachments: message.has_attachments,
+    };
     let item = ProjectionItem {
         item_key: message.id.clone(),
-        owner_key: message.person_id.as_str().to_owned(),
-        sort_key: person_message_sort_key(ordinal),
-        value: serde_json::to_value(message)?,
+        owner_key: identity_node_owner(node_id),
+        sort_key: person_message_sort_key(message)?,
+        value: serde_json::to_value(stored)?,
     };
     item.validate()?;
     Ok(item)
 }
 
-pub(super) fn person_message_from_projection_item(
+fn person_message_from_projection_item(
     item: &ProjectionItem,
+    compact_state: &CompactProjectionState,
 ) -> Result<PersonMessage, SelfHostError> {
     item.validate()?;
-    let message: PersonMessage = serde_json::from_value(item.value.clone())?;
-    if serde_json::to_value(&message)? != item.value {
+    let stored: StoredPersonMessage = serde_json::from_value(item.value.clone())?;
+    if serde_json::to_value(&stored)? != item.value {
         return Err(SelfHostError::Ingestion(format!(
             "projection item {} contains a non-canonical person message value",
             item.item_key
         )));
     }
-    let ordinal = person_message_ordinal(&message)?;
+    let person_id = compact_state.person_id_for_node(stored.node_id)?;
+    let message = PersonMessage {
+        id: stored.id,
+        source_observation_id: stored.source_observation_id,
+        person_id: EntityRef::new(person_id),
+        channel: stored.channel,
+        text: stored.text,
+        ts: stored.ts,
+        thread_ts: stored.thread_ts,
+        has_attachments: stored.has_attachments,
+    };
     if item.item_key != message.id
-        || item.owner_key != message.person_id.as_str()
-        || item.sort_key != person_message_sort_key(ordinal)
+        || item.owner_key != identity_node_owner(stored.node_id)
+        || item.sort_key != person_message_sort_key(&message)?
     {
         return Err(SelfHostError::Ingestion(format!(
             "projection item {} metadata does not match its person message value",
@@ -2450,11 +2867,12 @@ pub(super) fn person_message_from_projection_item(
 #[cfg(test)]
 fn detach_person_messages(
     person_page: &mut PersonPageOutput,
+    compact_state: &CompactProjectionState,
 ) -> Result<Vec<ProjectionItem>, SelfHostError> {
     let messages = std::mem::take(&mut person_page.messages);
     let mut items = messages
         .iter()
-        .map(person_message_projection_item)
+        .map(|message| person_message_projection_item(message, compact_state))
         .collect::<Result<Vec<_>, _>>()?;
     items.sort_by(|left, right| {
         left.owner_key
@@ -2463,6 +2881,231 @@ fn detach_person_messages(
             .then_with(|| left.item_key.cmp(&right.item_key))
     });
     Ok(items)
+}
+
+fn identity_node_owner(node_id: IdentityNodeId) -> String {
+    format!("identity-node:{node_id:020}")
+}
+
+fn person_slide_projection_item(
+    slide: &PersonSlide,
+    compact_state: &CompactProjectionState,
+) -> Result<ProjectionItem, SelfHostError> {
+    let node_id =
+        compact_state.fact_node(&slide.source_observation_id, slide.person_id.as_str())?;
+    let stored = StoredPersonSlide {
+        node_id,
+        id: slide.id.clone(),
+        source_observation_id: slide.source_observation_id.clone(),
+        document_id: slide.document_id.clone(),
+        title: slide.title.clone(),
+        role: slide.role.clone(),
+        last_seen_revision: slide.last_seen_revision.clone(),
+        slide_count: slide.slide_count,
+        thumbnail_ref: slide.thumbnail_ref.clone(),
+        last_modified: slide.last_modified,
+    };
+    let item = ProjectionItem {
+        item_key: slide.id.clone(),
+        owner_key: identity_node_owner(node_id),
+        sort_key: format!("{:020}:{}", person_slide_append_seq(slide)?, slide.id),
+        value: serde_json::to_value(stored)?,
+    };
+    item.validate()?;
+    Ok(item)
+}
+
+fn person_slide_from_projection_item(
+    item: &ProjectionItem,
+    compact_state: &CompactProjectionState,
+) -> Result<PersonSlide, SelfHostError> {
+    item.validate()?;
+    let stored: StoredPersonSlide = serde_json::from_value(item.value.clone())?;
+    if serde_json::to_value(&stored)? != item.value
+        || item.item_key != stored.id
+        || item.owner_key != identity_node_owner(stored.node_id)
+    {
+        return Err(SelfHostError::Ingestion(format!(
+            "projection item {} is not a canonical person slide fact",
+            item.item_key
+        )));
+    }
+    let person_id = compact_state.person_id_for_node(stored.node_id)?;
+    let slide = PersonSlide {
+        id: stored.id,
+        source_observation_id: stored.source_observation_id,
+        person_id: EntityRef::new(person_id),
+        document_id: stored.document_id,
+        title: stored.title,
+        role: stored.role,
+        last_seen_revision: stored.last_seen_revision,
+        slide_count: stored.slide_count,
+        thumbnail_ref: stored.thumbnail_ref,
+        last_modified: stored.last_modified,
+    };
+    if item.sort_key != format!("{:020}:{}", person_slide_append_seq(&slide)?, slide.id) {
+        return Err(SelfHostError::Ingestion(format!(
+            "projection item {} has a non-canonical slide sort key",
+            item.item_key
+        )));
+    }
+    Ok(slide)
+}
+
+fn identity_replay_event(
+    observation: &Observation,
+    append_seq: u64,
+) -> Option<IdentityReplayEvent> {
+    let candidates = IdentityProjector::extract_candidates(std::slice::from_ref(observation));
+    let consent_decision = compact_consent_decision_from_observation(observation);
+    (!candidates.is_empty() || consent_decision.is_some()).then(|| IdentityReplayEvent {
+        append_seq,
+        observation_id: observation.id.as_str().to_owned(),
+        candidates,
+        consent_decision,
+    })
+}
+
+fn identity_replay_event_projection_item(
+    event: &IdentityReplayEvent,
+) -> Result<ProjectionItem, SelfHostError> {
+    let item = ProjectionItem {
+        item_key: format!(
+            "identity-event:{:020}:{}",
+            event.append_seq, event.observation_id
+        ),
+        owner_key: IDENTITY_EVENT_ITEM_OWNER.to_owned(),
+        sort_key: format!("{:020}:{}", event.append_seq, event.observation_id),
+        value: serde_json::to_value(event)?,
+    };
+    item.validate()?;
+    Ok(item)
+}
+
+fn identity_replay_event_from_projection_item(
+    item: &ProjectionItem,
+) -> Result<IdentityReplayEvent, SelfHostError> {
+    item.validate()?;
+    let event: IdentityReplayEvent = serde_json::from_value(item.value.clone())?;
+    let expected = identity_replay_event_projection_item(&event)?;
+    if expected != *item {
+        return Err(SelfHostError::Ingestion(format!(
+            "projection item {} is not a canonical identity replay event",
+            item.item_key
+        )));
+    }
+    Ok(event)
+}
+
+fn person_component_projection_item(
+    component: &PersonComponentAggregate,
+) -> Result<ProjectionItem, SelfHostError> {
+    validate_person_component(component)?;
+    let person_id = component.person.person_id.as_str();
+    let item = ProjectionItem {
+        item_key: format!("person-component:{person_id}"),
+        owner_key: PERSON_COMPONENT_ITEM_OWNER.to_owned(),
+        sort_key: person_id.to_owned(),
+        value: serde_json::to_value(component)?,
+    };
+    item.validate()?;
+    Ok(item)
+}
+
+fn person_component_from_projection_item(
+    item: &ProjectionItem,
+) -> Result<PersonComponentAggregate, SelfHostError> {
+    item.validate()?;
+    let mut component: PersonComponentAggregate = serde_json::from_value(item.value.clone())?;
+    if let Some(profile) = &mut component.profile {
+        profile.frontend_profile = component.frontend_profile.clone();
+        profile.frontend_profile_created_at = component
+            .frontend_profile_rank
+            .as_ref()
+            .map(|rank| rank.created_at);
+    }
+    validate_person_component(&component)?;
+    let expected = person_component_projection_item(&component)?;
+    if expected != *item {
+        return Err(SelfHostError::Ingestion(format!(
+            "projection item {} is not a canonical person component aggregate",
+            item.item_key
+        )));
+    }
+    Ok(component)
+}
+
+fn validate_person_component(component: &PersonComponentAggregate) -> Result<(), SelfHostError> {
+    let person_id = component.person.person_id.as_str();
+    let visible = component.consent != ConsentStatus::OptedOut;
+    if component.profile.is_some() != visible || component.activity.is_some() != visible {
+        return Err(SelfHostError::Ingestion(format!(
+            "person component {person_id} visibility disagrees with consent"
+        )));
+    }
+    if !visible {
+        if component.fact_weight != 0
+            || !component.active_channels.is_empty()
+            || !component.slide_blob_refs.is_empty()
+            || component.frontend_profile_rank.is_some()
+            || component.frontend_profile.is_some()
+        {
+            return Err(SelfHostError::Ingestion(format!(
+                "opted-out person component {person_id} retains materialized aggregate data"
+            )));
+        }
+        return Ok(());
+    }
+    let activity = component.activity.as_ref().ok_or_else(|| {
+        SelfHostError::Ingestion(format!("person component {person_id} has no activity"))
+    })?;
+    let profile = component.profile.as_ref().ok_or_else(|| {
+        SelfHostError::Ingestion(format!("person component {person_id} has no profile"))
+    })?;
+    if activity.person_id != component.person.person_id
+        || profile.person_id != component.person.person_id
+        || component.fact_weight != component_activity_fact_weight(activity)?
+        || component.active_channels
+            != activity
+                .active_channels
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+    {
+        return Err(SelfHostError::Ingestion(format!(
+            "person component {person_id} aggregate counters are inconsistent"
+        )));
+    }
+    match (
+        &component.frontend_profile_rank,
+        &component.frontend_profile,
+        &profile.frontend_profile,
+    ) {
+        (None, None, None) => {
+            if profile.frontend_profile_created_at.is_some() {
+                return Err(SelfHostError::Ingestion(format!(
+                    "person component {person_id} has an orphan frontend profile timestamp"
+                )));
+            }
+        }
+        (Some(rank), Some(stored), Some(profile_frontend)) => {
+            if rank.richness_score != stored.profile.richness_score()
+                || rank.stable_id != stored.source_document_id
+                || profile.frontend_profile_created_at != Some(rank.created_at)
+                || serde_json::to_value(stored)? != serde_json::to_value(profile_frontend)?
+            {
+                return Err(SelfHostError::Ingestion(format!(
+                    "person component {person_id} frontend profile aggregate is inconsistent"
+                )));
+            }
+        }
+        _ => {
+            return Err(SelfHostError::Ingestion(format!(
+                "person component {person_id} frontend profile aggregate is incomplete"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn canonical_reply_slo_row(mut row: ReplyLatency) -> ReplyLatency {
@@ -2531,13 +3174,30 @@ pub(super) fn reply_slo_from_projection_item(
 #[cfg(test)]
 fn detach_projection_items(
     snapshot: &mut ProjectionSnapshot,
+    compact_state: &CompactProjectionState,
+    person_components: &BTreeMap<String, PersonComponentAggregate>,
+    identity_event_items: Vec<ProjectionItem>,
 ) -> Result<(ProjectionItemCommit, u64, u64), SelfHostError> {
-    let mut items = detach_person_messages(&mut snapshot.person_page)?;
+    let mut items = detach_person_messages(&mut snapshot.person_page, compact_state)?;
     let person_message_count = u64::try_from(items.len()).map_err(|_| {
         SelfHostError::Ingestion(
             "person message item count does not fit u64 during full build".to_owned(),
         )
     })?;
+    let slides = std::mem::take(&mut snapshot.person_page.slides);
+    items.extend(
+        slides
+            .iter()
+            .map(|slide| person_slide_projection_item(slide, compact_state))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    items.extend(identity_event_items);
+    items.extend(
+        person_components
+            .values()
+            .map(person_component_projection_item)
+            .collect::<Result<Vec<_>, _>>()?,
+    );
 
     let mut expected_reply_slo = snapshot.reply_slo.clone();
     refresh_reply_slo_statuses(&mut expected_reply_slo, snapshot.built_at);
@@ -2574,11 +3234,57 @@ fn detach_projection_items(
 
 fn validate_pending_projection_item_commit(
     pending: &PendingProjectionItemCommit,
+    compact_state: &CompactProjectionState,
     final_person_message_count: u64,
     final_reply_slo_count: u64,
     activities: &[PersonActivity],
 ) -> Result<(), SelfHostError> {
     pending.commit.validate()?;
+    let ProjectionItemCommit::Replace { items } = &pending.commit else {
+        return Err(SelfHostError::Ingestion(
+            "full materialization must publish a replace item commit".to_owned(),
+        ));
+    };
+    let mut messages_by_person = BTreeMap::<String, u64>::new();
+    let mut person_message_count = 0_u64;
+    let mut reply_slo_count = 0_u64;
+    for item in items {
+        if item.owner_key == REPLY_SLO_ITEM_OWNER {
+            reply_slo_from_projection_item(item)?;
+            reply_slo_count = reply_slo_count.checked_add(1).ok_or_else(|| {
+                SelfHostError::Ingestion("reply SLO item count overflow".to_owned())
+            })?;
+        } else if item.item_key.starts_with("pm:") {
+            let message = person_message_from_projection_item(item, compact_state)?;
+            person_message_count = person_message_count.checked_add(1).ok_or_else(|| {
+                SelfHostError::Ingestion("person message item count overflow".to_owned())
+            })?;
+            let count = messages_by_person
+                .entry(message.person_id.as_str().to_owned())
+                .or_default();
+            *count = count.checked_add(1).ok_or_else(|| {
+                SelfHostError::Ingestion("person component message count overflow".to_owned())
+            })?;
+        } else if item.item_key.starts_with("ps:") {
+            person_slide_from_projection_item(item, compact_state)?;
+        } else if item.owner_key == IDENTITY_EVENT_ITEM_OWNER {
+            identity_replay_event_from_projection_item(item)?;
+        } else if item.owner_key == PERSON_COMPONENT_ITEM_OWNER {
+            person_component_from_projection_item(item)?;
+        } else {
+            return Err(SelfHostError::Ingestion(format!(
+                "projection item {} has an unknown keyed materialization kind",
+                item.item_key
+            )));
+        }
+    }
+    if person_message_count != final_person_message_count
+        || reply_slo_count != final_reply_slo_count
+    {
+        return Err(SelfHostError::Ingestion(
+            "full materialization item counts disagree with manifest".to_owned(),
+        ));
+    }
     let activity_counts = activities
         .iter()
         .map(|activity| {
@@ -2593,197 +3299,16 @@ fn validate_pending_projection_item_commit(
             ))
         })
         .collect::<Result<BTreeMap<_, _>, SelfHostError>>()?;
-    let (inserts, updates, deletes, replace) = match &pending.commit {
-        ProjectionItemCommit::Replace { items } => {
-            if pending.base_person_message_count != 0
-                || pending.base_reply_slo_count != 0
-                || !pending.replaced_person_owners.is_empty()
-            {
-                return Err(SelfHostError::Ingestion(
-                    "projection item replace commit must have zero base counts and owners"
-                        .to_owned(),
-                ));
-            }
-            (items.as_slice(), &[][..], &[][..], true)
-        }
-        ProjectionItemCommit::Delta {
-            inserts,
-            updates,
-            deletes,
-        } => (
-            inserts.as_slice(),
-            updates.as_slice(),
-            deletes.as_slice(),
-            false,
-        ),
-    };
-
-    let mut inserted_person_items = Vec::new();
-    let mut inserted_reply_slo_items = Vec::new();
-    for item in inserts {
-        if item.owner_key == REPLY_SLO_ITEM_OWNER {
-            reply_slo_from_projection_item(item)?;
-            inserted_reply_slo_items.push(item);
-        } else {
-            person_message_from_projection_item(item)?;
-            inserted_person_items.push(item);
-        }
-    }
-    let mut updated_person_items = Vec::new();
-    for item in updates {
-        if item.owner_key == REPLY_SLO_ITEM_OWNER {
-            reply_slo_from_projection_item(item)?;
-        } else {
-            person_message_from_projection_item(item)?;
-            if !pending.replaced_person_owners.contains(&item.owner_key) {
-                return Err(SelfHostError::Ingestion(format!(
-                    "person message update {} does not belong to a replaced owner",
-                    item.item_key
-                )));
-            }
-            updated_person_items.push(item);
-        }
-    }
-
-    let mut deleted_person_item_count = 0_u64;
-    for item_key in deletes {
-        if item_key.starts_with("reply-slo:") {
-            return Err(SelfHostError::Ingestion(
-                "observation projection delta must not delete reply SLO rows".to_owned(),
-            ));
-        }
-        let belongs_to_replaced_owner = pending.replaced_person_owners.iter().any(|owner| {
-            item_key
-                .strip_prefix("pm:")
-                .is_some_and(|suffix| suffix.starts_with(&format!("{owner}:")))
-        });
-        if !belongs_to_replaced_owner {
-            return Err(SelfHostError::Ingestion(format!(
-                "person message delete {item_key} does not belong to a replaced owner"
-            )));
-        }
-        deleted_person_item_count = deleted_person_item_count.checked_add(1).ok_or_else(|| {
-            SelfHostError::Ingestion("pending person message delete count overflow".to_owned())
-        })?;
-    }
-
-    let inserted_person_item_count = u64::try_from(inserted_person_items.len()).map_err(|_| {
-        SelfHostError::Ingestion("pending person message item count does not fit u64".to_owned())
-    })?;
-    let inserted_reply_slo_item_count =
-        u64::try_from(inserted_reply_slo_items.len()).map_err(|_| {
-            SelfHostError::Ingestion("pending reply SLO item count does not fit u64".to_owned())
-        })?;
-    let expected_person_message_count = if replace {
-        inserted_person_item_count
-    } else {
-        pending
-            .base_person_message_count
-            .checked_add(inserted_person_item_count)
-            .and_then(|count| count.checked_sub(deleted_person_item_count))
-            .ok_or_else(|| {
-                SelfHostError::Ingestion("pending person message commit count overflow".to_owned())
-            })?
-    };
-    if expected_person_message_count != final_person_message_count {
-        return Err(SelfHostError::Ingestion(format!(
-            "pending person message commit yields {expected_person_message_count} rows, expected {final_person_message_count}"
-        )));
-    }
-    let expected_reply_slo_count = if replace {
-        inserted_reply_slo_item_count
-    } else {
-        pending
-            .base_reply_slo_count
-            .checked_add(inserted_reply_slo_item_count)
-            .ok_or_else(|| {
-                SelfHostError::Ingestion("pending reply SLO commit count overflow".to_owned())
-            })?
-    };
-    if expected_reply_slo_count != final_reply_slo_count {
-        return Err(SelfHostError::Ingestion(format!(
-            "pending reply SLO commit yields {expected_reply_slo_count} rows, expected {final_reply_slo_count}"
-        )));
-    }
-
-    let mut ordinals_by_owner = BTreeMap::<String, BTreeSet<u64>>::new();
-    for item in inserted_person_items
-        .iter()
-        .chain(updated_person_items.iter())
+    if messages_by_person
+        .keys()
+        .any(|person_id| !activity_counts.contains_key(person_id))
+        || activity_counts.iter().any(|(person_id, expected)| {
+            messages_by_person.get(person_id).copied().unwrap_or(0) != *expected
+        })
     {
-        let message = person_message_from_projection_item(item)?;
-        let ordinal = person_message_ordinal(&message)?;
-        if !activity_counts.contains_key(&item.owner_key) {
-            return Err(SelfHostError::Ingestion(format!(
-                "person message item {} references an owner with no activity",
-                item.item_key
-            )));
-        }
-        if !ordinals_by_owner
-            .entry(item.owner_key.clone())
-            .or_default()
-            .insert(ordinal)
-        {
-            return Err(SelfHostError::Ingestion(format!(
-                "person message commit repeats ordinal {ordinal} for {}",
-                item.owner_key
-            )));
-        }
-    }
-
-    for (owner, ordinals) in ordinals_by_owner {
-        let final_owner_count = activity_counts[&owner];
-        let committed_owner_count = u64::try_from(ordinals.len()).map_err(|_| {
-            SelfHostError::Ingestion(format!(
-                "pending person message count does not fit u64 for {owner}"
-            ))
-        })?;
-        let replaces_complete_owner = replace || pending.replaced_person_owners.contains(&owner);
-        let first_expected = if replaces_complete_owner {
-            1
-        } else {
-            final_owner_count
-                .checked_sub(committed_owner_count)
-                .and_then(|value| value.checked_add(1))
-                .ok_or_else(|| {
-                    SelfHostError::Ingestion(format!(
-                        "pending person message delta exceeds final activity count for {owner}"
-                    ))
-                })?
-        };
-        let expected = first_expected..=final_owner_count;
-        if ordinals.iter().copied().ne(expected) {
-            return Err(SelfHostError::Ingestion(format!(
-                "pending person message ordinals are not a contiguous final segment for {owner}"
-            )));
-        }
-    }
-    if replace {
-        for (owner, count) in activity_counts {
-            let committed = inserted_person_items
-                .iter()
-                .filter(|item| item.owner_key == owner)
-                .count();
-            if u64::try_from(committed).ok() != Some(count) {
-                return Err(SelfHostError::Ingestion(format!(
-                    "person message replace count does not match activity for {owner}"
-                )));
-            }
-        }
-    } else {
-        for owner in &pending.replaced_person_owners {
-            let expected = activity_counts.get(owner).copied().unwrap_or(0);
-            let committed = inserted_person_items
-                .iter()
-                .chain(updated_person_items.iter())
-                .filter(|item| item.owner_key == *owner)
-                .count();
-            if u64::try_from(committed).ok() != Some(expected) {
-                return Err(SelfHostError::Ingestion(format!(
-                    "component re-projection committed {committed} desired messages for {owner}, expected {expected}"
-                )));
-            }
-        }
+        return Err(SelfHostError::Ingestion(
+            "full materialization message rows disagree with component activities".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -2804,7 +3329,8 @@ fn person_message_from_slack(observation: &Observation, person_id: &str) -> Pers
         .unwrap_or("unknown")
         .to_owned();
     PersonMessage {
-        id: String::new(),
+        id: format!("pm:{}", observation.id),
+        source_observation_id: observation.id.as_str().to_owned(),
         person_id: EntityRef::new(person_id),
         channel,
         text,
@@ -2832,38 +3358,6 @@ fn person_identity_info(
             _ => None,
         })
         .collect()
-}
-
-fn person_activity(
-    person_id: &EntityRef,
-    slides: &[lethe_projection_person::person_page::types::PersonSlide],
-    messages: &[PersonMessage],
-) -> PersonActivity {
-    let mut active_channels = messages
-        .iter()
-        .map(|message| message.channel.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    active_channels.sort();
-    let first_activity = slides
-        .iter()
-        .filter_map(|slide| slide.last_modified)
-        .chain(messages.iter().map(|message| message.ts))
-        .min();
-    let last_activity = slides
-        .iter()
-        .filter_map(|slide| slide.last_modified)
-        .chain(messages.iter().map(|message| message.ts))
-        .max();
-    PersonActivity {
-        person_id: person_id.clone(),
-        total_slides_related: slides.len(),
-        total_messages: messages.len(),
-        first_activity,
-        last_activity,
-        active_channels,
-    }
 }
 
 fn freshness_projection_after_delta(
@@ -3054,15 +3548,19 @@ fn refresh_reply_slo_statuses(projection: &mut ReplySloProjection, built_at: Dat
 
 fn person_page_output_count(
     person_page: &PersonPageOutput,
+    person_slide_count: u64,
     person_message_count: u64,
 ) -> Result<usize, SelfHostError> {
+    let person_slide_count = usize::try_from(person_slide_count).map_err(|_| {
+        SelfHostError::Ingestion("person slide output count does not fit usize".to_owned())
+    })?;
     let person_message_count = usize::try_from(person_message_count).map_err(|_| {
         SelfHostError::Ingestion("person message output count does not fit usize".to_owned())
     })?;
     person_page
         .profiles
         .len()
-        .checked_add(person_page.slides.len())
+        .checked_add(person_slide_count)
         .and_then(|count| count.checked_add(person_message_count))
         .and_then(|count| count.checked_add(person_page.activities.len()))
         .ok_or_else(|| SelfHostError::Ingestion("person-page output count overflow".to_owned()))
@@ -3212,7 +3710,7 @@ fn for_each_observation_page(
     persistence: &dyn StoragePorts,
     stats: ObservationStats,
     page_size: usize,
-    mut visit: impl FnMut(&[Observation]) -> Result<(), SelfHostError>,
+    mut visit: impl FnMut(&[StoredObservation], &[Observation]) -> Result<(), SelfHostError>,
 ) -> Result<(), SelfHostError> {
     if page_size == 0 {
         return Err(SelfHostError::Ingestion(
@@ -3247,7 +3745,7 @@ fn for_each_observation_page(
         }
 
         let mut observations = Vec::with_capacity(page.len());
-        for stored in page {
+        for stored in &page {
             if stored.append_seq <= after_append_seq {
                 return Err(SelfHostError::Ingestion(format!(
                     "canonical observation page is not strictly ordered after append sequence {after_append_seq}"
@@ -3271,9 +3769,9 @@ fn for_each_observation_page(
                     stats.count
                 )));
             }
-            observations.push(stored.observation);
+            observations.push(stored.observation.clone());
         }
-        visit(&observations)?;
+        visit(&page, &observations)?;
     }
 
     if seen != stats.count || after_append_seq != stats.max_append_seq {
@@ -3324,13 +3822,17 @@ fn frontend_profiles_from_supplementals(
             }
             let richness = profile.profile.richness_score();
             let should_replace = frontend_profiles.get(&person_id).is_none_or(
-                |(current_richness, current_created_at, _): &(
+                |(current_richness, current_created_at, current_profile): &(
                     usize,
                     DateTime<Utc>,
                     FrontendProfile,
                 )| {
                     richness > *current_richness
-                        || (richness == *current_richness && created_at > *current_created_at)
+                        || (richness == *current_richness
+                            && (created_at > *current_created_at
+                                || (created_at == *current_created_at
+                                    && profile.source_document_id
+                                        > current_profile.source_document_id)))
                 },
             );
             if should_replace {
@@ -3363,6 +3865,7 @@ fn install_frontend_profiles(
         profile.self_intro_slide_id = None;
         profile.self_intro_thumbnail = None;
         profile.frontend_profile = None;
+        profile.frontend_profile_created_at = None;
         profile.last_activity = activity.last_activity;
         profile.profile_updated_at = activity
             .last_activity
@@ -3379,6 +3882,7 @@ fn install_frontend_profiles(
                 .or_else(|| frontend_profile.thumbnail_ref.clone());
             profile.profile_updated_at = profile.profile_updated_at.max(created_at);
             profile.frontend_profile = Some(frontend_profile);
+            profile.frontend_profile_created_at = Some(created_at);
         }
     }
     if !frontend_profiles.is_empty() {
@@ -3404,7 +3908,7 @@ fn rebuild_materialized_snapshot_paged(
         FreshnessProjector::new(freshness_thresholds.to_vec(), built_at).project_observations(&[]);
     let mut answer_log = Vec::new();
 
-    for_each_observation_page(persistence, stats, page_size, |observations| {
+    for_each_observation_page(persistence, stats, page_size, |_, observations| {
         compact_state.apply_observation_page(observations)?;
         for observation in observations {
             add_observation_to_fingerprint(&mut canonical_fingerprint, observation)?;
@@ -3434,6 +3938,25 @@ fn rebuild_materialized_snapshot_paged(
     person_page.activities.retain(|activity| {
         person_consents.get(activity.person_id.as_str()) != Some(&ConsentStatus::OptedOut)
     });
+    let profile_index = person_page
+        .profiles
+        .iter()
+        .enumerate()
+        .map(|(index, profile)| (profile.person_id.as_str().to_owned(), index))
+        .collect::<BTreeMap<_, _>>();
+    let activity_index = person_page
+        .activities
+        .iter()
+        .enumerate()
+        .map(|(index, activity)| (activity.person_id.as_str().to_owned(), index))
+        .collect::<BTreeMap<_, _>>();
+    if profile_index.keys().collect::<BTreeSet<_>>()
+        != activity_index.keys().collect::<BTreeSet<_>>()
+    {
+        return Err(SelfHostError::Ingestion(
+            "paged person profile/activity indexes differ".to_owned(),
+        ));
+    }
 
     let frontend_profiles = frontend_profiles_from_supplementals(
         persistence,
@@ -3460,36 +3983,57 @@ fn rebuild_materialized_snapshot_paged(
     let mut person_message_count = 0_u64;
     let mut reply_slo_count = 0_u64;
     let reply_slo_join_index = ReplySloJoinIndex::from_records(supplementals);
-    for_each_observation_page(persistence, stats, page_size, |observations| {
-        let mut inserts = Vec::new();
-        if observations
+    let mut identity_event_count = 0_u64;
+    for_each_observation_page(persistence, stats, page_size, |stored, observations| {
+        let fact_append_sequences = stored
             .iter()
-            .any(|observation| observation.schema.as_str() == "schema:slack-message")
-        {
-            let delta = increment_person_page_for_slack(
-                &identity,
-                &identity,
-                &person_page,
-                &person_consents,
-                &person_consents,
-                observations,
-            )?
-            .ok_or_else(|| {
-                SelfHostError::Ingestion(
-                    "fixed-identity paged person projection unexpectedly changed topology"
-                        .to_owned(),
-                )
-            })?;
-            person_page = delta.person_page;
-            if !delta.message_updates.is_empty()
-                || !delta.message_deletes.is_empty()
-                || !delta.replaced_person_owners.is_empty()
-            {
-                return Err(SelfHostError::Ingestion(
-                    "fixed-identity paged projection produced a replacement delta".to_owned(),
-                ));
+            .map(|stored| (stored.observation.id.as_str().to_owned(), stored.append_seq))
+            .collect::<BTreeMap<_, _>>();
+        let mut inserts = Vec::new();
+        for stored_observation in stored {
+            if let Some(event) = identity_replay_event(
+                &stored_observation.observation,
+                stored_observation.append_seq,
+            ) {
+                inserts.push(identity_replay_event_projection_item(&event)?);
+                identity_event_count = identity_event_count.checked_add(1).ok_or_else(|| {
+                    SelfHostError::Ingestion("identity event count overflow".to_owned())
+                })?;
             }
-            inserts.extend(delta.message_inserts);
+        }
+        for observation in observations
+            .iter()
+            .filter(|observation| observation.schema.as_str() == "schema:slack-message")
+        {
+            let node_id = slack_identity_node_for_observation(&compact_state, observation)?;
+            let person_id = compact_state.person_id_for_node(node_id)?;
+            if person_consents.get(&person_id) == Some(&ConsentStatus::OptedOut) {
+                continue;
+            }
+            let append_seq = fact_append_sequences
+                .get(observation.id.as_str())
+                .copied()
+                .ok_or_else(|| {
+                    SelfHostError::Ingestion(format!(
+                        "Slack message {} has no append sequence during paged rebuild",
+                        observation.id
+                    ))
+                })?;
+            let mut message = person_message_from_slack(observation, &person_id);
+            message.id = materialized_message_id(append_seq, &observation.id);
+            let profile = person_page.profiles.get_mut(profile_index[&person_id]);
+            let activity = person_page.activities.get_mut(activity_index[&person_id]);
+            match (profile, activity) {
+                (Some(profile), Some(activity)) => {
+                    add_message_to_profile_activity(profile, activity, &message)?;
+                }
+                _ => {
+                    return Err(SelfHostError::Ingestion(format!(
+                        "paged Slack component {person_id} has no profile/activity aggregate"
+                    )));
+                }
+            }
+            inserts.push(person_message_projection_item(&message, &compact_state)?);
         }
 
         let non_slack = observations
@@ -3498,7 +4042,8 @@ fn rebuild_materialized_snapshot_paged(
             .cloned()
             .collect::<Vec<_>>();
         if !non_slack.is_empty() {
-            let page = PersonPageProjector::project(&identity, &non_slack, &[]);
+            let mut page = PersonPageProjector::project(&identity, &non_slack, &[]);
+            normalize_person_fact_ids(&mut page, &fact_append_sequences)?;
             merge_non_slack_person_page(&mut person_page, page, &person_consents)?;
         }
 
@@ -3514,15 +4059,15 @@ fn rebuild_materialized_snapshot_paged(
                 .map(reply_slo_projection_item)
                 .collect::<Result<Vec<_>, _>>()?,
         );
-        let page_person_message_count = inserts
-            .len()
-            .checked_sub(reply_slo.rows.len())
-            .and_then(|count| u64::try_from(count).ok())
-            .ok_or_else(|| {
-                SelfHostError::Ingestion(
-                    "paged person message row count does not fit u64".to_owned(),
-                )
-            })?;
+        let page_person_message_count = u64::try_from(
+            inserts
+                .iter()
+                .filter(|item| item.item_key.starts_with("pm:"))
+                .count(),
+        )
+        .map_err(|_| {
+            SelfHostError::Ingestion("paged person message row count does not fit u64".to_owned())
+        })?;
         person_message_count = person_message_count
             .checked_add(page_person_message_count)
             .ok_or_else(|| {
@@ -3566,7 +4111,7 @@ fn rebuild_materialized_snapshot_paged(
                     slide.id, slide.person_id
                 ))
             })?;
-        let sort_key = (identity_rank, person_slide_ordinal(slide)?);
+        let sort_key = (identity_rank, person_slide_append_seq(slide)?);
         if slide_sort_keys.insert(slide.id.clone(), sort_key).is_some() {
             return Err(SelfHostError::Ingestion(format!(
                 "paged person-page contains duplicate slide id {}",
@@ -3578,6 +4123,32 @@ fn rebuild_materialized_snapshot_paged(
         .slides
         .sort_by_key(|slide| slide_sort_keys[&slide.id]);
     install_frontend_profiles(&mut person_page, frontend_profiles)?;
+    let person_components = person_component_aggregates(&identity, &person_page, &person_consents)?;
+    let person_slide_count = u64::try_from(person_page.slides.len())
+        .map_err(|_| SelfHostError::Ingestion("person slide count does not fit u64".to_owned()))?;
+    let mut keyed_state_items = person_page
+        .slides
+        .iter()
+        .map(|slide| person_slide_projection_item(slide, &compact_state))
+        .collect::<Result<Vec<_>, _>>()?;
+    keyed_state_items.extend(
+        person_components
+            .values()
+            .map(person_component_projection_item)
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    if !keyed_state_items.is_empty() {
+        persistence.commit_projection_items(
+            &staging_projection,
+            &staging_manifest,
+            &ProjectionItemCommit::Delta {
+                inserts: keyed_state_items,
+                updates: Vec::new(),
+                deletes: Vec::new(),
+            },
+        )?;
+    }
+    person_page.slides.clear();
 
     let canonical_observation_fingerprint = hex::encode(canonical_fingerprint);
     let supplemental_fingerprint = supplemental_fingerprint(supplementals)?;
@@ -3590,7 +4161,7 @@ fn rebuild_materialized_snapshot_paged(
         stats,
         &supplemental_fingerprint,
         supplementals.len(),
-        person_page_output_count(&person_page, person_message_count)?,
+        person_page_output_count(&person_page, person_slide_count, person_message_count)?,
         built_at,
     );
     let materialized = MaterializedProjectionSnapshot {
@@ -3601,6 +4172,9 @@ fn rebuild_materialized_snapshot_paged(
         supplemental_fingerprint,
         compact_state,
         person_consents,
+        person_components,
+        identity_event_count,
+        person_slide_count,
         person_message_count,
         reply_slo_count,
         snapshot: ProjectionSnapshot {
@@ -3623,6 +4197,11 @@ fn rebuild_materialized_snapshot_paged(
 
     let expected_item_count = person_message_count
         .checked_add(reply_slo_count)
+        .and_then(|count| count.checked_add(person_slide_count))
+        .and_then(|count| count.checked_add(identity_event_count))
+        .and_then(|count| {
+            count.checked_add(u64::try_from(materialized.person_components.len()).ok()?)
+        })
         .ok_or_else(|| {
             SelfHostError::Ingestion(
                 "projection item count overflow after paged rebuild".to_owned(),
@@ -3638,18 +4217,18 @@ fn rebuild_materialized_snapshot_paged(
     persistence.publish_projection_items_from_staging(
         &ProjectionRef::new("proj:person-page"),
         &staging_projection,
-        &serde_json::to_value(&materialized)?,
+        &materialized.manifest_value()?,
         expected_item_count,
     )?;
     Ok(materialized)
 }
 
-fn materialized_snapshot_after_supplemental_delta(
-    core: &AppCore,
+fn apply_supplemental_delta(
+    core: &mut AppCore,
     persistence: &dyn StoragePorts,
     changed: &lethe_core::domain::SupplementalRecord,
     built_at: DateTime<Utc>,
-) -> Result<SupplementalMaterializedDelta, SelfHostError> {
+) -> Result<ProjectionItemCommit, SelfHostError> {
     let persisted_stats = persistence.observation_stats()?;
     if persisted_stats != core.observation_stats {
         return Err(SelfHostError::ProjectionStale(format!(
@@ -3667,12 +4246,20 @@ fn materialized_snapshot_after_supplemental_delta(
                 "proj:person-page manifest is missing during supplemental delta".to_owned(),
             )
         })?;
-    let persisted_materialized: MaterializedProjectionSnapshot =
+    let persisted_materialized: MaterializedProjectionManifest =
         serde_json::from_value(persisted_manifest)?;
-    persisted_materialized.validate()?;
-    if !persisted_materialized.matches(persisted_stats, &core.supplemental_fingerprint)
+    if persisted_materialized.format_version != NON_CORPUS_MATERIALIZATION_VERSION
+        || persisted_materialized.last_append_seq != persisted_stats.max_append_seq
+        || persisted_materialized.observation_count != persisted_stats.count
+        || persisted_materialized.supplemental_fingerprint != core.supplemental_fingerprint
         || persisted_materialized.canonical_observation_fingerprint
             != core.canonical_observation_fingerprint
+        || persisted_materialized.identity_event_count != core.identity_event_count
+        || persisted_materialized.person_component_count
+            != u64::try_from(core.person_components.len()).map_err(|_| {
+                SelfHostError::Ingestion("person component count does not fit u64".to_owned())
+            })?
+        || persisted_materialized.person_slide_count != core.person_slide_count
         || persisted_materialized.person_message_count != core.person_message_count
         || persisted_materialized.reply_slo_count != core.reply_slo_count
     {
@@ -3707,35 +4294,85 @@ fn materialized_snapshot_after_supplemental_delta(
         )));
     }
 
-    let mut snapshot = core.snapshot.clone();
-    snapshot.freshness = freshness_projection_after_delta(
-        &snapshot.freshness,
+    core.snapshot.freshness = freshness_projection_after_delta(
+        &core.snapshot.freshness,
         &core.freshness_thresholds,
         &[],
         built_at,
     )?;
     if affects_claim_queue(&changed.kind) {
-        snapshot.claim_queue = core.supplemental_projection_cache.claim_queue();
+        core.snapshot.claim_queue = core.supplemental_projection_cache.claim_queue();
     }
-    (snapshot.resume_snapshot, snapshot.plan_state) = core
+    (core.snapshot.resume_snapshot, core.snapshot.plan_state) = core
         .supplemental_projection_cache
-        .cognition(&snapshot.claim_queue, built_at);
-    snapshot.card_queue = core
+        .cognition(&core.snapshot.claim_queue, built_at);
+    core.snapshot.card_queue = core
         .supplemental_projection_cache
         .card_queue
         .projection(built_at);
-    if changed.kind == "slide-analysis" {
-        let frontend_profiles = frontend_profiles_from_supplementals(
-            persistence,
-            &snapshot.identity,
-            &core.person_consents,
-            &core.supplemental_projection_cache.frontend_records,
-            core.observation_stats.max_append_seq,
-        )?;
-        install_frontend_profiles(&mut snapshot.person_page, frontend_profiles)?;
-    }
 
     let mut updates = Vec::new();
+    if let Some((person_id, created_at, frontend_profile)) =
+        frontend_profile_from_supplemental_delta(
+            persistence,
+            &core.compact_state,
+            changed,
+            core.observation_stats.max_append_seq,
+        )?
+        && core
+            .person_components
+            .get(&person_id)
+            .is_some_and(|component| component.consent != ConsentStatus::OptedOut)
+    {
+        let component = core.person_components.get_mut(&person_id).ok_or_else(|| {
+            SelfHostError::Ingestion(format!(
+                "frontend profile resolved to missing person component {person_id}"
+            ))
+        })?;
+        let candidate_rank = FrontendProfileRank {
+            richness_score: frontend_profile.profile.richness_score(),
+            created_at,
+            stable_id: frontend_profile.source_document_id.clone(),
+        };
+        let replace = component
+            .frontend_profile_rank
+            .as_ref()
+            .is_none_or(|current| {
+                (
+                    current.richness_score,
+                    current.created_at,
+                    current.stable_id.as_str(),
+                ) < (
+                    candidate_rank.richness_score,
+                    candidate_rank.created_at,
+                    candidate_rank.stable_id.as_str(),
+                )
+            });
+        if replace {
+            let profile = component.profile.as_mut().ok_or_else(|| {
+                SelfHostError::Ingestion(format!(
+                    "visible person component {person_id} has no profile"
+                ))
+            })?;
+            profile.self_intro_text = frontend_profile.profile.bio_text.clone();
+            profile.self_intro_slide_id = Some(frontend_profile.source_document_id.clone());
+            profile.self_intro_thumbnail = frontend_profile
+                .thumbnail_url
+                .clone()
+                .or_else(|| frontend_profile.thumbnail_ref.clone());
+            profile.profile_updated_at = profile
+                .last_activity
+                .into_iter()
+                .chain(Some(created_at))
+                .max()
+                .unwrap_or(created_at);
+            profile.frontend_profile = Some(frontend_profile.clone());
+            profile.frontend_profile_created_at = Some(created_at);
+            component.frontend_profile_rank = Some(candidate_rank);
+            component.frontend_profile = Some(frontend_profile);
+            updates.push(person_component_projection_item(component)?);
+        }
+    }
     if changed.kind == "send-record@1"
         && let Some(draft_id) = changed.derived_from.supplementals.first()
         && let Some(draft) = core
@@ -3779,42 +4416,118 @@ fn materialized_snapshot_after_supplemental_delta(
         }
     }
 
-    snapshot.built_at = built_at;
-    snapshot.lineage = build_person_page_lineage(
+    core.snapshot.identity = IdentityResolutionOutput::default();
+    core.snapshot.person_page = PersonPageOutput::default();
+    core.snapshot.built_at = built_at;
+    core.snapshot.lineage = build_person_page_lineage(
         &core.canonical_observation_fingerprint,
         core.observation_stats,
         &next_supplemental_fingerprint,
         core.supplemental_count,
-        person_page_output_count(&snapshot.person_page, core.person_message_count)?,
+        core.snapshot.lineage.output_count,
         built_at,
     );
-    let materialized = MaterializedProjectionSnapshot {
-        format_version: NON_CORPUS_MATERIALIZATION_VERSION,
-        last_append_seq: core.observation_stats.max_append_seq,
-        observation_count: core.observation_stats.count,
-        canonical_observation_fingerprint: core.canonical_observation_fingerprint.clone(),
-        supplemental_fingerprint: next_supplemental_fingerprint,
-        compact_state: core.compact_state.clone(),
-        person_consents: core.person_consents.clone(),
-        person_message_count: core.person_message_count,
-        reply_slo_count: core.reply_slo_count,
-        snapshot,
-        pending_item_commit: None,
-    };
-    materialized.validate()?;
+    core.supplemental_fingerprint = next_supplemental_fingerprint;
+    core.claim_queue_dirty = false;
     let item_commit = ProjectionItemCommit::Delta {
         inserts: Vec::new(),
         updates,
         deletes: Vec::new(),
     };
     item_commit.validate()?;
-    Ok(SupplementalMaterializedDelta {
-        materialized,
-        item_commit,
-    })
+    Ok(item_commit)
+}
+
+fn frontend_profile_from_supplemental_delta(
+    persistence: &dyn StoragePorts,
+    compact_state: &CompactProjectionState,
+    changed: &lethe_core::domain::SupplementalRecord,
+    canonical_high_water: u64,
+) -> Result<Option<(String, DateTime<Utc>, FrontendProfile)>, SelfHostError> {
+    if changed.kind != "slide-analysis" {
+        return Ok(None);
+    }
+    let Some(observation_id) = changed.derived_from.observations.first() else {
+        return Ok(None);
+    };
+    let stored = persistence
+        .observation_by_id(observation_id)?
+        .ok_or_else(|| {
+            SelfHostError::Ingestion(format!(
+                "slide-analysis supplemental {} references missing observation {observation_id}",
+                changed.id
+            ))
+        })?;
+    if stored.append_seq > canonical_high_water {
+        return Err(SelfHostError::Ingestion(format!(
+            "slide-analysis supplemental {} crossed canonical high-water {canonical_high_water}",
+            changed.id
+        )));
+    }
+    let mut identifiers = BTreeSet::new();
+    if let Ok(mut profile) = serde_json::from_value::<StudentProfile>(changed.payload.clone()) {
+        profile.normalize_in_place();
+        identifiers.extend(profile.email);
+        identifiers.extend(profile.generated_email);
+    }
+    if let Some(owner) = stored
+        .observation
+        .payload
+        .pointer("/relations/owner")
+        .and_then(serde_json::Value::as_str)
+    {
+        identifiers.insert(owner.to_owned());
+    }
+    if let Some(editors) = stored
+        .observation
+        .payload
+        .pointer("/relations/editors")
+        .and_then(serde_json::Value::as_array)
+    {
+        identifiers.extend(
+            editors
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+        );
+    }
+    let mut person_ids = BTreeSet::new();
+    for identifier in identifiers {
+        if let Some(nodes) = compact_state.nodes_by_identifier_value.get(&identifier) {
+            for node_id in nodes {
+                person_ids.insert(compact_state.person_id_for_node(*node_id)?);
+            }
+        }
+    }
+    let identity = IdentityResolutionOutput {
+        resolved_persons: person_ids
+            .iter()
+            .filter_map(|person_id| compact_state.identity.resolved_person(person_id, "1.0.0"))
+            .collect(),
+        candidates: Vec::new(),
+        person_identifiers: Vec::new(),
+    };
+    let mut projected = PersonPageProjector::project_frontend_profiles(
+        &identity,
+        std::slice::from_ref(&stored.observation),
+        &[changed],
+    )
+    .into_iter()
+    .collect::<Vec<_>>();
+    projected.sort_by(|left, right| left.0.cmp(&right.0));
+    if projected.len() > 1 {
+        return Err(SelfHostError::Ingestion(format!(
+            "slide-analysis supplemental {} resolved to multiple person components",
+            changed.id
+        )));
+    }
+    Ok(projected
+        .pop()
+        .map(|(person_id, (created_at, profile))| (person_id, created_at, profile)))
 }
 
 fn current_materialized_snapshot(
+    persistence: &dyn StoragePorts,
     value: serde_json::Value,
     stats: ObservationStats,
     supplemental_fingerprint: &str,
@@ -3833,11 +4546,19 @@ fn current_materialized_snapshot(
     if format_version != u64::from(NON_CORPUS_MATERIALIZATION_VERSION) {
         return Ok(None);
     }
-    let materialized: MaterializedProjectionSnapshot = serde_json::from_value(value)?;
-    materialized.validate()?;
-    let expected_projection_item_count = materialized
+    let manifest: MaterializedProjectionManifest = serde_json::from_value(value)?;
+    if manifest.last_append_seq != stats.max_append_seq
+        || manifest.observation_count != stats.count
+        || manifest.supplemental_fingerprint != supplemental_fingerprint
+    {
+        return Ok(None);
+    }
+    let expected_projection_item_count = manifest
         .person_message_count
-        .checked_add(materialized.reply_slo_count)
+        .checked_add(manifest.reply_slo_count)
+        .and_then(|count| count.checked_add(manifest.person_slide_count))
+        .and_then(|count| count.checked_add(manifest.identity_event_count))
+        .and_then(|count| count.checked_add(manifest.person_component_count))
         .ok_or_else(|| {
             SelfHostError::Ingestion(
                 "proj:person-page manifest projection item count overflow".to_owned(),
@@ -3848,15 +4569,129 @@ fn current_materialized_snapshot(
             "proj:person-page manifest expects {expected_projection_item_count} projection item rows, but storage contains {persisted_projection_item_count}"
         )));
     }
-    if materialized.reply_slo_count != persisted_reply_slo_count {
+    if manifest.reply_slo_count != persisted_reply_slo_count {
         return Err(SelfHostError::Ingestion(format!(
             "proj:person-page manifest expects {} reply SLO rows, but reserved owner contains {persisted_reply_slo_count}",
-            materialized.reply_slo_count
+            manifest.reply_slo_count
         )));
     }
-    Ok(materialized
-        .matches(stats, supplemental_fingerprint)
-        .then_some(materialized))
+    let identity_items = persistence.projection_items_by_owner(
+        &ProjectionRef::new("proj:person-page"),
+        IDENTITY_EVENT_ITEM_OWNER,
+    )?;
+    if u64::try_from(identity_items.len()).ok() != Some(manifest.identity_event_count) {
+        return Err(SelfHostError::Ingestion(format!(
+            "proj:person-page manifest expects {} identity events, but storage contains {}",
+            manifest.identity_event_count,
+            identity_items.len()
+        )));
+    }
+    let mut compact_state = CompactProjectionState {
+        identity: IdentityState::default(),
+        observation_ids_by_node: Vec::new(),
+        nodes_by_observation_id: BTreeMap::new(),
+        nodes_by_identifier_value: BTreeMap::new(),
+        consent_by_subject: BTreeMap::new(),
+        consent_by_identifier: BTreeMap::new(),
+    };
+    let mut previous_append_seq = None;
+    for item in &identity_items {
+        let event = identity_replay_event_from_projection_item(item)?;
+        if previous_append_seq.is_some_and(|previous| previous >= event.append_seq) {
+            return Err(SelfHostError::Ingestion(
+                "persisted identity replay events are not in strict append order".to_owned(),
+            ));
+        }
+        previous_append_seq = Some(event.append_seq);
+        compact_state.apply_replay_event(&event)?;
+    }
+    compact_state.validate()?;
+
+    let component_items = persistence.projection_items_by_owner(
+        &ProjectionRef::new("proj:person-page"),
+        PERSON_COMPONENT_ITEM_OWNER,
+    )?;
+    if u64::try_from(component_items.len()).ok() != Some(manifest.person_component_count) {
+        return Err(SelfHostError::Ingestion(format!(
+            "proj:person-page manifest expects {} component aggregates, but storage contains {}",
+            manifest.person_component_count,
+            component_items.len()
+        )));
+    }
+    let mut person_components = BTreeMap::new();
+    for item in &component_items {
+        let component = person_component_from_projection_item(item)?;
+        let person_id = component.person.person_id.as_str().to_owned();
+        if person_components
+            .insert(person_id.clone(), component)
+            .is_some()
+        {
+            return Err(SelfHostError::Ingestion(format!(
+                "persisted person component {person_id} is duplicated"
+            )));
+        }
+    }
+    let identity = compact_state.resolve_identity();
+    let person_consents = compact_state.person_consents(&identity);
+    for person in &identity.resolved_persons {
+        let person_id = person.person_id.as_str();
+        let component = person_components.get(person_id).ok_or_else(|| {
+            SelfHostError::Ingestion(format!(
+                "identity component {person_id} has no keyed aggregate"
+            ))
+        })?;
+        if serde_json::to_value(&component.person)? != serde_json::to_value(person)?
+            || person_consents.get(person_id) != Some(&component.consent)
+        {
+            return Err(SelfHostError::Ingestion(format!(
+                "keyed person component {person_id} disagrees with identity replay"
+            )));
+        }
+    }
+    let person_page = PersonPageOutput {
+        profiles: person_components
+            .values()
+            .filter_map(|component| component.profile.clone())
+            .collect(),
+        slides: Vec::new(),
+        messages: Vec::new(),
+        activities: person_components
+            .values()
+            .filter_map(|component| component.activity.clone())
+            .collect(),
+    };
+    let auxiliary = manifest.snapshot;
+    let materialized = MaterializedProjectionSnapshot {
+        format_version: manifest.format_version,
+        last_append_seq: manifest.last_append_seq,
+        observation_count: manifest.observation_count,
+        canonical_observation_fingerprint: manifest.canonical_observation_fingerprint,
+        supplemental_fingerprint: manifest.supplemental_fingerprint,
+        compact_state,
+        person_consents,
+        person_components,
+        identity_event_count: manifest.identity_event_count,
+        person_slide_count: manifest.person_slide_count,
+        person_message_count: manifest.person_message_count,
+        reply_slo_count: manifest.reply_slo_count,
+        snapshot: ProjectionSnapshot {
+            identity,
+            person_page,
+            answer_log: auxiliary.answer_log,
+            claim_queue: auxiliary.claim_queue,
+            freshness: auxiliary.freshness,
+            resume_snapshot: auxiliary.resume_snapshot,
+            plan_state: auxiliary.plan_state,
+            card_queue: auxiliary.card_queue,
+            reply_slo: ReplySloProjection::default(),
+            break_glass: auxiliary.break_glass,
+            built_at: auxiliary.built_at,
+            lineage: auxiliary.lineage,
+        },
+        pending_item_commit: None,
+    };
+    materialized.validate()?;
+    Ok(Some(materialized))
 }
 
 fn validate_persisted_supplemental_anchors(
@@ -3908,6 +4743,7 @@ impl AppService {
             persistence.projection_item_count_by_owner(&person_page_ref, REPLY_SLO_ITEM_OWNER)?;
         let materialized = match persistence.projection_records(&person_page_ref)? {
             Some(value) => current_materialized_snapshot(
+                &persistence,
                 value,
                 stats,
                 &supplemental_fingerprint,

@@ -4,7 +4,9 @@
 //! Results are Projection-level (NOT canonical truth).
 
 pub mod projector;
+pub mod state;
 pub mod types;
 
 pub use projector::IdentityProjector;
+pub use state::*;
 pub use types::*;

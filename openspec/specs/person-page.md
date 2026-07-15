@@ -96,7 +96,7 @@ spec:
 
 | Column | Type | Description |
 |---|---|---|
-| id | TEXT PK | |
+| id | TEXT PK | `ps:{append_seq:020}:{ObservationId}:{claim}` |
 | person_id | TEXT FK | → person_profiles |
 | document_id | TEXT | "document:gslide:{id}" |
 | title | TEXT | presentation title |
@@ -110,7 +110,7 @@ spec:
 
 | Column | Type | Description |
 |---|---|---|
-| id | TEXT PK | |
+| id | TEXT PK | `pm:{append_seq:020}:{ObservationId}` |
 | person_id | TEXT FK | → person_profiles |
 | channel | TEXT | Slack channel name |
 | text | TEXT | message text (truncated for listing) |
@@ -297,6 +297,8 @@ SELECT * FROM person_activity WHERE person_id = :id;
 | 4 | API は projection_metadata を必ず返却 | response schema check |
 | 5 | pending identity candidate は person page に露出しない | approved identity join check |
 | 6 | pagination が正しく機能する | offset/limit test |
+| 7 | message/slide IDはperson IDとperson内ordinalに依存しない | late-bridge regression |
+| 8 | message順はappend_seq、同値時はfact IDで決定する | strict row validation |
 
 ---
 

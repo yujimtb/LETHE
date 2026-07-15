@@ -119,16 +119,12 @@ impl AppService {
         };
         let projection_result = (|| {
             let store = self.persistence_lock()?;
-            let delta = materialized_snapshot_after_supplemental_delta(
-                &core,
-                store.as_ref(),
-                &persisted_record,
-                Utc::now(),
-            )?;
-            let manifest = serde_json::to_value(&delta.materialized)?;
-            Ok::<_, SelfHostError>((delta, manifest))
+            let item_commit =
+                apply_supplemental_delta(&mut core, store.as_ref(), &persisted_record, Utc::now())?;
+            let manifest = core.manifest_value()?;
+            Ok::<_, SelfHostError>((item_commit, manifest))
         })();
-        let (delta, manifest) = match projection_result {
+        let (item_commit, manifest) = match projection_result {
             Ok(result) => result,
             Err(error) => {
                 core.rollback_supplemental(rollback);
@@ -142,15 +138,16 @@ impl AppService {
                     &persisted_record,
                     &ProjectionRef::new("proj:person-page"),
                     &manifest,
-                    &delta.item_commit,
+                    &item_commit,
                 )?;
             Ok::<_, SelfHostError>(())
         })();
         if let Err(error) = commit_result {
             core.rollback_supplemental(rollback);
+            core.mark_non_corpus_materializations_stale();
             return Err(error);
         }
-        core.install_materialized(delta.materialized);
+        core.activate_non_corpus_projections();
 
         drop(core);
         self.emit_audit(
