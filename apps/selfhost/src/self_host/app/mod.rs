@@ -91,6 +91,8 @@ pub enum SelfHostError {
     Policy(String),
     #[error("authentication failed: {0}")]
     Auth(String),
+    #[error("bulk import session conflict ({code}): {detail}")]
+    BulkImportSessionConflict { code: &'static str, detail: String },
     #[error("projection stale: {0}")]
     ProjectionStale(String),
     #[error("{code}: {detail}")]
@@ -618,6 +620,7 @@ fn prepare_draft(core: &AppCore, draft: ObservationDraft) -> Result<Observation,
 pub struct AppService {
     core: Arc<Mutex<AppCore>>,
     persistence: Arc<Mutex<Box<dyn StoragePorts>>>,
+    bulk_import_operation: Arc<Mutex<()>>,
     search_index: search_index::SearchIndexManager,
     config: Arc<SelfHostConfig>,
     slack_sources: Vec<SlackSourceRuntime>,
@@ -3081,6 +3084,7 @@ impl AppService {
             freshness_thresholds(&config),
             config.channels.clone(),
         )?;
+        recover_bulk_import_session_after_bootstrap(&persistence, stats)?;
         let persistence: Arc<Mutex<Box<dyn StoragePorts>>> =
             Arc::new(Mutex::new(Box::new(persistence)));
         let corpus_config = config.corpus.projector_config();
@@ -3126,6 +3130,7 @@ impl AppService {
         Ok(Self {
             core: Arc::new(Mutex::new(core)),
             persistence,
+            bulk_import_operation: Arc::new(Mutex::new(())),
             search_index,
             config: Arc::new(config),
             slack_sources,
@@ -3251,6 +3256,7 @@ impl AppService {
         &self,
     ) -> Result<Vec<AttributeInventoryDocument>, SelfHostError> {
         let core = self.core_lock()?;
+        self.ensure_projection_fresh(&core.catalog, "proj:person-page")?;
         Ok(build_inventory_documents(&core.snapshot))
     }
 
@@ -3259,11 +3265,24 @@ impl AppService {
         drafts: Vec<ObservationDraft>,
         source_instance_id: &str,
     ) -> Result<ImportReport, SelfHostError> {
+        self.ingest_observation_drafts_with_session(drafts, source_instance_id, None)
+    }
+
+    pub fn ingest_observation_drafts_with_session(
+        &self,
+        drafts: Vec<ObservationDraft>,
+        source_instance_id: &str,
+        bulk_session_id: Option<&str>,
+    ) -> Result<ImportReport, SelfHostError> {
         if source_instance_id.trim().is_empty() {
             return Err(SelfHostError::Ingestion(
                 "source_instance_id must not be blank".to_owned(),
             ));
         }
+
+        let _operation = self.bulk_import_operation_lock()?;
+        let mut core = self.core_lock()?;
+        let bulk_session = self.bulk_import_session_for_append(bulk_session_id)?;
 
         let mut report = ImportReport {
             ingested: 0,
@@ -3271,7 +3290,6 @@ impl AppService {
             quarantined: 0,
         };
 
-        let mut core = self.core_lock()?;
         let mut prepared_observations = Vec::new();
         let mut remaining = drafts.into_iter();
         loop {
@@ -3324,7 +3342,15 @@ impl AppService {
         }
 
         if !request_appended_observations.is_empty() {
-            self.materialize_after_observation_append(&mut core, &request_appended_observations)?;
+            if let Some(session) = bulk_session.clone() {
+                self.record_deferred_bulk_import_append(session)?;
+                core.mark_non_corpus_materializations_stale();
+            } else {
+                self.materialize_after_observation_append(
+                    &mut core,
+                    &request_appended_observations,
+                )?;
+            }
         }
 
         if report.ingested > 0 {
@@ -3337,6 +3363,7 @@ impl AppService {
                     "ingested": report.ingested,
                     "duplicates": report.duplicates,
                     "quarantined": report.quarantined,
+                    "bulk_session_id": bulk_session_id,
                 }),
             );
             self.search_index.catch_up_after_append()?;
@@ -3410,6 +3437,7 @@ fn freshness_thresholds(config: &SelfHostConfig) -> Vec<FreshnessThreshold> {
     values
 }
 
+mod bulk_import;
 mod media_support;
 pub(crate) mod projection_api;
 mod search_index;
@@ -3419,6 +3447,8 @@ mod supplemental_write;
 mod sync;
 mod sync_support;
 
+use bulk_import::recover_bulk_import_session_after_bootstrap;
+pub use bulk_import::{BulkImportSessionPhase, BulkImportSessionReport};
 use media_support::*;
 pub use projection_api::CorpusSourceTypeSummary;
 #[cfg(test)]

@@ -3,6 +3,8 @@ use super::*;
 
 impl AppService {
     pub fn sync_all(&self) -> Result<SyncReport, SelfHostError> {
+        let _bulk_import_operation = self.bulk_import_operation_lock()?;
+        self.ensure_bulk_import_session_inactive("source sync")?;
         let started_at = std::time::Instant::now();
         let mut slack_ingested = 0usize;
         let mut google_ingested = 0usize;
