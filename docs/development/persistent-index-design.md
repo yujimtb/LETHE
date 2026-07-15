@@ -111,6 +111,10 @@ manager の状態は `Opening | CatchingUp | Rebuilding | Ready | Failed` であ
 
 page が過大、空なのに high-water 未到達、`append_seq` が非単調、最終件数 / high-water が不一致なら fail-fast し、既存 target materialization を保持する。Person Message と ReplySLO の全行は `ProjectionSnapshot` に常駐させず、SQLite row store から必要な行だけ読む。
 
+ReplySLO の二巡目では、全 supplemental S 件から `draft_id -> observation_id` と `observation_id -> earliest_sent_at` の hash join index をループ開始前に一度だけ構築し、全 Observation page で共有する。従来は N 件の Observation を page size P で処理するたびに supplemental 全件を走査していたため O((N/P)·S + N) だったが、現在の rebuild は期待計算量 O(S + N)、追加メモリ O(S) である。earliest sent は同一 observation に複数の send record がある場合も index 更新時に最小値を維持する。
+
+通常の canonical append は resident join index を参照して追加 Observation ΔN 件だけを ReplySLO row に変換し、既存行を再投影しないため期待計算量 O(ΔN) である。reply draft / send record の append は同じ index を O(1) で更新し、send record が影響する1 Observation row だけを upsert する。supplemental または projection の永続 commit が失敗した場合は専用 rollback token で index と supplemental store を元に戻し、全件再構築への silent fallback は行わない。
+
 supplemental write は supplemental append、strict projection item delta、manifest を一つの SQLite transaction で commit する。insert-existing、update-missing、delete-missing、同一 key の競合操作は拒否する。commit 成功後にだけ in-memory compact state を交換するため、途中失敗で DB と公開 state が分離しない。
 
 外部の bulk import request はさらに `IMPORT_PROCESS_BATCH_SIZE = 512` 件ずつへ分割して draft を準備する。各内部 batch の一時 Vec を解放し、request 内で準備した最大10,000件だけを一度の durable bulk append へ渡す。新規追加された Observation だけを request-local Vec に集めて非コーパス materialization を一度だけ行い、その後に検索 index を一度だけ catch-up する。したがって 10,000 件の HTTP request でも、500k 件全体の Observation / Corpus Vec や index writer 入力を resident にしない。全件重複なら materialization と index catch-up を行わず、入力が空でも暗黙の再構築へ進まない。

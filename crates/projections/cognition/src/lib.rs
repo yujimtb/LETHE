@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, Utc};
 use lethe_core::domain::{
@@ -505,6 +505,149 @@ pub struct ReplySloProjection {
     pub overdue: Vec<ReplyLatency>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplySloJoinIndex {
+    draft_to_observation: HashMap<String, ObservationId>,
+    sent_by_observation: HashMap<String, DateTime<Utc>>,
+}
+
+#[derive(Debug)]
+pub struct ReplySloJoinIndexUpdate {
+    affected_observation_id: Option<ObservationId>,
+    rollback: ReplySloJoinIndexRollback,
+}
+
+#[derive(Debug)]
+enum ReplySloJoinIndexRollback {
+    Draft {
+        draft_id: String,
+        previous: Option<ObservationId>,
+    },
+    Sent {
+        observation_id: String,
+        previous: Option<DateTime<Utc>>,
+    },
+    None,
+}
+
+impl ReplySloJoinIndex {
+    pub fn build(records: &[SupplementalRecord]) -> Self {
+        let mut index = Self::default();
+        for record in records
+            .iter()
+            .filter(|record| record.kind == "reply-draft@1")
+        {
+            index.index_draft(record);
+        }
+        for record in records
+            .iter()
+            .filter(|record| record.kind == "send-record@1")
+        {
+            index.index_send(record);
+        }
+        index
+    }
+
+    pub fn apply_append(&mut self, record: &SupplementalRecord) -> ReplySloJoinIndexUpdate {
+        match record.kind.as_str() {
+            "reply-draft@1" => {
+                let Some(observation_id) = record.derived_from.observations.first().cloned() else {
+                    return ReplySloJoinIndexUpdate::none();
+                };
+                let draft_id = record.id.as_str().to_owned();
+                let previous = self
+                    .draft_to_observation
+                    .insert(draft_id.clone(), observation_id);
+                ReplySloJoinIndexUpdate {
+                    affected_observation_id: None,
+                    rollback: ReplySloJoinIndexRollback::Draft { draft_id, previous },
+                }
+            }
+            "send-record@1" => {
+                let Some((observation_id, sent_at)) = self.send_join(record) else {
+                    return ReplySloJoinIndexUpdate::none();
+                };
+                let observation_key = observation_id.as_str().to_owned();
+                let previous = self.sent_by_observation.get(&observation_key).copied();
+                self.sent_by_observation
+                    .entry(observation_key.clone())
+                    .and_modify(|current| *current = (*current).min(sent_at))
+                    .or_insert(sent_at);
+                ReplySloJoinIndexUpdate {
+                    affected_observation_id: Some(observation_id),
+                    rollback: ReplySloJoinIndexRollback::Sent {
+                        observation_id: observation_key,
+                        previous,
+                    },
+                }
+            }
+            _ => ReplySloJoinIndexUpdate::none(),
+        }
+    }
+
+    pub fn rollback(&mut self, update: ReplySloJoinIndexUpdate) {
+        match update.rollback {
+            ReplySloJoinIndexRollback::Draft { draft_id, previous } => match previous {
+                Some(previous) => {
+                    self.draft_to_observation.insert(draft_id, previous);
+                }
+                None => {
+                    self.draft_to_observation.remove(&draft_id);
+                }
+            },
+            ReplySloJoinIndexRollback::Sent {
+                observation_id,
+                previous,
+            } => match previous {
+                Some(previous) => {
+                    self.sent_by_observation.insert(observation_id, previous);
+                }
+                None => {
+                    self.sent_by_observation.remove(&observation_id);
+                }
+            },
+            ReplySloJoinIndexRollback::None => {}
+        }
+    }
+
+    fn index_draft(&mut self, record: &SupplementalRecord) {
+        if let Some(observation_id) = record.derived_from.observations.first() {
+            self.draft_to_observation
+                .insert(record.id.as_str().to_owned(), observation_id.clone());
+        }
+    }
+
+    fn index_send(&mut self, record: &SupplementalRecord) {
+        let Some((observation_id, sent_at)) = self.send_join(record) else {
+            return;
+        };
+        self.sent_by_observation
+            .entry(observation_id.as_str().to_owned())
+            .and_modify(|current| *current = (*current).min(sent_at))
+            .or_insert(sent_at);
+    }
+
+    fn send_join(&self, record: &SupplementalRecord) -> Option<(ObservationId, DateTime<Utc>)> {
+        let draft_id = single_draft_anchor(record)?;
+        let observation_id = self.draft_to_observation.get(draft_id.as_str())?.clone();
+        let sent_at = string_field(&record.payload, "sent_at").and_then(parse_datetime)?;
+        Some((observation_id, sent_at))
+    }
+}
+
+impl ReplySloJoinIndexUpdate {
+    pub fn affected_observation_id(&self) -> Option<&ObservationId> {
+        self.affected_observation_id.as_ref()
+    }
+
+    fn none() -> Self {
+        Self {
+            affected_observation_id: None,
+            rollback: ReplySloJoinIndexRollback::None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ReplySloProjector {
     now: DateTime<Utc>,
@@ -520,36 +663,15 @@ impl ReplySloProjector {
         observations: &[Observation],
         records: &[SupplementalRecord],
     ) -> ReplySloProjection {
-        let draft_to_observation = records
-            .iter()
-            .filter(|record| record.kind == "reply-draft@1")
-            .filter_map(|record| {
-                let observation_id = record.derived_from.observations.first()?;
-                Some((record.id.as_str().to_owned(), observation_id.clone()))
-            })
-            .collect::<BTreeMap<_, _>>();
+        let join_index = ReplySloJoinIndex::build(records);
+        self.project_observations(observations, &join_index)
+    }
 
-        let mut sent_by_observation = BTreeMap::<String, DateTime<Utc>>::new();
-        for record in records
-            .iter()
-            .filter(|record| record.kind == "send-record@1")
-        {
-            let Some(draft_id) = single_draft_anchor(record) else {
-                continue;
-            };
-            let Some(observation_id) = draft_to_observation.get(draft_id.as_str()) else {
-                continue;
-            };
-            let Some(sent_at) = string_field(&record.payload, "sent_at").and_then(parse_datetime)
-            else {
-                continue;
-            };
-            sent_by_observation
-                .entry(observation_id.as_str().to_owned())
-                .and_modify(|current| *current = (*current).min(sent_at))
-                .or_insert(sent_at);
-        }
-
+    pub fn project_observations(
+        &self,
+        observations: &[Observation],
+        join_index: &ReplySloJoinIndex,
+    ) -> ReplySloProjection {
         let mut rows = observations
             .iter()
             .filter_map(|observation| {
@@ -561,7 +683,10 @@ impl ReplySloProjector {
                     .pointer("/communication/reply_due_at")
                     .and_then(serde_json::Value::as_str)
                     .and_then(parse_datetime)?;
-                let sent_at = sent_by_observation.get(observation.id.as_str()).copied();
+                let sent_at = join_index
+                    .sent_by_observation
+                    .get(observation.id.as_str())
+                    .copied();
                 let latency_seconds =
                     sent_at.map(|sent_at| (sent_at - observation.published).num_seconds());
                 let status = match sent_at {
@@ -1229,5 +1354,107 @@ mod tests {
         assert_eq!(projection.rows[0].latency_seconds, Some(20));
         assert_eq!(projection.rows[0].status, ReplySloStatus::SentOnTime);
         assert!(projection.overdue.is_empty());
+    }
+
+    #[test]
+    fn reply_slo_indexed_and_incremental_projection_match_full_rebuild() {
+        let observations = vec![
+            communication_observation(
+                "obs:on-time",
+                "chan:gmail:inbox",
+                at(0),
+                at(0) + chrono::Duration::minutes(30),
+            ),
+            communication_observation(
+                "obs:late",
+                "chan:gmail:inbox",
+                at(1),
+                at(1) + chrono::Duration::minutes(30),
+            ),
+            communication_observation(
+                "obs:unsent",
+                "chan:gmail:inbox",
+                at(2),
+                at(2) + chrono::Duration::minutes(30),
+            ),
+        ];
+        let records = vec![
+            supplemental(
+                "sup:draft-on-time",
+                "reply-draft@1",
+                serde_json::json!({"drafted_at": at(3)}),
+                obs_anchor("obs:on-time"),
+                at(3),
+            ),
+            supplemental(
+                "sup:draft-late",
+                "reply-draft@1",
+                serde_json::json!({"drafted_at": at(4)}),
+                obs_anchor("obs:late"),
+                at(4),
+            ),
+            supplemental(
+                "sup:draft-unsent",
+                "reply-draft@1",
+                serde_json::json!({"drafted_at": at(5)}),
+                obs_anchor("obs:unsent"),
+                at(5),
+            ),
+            supplemental(
+                "sup:send-on-time-later",
+                "send-record@1",
+                serde_json::json!({"sent_at": at(0) + chrono::Duration::minutes(25)}),
+                sup_anchor("sup:draft-on-time"),
+                at(20),
+            ),
+            supplemental(
+                "sup:send-late",
+                "send-record@1",
+                serde_json::json!({"sent_at": at(1) + chrono::Duration::minutes(40)}),
+                sup_anchor("sup:draft-late"),
+                at(21),
+            ),
+            supplemental(
+                "sup:send-on-time-earliest",
+                "send-record@1",
+                serde_json::json!({"sent_at": at(0) + chrono::Duration::minutes(20)}),
+                sup_anchor("sup:draft-on-time"),
+                at(22),
+            ),
+        ];
+        let projector = ReplySloProjector::new(at(0) + chrono::Duration::hours(1));
+        let full = projector.project_records(&observations, &records);
+
+        let join_index = ReplySloJoinIndex::build(&records);
+        let indexed = projector.project_observations(&observations, &join_index);
+        assert_eq!(
+            serde_json::to_value(&indexed).unwrap(),
+            serde_json::to_value(&full).unwrap()
+        );
+
+        let mut incremental_index = ReplySloJoinIndex::default();
+        for record in &records {
+            incremental_index.apply_append(record);
+        }
+        let incremental = projector.project_observations(&observations, &incremental_index);
+        assert_eq!(
+            serde_json::to_value(&incremental).unwrap(),
+            serde_json::to_value(&full).unwrap()
+        );
+        assert_eq!(incremental.rows[0].status, ReplySloStatus::SentOnTime);
+        assert_eq!(incremental.rows[1].status, ReplySloStatus::SentLate);
+        assert_eq!(incremental.rows[2].status, ReplySloStatus::Overdue);
+        assert_eq!(incremental.overdue.len(), 2);
+
+        let earlier_send = supplemental(
+            "sup:send-temporary",
+            "send-record@1",
+            serde_json::json!({"sent_at": at(10)}),
+            sup_anchor("sup:draft-on-time"),
+            at(23),
+        );
+        let update = incremental_index.apply_append(&earlier_send);
+        incremental_index.rollback(update);
+        assert_eq!(incremental_index, join_index);
     }
 }

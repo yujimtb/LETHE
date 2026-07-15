@@ -1323,9 +1323,98 @@ fn paged_materialization_matches_full_build_and_publishes_atomically() {
             max_age_seconds: 172_800,
         },
     ];
+    let first_draft_id = SupplementalId::new("sup:paged-reply-draft-first");
+    let supplementals = vec![
+        SupplementalRecord {
+            id: first_draft_id.clone(),
+            kind: "reply-draft@1".to_owned(),
+            derived_from: InputAnchorSet {
+                observations: vec![observations[0].id.clone()],
+                blobs: Vec::new(),
+                supplementals: Vec::new(),
+            },
+            payload: serde_json::json!({
+                "channel": "slack",
+                "recipient": "U01",
+                "body": "first reply",
+                "drafted_at": built_at - chrono::Duration::minutes(170),
+            }),
+            created_by: ActorRef::new("actor:test"),
+            created_at: built_at - chrono::Duration::minutes(170),
+            mutability: Mutability::AppendOnly,
+            record_version: None,
+            model_version: None,
+            consent_metadata: None,
+            lineage: None,
+        },
+        SupplementalRecord {
+            id: SupplementalId::new("sup:paged-reply-draft-third"),
+            kind: "reply-draft@1".to_owned(),
+            derived_from: InputAnchorSet {
+                observations: vec![observations[2].id.clone()],
+                blobs: Vec::new(),
+                supplementals: Vec::new(),
+            },
+            payload: serde_json::json!({
+                "channel": "slack",
+                "recipient": "U02",
+                "body": "third reply",
+                "drafted_at": built_at - chrono::Duration::minutes(50),
+            }),
+            created_by: ActorRef::new("actor:test"),
+            created_at: built_at - chrono::Duration::minutes(50),
+            mutability: Mutability::AppendOnly,
+            record_version: None,
+            model_version: None,
+            consent_metadata: None,
+            lineage: None,
+        },
+        SupplementalRecord {
+            id: SupplementalId::new("sup:paged-send-later"),
+            kind: "send-record@1".to_owned(),
+            derived_from: InputAnchorSet {
+                observations: Vec::new(),
+                blobs: Vec::new(),
+                supplementals: vec![first_draft_id.clone()],
+            },
+            payload: serde_json::json!({
+                "channel": "slack",
+                "sent_at": built_at - chrono::Duration::minutes(140),
+                "mode": "automatic",
+            }),
+            created_by: ActorRef::new("actor:test"),
+            created_at: built_at - chrono::Duration::minutes(140),
+            mutability: Mutability::AppendOnly,
+            record_version: None,
+            model_version: None,
+            consent_metadata: None,
+            lineage: None,
+        },
+        SupplementalRecord {
+            id: SupplementalId::new("sup:paged-send-earliest"),
+            kind: "send-record@1".to_owned(),
+            derived_from: InputAnchorSet {
+                observations: Vec::new(),
+                blobs: Vec::new(),
+                supplementals: vec![first_draft_id],
+            },
+            payload: serde_json::json!({
+                "channel": "slack",
+                "sent_at": built_at - chrono::Duration::minutes(150),
+                "mode": "automatic",
+            }),
+            created_by: ActorRef::new("actor:test"),
+            created_at: built_at - chrono::Duration::minutes(130),
+            mutability: Mutability::AppendOnly,
+            record_version: None,
+            model_version: None,
+            consent_metadata: None,
+            lineage: None,
+        },
+    ];
     let full = super::MaterializedProjectionSnapshot::build_at(
         observations,
-        vec![],
+        supplementals.clone(),
         thresholds.clone(),
         vec![],
         stats,
@@ -1339,7 +1428,7 @@ fn paged_materialization_matches_full_build_and_publishes_atomically() {
     for page_size in [1, 128] {
         let paged = super::rebuild_materialized_snapshot_paged(
             &persistence,
-            &[],
+            &supplementals,
             &thresholds,
             &[],
             stats,
@@ -1548,6 +1637,52 @@ fn wave2_slack_incremental_materialization_matches_normalized_full_rebuild() {
             initial_at + chrono::Duration::minutes(1),
         ),
     ];
+    let draft_id = SupplementalId::new("sup:incremental-reply-draft");
+    let supplementals = vec![
+        SupplementalRecord {
+            id: draft_id.clone(),
+            kind: "reply-draft@1".to_owned(),
+            derived_from: InputAnchorSet {
+                observations: vec![initial[0].id.clone()],
+                blobs: Vec::new(),
+                supplementals: Vec::new(),
+            },
+            payload: serde_json::json!({
+                "channel": "slack",
+                "recipient": "U01",
+                "body": "indexed reply",
+                "drafted_at": initial_at + chrono::Duration::minutes(5),
+            }),
+            created_by: ActorRef::new("actor:test"),
+            created_at: initial_at + chrono::Duration::minutes(5),
+            mutability: Mutability::AppendOnly,
+            record_version: None,
+            model_version: None,
+            consent_metadata: None,
+            lineage: None,
+        },
+        SupplementalRecord {
+            id: SupplementalId::new("sup:incremental-send-record"),
+            kind: "send-record@1".to_owned(),
+            derived_from: InputAnchorSet {
+                observations: Vec::new(),
+                blobs: Vec::new(),
+                supplementals: vec![draft_id],
+            },
+            payload: serde_json::json!({
+                "channel": "slack",
+                "sent_at": initial_at + chrono::Duration::minutes(10),
+                "mode": "automatic",
+            }),
+            created_by: ActorRef::new("actor:test"),
+            created_at: initial_at + chrono::Duration::minutes(10),
+            mutability: Mutability::AppendOnly,
+            record_version: None,
+            model_version: None,
+            consent_metadata: None,
+            lineage: None,
+        },
+    ];
     let appended = vec![
         wave2_slack_observation(
             "U01",
@@ -1570,7 +1705,7 @@ fn wave2_slack_incremental_materialization_matches_normalized_full_rebuild() {
     );
     let initial_materialized = super::MaterializedProjectionSnapshot::build_at(
         initial.clone(),
-        vec![],
+        supplementals.clone(),
         thresholds.clone(),
         vec![],
         lethe_storage_api::ObservationStats {
@@ -1604,7 +1739,7 @@ fn wave2_slack_incremental_materialization_matches_normalized_full_rebuild() {
     let core = AppCore::from_materialized(
         initial_materialized,
         vec![],
-        vec![],
+        supplementals.clone(),
         thresholds.clone(),
         vec![],
     )
@@ -1623,6 +1758,31 @@ fn wave2_slack_incremental_materialization_matches_normalized_full_rebuild() {
     let super::MaterializedDeltaResult::Applied(incremental) = incremental else {
         panic!("Wave2-compatible Slack delta unexpectedly required full rebuild");
     };
+    let incremental_reply_keys = match pending_projection_item_commit(&incremental) {
+        lethe_storage_api::ProjectionItemCommit::Delta {
+            inserts,
+            updates,
+            deletes,
+        } => {
+            assert!(updates.is_empty());
+            assert!(deletes.is_empty());
+            inserts
+                .iter()
+                .filter(|item| item.owner_key == super::REPLY_SLO_ITEM_OWNER)
+                .map(|item| item.item_key.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        }
+        lethe_storage_api::ProjectionItemCommit::Replace { .. } => {
+            panic!("observation delta unexpectedly replaced all ReplySLO rows")
+        }
+    };
+    assert_eq!(
+        incremental_reply_keys,
+        appended
+            .iter()
+            .map(|observation| format!("reply-slo:{}", observation.id))
+            .collect()
+    );
     apply_projection_item_commit(
         &mut incremental_message_rows,
         pending_projection_item_commit(&incremental),
@@ -1632,7 +1792,7 @@ fn wave2_slack_incremental_materialization_matches_normalized_full_rebuild() {
     all.extend(appended);
     let full = super::MaterializedProjectionSnapshot::build_at(
         all,
-        vec![],
+        supplementals,
         thresholds,
         vec![],
         final_stats,

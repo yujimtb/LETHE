@@ -115,6 +115,7 @@ impl AppService {
                 "supplemental missing after store write".to_owned(),
             ));
         };
+        let reply_slo_index_update = core.reply_slo_join_index.apply_append(&persisted_record);
 
         let projection_result = (|| {
             let store = self.persistence_lock()?;
@@ -122,6 +123,7 @@ impl AppService {
                 &core,
                 store.as_ref(),
                 &persisted_record,
+                reply_slo_index_update.affected_observation_id(),
                 Utc::now(),
             )?;
             let manifest = serde_json::to_value(&delta.materialized)?;
@@ -130,6 +132,7 @@ impl AppService {
         let (delta, manifest) = match projection_result {
             Ok(result) => result,
             Err(error) => {
+                core.reply_slo_join_index.rollback(reply_slo_index_update);
                 core.rollback_supplemental(rollback);
                 core.mark_non_corpus_materializations_stale();
                 return Err(error);
@@ -146,6 +149,7 @@ impl AppService {
             Ok::<_, SelfHostError>(())
         })();
         if let Err(error) = commit_result {
+            core.reply_slo_join_index.rollback(reply_slo_index_update);
             core.rollback_supplemental(rollback);
             return Err(error);
         }
