@@ -202,7 +202,7 @@ pub struct ProjectionSnapshot {
     pub lineage: LineageManifest,
 }
 
-const NON_CORPUS_MATERIALIZATION_VERSION: u32 = 5;
+const NON_CORPUS_MATERIALIZATION_VERSION: u32 = 6;
 const REPLY_SLO_ITEM_OWNER: &str = "__reply_slo__";
 const NON_CORPUS_REBUILD_STAGING_PROJECTION_ID: &str = "proj:person-page:rebuild-staging";
 const CANONICAL_OBSERVATION_FINGERPRINT_DOMAIN: &[u8] =
@@ -249,6 +249,7 @@ struct PendingProjectionItemCommit {
     base_person_message_count: u64,
     base_reply_slo_count: u64,
     replaced_person_owners: BTreeSet<String>,
+    deleted_person_item_owners: BTreeMap<String, String>,
     commit: ProjectionItemCommit,
 }
 
@@ -1160,6 +1161,7 @@ impl MaterializedProjectionSnapshot {
         stats: ObservationStats,
         built_at: DateTime<Utc>,
     ) -> Result<Self, SelfHostError> {
+        let fact_append_sequences = observation_append_sequences(&observations, stats)?;
         let mut built = ProjectionSnapshot::build_with_state(
             observations,
             persisted_supplementals,
@@ -1168,6 +1170,7 @@ impl MaterializedProjectionSnapshot {
             stats,
             built_at,
         )?;
+        normalize_person_fact_ids(&mut built.snapshot.person_page, &fact_append_sequences)?;
         let (projection_item_commit, person_message_count, reply_slo_count) =
             detach_projection_items(&mut built.snapshot)?;
         let materialized = Self {
@@ -1185,6 +1188,7 @@ impl MaterializedProjectionSnapshot {
                 base_person_message_count: 0,
                 base_reply_slo_count: 0,
                 replaced_person_owners: BTreeSet::new(),
+                deleted_person_item_owners: BTreeMap::new(),
                 commit: projection_item_commit,
             }),
         };
@@ -1259,11 +1263,17 @@ impl MaterializedProjectionSnapshot {
         let mut message_inserts = Vec::new();
         let mut message_updates = Vec::new();
         let mut message_deletes = Vec::new();
+        let mut message_delete_owners = BTreeMap::new();
         let mut replaced_person_owners = BTreeSet::new();
         if appended_observations
             .iter()
             .any(|observation| observation.schema.as_str() == "schema:slack-message")
         {
+            let appended_fact_sequences = stored_observation_append_sequences(
+                lookup,
+                appended_observations,
+                stats.max_append_seq,
+            )?;
             let person_page_delta = match increment_person_page_for_slack(
                 &snapshot.identity,
                 &identity,
@@ -1271,6 +1281,7 @@ impl MaterializedProjectionSnapshot {
                 &core.person_consents,
                 &person_consents,
                 appended_observations,
+                &appended_fact_sequences,
             )? {
                 Some(person_page) => person_page,
                 None => reproject_affected_person_components(
@@ -1291,6 +1302,7 @@ impl MaterializedProjectionSnapshot {
             message_inserts = person_page_delta.message_inserts;
             message_updates = person_page_delta.message_updates;
             message_deletes = person_page_delta.message_deletes;
+            message_delete_owners = person_page_delta.message_delete_owners;
             replaced_person_owners = person_page_delta.replaced_person_owners;
         }
         let inserted_person_message_count = u64::try_from(message_inserts.len()).map_err(|_| {
@@ -1369,6 +1381,7 @@ impl MaterializedProjectionSnapshot {
                 base_person_message_count: core.person_message_count,
                 base_reply_slo_count: core.reply_slo_count,
                 replaced_person_owners,
+                deleted_person_item_owners: message_delete_owners,
                 commit: ProjectionItemCommit::Delta {
                     inserts: message_inserts
                         .into_iter()
@@ -1446,11 +1459,171 @@ fn contributes_to_reply_slo(observation: &Observation) -> bool {
             .is_some()
 }
 
+#[cfg(test)]
+fn observation_append_sequences(
+    observations: &[Observation],
+    stats: ObservationStats,
+) -> Result<BTreeMap<String, u64>, SelfHostError> {
+    let count = u64::try_from(observations.len())
+        .map_err(|_| SelfHostError::Ingestion("observation count does not fit u64".to_owned()))?;
+    if count != stats.count {
+        return Err(SelfHostError::Ingestion(format!(
+            "fact provenance expected {} observations, received {count}",
+            stats.count
+        )));
+    }
+    if count == 0 {
+        if stats.max_append_seq != 0 {
+            return Err(SelfHostError::Ingestion(format!(
+                "empty fact provenance has non-zero high-water {}",
+                stats.max_append_seq
+            )));
+        }
+        return Ok(BTreeMap::new());
+    }
+    let first_append_seq = stats
+        .max_append_seq
+        .checked_sub(count - 1)
+        .filter(|first| *first > 0)
+        .ok_or_else(|| {
+            SelfHostError::Ingestion(format!(
+                "canonical high-water {} cannot identify {count} fact sequences",
+                stats.max_append_seq
+            ))
+        })?;
+    observations
+        .iter()
+        .enumerate()
+        .map(|(index, observation)| {
+            let offset = u64::try_from(index).map_err(|_| {
+                SelfHostError::Ingestion("fact sequence offset does not fit u64".to_owned())
+            })?;
+            let append_seq = first_append_seq.checked_add(offset).ok_or_else(|| {
+                SelfHostError::Ingestion("fact append sequence overflow".to_owned())
+            })?;
+            Ok((observation.id.as_str().to_owned(), append_seq))
+        })
+        .collect()
+}
+
+fn stored_observation_append_sequences(
+    lookup: &dyn ComponentProjectionLookup,
+    observations: &[Observation],
+    canonical_high_water: u64,
+) -> Result<BTreeMap<String, u64>, SelfHostError> {
+    let mut sequences = BTreeMap::new();
+    let mut seen_append_sequences = BTreeSet::new();
+    for observation in observations {
+        let stored = lookup.stored_observation(&observation.id)?.ok_or_else(|| {
+            SelfHostError::Ingestion(format!(
+                "fact provenance references missing observation {}",
+                observation.id
+            ))
+        })?;
+        if stored.observation.id != observation.id {
+            return Err(SelfHostError::Ingestion(format!(
+                "fact provenance lookup returned {} for {}",
+                stored.observation.id, observation.id
+            )));
+        }
+        if stored.append_seq == 0 || stored.append_seq > canonical_high_water {
+            return Err(SelfHostError::Ingestion(format!(
+                "fact observation {} has append sequence {} outside high-water {canonical_high_water}",
+                observation.id, stored.append_seq
+            )));
+        }
+        if !seen_append_sequences.insert(stored.append_seq) {
+            return Err(SelfHostError::Ingestion(format!(
+                "fact provenance repeats append sequence {}",
+                stored.append_seq
+            )));
+        }
+        sequences.insert(observation.id.as_str().to_owned(), stored.append_seq);
+    }
+    Ok(sequences)
+}
+
+fn materialized_message_id(append_seq: u64, observation_id: &ObservationId) -> String {
+    format!("pm:{append_seq:020}:{observation_id}")
+}
+
+fn materialized_slide_id(append_seq: u64, observation_id: &str, claim: &str) -> String {
+    format!("ps:{append_seq:020}:{observation_id}:{claim}")
+}
+
+fn normalize_person_fact_ids(
+    person_page: &mut PersonPageOutput,
+    append_sequences: &BTreeMap<String, u64>,
+) -> Result<(), SelfHostError> {
+    let mut message_ids = BTreeSet::new();
+    for message in &mut person_page.messages {
+        let observation_id = message.source_observation_id.as_str();
+        if observation_id.is_empty() || message.id != format!("pm:{observation_id}") {
+            return Err(SelfHostError::Ingestion(format!(
+                "person message {} has invalid source provenance",
+                message.id
+            )));
+        }
+        let append_seq = append_sequences
+            .get(observation_id)
+            .copied()
+            .ok_or_else(|| {
+                SelfHostError::Ingestion(format!(
+                    "person message {} references observation outside fact provenance",
+                    message.id
+                ))
+            })?;
+        message.id = materialized_message_id(append_seq, &ObservationId::new(observation_id));
+        if !message_ids.insert(message.id.clone()) {
+            return Err(SelfHostError::Ingestion(format!(
+                "person-page produced duplicate stable message id {}",
+                message.id
+            )));
+        }
+    }
+
+    let mut slide_ids = BTreeSet::new();
+    for slide in &mut person_page.slides {
+        let observation_id = slide.source_observation_id.as_str();
+        let prefix = format!("ps:{observation_id}:");
+        let claim = slide.id.strip_prefix(&prefix).ok_or_else(|| {
+            SelfHostError::Ingestion(format!(
+                "person slide {} has invalid source provenance",
+                slide.id
+            ))
+        })?;
+        if observation_id.is_empty() || claim.is_empty() {
+            return Err(SelfHostError::Ingestion(format!(
+                "person slide {} has blank source provenance",
+                slide.id
+            )));
+        }
+        let append_seq = append_sequences
+            .get(observation_id)
+            .copied()
+            .ok_or_else(|| {
+                SelfHostError::Ingestion(format!(
+                    "person slide {} references observation outside fact provenance",
+                    slide.id
+                ))
+            })?;
+        slide.id = materialized_slide_id(append_seq, observation_id, claim);
+        if !slide_ids.insert(slide.id.clone()) {
+            return Err(SelfHostError::Ingestion(format!(
+                "person-page produced duplicate stable slide id {}",
+                slide.id
+            )));
+        }
+    }
+    Ok(())
+}
+
 struct IncrementalPersonPageResult {
     person_page: PersonPageOutput,
     message_inserts: Vec<ProjectionItem>,
     message_updates: Vec<ProjectionItem>,
     message_deletes: Vec<String>,
+    message_delete_owners: BTreeMap<String, String>,
     replaced_person_owners: BTreeSet<String>,
 }
 
@@ -1471,7 +1644,7 @@ fn merge_non_slack_person_page(
         .map(|(index, activity)| (activity.person_id.as_str().to_owned(), index))
         .collect::<BTreeMap<_, _>>();
 
-    for mut slide in page.slides {
+    for slide in page.slides {
         let person_id = slide.person_id.as_str();
         if person_consents.get(person_id) == Some(&ConsentStatus::OptedOut) {
             continue;
@@ -1489,7 +1662,6 @@ fn merge_non_slack_person_page(
                 .ok_or_else(|| {
                     SelfHostError::Ingestion(format!("person slide count overflow for {person_id}"))
                 })?;
-        slide.id = format!("ps:{}:{}", slide.person_id, activity.total_slides_related);
         if let Some(last_modified) = slide.last_modified {
             activity.first_activity = Some(
                 activity
@@ -1534,6 +1706,7 @@ fn increment_person_page_for_slack(
     current_consents: &BTreeMap<String, ConsentStatus>,
     next_consents: &BTreeMap<String, ConsentStatus>,
     appended_observations: &[Observation],
+    fact_append_sequences: &BTreeMap<String, u64>,
 ) -> Result<Option<IncrementalPersonPageResult>, SelfHostError> {
     if !current.messages.is_empty() {
         return Err(SelfHostError::Ingestion(
@@ -1591,18 +1764,25 @@ fn increment_person_page_for_slack(
         .iter()
         .filter(|observation| observation.schema.as_str() == "schema:slack-message")
     {
-        let mut person_ids = BTreeSet::new();
-        for identifier in ["user_id", "email"] {
-            if let Some(value) = observation
-                .payload
-                .get(identifier)
-                .and_then(serde_json::Value::as_str)
-                && let Some(person_id) = next_identifier_owners.get(value)
-            {
-                person_ids.insert(person_id.clone());
-            }
-        }
-        for person_id in person_ids {
+        let user_id = observation
+            .payload
+            .get("user_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                SelfHostError::Ingestion(format!(
+                    "Slack message {} has no identity node user_id",
+                    observation.id
+                ))
+            })?;
+        let person_id = next_identifier_owners
+            .get(user_id)
+            .cloned()
+            .ok_or_else(|| {
+                SelfHostError::Ingestion(format!(
+                    "Slack identity node {user_id} has no resolved component"
+                ))
+            })?;
+        {
             if next_consents.get(&person_id) == Some(&ConsentStatus::OptedOut) {
                 continue;
             }
@@ -1620,13 +1800,17 @@ fn increment_person_page_for_slack(
             activity.total_messages = activity.total_messages.checked_add(1).ok_or_else(|| {
                 SelfHostError::Ingestion(format!("person message count overflow for {person_id}"))
             })?;
-            let ordinal = u64::try_from(activity.total_messages).map_err(|_| {
-                SelfHostError::Ingestion(format!(
-                    "person message ordinal does not fit u64 for {person_id}"
-                ))
-            })?;
             let mut message = person_message_from_slack(observation, &person_id);
-            message.id = format!("pm:{person_id}:{ordinal}");
+            let append_seq = fact_append_sequences
+                .get(observation.id.as_str())
+                .copied()
+                .ok_or_else(|| {
+                    SelfHostError::Ingestion(format!(
+                        "Slack message {} has no append sequence",
+                        observation.id
+                    ))
+                })?;
+            message.id = materialized_message_id(append_seq, &observation.id);
             activity.first_activity = Some(
                 activity
                     .first_activity
@@ -1656,9 +1840,8 @@ fn increment_person_page_for_slack(
             continue;
         }
         let mut person_slides = slides_by_person.remove(person_id).unwrap_or_default();
-        for (index, slide) in person_slides.iter_mut().enumerate() {
+        for slide in &mut person_slides {
             slide.person_id = person.person_id.clone();
-            slide.id = format!("ps:{}:{}", person.person_id, index + 1);
         }
         let mut activity = activities_by_person
             .remove(person_id)
@@ -1722,6 +1905,7 @@ fn increment_person_page_for_slack(
         message_inserts: message_upserts,
         message_updates: Vec::new(),
         message_deletes: Vec::new(),
+        message_delete_owners: BTreeMap::new(),
         replaced_person_owners: BTreeSet::new(),
     }))
 }
@@ -1806,6 +1990,10 @@ fn reproject_affected_person_components(
             )));
         }
     }
+    let fact_append_sequences = observations_by_append_seq
+        .iter()
+        .map(|(append_seq, observation)| (observation.id.as_str().to_owned(), *append_seq))
+        .collect::<BTreeMap<_, _>>();
     let observations = observations_by_append_seq.into_values().collect::<Vec<_>>();
 
     let affected_identity = IdentityResolutionOutput {
@@ -1837,6 +2025,7 @@ fn reproject_affected_person_components(
         .collect::<Vec<_>>();
     let mut reprojected =
         PersonPageProjector::project(&affected_identity, &observations, &affected_supplementals);
+    normalize_person_fact_ids(&mut reprojected, &fact_append_sequences)?;
     reprojected.profiles.retain(|profile| {
         next_consents.get(profile.person_id.as_str()) != Some(&ConsentStatus::OptedOut)
     });
@@ -1886,13 +2075,17 @@ fn reproject_affected_person_components(
     for (item_key, item) in desired_items {
         if existing_items.remove(&item_key).is_some() {
             // Replaced owners publish their complete desired row set. Keeping
-            // equal rows in `updates` lets validation prove ordinal coverage
+            // equal rows in `updates` lets validation prove fact coverage
             // without loading unrelated owners.
             message_updates.push(item);
         } else {
             message_inserts.push(item);
         }
     }
+    let message_delete_owners = existing_items
+        .iter()
+        .map(|(item_key, item)| (item_key.clone(), item.owner_key.clone()))
+        .collect::<BTreeMap<_, _>>();
     let message_deletes = existing_items.into_keys().collect::<Vec<_>>();
 
     let mut person_page = current_page.clone();
@@ -1950,6 +2143,7 @@ fn reproject_affected_person_components(
         message_inserts,
         message_updates,
         message_deletes,
+        message_delete_owners,
         replaced_person_owners,
     })
 }
@@ -2068,7 +2262,7 @@ fn sort_person_page_for_identity(
     for slide in &person_page.slides {
         let key = (
             rank(slide.person_id.as_str())?,
-            person_slide_ordinal(slide)?,
+            person_slide_append_seq(slide)?,
         );
         if slide_sort_keys.insert(slide.id.clone(), key).is_some() {
             return Err(SelfHostError::Ingestion(format!(
@@ -2121,61 +2315,49 @@ fn person_message_activity_count(activities: &[PersonActivity]) -> Result<u64, S
     Ok(count)
 }
 
-fn person_message_ordinal(message: &PersonMessage) -> Result<u64, SelfHostError> {
-    let prefix = format!("pm:{}:", message.person_id);
-    let suffix = message.id.strip_prefix(&prefix).ok_or_else(|| {
+fn stable_fact_append_seq(id: &str, prefix: &str) -> Result<u64, SelfHostError> {
+    let suffix = id.strip_prefix(prefix).ok_or_else(|| {
+        SelfHostError::Ingestion(format!("stable fact id {id} does not start with {prefix}"))
+    })?;
+    let (append_seq, provenance) = suffix.split_once(':').ok_or_else(|| {
+        SelfHostError::Ingestion(format!("stable fact id {id} has no provenance"))
+    })?;
+    let parsed = append_seq.parse::<u64>().map_err(|_| {
         SelfHostError::Ingestion(format!(
-            "person message {} does not belong to {}",
-            message.id, message.person_id
+            "stable fact id {id} has an invalid append sequence"
         ))
     })?;
-    let ordinal = suffix.parse::<u64>().map_err(|_| {
-        SelfHostError::Ingestion(format!(
-            "person message {} has an invalid ordinal",
-            message.id
-        ))
-    })?;
-    if ordinal == 0 || message.id != format!("{prefix}{ordinal}") {
+    if parsed == 0 || append_seq != format!("{parsed:020}") || provenance.is_empty() {
         return Err(SelfHostError::Ingestion(format!(
-            "person message {} has a non-canonical ordinal",
-            message.id
+            "stable fact id {id} is not canonical"
         )));
     }
-    Ok(ordinal)
+    Ok(parsed)
 }
 
-fn person_slide_ordinal(slide: &PersonSlide) -> Result<u64, SelfHostError> {
-    let prefix = format!("ps:{}:", slide.person_id);
-    let suffix = slide.id.strip_prefix(&prefix).ok_or_else(|| {
-        SelfHostError::Ingestion(format!(
-            "person slide {} does not belong to {}",
-            slide.id, slide.person_id
-        ))
-    })?;
-    let ordinal = suffix.parse::<u64>().map_err(|_| {
-        SelfHostError::Ingestion(format!("person slide {} has an invalid ordinal", slide.id))
-    })?;
-    if ordinal == 0 || slide.id != format!("{prefix}{ordinal}") {
-        return Err(SelfHostError::Ingestion(format!(
-            "person slide {} has a non-canonical ordinal",
-            slide.id
-        )));
-    }
-    Ok(ordinal)
+fn person_message_append_seq(message: &PersonMessage) -> Result<u64, SelfHostError> {
+    stable_fact_append_seq(&message.id, "pm:")
 }
 
-fn person_message_sort_key(ordinal: u64) -> String {
-    format!("{ordinal:020}")
+fn person_slide_append_seq(slide: &PersonSlide) -> Result<u64, SelfHostError> {
+    stable_fact_append_seq(&slide.id, "ps:")
+}
+
+fn person_message_sort_key(message: &PersonMessage) -> Result<String, SelfHostError> {
+    Ok(format!(
+        "{:020}:{}",
+        person_message_append_seq(message)?,
+        message.id
+    ))
 }
 
 fn person_message_projection_item(
     message: &PersonMessage,
 ) -> Result<ProjectionItem, SelfHostError> {
-    let ordinal = person_message_ordinal(message)?;
     let item = ProjectionItem {
         item_key: message.id.clone(),
         owner_key: message.person_id.as_str().to_owned(),
-        sort_key: person_message_sort_key(ordinal),
+        sort_key: person_message_sort_key(message)?,
         value: serde_json::to_value(message)?,
     };
     item.validate()?;
@@ -2193,10 +2375,9 @@ pub(super) fn person_message_from_projection_item(
             item.item_key
         )));
     }
-    let ordinal = person_message_ordinal(&message)?;
     if item.item_key != message.id
         || item.owner_key != message.person_id.as_str()
-        || item.sort_key != person_message_sort_key(ordinal)
+        || item.sort_key != person_message_sort_key(&message)?
     {
         return Err(SelfHostError::Ingestion(format!(
             "projection item {} metadata does not match its person message value",
@@ -2357,6 +2538,7 @@ fn validate_pending_projection_item_commit(
             if pending.base_person_message_count != 0
                 || pending.base_reply_slo_count != 0
                 || !pending.replaced_person_owners.is_empty()
+                || !pending.deleted_person_item_owners.is_empty()
             {
                 return Err(SelfHostError::Ingestion(
                     "projection item replace commit must have zero base counts and owners"
@@ -2404,6 +2586,17 @@ fn validate_pending_projection_item_commit(
         }
     }
 
+    let delete_keys = deletes.iter().cloned().collect::<BTreeSet<_>>();
+    let recorded_delete_keys = pending
+        .deleted_person_item_owners
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if delete_keys != recorded_delete_keys {
+        return Err(SelfHostError::Ingestion(
+            "person message delete provenance does not match pending deletes".to_owned(),
+        ));
+    }
     let mut deleted_person_item_count = 0_u64;
     for item_key in deletes {
         if item_key.starts_with("reply-slo:") {
@@ -2411,14 +2604,11 @@ fn validate_pending_projection_item_commit(
                 "observation projection delta must not delete reply SLO rows".to_owned(),
             ));
         }
-        let belongs_to_replaced_owner = pending.replaced_person_owners.iter().any(|owner| {
-            item_key
-                .strip_prefix("pm:")
-                .is_some_and(|suffix| suffix.starts_with(&format!("{owner}:")))
-        });
-        if !belongs_to_replaced_owner {
+        stable_fact_append_seq(item_key, "pm:")?;
+        let owner = &pending.deleted_person_item_owners[item_key];
+        if !pending.replaced_person_owners.contains(owner) {
             return Err(SelfHostError::Ingestion(format!(
-                "person message delete {item_key} does not belong to a replaced owner"
+                "person message delete {item_key} belongs to non-replaced owner {owner}"
             )));
         }
         deleted_person_item_count = deleted_person_item_count.checked_add(1).ok_or_else(|| {
@@ -2465,55 +2655,41 @@ fn validate_pending_projection_item_commit(
         )));
     }
 
-    let mut ordinals_by_owner = BTreeMap::<String, BTreeSet<u64>>::new();
+    let mut append_sequences_by_owner = BTreeMap::<String, BTreeSet<u64>>::new();
     for item in inserted_person_items
         .iter()
         .chain(updated_person_items.iter())
     {
         let message = person_message_from_projection_item(item)?;
-        let ordinal = person_message_ordinal(&message)?;
+        let append_seq = person_message_append_seq(&message)?;
         if !activity_counts.contains_key(&item.owner_key) {
             return Err(SelfHostError::Ingestion(format!(
                 "person message item {} references an owner with no activity",
                 item.item_key
             )));
         }
-        if !ordinals_by_owner
+        if !append_sequences_by_owner
             .entry(item.owner_key.clone())
             .or_default()
-            .insert(ordinal)
+            .insert(append_seq)
         {
             return Err(SelfHostError::Ingestion(format!(
-                "person message commit repeats ordinal {ordinal} for {}",
+                "person message commit repeats append sequence {append_seq} for {}",
                 item.owner_key
             )));
         }
     }
 
-    for (owner, ordinals) in ordinals_by_owner {
+    for (owner, append_sequences) in append_sequences_by_owner {
         let final_owner_count = activity_counts[&owner];
-        let committed_owner_count = u64::try_from(ordinals.len()).map_err(|_| {
+        let committed_owner_count = u64::try_from(append_sequences.len()).map_err(|_| {
             SelfHostError::Ingestion(format!(
                 "pending person message count does not fit u64 for {owner}"
             ))
         })?;
-        let replaces_complete_owner = replace || pending.replaced_person_owners.contains(&owner);
-        let first_expected = if replaces_complete_owner {
-            1
-        } else {
-            final_owner_count
-                .checked_sub(committed_owner_count)
-                .and_then(|value| value.checked_add(1))
-                .ok_or_else(|| {
-                    SelfHostError::Ingestion(format!(
-                        "pending person message delta exceeds final activity count for {owner}"
-                    ))
-                })?
-        };
-        let expected = first_expected..=final_owner_count;
-        if ordinals.iter().copied().ne(expected) {
+        if committed_owner_count > final_owner_count {
             return Err(SelfHostError::Ingestion(format!(
-                "pending person message ordinals are not a contiguous final segment for {owner}"
+                "pending person message delta exceeds final activity count for {owner}"
             )));
         }
     }
@@ -2563,7 +2739,8 @@ fn person_message_from_slack(observation: &Observation, person_id: &str) -> Pers
         .unwrap_or("unknown")
         .to_owned();
     PersonMessage {
-        id: String::new(),
+        id: format!("pm:{}", observation.id),
+        source_observation_id: observation.id.as_str().to_owned(),
         person_id: EntityRef::new(person_id),
         channel,
         text,
@@ -2927,7 +3104,7 @@ fn for_each_observation_page(
     persistence: &dyn StoragePorts,
     stats: ObservationStats,
     page_size: usize,
-    mut visit: impl FnMut(&[Observation]) -> Result<(), SelfHostError>,
+    mut visit: impl FnMut(&[StoredObservation], &[Observation]) -> Result<(), SelfHostError>,
 ) -> Result<(), SelfHostError> {
     if page_size == 0 {
         return Err(SelfHostError::Ingestion(
@@ -2962,7 +3139,7 @@ fn for_each_observation_page(
         }
 
         let mut observations = Vec::with_capacity(page.len());
-        for stored in page {
+        for stored in &page {
             if stored.append_seq <= after_append_seq {
                 return Err(SelfHostError::Ingestion(format!(
                     "canonical observation page is not strictly ordered after append sequence {after_append_seq}"
@@ -2986,9 +3163,9 @@ fn for_each_observation_page(
                     stats.count
                 )));
             }
-            observations.push(stored.observation);
+            observations.push(stored.observation.clone());
         }
-        visit(&observations)?;
+        visit(&page, &observations)?;
     }
 
     if seen != stats.count || after_append_seq != stats.max_append_seq {
@@ -3119,7 +3296,7 @@ fn rebuild_materialized_snapshot_paged(
         FreshnessProjector::new(freshness_thresholds.to_vec(), built_at).project_observations(&[]);
     let mut answer_log = Vec::new();
 
-    for_each_observation_page(persistence, stats, page_size, |observations| {
+    for_each_observation_page(persistence, stats, page_size, |_, observations| {
         compact_state.apply_observation_page(observations)?;
         for observation in observations {
             add_observation_to_fingerprint(&mut canonical_fingerprint, observation)?;
@@ -3174,7 +3351,11 @@ fn rebuild_materialized_snapshot_paged(
 
     let mut person_message_count = 0_u64;
     let mut reply_slo_count = 0_u64;
-    for_each_observation_page(persistence, stats, page_size, |observations| {
+    for_each_observation_page(persistence, stats, page_size, |stored, observations| {
+        let fact_append_sequences = stored
+            .iter()
+            .map(|stored| (stored.observation.id.as_str().to_owned(), stored.append_seq))
+            .collect::<BTreeMap<_, _>>();
         let mut inserts = Vec::new();
         if observations
             .iter()
@@ -3187,6 +3368,7 @@ fn rebuild_materialized_snapshot_paged(
                 &person_consents,
                 &person_consents,
                 observations,
+                &fact_append_sequences,
             )?
             .ok_or_else(|| {
                 SelfHostError::Ingestion(
@@ -3197,6 +3379,7 @@ fn rebuild_materialized_snapshot_paged(
             person_page = delta.person_page;
             if !delta.message_updates.is_empty()
                 || !delta.message_deletes.is_empty()
+                || !delta.message_delete_owners.is_empty()
                 || !delta.replaced_person_owners.is_empty()
             {
                 return Err(SelfHostError::Ingestion(
@@ -3212,7 +3395,8 @@ fn rebuild_materialized_snapshot_paged(
             .cloned()
             .collect::<Vec<_>>();
         if !non_slack.is_empty() {
-            let page = PersonPageProjector::project(&identity, &non_slack, &[]);
+            let mut page = PersonPageProjector::project(&identity, &non_slack, &[]);
+            normalize_person_fact_ids(&mut page, &fact_append_sequences)?;
             merge_non_slack_person_page(&mut person_page, page, &person_consents)?;
         }
 
@@ -3280,7 +3464,7 @@ fn rebuild_materialized_snapshot_paged(
                     slide.id, slide.person_id
                 ))
             })?;
-        let sort_key = (identity_rank, person_slide_ordinal(slide)?);
+        let sort_key = (identity_rank, person_slide_append_seq(slide)?);
         if slide_sort_keys.insert(slide.id.clone(), sort_key).is_some() {
             return Err(SelfHostError::Ingestion(format!(
                 "paged person-page contains duplicate slide id {}",

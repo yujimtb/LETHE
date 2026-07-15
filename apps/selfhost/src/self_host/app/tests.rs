@@ -381,7 +381,7 @@ fn bootstrap_rebuilds_snapshot_from_persisted_observations() {
         .projection_records(&ProjectionRef::new("proj:person-page"))
         .unwrap()
         .unwrap();
-    assert_eq!(materialized["format_version"], 5);
+    assert_eq!(materialized["format_version"], 6);
     assert_eq!(materialized["observation_count"], 1);
     assert_eq!(materialized["last_append_seq"], 1);
     assert_eq!(materialized["person_message_count"], 1);
@@ -829,7 +829,7 @@ fn materialized_snapshot_selection_is_versioned_strict_and_stats_bound() {
     );
 
     let mut version_mismatch = value.clone();
-    version_mismatch["format_version"] = serde_json::json!(6);
+    version_mismatch["format_version"] = serde_json::json!(7);
     assert!(
         super::current_materialized_snapshot(version_mismatch, stats, &fingerprint, 0, 0)
             .unwrap()
@@ -1411,16 +1411,16 @@ fn slack_late_bridge_reprojects_only_affected_components_and_matches_full_rebuil
             "2.000001",
             initial_at + chrono::Duration::minutes(1),
         ),
+        component_google_observation(
+            "d@example.test",
+            "component-d",
+            initial_at + chrono::Duration::minutes(2),
+        ),
         wave2_slack_observation(
             "U-C",
             "Bridge",
             Some("c@example.test"),
             "3.000001",
-            initial_at + chrono::Duration::minutes(2),
-        ),
-        component_google_observation(
-            "d@example.test",
-            "component-d",
             initial_at + chrono::Duration::minutes(3),
         ),
     ];
@@ -1449,6 +1449,11 @@ fn slack_late_bridge_reprojects_only_affected_components_and_matches_full_rebuil
         &mut incremental_rows,
         pending_projection_item_commit(&initial_materialized),
     );
+    let bridge_message_id = format!("pm:{:020}:{}", 4, initial[3].id);
+    assert_eq!(
+        incremental_rows[&bridge_message_id].owner_key,
+        "person:component-3"
+    );
     let core =
         AppCore::from_materialized(initial_materialized, vec![], vec![], vec![], vec![]).unwrap();
     let mut all = initial.clone();
@@ -1467,6 +1472,20 @@ fn slack_late_bridge_reprojects_only_affected_components_and_matches_full_rebuil
         &lookup,
     )
     .unwrap();
+    let lethe_storage_api::ProjectionItemCommit::Delta {
+        inserts: _,
+        updates,
+        deletes,
+    } = pending_projection_item_commit(&incremental)
+    else {
+        panic!("component re-projection must publish a delta");
+    };
+    assert!(
+        updates
+            .iter()
+            .any(|item| item.item_key == bridge_message_id)
+    );
+    assert!(!deletes.contains(&bridge_message_id));
     apply_projection_item_commit(
         &mut incremental_rows,
         pending_projection_item_commit(&incremental),
@@ -1492,6 +1511,10 @@ fn slack_late_bridge_reprojects_only_affected_components_and_matches_full_rebuil
     assert!(!requested.contains(initial[0].id.as_str()));
     assert!(!requested.contains(initial[1].id.as_str()));
     assert_eq!(requested.len(), 3);
+    assert_eq!(
+        incremental_rows[&bridge_message_id].owner_key,
+        "person:component-2"
+    );
     assert_eq!(incremental_rows, full_rows);
     assert_eq!(
         serde_json::to_value(incremental).unwrap(),
@@ -1696,6 +1719,16 @@ fn component_reprojection_is_invariant_to_slack_batch_partition() {
                 &core, batch, stats, final_at, &lookup,
             )
             .unwrap();
+            if consumed == deltas.len() {
+                assert!(
+                    !lookup
+                        .requested_observations
+                        .borrow()
+                        .iter()
+                        .any(|id| id == initial[2].id.as_str()),
+                    "stable component ID must keep Gamma outside partition {partition:?}"
+                );
+            }
             apply_projection_item_commit(&mut rows, pending_projection_item_commit(&incremental));
             core =
                 AppCore::from_materialized(*incremental, vec![], vec![], vec![], vec![]).unwrap();
@@ -2063,12 +2096,16 @@ fn wave2_slack_incremental_materialization_matches_normalized_full_rebuild() {
         count: 4,
         max_append_seq: 4,
     };
+    let mut lookup_observations = initial.clone();
+    lookup_observations.extend(appended.iter().cloned());
+    let lookup =
+        component_projection_lookup(&lookup_observations, incremental_message_rows.clone());
     let incremental = super::MaterializedProjectionSnapshot::compact_incremental_delta(
         &core,
         &appended,
         final_stats,
         final_at,
-        &TestComponentProjectionLookup::default(),
+        &lookup,
     )
     .unwrap();
     apply_projection_item_commit(

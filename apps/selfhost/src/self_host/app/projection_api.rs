@@ -57,20 +57,15 @@ impl AppService {
                 messages.len()
             )));
         }
-        for (index, message) in messages.iter().enumerate() {
-            let expected_ordinal = u64::try_from(index)
-                .ok()
-                .and_then(|value| value.checked_add(1))
-                .ok_or_else(|| {
-                    SelfHostError::Ingestion(format!(
-                        "person message ordinal overflow while reading {person_id}"
-                    ))
-                })?;
-            if person_message_ordinal(message)? != expected_ordinal {
+        let mut previous_append_seq = None;
+        for message in &messages {
+            let append_seq = person_message_append_seq(message)?;
+            if previous_append_seq.is_some_and(|previous| previous >= append_seq) {
                 return Err(SelfHostError::Ingestion(format!(
-                    "person message rows for {person_id} are not contiguous from ordinal 1"
+                    "person message rows for {person_id} are not in strict append order"
                 )));
             }
+            previous_append_seq = Some(append_seq);
         }
         Ok(messages)
     }

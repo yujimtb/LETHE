@@ -47,6 +47,8 @@ pub struct IdentityInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonSlide {
     pub id: String,
+    #[serde(skip)]
+    pub source_observation_id: String,
     pub person_id: EntityRef,
     pub document_id: String,
     pub title: String,
@@ -63,6 +65,8 @@ pub struct PersonSlide {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonMessage {
     pub id: String,
+    #[serde(skip)]
+    pub source_observation_id: String,
     pub person_id: EntityRef,
     pub channel: String,
     pub text: String,
