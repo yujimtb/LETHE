@@ -245,21 +245,21 @@ impl AppService {
     ) -> Result<(), SelfHostError> {
         let result = match classify_non_corpus_delta(appended_observations) {
             NonCorpusDeltaKind::FreshnessOnly | NonCorpusDeltaKind::SlackMessage => {
-                let stats = self.persistence_lock()?.observation_stats()?;
-                match MaterializedProjectionSnapshot::compact_incremental_delta(
-                    core,
-                    appended_observations,
-                    stats,
-                    Utc::now(),
-                )? {
-                    MaterializedDeltaResult::Applied(materialized) => {
-                        self.persist_materialized_snapshot(core, *materialized)
-                    }
-                    MaterializedDeltaResult::FullRebuildRequired(reason) => {
-                        tracing::info!(%reason, "compact non-corpus delta requires full rebuild");
-                        self.refresh_materialized_snapshot(core)
-                    }
-                }
+                let materialized = {
+                    let persistence = self.persistence_lock()?;
+                    let stats = persistence.observation_stats()?;
+                    let lookup = StorageComponentProjectionLookup {
+                        storage: persistence.as_ref(),
+                    };
+                    MaterializedProjectionSnapshot::compact_incremental_delta(
+                        core,
+                        appended_observations,
+                        stats,
+                        Utc::now(),
+                        &lookup,
+                    )?
+                };
+                self.persist_materialized_snapshot(core, *materialized)
             }
             NonCorpusDeltaKind::FullRebuild => self.refresh_materialized_snapshot(core),
         };

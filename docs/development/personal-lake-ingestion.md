@@ -618,12 +618,19 @@ Import performance note: `AppService::ingest_observation_drafts` prepares the
 batch once, appends observations through the storage bulk API inside one SQLite
 transaction, and emits one summary audit event. For each non-empty batch, the
 persistent corpus index consumes only the new canonical tail and upserts each
-`record_id` once. Non-corpus materialization fixes one canonical high-water,
+`record_id` once. A reference non-corpus rebuild fixes one canonical high-water,
 performs two bounded page passes, writes message and reply-SLO rows to a SQLite
 staging projection, and atomically publishes the verified manifest and rows.
-This path never loads all observations or the full corpus into memory. Do not
-reintroduce per-observation materialization, per-observation audit writes, or a
-full corpus-index rebuild on normal import.
+Normal Slack deltas use compact identity Observation references. Stable topology
+appends remain direct inserts; topology, identifier-owner, and consent changes
+re-project only the affected old/new component and commit strict owner-scoped
+message inserts/updates/deletes with the manifest. Missing references or owner
+inconsistency fail explicitly. See
+[Identity / person-page component-local re-projection](identity-person-page-local-reprojection.md).
+Neither path loads all observations or the full corpus into memory. Do not
+reintroduce per-observation materialization, per-observation audit writes, a
+normal Slack topology fallback to full non-corpus rebuild, or a full corpus-index
+rebuild on normal import.
 
 Supplemental writes compute a strict non-corpus projection-item delta. SQLite
 commits the supplemental append, item inserts/updates/deletes, and projection

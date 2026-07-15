@@ -276,6 +276,18 @@ impl IdentityProjector {
         candidates: &[PersonCandidate],
         matches: &[ResolutionCandidate],
     ) -> IdentityResolutionOutput {
+        self.resolve_with_component_members(candidates, matches).0
+    }
+
+    /// Build the resolution output together with the candidate indexes in each
+    /// resolved component. The component order is exactly the order used by
+    /// `resolved_persons`, so incremental consumers can reuse the projector's
+    /// topology without reimplementing its union rules.
+    pub fn resolve_with_component_members(
+        &self,
+        candidates: &[PersonCandidate],
+        matches: &[ResolutionCandidate],
+    ) -> (IdentityResolutionOutput, Vec<Vec<usize>>) {
         // Union-Find for merging.
         let n = candidates.len();
         let mut parent: Vec<usize> = (0..n).collect();
@@ -430,11 +442,14 @@ impl IdentityProjector {
             .cloned()
             .collect();
 
-        IdentityResolutionOutput {
-            resolved_persons,
-            candidates: unresolved,
-            person_identifiers,
-        }
+        (
+            IdentityResolutionOutput {
+                resolved_persons,
+                candidates: unresolved,
+                person_identifiers,
+            },
+            grouped_members,
+        )
     }
 
     fn parse_pc_index(id: &str) -> Option<usize> {
