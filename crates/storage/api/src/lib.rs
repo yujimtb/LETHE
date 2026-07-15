@@ -66,6 +66,28 @@ pub struct SyncMetricRecord {
     pub latency_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SlackThreadKey {
+    pub source_instance: String,
+    pub channel_id: String,
+    pub thread_ts: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredSlackThread {
+    pub key: SlackThreadKey,
+    pub observation_append_seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlackThreadCatalogEntry {
+    pub key: SlackThreadKey,
+    pub reply_cursor: String,
+    pub active: bool,
+    pub next_poll_generation: u64,
+    pub discovered_append_seq: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionItem {
     pub item_key: String,
@@ -274,6 +296,41 @@ pub trait RuntimeStateStore: Send {
     fn deep_check(&self) -> StorageResult<()>;
 }
 
+pub trait SlackThreadCatalogStore: Send {
+    fn append_slack_observation(
+        &self,
+        observation: &Observation,
+        thread: &SlackThreadKey,
+    ) -> StorageResult<AppendOutcome>;
+    fn slack_thread_discovery_high_water(&self) -> StorageResult<u64>;
+    fn commit_slack_thread_discovery(
+        &self,
+        high_water: u64,
+        threads: &[DiscoveredSlackThread],
+    ) -> StorageResult<()>;
+    fn advance_slack_thread_poll_generation(&self) -> StorageResult<u64>;
+    fn slack_threads_to_poll(
+        &self,
+        source_instance: &str,
+        channel_id: &str,
+        generation: u64,
+        limit: usize,
+    ) -> StorageResult<Vec<SlackThreadCatalogEntry>>;
+    fn complete_slack_thread_poll(
+        &self,
+        key: &SlackThreadKey,
+        generation: u64,
+        reply_cursor: &str,
+        active: bool,
+        next_poll_generation: u64,
+    ) -> StorageResult<()>;
+    fn slack_thread_catalog(
+        &self,
+        source_instance: &str,
+        channel_id: &str,
+    ) -> StorageResult<Vec<SlackThreadCatalogEntry>>;
+}
+
 pub trait ProjectionWatermarkStore: Send {
     fn projection_leaf_watermark(
         &self,
@@ -293,6 +350,7 @@ pub trait StoragePorts:
     + ProjectionMaterializer
     + SupplementalProjectionCommitter
     + RuntimeStateStore
+    + SlackThreadCatalogStore
     + ProjectionWatermarkStore
 {
 }
@@ -304,6 +362,7 @@ impl<T> StoragePorts for T where
         + ProjectionMaterializer
         + SupplementalProjectionCommitter
         + RuntimeStateStore
+        + SlackThreadCatalogStore
         + ProjectionWatermarkStore
 {
 }

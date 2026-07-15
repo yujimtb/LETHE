@@ -35,10 +35,11 @@ tools / e2e ── public crate interfaces
 
 - selfhost app: bootstrap/auth、sync workflow、Projection API、
   persistence/ingestion support、検索index lifecycle、固定high-waterの二段ページング
-  materialization、supplemental atomic delta、media support、slide scoring
+  materialization、Slack thread catalog/active queue、supplemental atomic delta、media support、
+  slide scoring
 - search-index: Tantivy schema/query、`record_id`単位の冪等upsert、canonical tailの
   incremental catch-up、世代のbuild/検証/publish/retire
-- SQLite storage: persistence API、schema initialization、tests
+- SQLite storage: persistence API、schema initialization、Slack thread catalog transaction、tests
 
 ## Runtime data
 

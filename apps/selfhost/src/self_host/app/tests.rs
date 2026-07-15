@@ -5,14 +5,15 @@ use chrono::Utc;
 use lethe_adapter_api::retry::ResilientExecutor;
 use lethe_adapter_api::traits::ObservationDraft;
 use lethe_adapter_gslides::gslides::client::{PresentationNative, SlideNative, SlideRevision};
-use lethe_adapter_slack::slack::client::{SlackMessage, SlackMessageType};
+use lethe_adapter_slack::slack::client::{FixtureSlackClient, SlackMessage, SlackMessageType};
+use lethe_adapter_slack::slack::mapper::SlackAdapter;
 use lethe_core::domain::supplemental::InputAnchorSet;
 
 use super::{
     AppCore, AppService, GoogleSourceRuntime, SelfHostError, SlackSourceRuntime,
-    classify_slack_ingress, extract_slide_text_fragments, infer_profile_name_from_fragments,
-    known_thread_roots_from_observations, latest_revision_to_capture, namespace_draft,
-    non_empty_state, ranked_self_intro_slide_indices, thread_cursor_key, thread_root_ts,
+    classify_slack_ingress, discovered_slack_threads, extract_slide_text_fragments,
+    infer_profile_name_from_fragments, latest_revision_to_capture, namespace_draft,
+    non_empty_state, ranked_self_intro_slide_indices, thread_root_ts,
 };
 use crate::self_host::config::{
     ApiTokenConfig, CorpusProjectionConfig, FreshnessConfig, GoogleConfig, JsonWebKey,
@@ -29,6 +30,7 @@ use lethe_core::domain::{
 use lethe_derivation_gemini::GeminiSlideAnalyzer;
 use lethe_policy::governance::audit::InMemoryAuditLog;
 use lethe_runtime::runtime::partition::RoutingKeyOrder;
+use lethe_storage_api::{SlackThreadKey, StoredObservation};
 use lethe_storage_sqlite::persistence::SqlitePersistence;
 
 #[test]
@@ -531,15 +533,7 @@ fn classify_slack_ingress_distinguishes_dm_mention_and_channel() {
 }
 
 #[test]
-fn thread_cursor_key_is_stable() {
-    assert_eq!(
-        thread_cursor_key("C01ABC", "1234567890.123456"),
-        "slack:C01ABC:thread:1234567890.123456:oldest_ts"
-    );
-}
-
-#[test]
-fn known_thread_roots_from_observations_finds_thread_parents() {
+fn incremental_thread_discovery_finds_roots_and_out_of_order_replies_without_duplicates() {
     fn slack_observation(
         channel_id: &str,
         ts: &str,
@@ -575,24 +569,313 @@ fn known_thread_roots_from_observations_finds_thread_parents() {
             recorded_at: Utc::now(),
             consent: None,
             idempotency_key: IdempotencyKey::new(format!("slack:{channel_id}:{ts}")),
-            meta: serde_json::json!({}),
+            meta: serde_json::json!({"source_instance": "slack-test"}),
         }
     }
 
-    let roots = known_thread_roots_from_observations(
-        &[
-            slack_observation("C01ABC", "100.000001", None, Some(2)),
-            slack_observation("C01ABC", "101.000001", Some("100.000001"), None),
-            slack_observation("C02XYZ", "200.000001", None, Some(3)),
-            slack_observation("C01ABC", "102.000001", None, Some(0)),
-        ],
-        "C01ABC",
+    let observations = [
+        slack_observation("C01ABC", "101.000001", Some("100.000001"), None),
+        slack_observation("C01ABC", "100.000001", None, Some(2)),
+        slack_observation("C01ABC", "102.000001", Some("100.000001"), None),
+        slack_observation("C02XYZ", "201.000001", Some("200.000001"), None),
+        slack_observation("C01ABC", "103.000001", None, Some(0)),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, observation)| StoredObservation {
+        leaf_id: "lake:test".into(),
+        append_seq: u64::try_from(index + 1).unwrap(),
+        observation,
+    })
+    .collect::<Vec<_>>();
+    let roots = discovered_slack_threads(&observations).unwrap();
+    let roots = roots
+        .into_iter()
+        .map(|thread| (thread.key, thread.observation_append_seq))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    assert_eq!(roots.len(), 2);
+    assert_eq!(
+        roots[&SlackThreadKey {
+            source_instance: "slack-test".into(),
+            channel_id: "C01ABC".into(),
+            thread_ts: "100.000001".into(),
+        }],
+        1
+    );
+    assert_eq!(
+        roots[&SlackThreadKey {
+            source_instance: "slack-test".into(),
+            channel_id: "C02XYZ".into(),
+            thread_ts: "200.000001".into(),
+        }],
+        4
+    );
+}
+
+#[test]
+fn thread_catalog_sync_matches_full_rediscovery_without_repolling_idle_threads() {
+    fn message(ts: &str, thread_ts: Option<&str>, reply_count: u32) -> SlackMessage {
+        SlackMessage {
+            channel_id: String::new(),
+            channel_name: "general".into(),
+            ts: ts.into(),
+            thread_ts: thread_ts.map(str::to_owned),
+            user_id: format!("U-{ts}"),
+            user_name: format!("user-{ts}"),
+            email: None,
+            text: format!("message-{ts}"),
+            ingress_kind: None,
+            mentions: vec![],
+            message_type: SlackMessageType::Message,
+            edited: None,
+            reactions: vec![],
+            files: vec![],
+            reply_count,
+            reply_users_count: u32::from(reply_count > 0),
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!("lethe-self-host-test-{}", uuid::Uuid::now_v7()));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let service = test_service(test_config(db, blobs), persistence);
+    let adapter = SlackAdapter::new(FixtureSlackClient::new(), service.slack_adapter_config());
+    let file_client = FixtureSlackClient::new();
+    let mut replies_client = FixtureSlackClient::new();
+    let root_one = "1700000000.000001";
+    let reply_one = "1700000001.000001";
+    replies_client
+        .replies
+        .insert(root_one.into(), vec![message(reply_one, Some(root_one), 0)]);
+
+    let mut latest_ts = None;
+    assert!(matches!(
+        service
+            .ingest_slack_message(
+                &adapter,
+                &file_client,
+                "slack-test",
+                "C01ABC",
+                message(root_one, None, 1),
+                &mut latest_ts,
+            )
+            .unwrap(),
+        IngestResult::Ingested { .. }
+    ));
+    service.refresh_slack_thread_catalog().unwrap();
+    assert_eq!(
+        service
+            .persistence_lock()
+            .unwrap()
+            .slack_thread_discovery_high_water()
+            .unwrap(),
+        1
     );
 
+    let generation_one = service
+        .persistence_lock()
+        .unwrap()
+        .advance_slack_thread_poll_generation()
+        .unwrap();
+    let thread = service
+        .persistence_lock()
+        .unwrap()
+        .slack_threads_to_poll("slack-test", "C01ABC", generation_one, 10)
+        .unwrap()
+        .remove(0);
     assert_eq!(
-        roots,
-        std::collections::BTreeSet::from(["100.000001".to_string()])
+        service
+            .sync_thread_replies(
+                &adapter,
+                &file_client,
+                &replies_client,
+                &thread,
+                generation_one,
+            )
+            .unwrap(),
+        (1, 0, 1)
     );
+
+    let generation_two = service
+        .persistence_lock()
+        .unwrap()
+        .advance_slack_thread_poll_generation()
+        .unwrap();
+    let thread = service
+        .persistence_lock()
+        .unwrap()
+        .slack_threads_to_poll("slack-test", "C01ABC", generation_two, 10)
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        service
+            .sync_thread_replies(
+                &adapter,
+                &file_client,
+                &replies_client,
+                &thread,
+                generation_two,
+            )
+            .unwrap(),
+        (0, 0, 0)
+    );
+    assert_eq!(replies_client.reply_call_count(), 2);
+
+    let root_two = "1700000002.000001";
+    let reply_two = "1700000003.000001";
+    replies_client
+        .replies
+        .insert(root_two.into(), vec![message(reply_two, Some(root_two), 0)]);
+    assert!(matches!(
+        service
+            .ingest_slack_message(
+                &adapter,
+                &file_client,
+                "slack-test",
+                "C01ABC",
+                message(root_two, None, 1),
+                &mut latest_ts,
+            )
+            .unwrap(),
+        IngestResult::Ingested { .. }
+    ));
+    let generation_three = service
+        .persistence_lock()
+        .unwrap()
+        .advance_slack_thread_poll_generation()
+        .unwrap();
+    let threads = service
+        .persistence_lock()
+        .unwrap()
+        .slack_threads_to_poll("slack-test", "C01ABC", generation_three, 10)
+        .unwrap();
+    assert_eq!(
+        threads.len(),
+        1,
+        "idle historical thread must not be re-polled"
+    );
+    assert_eq!(threads[0].key.thread_ts, root_two);
+    assert_eq!(
+        service
+            .sync_thread_replies(
+                &adapter,
+                &file_client,
+                &replies_client,
+                &threads[0],
+                generation_three,
+            )
+            .unwrap(),
+        (1, 0, 1)
+    );
+    assert_eq!(
+        replies_client.reply_call_count(),
+        3,
+        "two cataloged roots must produce one delta-based remote call"
+    );
+
+    let generation_four = service
+        .persistence_lock()
+        .unwrap()
+        .advance_slack_thread_poll_generation()
+        .unwrap();
+    let root_two_entry = service
+        .persistence_lock()
+        .unwrap()
+        .slack_threads_to_poll("slack-test", "C01ABC", generation_four, 10)
+        .unwrap()
+        .remove(0);
+    service
+        .sync_thread_replies(
+            &adapter,
+            &file_client,
+            &replies_client,
+            &root_two_entry,
+            generation_four,
+        )
+        .unwrap();
+
+    let late_reply = "1700000004.000001";
+    replies_client.replies.insert(
+        root_one.into(),
+        vec![
+            message(reply_one, Some(root_one), 0),
+            message(late_reply, Some(root_one), 0),
+        ],
+    );
+    let due_generation = generation_two + super::IDLE_THREAD_RECHECK_INTERVAL;
+    let mut generation = generation_four;
+    while generation < due_generation {
+        generation = service
+            .persistence_lock()
+            .unwrap()
+            .advance_slack_thread_poll_generation()
+            .unwrap();
+    }
+    let due_threads = service
+        .persistence_lock()
+        .unwrap()
+        .slack_threads_to_poll("slack-test", "C01ABC", generation, 10)
+        .unwrap();
+    let root_one_entry = due_threads
+        .iter()
+        .find(|entry| entry.key.thread_ts == root_one)
+        .unwrap();
+    assert_eq!(
+        service
+            .sync_thread_replies(
+                &adapter,
+                &file_client,
+                &replies_client,
+                root_one_entry,
+                generation,
+            )
+            .unwrap(),
+        (1, 0, 1)
+    );
+
+    let observations = service
+        .persistence_lock()
+        .unwrap()
+        .observation_page(0, 20)
+        .unwrap();
+    let actual_timestamps = observations
+        .iter()
+        .filter_map(|stored| stored.observation.payload.get("ts"))
+        .filter_map(serde_json::Value::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let full_rediscovery_timestamps =
+        std::collections::BTreeSet::from([root_one, reply_one, root_two, reply_two, late_reply]);
+    assert_eq!(actual_timestamps, full_rediscovery_timestamps);
+    assert_eq!(observations.len(), full_rediscovery_timestamps.len());
+    service.refresh_slack_thread_catalog().unwrap();
+    let persistence = service.persistence_lock().unwrap();
+    assert_eq!(
+        persistence.slack_thread_discovery_high_water().unwrap(),
+        persistence.observation_stats().unwrap().max_append_seq
+    );
+    assert_eq!(
+        persistence
+            .slack_thread_catalog("slack-test", "C01ABC")
+            .unwrap()
+            .len(),
+        2
+    );
+    drop(persistence);
+    service.refresh_slack_thread_catalog().unwrap();
+    assert_eq!(
+        service
+            .persistence_lock()
+            .unwrap()
+            .slack_thread_catalog("slack-test", "C01ABC")
+            .unwrap()
+            .len(),
+        2,
+        "replaying an empty discovery tail must not duplicate catalog entries"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
