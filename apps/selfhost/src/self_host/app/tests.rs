@@ -381,7 +381,10 @@ fn bootstrap_rebuilds_snapshot_from_persisted_observations() {
         .projection_records(&ProjectionRef::new("proj:person-page"))
         .unwrap()
         .unwrap();
-    assert_eq!(materialized["format_version"], 4);
+    assert_eq!(
+        materialized["format_version"],
+        super::NON_CORPUS_MATERIALIZATION_VERSION
+    );
     assert_eq!(materialized["observation_count"], 1);
     assert_eq!(materialized["last_append_seq"], 1);
     assert_eq!(materialized["person_message_count"], 1);
@@ -829,7 +832,7 @@ fn materialized_snapshot_selection_is_versioned_strict_and_stats_bound() {
     );
 
     let mut version_mismatch = value.clone();
-    version_mismatch["format_version"] = serde_json::json!(5);
+    version_mismatch["format_version"] = serde_json::json!(4);
     assert!(
         super::current_materialized_snapshot(version_mismatch, stats, &fingerprint, 0, 0)
             .unwrap()
@@ -863,6 +866,156 @@ fn materialized_snapshot_selection_is_versioned_strict_and_stats_bound() {
         ),
         Err(SelfHostError::Ingestion(_))
     ));
+}
+
+#[test]
+fn supplemental_projection_cache_and_fingerprint_match_full_replay_after_each_delta() {
+    let built_at = chrono::DateTime::parse_from_rfc3339("2026-07-15T00:01:00Z")
+        .unwrap()
+        .to_utc();
+    let at = |second: u32| {
+        chrono::DateTime::parse_from_rfc3339(&format!("2026-07-15T00:00:{second:02}Z"))
+            .unwrap()
+            .to_utc()
+    };
+    let record = |id: &str,
+                  kind: &str,
+                  payload: serde_json::Value,
+                  derived_from: InputAnchorSet,
+                  second: u32| SupplementalRecord {
+        id: SupplementalId::new(id),
+        kind: kind.to_owned(),
+        derived_from,
+        payload,
+        created_by: ActorRef::new("actor:test"),
+        created_at: at(second),
+        mutability: Mutability::AppendOnly,
+        record_version: None,
+        model_version: None,
+        consent_metadata: None,
+        lineage: None,
+    };
+    let observation_anchor = |id: &str| InputAnchorSet {
+        observations: vec![lethe_core::domain::ObservationId::new(id)],
+        blobs: Vec::new(),
+        supplementals: Vec::new(),
+    };
+    let supplemental_anchor = |id: &str| InputAnchorSet {
+        observations: Vec::new(),
+        blobs: Vec::new(),
+        supplementals: vec![SupplementalId::new(id)],
+    };
+    let records = vec![
+        record(
+            "sup:summary-cache",
+            "session-summary@1",
+            serde_json::json!({"summary": "summary", "project": "alpha"}),
+            observation_anchor("obs:source"),
+            1,
+        ),
+        record(
+            "sup:parking-cache",
+            "parking@1",
+            serde_json::json!({
+                "statement": "park",
+                "resume_context": "context",
+                "project": "alpha"
+            }),
+            observation_anchor("obs:source"),
+            2,
+        ),
+        record(
+            "sup:claim-cache",
+            "claim@1",
+            serde_json::json!({
+                "statement": "claim",
+                "verification_mode": "check",
+                "project": "alpha"
+            }),
+            observation_anchor("obs:source"),
+            3,
+        ),
+        record(
+            "sup:transition-cache",
+            "claim-transition@1",
+            serde_json::json!({"to_state": "parked"}),
+            supplemental_anchor("sup:claim-cache"),
+            4,
+        ),
+        record(
+            "sup:decision-cache",
+            "decision@1",
+            serde_json::json!({"statement": "decide", "project": "alpha"}),
+            observation_anchor("obs:source"),
+            5,
+        ),
+        record(
+            "sup:draft-cache",
+            "reply-draft@1",
+            serde_json::json!({
+                "channel": "slack",
+                "recipient": "U01",
+                "body": "reply",
+                "expires_at": "2026-07-15T00:00:30Z"
+            }),
+            observation_anchor("obs:incoming"),
+            6,
+        ),
+        record(
+            "sup:approval-cache",
+            "reply-approval@1",
+            serde_json::json!({"decision": "approved", "interface": "api"}),
+            supplemental_anchor("sup:draft-cache"),
+            7,
+        ),
+        record(
+            "sup:send-cache",
+            "send-record@1",
+            serde_json::json!({
+                "mode": "approved",
+                "sent_at": "2026-07-15T00:00:08Z"
+            }),
+            supplemental_anchor("sup:draft-cache"),
+            8,
+        ),
+    ];
+
+    let mut cache = super::SupplementalProjectionCache::from_records(&[]);
+    let mut prefix = Vec::new();
+    let mut fingerprint = super::supplemental_fingerprint(&[]).unwrap();
+    for current in records {
+        cache.replace(None, &current);
+        fingerprint =
+            super::supplemental_fingerprint_after_delta(&fingerprint, None, &current).unwrap();
+        prefix.push(current);
+
+        assert_eq!(
+            fingerprint,
+            super::supplemental_fingerprint(&prefix).unwrap()
+        );
+        let incremental_claim_queue = cache.claim_queue();
+        let full_claim_queue =
+            lethe_projection_claim_queue::ClaimQueueProjector.project_records(&prefix);
+        assert_eq!(
+            serde_json::to_value(&incremental_claim_queue).unwrap(),
+            serde_json::to_value(&full_claim_queue).unwrap()
+        );
+        let incremental_cognition = cache.cognition(&incremental_claim_queue, built_at);
+        let full_cognition = lethe_projection_cognition::CognitionStateProjector::new(built_at)
+            .project_with_claim_queue(&prefix, &full_claim_queue);
+        assert_eq!(
+            serde_json::to_value(&incremental_cognition).unwrap(),
+            serde_json::to_value(&full_cognition).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(cache.card_queue.projection(built_at)).unwrap(),
+            serde_json::to_value(
+                lethe_projection_cognition::CardQueueProjector::new(built_at)
+                    .project_records(&prefix)
+            )
+            .unwrap()
+        );
+    }
 }
 
 #[test]
