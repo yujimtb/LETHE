@@ -4534,16 +4534,24 @@ fn current_materialized_snapshot(
     persisted_projection_item_count: u64,
     persisted_reply_slo_count: u64,
 ) -> Result<Option<MaterializedProjectionSnapshot>, SelfHostError> {
-    let format_version = value
-        .as_object()
-        .and_then(|object| object.get("format_version"))
+    let object = value.as_object().ok_or_else(|| {
+        SelfHostError::Ingestion(
+            "proj:person-page materialization manifest is not a JSON object".to_owned(),
+        )
+    })?;
+    let Some(format_version) = object
+        .get("format_version")
         .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| {
-            SelfHostError::Ingestion(
-                "proj:person-page materialization has no numeric format_version".to_owned(),
-            )
-        })?;
-    if format_version != u64::from(NON_CORPUS_MATERIALIZATION_VERSION) {
+    else {
+        return Ok(None);
+    };
+    let current_format_version = u64::from(NON_CORPUS_MATERIALIZATION_VERSION);
+    if format_version > current_format_version {
+        return Err(SelfHostError::Ingestion(format!(
+            "proj:person-page materialization format {format_version} is newer than supported format {current_format_version}"
+        )));
+    }
+    if format_version < current_format_version {
         return Ok(None);
     }
     let manifest: MaterializedProjectionManifest = serde_json::from_value(value)?;

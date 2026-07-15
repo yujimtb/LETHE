@@ -331,7 +331,7 @@ fn test_channels() -> Vec<lethe_registry::registry::ChannelRecord> {
 }
 
 #[test]
-fn bootstrap_rebuilds_snapshot_from_persisted_observations() {
+fn bootstrap_migrates_legacy_manifest_to_v7_without_data_loss() {
     let root = std::env::temp_dir().join(format!("lethe-self-host-test-{}", uuid::Uuid::now_v7()));
     let db = root.join("lethe.sqlite3");
     let blobs = root.join("blobs");
@@ -372,11 +372,32 @@ fn bootstrap_rebuilds_snapshot_from_persisted_observations() {
         }),
     };
     persistence.persist_observation(&observation).unwrap();
+    let legacy_corpus = lethe_projection_corpus::CorpusProjector::personal_all_text_config()
+        .project_observations(std::slice::from_ref(&observation));
+    let expected_search_record_ids = legacy_corpus
+        .iter()
+        .map(|record| record.record_id.clone())
+        .collect::<Vec<_>>();
+    let mut legacy_manifest = serde_json::to_value(super::ProjectionSnapshot::default()).unwrap();
+    legacy_manifest["corpus"] = serde_json::to_value(&legacy_corpus).unwrap();
+    assert!(legacy_manifest.get("format_version").is_none());
+    persistence
+        .materialize_projection(&ProjectionRef::new("proj:person-page"), &legacy_manifest)
+        .unwrap();
+    let canonical_stats = persistence.observation_stats().unwrap();
     drop(persistence);
 
     let mut config = test_config(db.clone(), blobs.clone());
     config.corpus.mode = lethe_projection_corpus::CorpusMode::PersonalAllText;
     let service = AppService::bootstrap(config.clone()).unwrap();
+    assert_eq!(
+        service
+            .persistence_lock()
+            .unwrap()
+            .observation_stats()
+            .unwrap(),
+        canonical_stats
+    );
     let built_at = service.core_lock().unwrap().snapshot.built_at;
     let materialized = service
         .persistence_lock()
@@ -447,6 +468,19 @@ fn bootstrap_rebuilds_snapshot_from_persisted_observations() {
     };
 
     assert_eq!(response.data.matches.len(), 1);
+    let migrated_matches = response.data.matches.clone();
+    assert_eq!(
+        migrated_matches
+            .iter()
+            .map(|record| record.record_id.clone())
+            .collect::<Vec<_>>(),
+        expected_search_record_ids
+    );
+    assert!(
+        migrated_matches[0]
+            .snippet
+            .contains("persisted bootstrap needle")
+    );
     assert!(
         response
             .data
@@ -467,6 +501,7 @@ fn bootstrap_rebuilds_snapshot_from_persisted_observations() {
     drop(service);
 
     let restarted = AppService::bootstrap(config).unwrap();
+    assert_eq!(restarted.search_index.rebuild_started(), 0);
     assert_eq!(restarted.core_lock().unwrap().snapshot.built_at, built_at);
     assert!(
         restarted
@@ -486,6 +521,14 @@ fn bootstrap_rebuilds_snapshot_from_persisted_observations() {
             .unwrap()
             .len(),
         1
+    );
+    assert_eq!(
+        restarted
+            .corpus_grep_response(&request)
+            .unwrap()
+            .data
+            .matches,
+        migrated_matches
     );
 
     let _ = std::fs::remove_dir_all(root);
@@ -1124,13 +1167,13 @@ fn materialized_snapshot_selection_is_versioned_strict_and_stats_bound() {
         .is_none()
     );
 
-    let mut version_mismatch = value.clone();
-    version_mismatch["format_version"] =
-        serde_json::json!(super::NON_CORPUS_MATERIALIZATION_VERSION + 1);
+    let mut legacy_version = value.clone();
+    legacy_version["format_version"] =
+        serde_json::json!(super::NON_CORPUS_MATERIALIZATION_VERSION - 1);
     assert!(
         super::current_materialized_snapshot(
             &persistence,
-            version_mismatch,
+            legacy_version,
             stats,
             &fingerprint,
             0,
@@ -1139,6 +1182,66 @@ fn materialized_snapshot_selection_is_versioned_strict_and_stats_bound() {
         .unwrap()
         .is_none()
     );
+
+    let mut missing_version = value.clone();
+    missing_version
+        .as_object_mut()
+        .unwrap()
+        .remove("format_version");
+    assert!(
+        super::current_materialized_snapshot(
+            &persistence,
+            missing_version,
+            stats,
+            &fingerprint,
+            0,
+            0
+        )
+        .unwrap()
+        .is_none()
+    );
+
+    let mut non_numeric_version = value.clone();
+    non_numeric_version["format_version"] = serde_json::json!("legacy");
+    assert!(
+        super::current_materialized_snapshot(
+            &persistence,
+            non_numeric_version,
+            stats,
+            &fingerprint,
+            0,
+            0
+        )
+        .unwrap()
+        .is_none()
+    );
+
+    let mut future_version = value.clone();
+    future_version["format_version"] =
+        serde_json::json!(super::NON_CORPUS_MATERIALIZATION_VERSION + 1);
+    assert!(matches!(
+        super::current_materialized_snapshot(
+            &persistence,
+            future_version,
+            stats,
+            &fingerprint,
+            0,
+            0
+        ),
+        Err(SelfHostError::Ingestion(message)) if message.contains("newer than supported")
+    ));
+
+    assert!(matches!(
+        super::current_materialized_snapshot(
+            &persistence,
+            serde_json::json!([]),
+            stats,
+            &fingerprint,
+            0,
+            0
+        ),
+        Err(SelfHostError::Ingestion(message)) if message.contains("not a JSON object")
+    ));
 
     let mut malformed_current = value;
     malformed_current["unexpected"] = serde_json::json!(true);

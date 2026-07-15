@@ -1366,6 +1366,35 @@ mod tests {
     }
 
     #[test]
+    fn metadata_without_format_version_requires_full_rebuild() {
+        let path = temp_root();
+        fs::create_dir_all(&path).unwrap();
+        let index =
+            PersistentCorpusIndex::create(&path, MIN_WRITER_HEAP_BYTES, "cfg".into()).unwrap();
+        let mut legacy_metadata = serde_json::to_value(index.metadata().unwrap()).unwrap();
+        legacy_metadata
+            .as_object_mut()
+            .unwrap()
+            .remove("index_format_version");
+        let payload = serde_json::to_string(&legacy_metadata).unwrap();
+        {
+            let _mutation = index.mutation_lock().unwrap();
+            let mut writer = index.writer_lock().unwrap();
+            let mut prepared = writer.prepare_commit().unwrap();
+            prepared.set_payload(&payload);
+            prepared.commit().unwrap();
+        }
+        drop(index);
+
+        let error =
+            PersistentCorpusIndex::open(&path, MIN_WRITER_HEAP_BYTES, "cfg".into()).unwrap_err();
+        assert!(matches!(error, IndexError::Json(_)));
+        assert!(error.requires_rebuild());
+
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn search_snapshot_binds_reader_to_commit_metadata() {
         let path = temp_root();
         fs::create_dir_all(&path).unwrap();
