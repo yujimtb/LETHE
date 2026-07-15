@@ -84,6 +84,15 @@ with build, and then starts Tailscale Funnel against that port. On this host a
 Windows Startup shortcut script is installed at
 `C:\Users\mitob\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\LETHEPersonalLakeServices.vbs`;
 it runs `scripts\start_personal_lake_services.cmd` hidden after user login.
+Keep the `shell.Run` argument on one line; splitting the quoted command path
+across lines makes Windows Script Host fail with `Unterminated string
+constant`.
+
+```vbscript
+Set shell = CreateObject("WScript.Shell")
+shell.Run """D:\userdata\docs\projects\skcollege_database\scripts\start_personal_lake_services.cmd""", 0, False
+```
+
 This keeps the personal lake and Funnel up across normal Windows logins, but it
 still depends on Windows, Docker Desktop, and Tailscale being signed in and able
 to start.

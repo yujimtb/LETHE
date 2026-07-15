@@ -202,7 +202,8 @@ Codex/Claude Code の MCP login 用ターミナルを開きます。
 個人 lake を常駐させる場合は `scripts/start_personal_lake_services.cmd` を使います。
 このホストでは Windows Startup の `LETHEPersonalLakeServices.vbs` が
 `scripts\start_personal_lake_services.cmd` を実行し、Docker Compose selfhost と
-Tailscale Funnel を起動します。Docker Desktop はログイン時起動、Tailscale は
+Tailscale Funnel を起動します。`.vbs` の `shell.Run` 引数は 1 行の引用済みパスにし、
+改行で分割しないでください。Docker Desktop はログイン時起動、Tailscale は
 Windows service 自動起動かつ unattended mode、Docker container は
 `restart: unless-stopped` です。このホストでは AC/DC とも sleep/hibernate を無効化し、
 本番運用を開始済みです。
