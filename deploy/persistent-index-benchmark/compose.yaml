@@ -1,0 +1,55 @@
+name: lethe-persistent-index-benchmark
+
+services:
+  lethe-selfhost:
+    build:
+      context: ../..
+      dockerfile: deploy/persistent-index-benchmark/Dockerfile
+      args:
+        LETHE_BENCH_SOURCE_HEAD: ${LETHE_BENCH_SOURCE_HEAD:?LETHE_BENCH_SOURCE_HEAD is required}
+        LETHE_BENCH_SOURCE_TREE_SHA256: ${LETHE_BENCH_SOURCE_TREE_SHA256:?LETHE_BENCH_SOURCE_TREE_SHA256 is required}
+    environment:
+      LETHE_CONFIG_PATH: /etc/lethe/config.toml
+      LETHE_BENCH_STORAGE_ENCRYPTION_KEY: ${LETHE_BENCH_STORAGE_ENCRYPTION_KEY:?LETHE_BENCH_STORAGE_ENCRYPTION_KEY is required}
+      LETHE_BENCH_READ_TOKEN: ${LETHE_BENCH_READ_TOKEN:?LETHE_BENCH_READ_TOKEN is required}
+      LETHE_BENCH_WRITE_TOKEN: ${LETHE_BENCH_WRITE_TOKEN:?LETHE_BENCH_WRITE_TOKEN is required}
+      LETHE_BENCH_HEALTH_TOKEN: ${LETHE_BENCH_HEALTH_TOKEN:?LETHE_BENCH_HEALTH_TOKEN is required}
+    labels:
+      com.hlab.lethe.purpose: persistent-search-index-benchmark
+      com.hlab.lethe.benchmark-root: "${LETHE_BENCH_ROOT:?LETHE_BENCH_ROOT is required}"
+      com.hlab.lethe.benchmark-storage: native-ext4-bind
+    ports:
+      - "127.0.0.1:${LETHE_BENCH_HTTP_PORT:?LETHE_BENCH_HTTP_PORT is required}:8080"
+    volumes:
+      - type: bind
+        source: ./config.toml
+        target: /etc/lethe/config.toml
+        read_only: true
+      - type: bind
+        source: ./mcp-jwks.json
+        target: /etc/lethe/mcp-jwks.json
+        read_only: true
+      - type: bind
+        source: "${LETHE_BENCH_ROOT:?LETHE_BENCH_ROOT is required}/db"
+        target: /var/lib/lethe
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 4G
+    memswap_limit: 4G
+    cpus: 4.0
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "4.0"
+    restart: "no"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

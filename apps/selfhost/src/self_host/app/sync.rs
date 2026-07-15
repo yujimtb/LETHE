@@ -10,6 +10,7 @@ impl AppService {
         let mut quarantined = 0usize;
         let mut fetched = 0usize;
         let mut dead_letters = Vec::new();
+        let mut post_commit_error = None;
 
         let slack_policy = self.slack_adapter_config();
         for source in &self.slack_sources {
@@ -273,42 +274,11 @@ impl AppService {
         }
 
         let last_sync_at = Utc::now();
+        let slide_obs_by_presentation = self.latest_workspace_slide_observations()?;
         let mut core = self.core_lock()?;
         core.last_sync_at = Some(last_sync_at);
         core.last_sync_error = None;
         let should_rebuild_snapshot = slack_ingested > 0 || google_ingested > 0;
-
-        let schema = lethe_core::domain::SchemaRef::new("schema:workspace-object-snapshot");
-        let slide_observations: Vec<lethe_core::domain::Observation> =
-            core.lake.by_schema(&schema).into_iter().cloned().collect();
-        let slide_obs_by_presentation = slide_observations.iter().fold(
-            HashMap::<String, lethe_core::domain::Observation>::new(),
-            |mut acc, obs| {
-                let Some(presentation_id) = obs
-                    .payload
-                    .pointer("/artifact/sourceObjectId")
-                    .and_then(|value| value.as_str())
-                else {
-                    return acc;
-                };
-                let Some(source_instance) = obs
-                    .meta
-                    .get("source_instance")
-                    .and_then(serde_json::Value::as_str)
-                else {
-                    return acc;
-                };
-                let key = format!("{source_instance}:{presentation_id}");
-
-                match acc.get(&key) {
-                    Some(existing) if existing.published >= obs.published => {}
-                    _ => {
-                        acc.insert(key, obs.clone());
-                    }
-                }
-                acc
-            },
-        );
         let slide_analysis_records: Vec<lethe_core::domain::SupplementalRecord> = core
             .supplemental
             .by_kind("slide-analysis")
@@ -639,9 +609,24 @@ impl AppService {
 
             slide_analyses = analysis_results.len();
 
+            let resolved_observation_ids = slide_obs_by_presentation
+                .values()
+                .map(|observation| observation.id.clone())
+                .collect::<HashSet<_>>();
+            let mut resolved_supplemental_ids = core
+                .supplemental
+                .list()
+                .into_iter()
+                .map(|record| record.id.clone())
+                .collect::<HashSet<_>>();
+
             for result in &analysis_results {
                 let record = SlideAnalysisProjector::build_supplemental(result);
-                let rollback = match core.upsert_supplemental(record) {
+                let rollback = match core.upsert_supplemental_checked(
+                    record,
+                    |observation_id| resolved_observation_ids.contains(observation_id),
+                    |supplemental_id| resolved_supplemental_ids.contains(supplemental_id),
+                ) {
                     Ok(rollback) => rollback,
                     Err(error) => {
                         dead_letters.push(DeadLetter {
@@ -665,12 +650,14 @@ impl AppService {
                         source: result.presentation_id.clone(),
                         reason: err.to_string(),
                     });
+                } else {
+                    resolved_supplemental_ids.insert(persisted_record.id);
                 }
             }
 
             for result in &analysis_results {
                 let draft = SlideAnalysisProjector::create_analysis_observation(result);
-                let observation = match core.prepare_observation(draft) {
+                let observation = match prepare_draft(&core, draft) {
                     Ok(observation) => observation,
                     Err(IngestResult::Rejected { message, .. }) => {
                         dead_letters.push(DeadLetter {
@@ -700,7 +687,7 @@ impl AppService {
                         continue;
                     }
                 };
-                match self.append_prepared_observation(&mut core, observation) {
+                match self.append_prepared_observation(observation) {
                     Ok(IngestResult::Duplicate { .. }) => duplicates += 1,
                     Ok(IngestResult::Quarantined { .. }) => quarantined += 1,
                     Ok(_) => {}
@@ -712,12 +699,26 @@ impl AppService {
             }
         }
 
-        if should_rebuild_snapshot || slide_analyses > 0 {
-            core.rebuild_snapshot();
-            self.persistence_lock()?.materialize_projection(
-                &ProjectionRef::new("proj:person-page"),
-                &serde_json::to_value(&core.snapshot)?,
-            )?;
+        let retained_observations = self
+            .persistence_lock()?
+            .apply_retention(self.config.resource_limits.retention_days)?;
+        if should_rebuild_snapshot || slide_analyses > 0 || retained_observations > 0 {
+            let materialize_result = self.refresh_materialized_snapshot(&mut core);
+            let index_result = self.search_index.catch_up_after_append();
+            if let Err(error) = materialize_result {
+                dead_letters.push(DeadLetter {
+                    source: "projection:person-page".to_owned(),
+                    reason: error.to_string(),
+                });
+                post_commit_error = Some(error);
+            }
+            if let Err(error) = index_result {
+                dead_letters.push(DeadLetter {
+                    source: "projection:corpus".to_owned(),
+                    reason: error.to_string(),
+                });
+                post_commit_error = Some(error);
+            }
         }
 
         self.persistence_lock()?
@@ -752,8 +753,11 @@ impl AppService {
                     latency_ms,
                 },
             )?;
-            store.apply_retention(self.config.resource_limits.retention_days)?;
             store.garbage_collect_orphan_blobs()?;
+        }
+
+        if let Some(error) = post_commit_error {
+            return Err(error);
         }
 
         Ok(SyncReport {
@@ -765,5 +769,66 @@ impl AppService {
             dead_letters,
             last_sync_at,
         })
+    }
+
+    fn latest_workspace_slide_observations(
+        &self,
+    ) -> Result<HashMap<String, Observation>, SelfHostError> {
+        let configured = self
+            .google_sources
+            .iter()
+            .flat_map(|source| {
+                source
+                    .config
+                    .presentation_ids
+                    .iter()
+                    .map(|presentation_id| format!("{}:{presentation_id}", source.config.id))
+            })
+            .collect::<HashSet<_>>();
+        let mut latest = HashMap::<String, Observation>::with_capacity(configured.len());
+        let mut cursor = 0u64;
+        loop {
+            let page = self
+                .persistence_lock()?
+                .observation_page(cursor, self.config.corpus.rebuild_page_size)?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page
+                .last()
+                .expect("non-empty observation page must have a tail")
+                .append_seq;
+            for stored in page {
+                let observation = stored.observation;
+                if observation.schema.as_str() != "schema:workspace-object-snapshot" {
+                    continue;
+                }
+                let Some(presentation_id) = observation
+                    .payload
+                    .pointer("/artifact/sourceObjectId")
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                let Some(source_instance) = observation
+                    .meta
+                    .get("source_instance")
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                let key = format!("{source_instance}:{presentation_id}");
+                if !configured.contains(&key) {
+                    continue;
+                }
+                match latest.get(&key) {
+                    Some(existing) if existing.published >= observation.published => {}
+                    _ => {
+                        latest.insert(key, observation);
+                    }
+                }
+            }
+        }
+        Ok(latest)
     }
 }

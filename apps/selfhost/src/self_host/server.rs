@@ -297,8 +297,13 @@ async fn projection_lineage(
     headers: HeaderMap,
     Path(projection_id): Path<String>,
 ) -> Result<Json<lethe_engine::projection::lineage::LineageManifest>, ApiError> {
-    service.authorize_headers(&headers, "read:persons")?;
     ensure_known_projection(&projection_id)?;
+    let scope = match projection_id.as_str() {
+        "proj:person-page" => "read:persons",
+        "proj:answer-log" => "read:answer-log",
+        _ => "read:corpus",
+    };
+    service.authorize_headers(&headers, scope)?;
     Ok(Json(service.lineage_manifest(&projection_id)?))
 }
 async fn projection_records(
@@ -512,6 +517,15 @@ impl From<SelfHostError> for ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 body: ErrorResponse::projection_stale(&detail, 30),
             },
+            SelfHostError::SearchIndexUnavailable { code, detail } => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                body: ErrorResponse {
+                    error: code.to_owned(),
+                    detail: Some(detail),
+                    details: None,
+                    retry_after: Some(5),
+                },
+            },
             SelfHostError::SupplementalValidation { code, detail } => {
                 Self::unprocessable_entity(code, detail)
             }
@@ -581,5 +595,26 @@ fn ensure_known_projection(projection_id: &str) -> Result<(), ApiError> {
         | "proj:plan-state"
         | "proj:card-queue" => Ok(()),
         _ => Err(ApiError::not_found()),
+    }
+}
+
+#[cfg(test)]
+mod search_index_error_tests {
+    use super::*;
+
+    #[test]
+    fn search_index_unavailable_maps_to_retryable_http_503() {
+        let error = ApiError::from(SelfHostError::SearchIndexUnavailable {
+            code: "search_index_rebuilding",
+            detail: "generation is rebuilding".to_owned(),
+        });
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.body.error, "search_index_rebuilding");
+        assert_eq!(
+            error.body.detail.as_deref(),
+            Some("generation is rebuilding")
+        );
+        assert_eq!(error.body.retry_after, Some(5));
     }
 }

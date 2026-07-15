@@ -10,7 +10,7 @@ impl SqlitePersistence {
                 leaf_id TEXT NOT NULL CHECK (leaf_id LIKE 'lake:%'),
                 routing_key TEXT NOT NULL,
                 identity_key TEXT NOT NULL,
-                canonical_json TEXT NOT NULL,
+                canonical_json_sha256 TEXT NOT NULL,
                 recorded_at TEXT NOT NULL,
                 observation_json TEXT NOT NULL,
                 UNIQUE (leaf_id, identity_key)
@@ -40,6 +40,23 @@ impl SqlitePersistence {
                 records_json TEXT NOT NULL,
                 materialized_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS projection_materialization_items (
+                projection_id TEXT NOT NULL,
+                item_key TEXT NOT NULL CHECK (length(trim(item_key)) > 0),
+                owner_key TEXT NOT NULL CHECK (length(trim(owner_key)) > 0),
+                sort_key TEXT NOT NULL CHECK (length(trim(sort_key)) > 0),
+                value_json TEXT NOT NULL,
+                PRIMARY KEY (projection_id, item_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS projection_materialization_items_owner_order
+                ON projection_materialization_items (
+                    projection_id,
+                    owner_key,
+                    sort_key,
+                    item_key
+                );
 
             CREATE TABLE IF NOT EXISTS projection_leaf_watermarks (
                 projection_id TEXT NOT NULL,
@@ -160,7 +177,7 @@ impl SqlitePersistence {
             "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
             params![
                 CURRENT_SCHEMA_VERSION,
-                "authoritative_leaf_storage_and_runtime_state",
+                "canonical_json_sha256",
                 chrono::Utc::now().to_rfc3339(),
             ],
         )?;

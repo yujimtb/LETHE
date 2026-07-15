@@ -110,7 +110,12 @@ pub struct ResourceLimits {
 #[derive(Debug, Clone)]
 pub struct CorpusProjectionConfig {
     pub mode: CorpusMode,
+    pub index_dir: PathBuf,
+    pub writer_heap_bytes: usize,
+    pub rebuild_page_size: usize,
 }
+
+pub const MIN_CORPUS_INDEX_WRITER_HEAP_BYTES: usize = 15_000_000;
 
 #[derive(Debug, Clone)]
 pub struct FreshnessConfig {
@@ -248,6 +253,9 @@ struct LimitsFileConfig {
 #[serde(deny_unknown_fields)]
 struct CorpusFileConfig {
     mode: CorpusMode,
+    index_dir: PathBuf,
+    writer_heap_bytes: usize,
+    rebuild_page_size: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -461,6 +469,9 @@ impl SelfHostConfig {
             },
             corpus: CorpusProjectionConfig {
                 mode: raw.corpus.mode,
+                index_dir: raw.corpus.index_dir,
+                writer_heap_bytes: raw.corpus.writer_heap_bytes,
+                rebuild_page_size: raw.corpus.rebuild_page_size,
             },
             freshness: FreshnessConfig {
                 threshold_seconds: raw.freshness.threshold_seconds,
@@ -517,6 +528,7 @@ impl FileConfig {
             self.limits.max_leaf_observations,
         )?;
         require_positive("limits.retention_days", self.limits.retention_days as usize)?;
+        self.corpus.validate()?;
         if matches!(self.corpus.mode, CorpusMode::PersonalAllText) {
             let has_corpus_reader = self.api_tokens.iter().any(|token| {
                 token
@@ -616,6 +628,24 @@ impl FileConfig {
             }
         }
         Ok(())
+    }
+}
+
+impl CorpusFileConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.index_dir.as_os_str().is_empty()
+            || self.index_dir.to_string_lossy().trim().is_empty()
+        {
+            return Err(ConfigError::Invalid(
+                "corpus.index_dir must not be blank".to_owned(),
+            ));
+        }
+        if self.writer_heap_bytes < MIN_CORPUS_INDEX_WRITER_HEAP_BYTES {
+            return Err(ConfigError::Invalid(format!(
+                "corpus.writer_heap_bytes must be at least {MIN_CORPUS_INDEX_WRITER_HEAP_BYTES}"
+            )));
+        }
+        require_positive("corpus.rebuild_page_size", self.rebuild_page_size)
     }
 }
 
@@ -776,12 +806,128 @@ fn parse_encryption_key(value: &str) -> Result<[u8; 32], ConfigError> {
 mod tests {
     use super::*;
 
+    fn corpus_file_config(
+        index_dir: &str,
+        writer_heap_bytes: usize,
+        rebuild_page_size: usize,
+    ) -> CorpusFileConfig {
+        CorpusFileConfig {
+            mode: CorpusMode::WorkspaceFiltered,
+            index_dir: PathBuf::from(index_dir),
+            writer_heap_bytes,
+            rebuild_page_size,
+        }
+    }
+
     #[test]
     fn secret_string_debug_redacts_value() {
         let secret = SecretString::new("super-secret-token").unwrap();
         let debug = format!("{secret:?}");
         assert!(!debug.contains("super-secret-token"));
         assert!(debug.contains("redacted"));
+    }
+
+    #[test]
+    fn corpus_index_settings_are_required() {
+        let cases = [
+            (
+                "index_dir",
+                r#"
+                mode = "workspace_filtered"
+                writer_heap_bytes = 33554432
+                rebuild_page_size = 512
+                "#,
+            ),
+            (
+                "writer_heap_bytes",
+                r#"
+                mode = "workspace_filtered"
+                index_dir = "data/corpus-index"
+                rebuild_page_size = 512
+                "#,
+            ),
+            (
+                "rebuild_page_size",
+                r#"
+                mode = "workspace_filtered"
+                index_dir = "data/corpus-index"
+                writer_heap_bytes = 33554432
+                "#,
+            ),
+        ];
+
+        for (field, source) in cases {
+            let error = toml::from_str::<CorpusFileConfig>(source).unwrap_err();
+            assert!(
+                error.to_string().contains(field),
+                "missing {field} was not reported: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn corpus_index_settings_reject_invalid_values() {
+        let blank_dir = corpus_file_config("   ", 32 * 1024 * 1024, 512)
+            .validate()
+            .unwrap_err();
+        assert!(
+            blank_dir
+                .to_string()
+                .contains("index_dir must not be blank")
+        );
+
+        for writer_heap_bytes in [0, MIN_CORPUS_INDEX_WRITER_HEAP_BYTES - 1] {
+            let error = corpus_file_config("data/corpus-index", writer_heap_bytes, 512)
+                .validate()
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("writer_heap_bytes must be at least 15000000")
+            );
+        }
+
+        let zero_page = corpus_file_config("data/corpus-index", 32 * 1024 * 1024, 0)
+            .validate()
+            .unwrap_err();
+        assert!(
+            zero_page
+                .to_string()
+                .contains("rebuild_page_size must be positive")
+        );
+    }
+
+    #[test]
+    fn corpus_index_settings_accept_writer_minimum_and_positive_page() {
+        corpus_file_config("data/corpus-index", MIN_CORPUS_INDEX_WRITER_HEAP_BYTES, 1)
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn shipped_config_files_include_valid_corpus_index_settings() {
+        let configs = [
+            (
+                "config.example.toml",
+                include_str!("../../../../config.example.toml"),
+            ),
+            (
+                "deploy/personal-lake/config.toml",
+                include_str!("../../../../deploy/personal-lake/config.toml"),
+            ),
+            (
+                "deploy/personal-lake/config.host.toml",
+                include_str!("../../../../deploy/personal-lake/config.host.toml"),
+            ),
+        ];
+
+        for (name, source) in configs {
+            let config = toml::from_str::<FileConfig>(source)
+                .unwrap_or_else(|error| panic!("{name} must parse: {error}"));
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("{name} must validate: {error}"));
+        }
     }
 
     #[test]
@@ -815,6 +961,9 @@ mod tests {
             retention_days = 30
             [corpus]
             mode = "workspace_filtered"
+            index_dir = "data/corpus-index"
+            writer_heap_bytes = 33554432
+            rebuild_page_size = 512
             [freshness.threshold_seconds]
             "sys:slack" = 129600
             [ops]
@@ -877,6 +1026,9 @@ mod tests {
             retention_days = 3650
             [corpus]
             mode = "personal_all_text"
+            index_dir = "data/corpus-index"
+            writer_heap_bytes = 33554432
+            rebuild_page_size = 512
             [freshness.threshold_seconds]
             "sys:slack" = 129600
             [ops]
@@ -927,6 +1079,9 @@ mod tests {
             retention_days = 3650
             [corpus]
             mode = "personal_all_text"
+            index_dir = "data/corpus-index"
+            writer_heap_bytes = 33554432
+            rebuild_page_size = 512
             [freshness.threshold_seconds]
             "sys:slack" = 129600
             [ops]
@@ -978,6 +1133,9 @@ mod tests {
             retention_days = 30
             [corpus]
             mode = "workspace_filtered"
+            index_dir = "data/corpus-index"
+            writer_heap_bytes = 33554432
+            rebuild_page_size = 512
             [freshness.threshold_seconds]
             "sys:slack" = 129600
             [ops]

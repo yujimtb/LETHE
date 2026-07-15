@@ -9,7 +9,7 @@ impl AppService {
         let core = self.core_lock()?;
         Ok(
             HealthResponse::from_catalog(&core.catalog, env!("CARGO_PKG_VERSION")).with_runtime(
-                Vec::new(),
+                vec![self.search_index.health_dependency()],
                 LastSyncHealth {
                     completed_at: core.last_sync_at,
                     error: core.last_sync_error.clone(),
@@ -20,7 +20,7 @@ impl AppService {
     }
 
     pub fn deep_health(&self) -> Result<HealthResponse, SelfHostError> {
-        let dependency = match self.persistence_lock()?.deep_check() {
+        let storage_dependency = match self.persistence_lock()?.deep_check() {
             Ok(()) => DependencyHealthInfo {
                 name: "storage".to_owned(),
                 status: "ok".to_owned(),
@@ -35,7 +35,10 @@ impl AppService {
         let core = self.core_lock()?;
         Ok(
             HealthResponse::from_catalog(&core.catalog, env!("CARGO_PKG_VERSION")).with_runtime(
-                vec![dependency],
+                vec![
+                    storage_dependency,
+                    self.search_index.deep_health_dependency(),
+                ],
                 LastSyncHealth {
                     completed_at: core.last_sync_at,
                     error: core.last_sync_error.clone(),
@@ -74,6 +77,7 @@ impl AppService {
         built_at: DateTime<Utc>,
         lineage: &LineageManifest,
     ) -> Result<ProjectionMetadata, SelfHostError> {
+        self.ensure_projection_fresh(catalog, projection_id)?;
         let projection_id = ProjectionRef::new(projection_id);
         let entry = catalog
             .get(&projection_id)
@@ -90,17 +94,31 @@ impl AppService {
 
     pub fn lineage_manifest(&self, projection_id: &str) -> Result<LineageManifest, SelfHostError> {
         let core = self.core_lock()?;
+        self.ensure_projection_fresh(&core.catalog, projection_id)?;
         match projection_id {
             "proj:person-page" => Ok(core.snapshot.lineage.clone()),
-            "proj:corpus" => Ok(build_projection_lineage(
-                "proj:corpus",
-                core.lake.list(),
-                core.snapshot.corpus.len(),
-                core.snapshot.built_at,
-            )),
+            "proj:corpus" => {
+                drop(core);
+                let metadata = self.search_index.execute(|index| index.metadata())?;
+                Ok(build_projection_lineage(
+                    "proj:corpus",
+                    &metadata.projection_watermark,
+                    ObservationStats {
+                        count: metadata.observation_count,
+                        max_append_seq: metadata.last_append_seq,
+                    },
+                    usize::try_from(metadata.record_count).map_err(|_| {
+                        SelfHostError::Ingestion(
+                            "corpus record count does not fit usize".to_owned(),
+                        )
+                    })?,
+                    metadata.committed_at,
+                ))
+            }
             "proj:answer-log" => Ok(build_projection_lineage(
                 "proj:answer-log",
-                core.lake.list(),
+                &core.snapshot.lineage.build_id,
+                core.observation_stats,
                 core.snapshot.answer_log.len(),
                 core.snapshot.built_at,
             )),
@@ -112,15 +130,19 @@ impl AppService {
             )),
             "proj:freshness" => Ok(build_projection_lineage(
                 "proj:freshness",
-                core.lake.list(),
+                &core.snapshot.lineage.build_id,
+                core.observation_stats,
                 core.snapshot.freshness.sources.len(),
                 core.snapshot.built_at,
             )),
             "proj:reply-slo" => Ok(build_mixed_projection_lineage(
                 "proj:reply-slo",
-                core.lake.list(),
+                &core.snapshot.lineage.build_id,
+                core.observation_stats,
                 &core.supplemental.list(),
-                core.snapshot.reply_slo.rows.len(),
+                usize::try_from(core.reply_slo_count).map_err(|_| {
+                    SelfHostError::Ingestion("reply SLO count does not fit usize".to_owned())
+                })?,
                 core.snapshot.built_at,
             )),
             "proj:break-glass" => Ok(build_channel_registry_projection_lineage(
@@ -153,6 +175,7 @@ impl AppService {
         read_mode: Option<&str>,
         pin: Option<&str>,
     ) -> Result<ReadMode, SelfHostError> {
+        self.ensure_projection_fresh(catalog, projection_id)?;
         let spec = &catalog
             .get(&ProjectionRef::new(projection_id))
             .ok_or_else(|| SelfHostError::NotFound(projection_id.to_string()))?
@@ -183,21 +206,88 @@ impl AppService {
         &self,
         core: &mut AppCore,
     ) -> Result<(), SelfHostError> {
-        let (observations, supplementals) = {
-            let store = self.persistence_lock()?;
-            (store.load_observations()?, store.load_supplementals()?)
+        #[cfg(test)]
+        self.non_corpus_rebuild_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let result = (|| {
+            let materialized = {
+                let store = self.persistence_lock()?;
+                let supplementals = store.load_supplementals()?;
+                let stats = store.observation_stats()?;
+                rebuild_materialized_snapshot_paged(
+                    store.as_ref(),
+                    &supplementals,
+                    &core.freshness_thresholds,
+                    &core
+                        .registry
+                        .list_channels()
+                        .into_iter()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    stats,
+                    self.config.corpus.rebuild_page_size,
+                    Utc::now(),
+                )?
+            };
+            core.install_materialized(materialized);
+            Ok(())
+        })();
+        if result.is_err() {
+            core.mark_non_corpus_materializations_stale();
+        }
+        result
+    }
+
+    pub(super) fn materialize_after_observation_append(
+        &self,
+        core: &mut AppCore,
+        appended_observations: &[Observation],
+    ) -> Result<(), SelfHostError> {
+        let result = match classify_non_corpus_delta(appended_observations) {
+            NonCorpusDeltaKind::FreshnessOnly | NonCorpusDeltaKind::SlackMessage => {
+                let stats = self.persistence_lock()?.observation_stats()?;
+                match MaterializedProjectionSnapshot::compact_incremental_delta(
+                    core,
+                    appended_observations,
+                    stats,
+                    Utc::now(),
+                )? {
+                    MaterializedDeltaResult::Applied(materialized) => {
+                        self.persist_materialized_snapshot(core, *materialized)
+                    }
+                    MaterializedDeltaResult::FullRebuildRequired(reason) => {
+                        tracing::info!(%reason, "compact non-corpus delta requires full rebuild");
+                        self.refresh_materialized_snapshot(core)
+                    }
+                }
+            }
+            NonCorpusDeltaKind::FullRebuild => self.refresh_materialized_snapshot(core),
         };
-        let snapshot = ProjectionSnapshot::build(
-            observations,
-            supplementals,
-            core.corpus_config.clone(),
-            core.freshness_thresholds.clone(),
-            core.registry.list_channels().into_iter().cloned().collect(),
+        if result.is_err() {
+            core.mark_non_corpus_materializations_stale();
+        }
+        result
+    }
+
+    fn persist_materialized_snapshot(
+        &self,
+        core: &mut AppCore,
+        mut materialized: MaterializedProjectionSnapshot,
+    ) -> Result<(), SelfHostError> {
+        materialized.validate()?;
+        let pending_commit = materialized.pending_item_commit.take().ok_or_else(|| {
+            SelfHostError::Ingestion(
+                "new proj:person-page materialization has no pending projection item commit"
+                    .to_owned(),
+            )
+        })?;
+        let snapshot_value = serde_json::to_value(&materialized)?;
+        self.persistence_lock()?.commit_projection_items(
+            &ProjectionRef::new("proj:person-page"),
+            &snapshot_value,
+            &pending_commit.commit,
         )?;
-        let snapshot_value = serde_json::to_value(&snapshot)?;
-        self.persistence_lock()?
-            .materialize_projection(&ProjectionRef::new("proj:person-page"), &snapshot_value)?;
-        core.snapshot = snapshot;
+        core.install_materialized(materialized);
         Ok(())
     }
 
@@ -212,19 +302,21 @@ impl AppService {
                 self.config.resource_limits.max_payload_bytes
             )));
         }
-        let mut core = self.core_lock()?;
-        let observation = match core.prepare_observation(draft) {
-            Ok(observation) => observation,
-            Err(IngestResult::Rejected { message, .. }) => {
-                return Err(SelfHostError::Ingestion(message));
+        let observation = {
+            let core = self.core_lock()?;
+            match prepare_draft(&core, draft) {
+                Ok(observation) => observation,
+                Err(IngestResult::Rejected { message, .. }) => {
+                    return Err(SelfHostError::Ingestion(message));
+                }
+                Err(IngestResult::Quarantined { ticket }) => {
+                    return Err(SelfHostError::Ingestion(ticket.reason));
+                }
+                Err(result) => return Ok(result),
             }
-            Err(IngestResult::Quarantined { ticket }) => {
-                return Err(SelfHostError::Ingestion(ticket.reason));
-            }
-            Err(result) => return Ok(result),
         };
 
-        let result = self.append_prepared_observation(&mut core, observation)?;
+        let result = self.append_prepared_observation(observation)?;
 
         match &result {
             IngestResult::Rejected { message, .. } => {
@@ -239,7 +331,6 @@ impl AppService {
 
     pub(super) fn append_prepared_observation(
         &self,
-        core: &mut AppCore,
         observation: Observation,
     ) -> Result<IngestResult, SelfHostError> {
         let recorded_at = observation.recorded_at;
@@ -247,22 +338,14 @@ impl AppService {
         let durable_outcome = self.persistence_lock()?.append_observation(&observation)?;
 
         let result = match durable_outcome {
-            DurableAppendOutcome::Appended(id) => match core.lake.append_idempotent(observation) {
-                lethe_engine::lake::store::AppendOutcome::Appended(_) => {
-                    self.emit_audit(
-                        "actor:self-host",
-                        AuditEventKind::WriteExecution,
-                        serde_json::json!({"observation_id": id.as_str()}),
-                    );
-                    IngestResult::Ingested { id, recorded_at }
-                }
-                lethe_engine::lake::store::AppendOutcome::Duplicate(existing_id)
-                | lethe_engine::lake::store::AppendOutcome::Conflict(existing_id) => {
-                    return Err(SelfHostError::Ingestion(format!(
-                        "SQLite accepted observation {id}, but cache already contains {existing_id}"
-                    )));
-                }
-            },
+            DurableAppendOutcome::Appended(id) => {
+                self.emit_audit(
+                    "actor:self-host",
+                    AuditEventKind::WriteExecution,
+                    serde_json::json!({"observation_id": id.as_str()}),
+                );
+                IngestResult::Ingested { id, recorded_at }
+            }
             DurableAppendOutcome::Duplicate(existing_id) => IngestResult::Duplicate { existing_id },
             DurableAppendOutcome::CanonicalCollision(existing_id) => IngestResult::Quarantined {
                 ticket: lethe_core::domain::QuarantineTicket {
@@ -580,29 +663,18 @@ pub(super) fn namespace_draft(
 }
 
 pub(super) fn build_person_page_lineage(
-    observations: &[Observation],
-    supplementals: &[&lethe_core::domain::SupplementalRecord],
+    canonical_observation_fingerprint: &str,
+    stats: ObservationStats,
+    supplemental_fingerprint: &str,
+    supplemental_count: usize,
     output_count: usize,
     built_at: DateTime<Utc>,
 ) -> LineageManifest {
-    let mut observation_refs = observations
-        .iter()
-        .map(|observation| format!("observation:{}", observation.id))
-        .collect::<Vec<_>>();
-    let mut supplemental_refs = supplementals
-        .iter()
-        .map(|record| format!("supplemental:{}", record.id))
-        .collect::<Vec<_>>();
-    observation_refs.sort();
-    supplemental_refs.sort();
-
-    let mut hasher = Sha256::new();
-    hasher.update(b"proj:person-page@1.0.0\n");
-    for input_ref in observation_refs.iter().chain(&supplemental_refs) {
-        hasher.update(input_ref.as_bytes());
-        hasher.update(b"\n");
-    }
-    let build_id = format!("build-{}", hex::encode(hasher.finalize()));
+    let build_id = person_page_build_id(
+        canonical_observation_fingerprint,
+        stats.count,
+        supplemental_fingerprint,
+    );
     let mut lineage = LineageManifest::new(
         ProjectionRef::new("proj:person-page"),
         SemVer::new("1.0.0"),
@@ -613,39 +685,35 @@ pub(super) fn build_person_page_lineage(
     lineage.deterministic = true;
     lineage.add_source(SourceSnapshot {
         source_ref: "lake".to_string(),
-        watermark_position: Some(observations.len()),
-        record_count: observations.len(),
+        watermark_position: Some(
+            usize::try_from(stats.max_append_seq)
+                .expect("canonical append sequence must fit usize"),
+        ),
+        record_count: usize::try_from(stats.count)
+            .expect("canonical observation count must fit usize"),
     });
     lineage.add_source(SourceSnapshot {
-        source_ref: "supplemental:slide-analysis".to_string(),
+        source_ref: "supplemental".to_string(),
         watermark_position: None,
-        record_count: supplementals.len(),
+        record_count: supplemental_count,
     });
-    for input_ref in observation_refs.into_iter().chain(supplemental_refs) {
-        lineage.add_input_ref(input_ref);
-    }
     lineage
 }
 
 pub(super) fn build_projection_lineage(
     projection_id: &str,
-    observations: &[Observation],
+    canonical_build_id: &str,
+    stats: ObservationStats,
     output_count: usize,
     built_at: DateTime<Utc>,
 ) -> LineageManifest {
-    let mut input_refs = observations
-        .iter()
-        .map(|observation| format!("observation:{}", observation.id))
-        .collect::<Vec<_>>();
-    input_refs.sort();
-
     let mut hasher = Sha256::new();
     hasher.update(projection_id.as_bytes());
     hasher.update(b"@1.0.0\n");
-    for input_ref in &input_refs {
-        hasher.update(input_ref.as_bytes());
-        hasher.update(b"\n");
-    }
+    hasher.update(canonical_build_id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(stats.count.to_be_bytes());
+    hasher.update(stats.max_append_seq.to_be_bytes());
     let build_id = format!("build-{}", hex::encode(hasher.finalize()));
     let mut lineage = LineageManifest::new(
         ProjectionRef::new(projection_id),
@@ -657,12 +725,13 @@ pub(super) fn build_projection_lineage(
     lineage.deterministic = true;
     lineage.add_source(SourceSnapshot {
         source_ref: "lake".to_string(),
-        watermark_position: Some(observations.len()),
-        record_count: observations.len(),
+        watermark_position: Some(
+            usize::try_from(stats.max_append_seq)
+                .expect("canonical append sequence must fit usize"),
+        ),
+        record_count: usize::try_from(stats.count)
+            .expect("canonical observation count must fit usize"),
     });
-    for input_ref in input_refs {
-        lineage.add_input_ref(input_ref);
-    }
     lineage
 }
 
@@ -707,25 +776,25 @@ pub(super) fn build_supplemental_projection_lineage(
 
 pub(super) fn build_mixed_projection_lineage(
     projection_id: &str,
-    observations: &[Observation],
+    canonical_build_id: &str,
+    stats: ObservationStats,
     supplementals: &[&lethe_core::domain::SupplementalRecord],
     output_count: usize,
     built_at: DateTime<Utc>,
 ) -> LineageManifest {
-    let mut input_refs = observations
+    let mut input_refs = supplementals
         .iter()
-        .map(|observation| format!("observation:{}", observation.id))
-        .chain(
-            supplementals
-                .iter()
-                .map(|record| format!("supplemental:{}", record.id)),
-        )
+        .map(|record| format!("supplemental:{}", record.id))
         .collect::<Vec<_>>();
     input_refs.sort();
 
     let mut hasher = Sha256::new();
     hasher.update(projection_id.as_bytes());
     hasher.update(b"@1.0.0\n");
+    hasher.update(canonical_build_id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(stats.count.to_be_bytes());
+    hasher.update(stats.max_append_seq.to_be_bytes());
     for input_ref in &input_refs {
         hasher.update(input_ref.as_bytes());
         hasher.update(b"\n");
@@ -741,8 +810,12 @@ pub(super) fn build_mixed_projection_lineage(
     lineage.deterministic = true;
     lineage.add_source(SourceSnapshot {
         source_ref: "lake".to_string(),
-        watermark_position: Some(observations.len()),
-        record_count: observations.len(),
+        watermark_position: Some(
+            usize::try_from(stats.max_append_seq)
+                .expect("canonical append sequence must fit usize"),
+        ),
+        record_count: usize::try_from(stats.count)
+            .expect("canonical observation count must fit usize"),
     });
     lineage.add_source(SourceSnapshot {
         source_ref: "supplemental".to_string(),
@@ -798,17 +871,10 @@ pub(super) fn consent_status_for_person_id(
     core: &AppCore,
     person_id: &str,
 ) -> Result<ConsentStatus, SelfHostError> {
-    let person = core
-        .snapshot
-        .identity
-        .resolved_persons
-        .iter()
-        .find(|person| person.person_id.as_str() == person_id)
-        .ok_or_else(|| SelfHostError::NotFound(person_id.to_string()))?;
-    Ok(PersonPageProjector::consent_status_for_person(
-        person,
-        core.lake.list(),
-    ))
+    core.person_consents
+        .get(person_id)
+        .cloned()
+        .ok_or_else(|| SelfHostError::NotFound(person_id.to_string()))
 }
 
 pub(super) fn json_contains_string(value: &serde_json::Value, needle: &str) -> bool {

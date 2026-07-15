@@ -97,6 +97,7 @@ impl AppService {
         }
 
         let mut core = self.core_lock()?;
+        self.ensure_projection_fresh(&core.catalog, "proj:person-page")?;
         if core.supplemental.get(&record.id).is_some() {
             return Err(append_only_conflict(&record.id));
         }
@@ -115,12 +116,40 @@ impl AppService {
             ));
         };
 
-        if let Err(error) = self.persistence_lock()?.put_supplemental(&persisted_record) {
+        let projection_result = (|| {
+            let store = self.persistence_lock()?;
+            let delta = materialized_snapshot_after_supplemental_delta(
+                &core,
+                store.as_ref(),
+                &persisted_record,
+                Utc::now(),
+            )?;
+            let manifest = serde_json::to_value(&delta.materialized)?;
+            Ok::<_, SelfHostError>((delta, manifest))
+        })();
+        let (delta, manifest) = match projection_result {
+            Ok(result) => result,
+            Err(error) => {
+                core.rollback_supplemental(rollback);
+                core.mark_non_corpus_materializations_stale();
+                return Err(error);
+            }
+        };
+        let commit_result = (|| {
+            self.persistence_lock()?
+                .commit_supplemental_and_projection(
+                    &persisted_record,
+                    &ProjectionRef::new("proj:person-page"),
+                    &manifest,
+                    &delta.item_commit,
+                )?;
+            Ok::<_, SelfHostError>(())
+        })();
+        if let Err(error) = commit_result {
             core.rollback_supplemental(rollback);
-            return Err(SelfHostError::Storage(error));
+            return Err(error);
         }
-
-        self.refresh_materialized_snapshot(&mut core)?;
+        core.install_materialized(delta.materialized);
 
         drop(core);
         self.emit_audit(

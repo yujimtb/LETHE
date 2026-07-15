@@ -649,19 +649,19 @@ fn decision_replacement_map(
                     .cmp(&right.created_at)
                     .then_with(|| left.id.as_str().cmp(right.id.as_str()))
             });
-            if replacements.len() > 1 {
-                if let Some(last) = replacements.last() {
-                    audit_log.push(ProjectionAuditEvent {
-                        record_id: last.id.clone(),
-                        target_claim_id: None,
-                        code: "ambiguous_decision_supersedes".to_owned(),
-                        message: format!(
-                            "multiple decisions supersede {}; newest replacement was selected",
-                            superseded
-                        ),
-                        created_at: last.created_at,
-                    });
-                }
+            if replacements.len() > 1
+                && let Some(last) = replacements.last()
+            {
+                audit_log.push(ProjectionAuditEvent {
+                    record_id: last.id.clone(),
+                    target_claim_id: None,
+                    code: "ambiguous_decision_supersedes".to_owned(),
+                    message: format!(
+                        "multiple decisions supersede {}; newest replacement was selected",
+                        superseded
+                    ),
+                    created_at: last.created_at,
+                });
             }
             replacements
                 .last()
@@ -819,7 +819,7 @@ fn normalize_search_text(value: &str) -> String {
 
 fn split_query_terms(query: &str) -> Vec<String> {
     query
-        .split(|ch| matches!(ch, ' ' | '\t' | '\u{3000}'))
+        .split([' ', '\t', '\u{3000}'])
         .filter(|term| !term.is_empty())
         .map(str::to_owned)
         .collect()

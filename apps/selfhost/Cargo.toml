@@ -24,6 +24,7 @@ lethe-projection-corpus = { path = "../../crates/projections/corpus" }
 lethe-projection-person = { path = "../../crates/projections/person" }
 lethe-registry = { path = "../../crates/registry" }
 lethe-runtime = { path = "../../crates/runtime" }
+lethe-search-index = { path = "../../crates/search-index" }
 lethe-storage-api = { path = "../../crates/storage/api" }
 lethe-storage-sqlite = { path = "../../crates/storage/sqlite" }
 regex.workspace = true

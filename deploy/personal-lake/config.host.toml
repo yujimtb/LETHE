@@ -47,6 +47,9 @@ retention_days = 3650
 
 [corpus]
 mode = "personal_all_text"
+index_dir = "deploy/personal-lake/data/corpus-index"
+writer_heap_bytes = 33554432
+rebuild_page_size = 512
 
 [freshness.threshold_seconds]
 "sys:claude-ai" = 129600

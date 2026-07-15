@@ -786,7 +786,6 @@ mod tests {
                 ],
                 ..PersonPageOutput::default()
             },
-            corpus: Vec::new(),
             answer_log: Vec::new(),
             claim_queue: Default::default(),
             freshness: Default::default(),

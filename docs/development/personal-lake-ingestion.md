@@ -616,10 +616,20 @@ latest published `2026-07-07T16:48:07.649Z`, and freshness `fresh`.
 
 Import performance note: `AppService::ingest_observation_drafts` prepares the
 batch once, appends observations through the storage bulk API inside one SQLite
-transaction, emits one summary audit event, and rebuilds/materializes projections
-once per non-empty import batch. This keeps large coding-agent imports bounded;
-do not reintroduce per-observation materialization or per-observation audit
-writes on this path.
+transaction, and emits one summary audit event. For each non-empty batch, the
+persistent corpus index consumes only the new canonical tail and upserts each
+`record_id` once. Non-corpus materialization fixes one canonical high-water,
+performs two bounded page passes, writes message and reply-SLO rows to a SQLite
+staging projection, and atomically publishes the verified manifest and rows.
+This path never loads all observations or the full corpus into memory. Do not
+reintroduce per-observation materialization, per-observation audit writes, or a
+full corpus-index rebuild on normal import.
+
+Supplemental writes compute a strict non-corpus projection-item delta. SQLite
+commits the supplemental append, item inserts/updates/deletes, and projection
+manifest in one transaction; the in-memory snapshot is installed only after
+that commit succeeds. A projection inconsistency fails the write and marks the
+non-corpus materialization stale instead of serving a partially updated view.
 
 ## Communication Channels
 
@@ -805,14 +815,25 @@ records. The response includes the flat `records` list plus `structure` with
 `root_session` and `sidechains`, so callers must preserve the parent/child
 relationship instead of flattening sidechains into a single anonymous thread.
 
-Selfhost startup rebuilds the projection snapshot from persisted observations
-and supplementals before materializing it. Importing new observations with
-the online import API rebuilds and materializes the projection snapshot inside
-the running service, so MCP corpus reads see the durable data without a service
-restart.
+Personal corpus search is backed by a persistent Tantivy index under
+`/var/lib/lethe/corpus-index`. `CURRENT` names the published generation and the
+generation files live under `generations/<UUIDv7>/`. Selfhost opens and validates
+that generation at startup, then incrementally catches up only observations
+after its stored append sequence. Online imports use the same tail catch-up and
+idempotent `record_id` upserts, so new durable data becomes searchable without a
+service restart or a full rebuild.
 
-Filtered corpus grep applies source-type filters before building the trigram
-index, then applies the regex execution timeout only to the regex matching loop.
-Keep that order intact: broad personal-lake text can exceed the request timeout
-or time out valid source-filtered coding-agent queries if indexing is counted as
-regex execution.
+The index stores the corpus fields required by `search_lake`, `get_record`, and
+`get_thread`; reads load only index data and the matching records. Selfhost does
+not retain every Observation or Corpus record in memory, and it does not build a
+trigram index for each request. Search uses the persistent 1〜3-gram Tantivy
+index for candidate selection and applies the existing source/time/order/cursor
+contract and final match verification to those candidates.
+
+A missing first generation, an incompatible schema or corpus configuration, or
+detected index corruption starts a background rebuild from fixed-size canonical
+pages. While the index is opening, catching up, rebuilding, or failed, HTTP and
+MCP corpus reads return an explicit unavailable error; they must never return an
+empty result as a silent substitute. A rebuilt generation becomes visible only
+after validation and atomic `CURRENT` publication, and the retired generation
+is removed only after its in-flight readers release it.

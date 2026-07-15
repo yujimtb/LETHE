@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
 pub const CORPUS_PROJECTION_ID: &str = "proj:corpus";
+pub const CORPUS_PROJECTOR_VERSION: u32 = 1;
 const SUPPORTED_SOURCE_TYPES: &[&str] = &[
     "chatgpt",
     "claude-ai",
@@ -70,7 +71,36 @@ impl Default for CorpusConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+impl CorpusConfig {
+    /// Stable fingerprint for every policy input that can change Corpus exposure.
+    pub fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+
+        fn sorted(values: &HashSet<String>) -> Vec<&str> {
+            let mut values = values.iter().map(String::as_str).collect::<Vec<_>>();
+            values.sort_unstable();
+            values
+        }
+
+        let policy = serde_json::json!({
+            "projector_version": CORPUS_PROJECTOR_VERSION,
+            "mode": self.mode,
+            "channel_allow_regex": self.channel_allow_regex.as_str(),
+            "channel_opt_in": sorted(&self.channel_opt_in),
+            "exclude_bot_authors": self.exclude_bot_authors,
+            "opt_out_people": sorted(&self.opt_out_people),
+            "allowed_folder_ids": sorted(&self.allowed_folder_ids),
+            "broad_visibility_threshold": self.broad_visibility_threshold,
+            "excluded_file_ids": sorted(&self.excluded_file_ids),
+            "exclude_form_response_sheets": self.exclude_form_response_sheets,
+        });
+        let encoded = serde_json::to_vec(&policy).expect("Corpus policy serializes");
+        format!("{:x}", Sha256::digest(encoded))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SharingThreshold {
     SpecificUsers,
     Domain,
@@ -124,29 +154,49 @@ impl CorpusProjector {
         }
     }
 
+    /// Projects one canonical Observation using the persisted workspace exclusion state.
+    pub fn project_observation(
+        &self,
+        observation: &Observation,
+        form_response_sheet_ids: &HashSet<String>,
+    ) -> Vec<CorpusRecord> {
+        let mut records = match self.config.mode {
+            CorpusMode::WorkspaceFiltered => {
+                if observation.schema.as_str() == "schema:bot-answer-log" {
+                    Vec::new()
+                } else {
+                    match observation.schema.as_str() {
+                        "schema:slack-message" => {
+                            self.slack_record(observation).into_iter().collect()
+                        }
+                        "schema:workspace-object-snapshot" => {
+                            self.workspace_records(observation, form_response_sheet_ids)
+                        }
+                        _ => Vec::new(),
+                    }
+                }
+            }
+            CorpusMode::PersonalAllText => personal_record(observation).into_iter().collect(),
+        };
+        records.sort_by(|left, right| {
+            right
+                .timestamp
+                .cmp(&left.timestamp)
+                .then_with(|| left.record_id.cmp(&right.record_id))
+        });
+        records
+    }
+
     fn project_workspace_filtered(&self, observations: &[Observation]) -> Vec<CorpusRecord> {
         let form_response_sheet_ids = observations
             .iter()
             .filter_map(linked_form_sheet_id)
             .collect::<HashSet<_>>();
 
-        let mut records = Vec::new();
-        for observation in observations {
-            if observation.schema.as_str() == "schema:bot-answer-log" {
-                continue;
-            }
-            match observation.schema.as_str() {
-                "schema:slack-message" => {
-                    if let Some(record) = self.slack_record(observation) {
-                        records.push(record);
-                    }
-                }
-                "schema:workspace-object-snapshot" => {
-                    records.extend(self.workspace_records(observation, &form_response_sheet_ids));
-                }
-                _ => {}
-            }
-        }
+        let mut records = observations
+            .iter()
+            .flat_map(|observation| self.project_observation(observation, &form_response_sheet_ids))
+            .collect::<Vec<_>>();
         records.sort_by(|left, right| {
             right
                 .timestamp
@@ -159,7 +209,7 @@ impl CorpusProjector {
     fn project_personal_all_text(&self, observations: &[Observation]) -> Vec<CorpusRecord> {
         let mut records = observations
             .iter()
-            .filter_map(personal_record)
+            .flat_map(|observation| self.project_observation(observation, &HashSet::new()))
             .collect::<Vec<_>>();
         records.sort_by(|left, right| {
             right
@@ -205,22 +255,22 @@ impl CorpusProjector {
         let anchor = string_at(&observation.payload, &["permalink"])
             .map(str::to_owned)
             .unwrap_or_else(|| format!("slack://{channel_id}/{ts}"));
-        Some(record(
-            format!("corpus:slack:{channel_id}:{ts}"),
-            "slack",
-            anchor,
-            channel.to_owned(),
-            Some(format!("#{channel}")),
-            observation.published,
+        Some(record(RecordInput {
+            record_id: format!("corpus:slack:{channel_id}:{ts}"),
+            source_type: "slack",
+            anchor_url: anchor,
+            source_title: channel.to_owned(),
+            source_location: Some(format!("#{channel}")),
+            timestamp: observation.published,
             text,
             thread_ts,
-            Some(channel.to_owned()),
-            serde_json::json!({
+            container: Some(channel.to_owned()),
+            metadata: serde_json::json!({
                 "observation_id": observation.id,
                 "channel_id": channel_id,
                 "author": string_at(&observation.payload, &["user_name"]),
             }),
-        ))
+        }))
     }
 
     fn workspace_records(
@@ -315,19 +365,22 @@ impl CorpusProjector {
                 let anchor = string_at(chunk, &["anchor"])
                     .map(|anchor| format!("{base_url}#{anchor}"))
                     .unwrap_or_else(|| base_url.clone());
-                Some(record(
-                    format!("corpus:docs:{}:{idx}", observation.id),
-                    "docs",
-                    anchor,
-                    title.clone(),
-                    heading,
-                    observation.published,
+                Some(record(RecordInput {
+                    record_id: format!("corpus:docs:{}:{idx}", observation.id),
+                    source_type: "docs",
+                    anchor_url: anchor,
+                    source_title: title.clone(),
+                    source_location: heading,
+                    timestamp: observation.published,
                     text,
-                    None,
-                    string_at(&observation.payload, &["artifact", "containerId"])
+                    thread_ts: None,
+                    container: string_at(&observation.payload, &["artifact", "containerId"])
                         .map(str::to_owned),
-                    serde_json::json!({"observation_id": observation.id}),
-                ))
+                    metadata: serde_json::json!({
+                        "observation_id": observation.id,
+                        "source_object_id": source_object_id(observation),
+                    }),
+                }))
             })
             .collect()
     }
@@ -355,18 +408,26 @@ impl CorpusProjector {
                     if text.trim().is_empty() {
                         continue;
                     }
-                    records.push(record(
-                        format!("corpus:sheets:{}:{tab_name}:{row_number}", observation.id),
-                        "sheets",
-                        format!("{base_url}#gid={tab_name}&range={row_number}:{row_number}"),
-                        title.clone(),
-                        Some(format!("{tab_name} row {row_number}")),
-                        observation.published,
+                    records.push(record(RecordInput {
+                        record_id: format!(
+                            "corpus:sheets:{}:{tab_name}:{row_number}",
+                            observation.id
+                        ),
+                        source_type: "sheets",
+                        anchor_url: format!(
+                            "{base_url}#gid={tab_name}&range={row_number}:{row_number}"
+                        ),
+                        source_title: title.clone(),
+                        source_location: Some(format!("{tab_name} row {row_number}")),
+                        timestamp: observation.published,
                         text,
-                        None,
-                        Some(tab_name.to_owned()),
-                        serde_json::json!({"observation_id": observation.id}),
-                    ));
+                        thread_ts: None,
+                        container: Some(tab_name.to_owned()),
+                        metadata: serde_json::json!({
+                            "observation_id": observation.id,
+                            "source_object_id": source_object_id(observation),
+                        }),
+                    }));
                 }
             }
         }
@@ -397,18 +458,22 @@ impl CorpusProjector {
                 .unwrap_or_default();
             format!("{}\n{}", title, questions)
         };
-        vec![record(
-            format!("corpus:forms:{}:{object_type}", observation.id),
-            "forms",
-            base_url,
-            title,
-            Some(object_type.to_owned()),
-            observation.published,
+        vec![record(RecordInput {
+            record_id: format!("corpus:forms:{}:{object_type}", observation.id),
+            source_type: "forms",
+            anchor_url: base_url,
+            source_title: title,
+            source_location: Some(object_type.to_owned()),
+            timestamp: observation.published,
             text,
-            None,
-            None,
-            serde_json::json!({"observation_id": observation.id}),
-        )]
+            thread_ts: None,
+            container: None,
+            metadata: serde_json::json!({
+                "observation_id": observation.id,
+                "source_object_id": source_object_id(observation),
+                "linked_sheet_id": linked_form_sheet_id(observation),
+            }),
+        })]
     }
 
     fn slide_records(&self, observation: &Observation) -> Vec<CorpusRecord> {
@@ -420,18 +485,22 @@ impl CorpusProjector {
             .and_then(serde_json::Value::as_array)
             .map(|slides| slides.iter().map(value_text).collect::<Vec<_>>().join("\n"))
             .unwrap_or_else(|| value_text(&observation.payload));
-        vec![record(
-            format!("corpus:slides:{}", observation.id),
-            "slides",
-            url,
-            title,
-            None,
-            observation.published,
+        vec![record(RecordInput {
+            record_id: format!("corpus:slides:{}", observation.id),
+            source_type: "slides",
+            anchor_url: url,
+            source_title: title,
+            source_location: None,
+            timestamp: observation.published,
             text,
-            None,
-            string_at(&observation.payload, &["artifact", "containerId"]).map(str::to_owned),
-            serde_json::json!({"observation_id": observation.id}),
-        )]
+            thread_ts: None,
+            container: string_at(&observation.payload, &["artifact", "containerId"])
+                .map(str::to_owned),
+            metadata: serde_json::json!({
+                "observation_id": observation.id,
+                "source_object_id": source_object_id(observation),
+            }),
+        })]
     }
 
     fn drive_records(&self, observation: &Observation) -> Vec<CorpusRecord> {
@@ -439,21 +508,24 @@ impl CorpusProjector {
         let text = string_at(&observation.payload, &["native", "text"])
             .map(str::to_owned)
             .unwrap_or_else(|| title.clone());
-        vec![record(
-            format!("corpus:drive:{}", observation.id),
-            "drive",
-            canonical_uri(observation),
-            title,
-            string_at(&observation.payload, &["artifact", "objectType"]).map(str::to_owned),
-            observation.published,
+        vec![record(RecordInput {
+            record_id: format!("corpus:drive:{}", observation.id),
+            source_type: "drive",
+            anchor_url: canonical_uri(observation),
+            source_title: title,
+            source_location: string_at(&observation.payload, &["artifact", "objectType"])
+                .map(str::to_owned),
+            timestamp: observation.published,
             text,
-            None,
-            string_at(&observation.payload, &["artifact", "containerId"]).map(str::to_owned),
-            serde_json::json!({
+            thread_ts: None,
+            container: string_at(&observation.payload, &["artifact", "containerId"])
+                .map(str::to_owned),
+            metadata: serde_json::json!({
                 "observation_id": observation.id,
+                "source_object_id": source_object_id(observation),
                 "sharing_level": string_at(&observation.payload, &["metadata", "sharingLevel"]),
             }),
-        )]
+        })]
     }
 }
 
@@ -484,9 +556,9 @@ pub fn projection_watermark(records: &[CorpusRecord]) -> String {
     )
 }
 
-fn record(
+struct RecordInput<'a> {
     record_id: String,
-    source_type: &str,
+    source_type: &'a str,
     anchor_url: String,
     source_title: String,
     source_location: Option<String>,
@@ -495,19 +567,21 @@ fn record(
     thread_ts: Option<String>,
     container: Option<String>,
     metadata: serde_json::Value,
-) -> CorpusRecord {
+}
+
+fn record(input: RecordInput<'_>) -> CorpusRecord {
     CorpusRecord {
-        record_id,
-        source_type: source_type.to_owned(),
-        anchor_url,
-        source_title,
-        source_location,
-        timestamp,
-        normalized_text: normalized_text(&text),
-        text,
-        thread_ts,
-        container,
-        metadata,
+        record_id: input.record_id,
+        source_type: input.source_type.to_owned(),
+        anchor_url: input.anchor_url,
+        source_title: input.source_title,
+        source_location: input.source_location,
+        timestamp: input.timestamp,
+        normalized_text: normalized_text(&input.text),
+        text: input.text,
+        thread_ts: input.thread_ts,
+        container: input.container,
+        metadata: input.metadata,
     }
 }
 
@@ -520,18 +594,18 @@ fn personal_record(observation: &Observation) -> Option<CorpusRecord> {
     let thread_key = personal_thread_key(observation, &source_type);
     let metadata = personal_metadata(observation, &source_type, thread_key.as_deref());
 
-    Some(record(
-        format!("corpus:{source_type}:{}", observation.id.as_str()),
-        &source_type,
-        personal_anchor_url(observation, &source_type),
-        personal_title(observation, &source_type),
-        personal_location(observation, &source_type),
-        observation.published,
+    Some(record(RecordInput {
+        record_id: format!("corpus:{source_type}:{}", observation.id.as_str()),
+        source_type: &source_type,
+        anchor_url: personal_anchor_url(observation, &source_type),
+        source_title: personal_title(observation, &source_type),
+        source_location: personal_location(observation, &source_type),
+        timestamp: observation.published,
         text,
-        thread_key,
-        personal_container(observation, &source_type),
+        thread_ts: thread_key,
+        container: personal_container(observation, &source_type),
         metadata,
-    ))
+    }))
 }
 
 fn personal_source_type(observation: &Observation) -> String {
@@ -958,7 +1032,7 @@ fn canonical_uri(observation: &Observation) -> String {
         .to_owned()
 }
 
-fn linked_form_sheet_id(observation: &Observation) -> Option<String> {
+pub fn linked_form_sheet_id(observation: &Observation) -> Option<String> {
     if observation.schema.as_str() == "schema:workspace-object-snapshot"
         && string_at(&observation.payload, &["artifact", "service"]) == Some("forms")
     {
@@ -966,6 +1040,10 @@ fn linked_form_sheet_id(observation: &Observation) -> Option<String> {
     } else {
         None
     }
+}
+
+fn source_object_id(observation: &Observation) -> Option<&str> {
+    string_at(&observation.payload, &["artifact", "sourceObjectId"])
 }
 
 fn is_opted_out(opt_out: &HashSet<String>, payload: &serde_json::Value, paths: &[&str]) -> bool {

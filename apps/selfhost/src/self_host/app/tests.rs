@@ -9,11 +9,10 @@ use lethe_adapter_slack::slack::client::{SlackMessage, SlackMessageType};
 use lethe_core::domain::supplemental::InputAnchorSet;
 
 use super::{
-    AppCore, AppService, GoogleSourceRuntime, ProjectionSnapshot, SelfHostError,
-    SlackSourceRuntime, classify_slack_ingress, extract_slide_text_fragments,
-    infer_profile_name_from_fragments, known_thread_roots_from_observations,
-    latest_revision_to_capture, namespace_draft, non_empty_state, ranked_self_intro_slide_indices,
-    thread_cursor_key, thread_root_ts,
+    AppCore, AppService, GoogleSourceRuntime, SelfHostError, SlackSourceRuntime,
+    classify_slack_ingress, extract_slide_text_fragments, infer_profile_name_from_fragments,
+    known_thread_roots_from_observations, latest_revision_to_capture, namespace_draft,
+    non_empty_state, ranked_self_intro_slide_indices, thread_cursor_key, thread_root_ts,
 };
 use crate::self_host::config::{
     ApiTokenConfig, CorpusProjectionConfig, FreshnessConfig, GoogleConfig, JsonWebKey,
@@ -145,7 +144,7 @@ fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
         bind_addr: "127.0.0.1:0".into(),
         mcp_bind_addr: "127.0.0.1:0".into(),
         mcp_oauth: test_mcp_oauth(),
-        database_path: db,
+        database_path: db.clone(),
         blob_dir: blobs,
         secret_encryption_key: [7; 32],
         poll_interval: std::time::Duration::from_secs(300),
@@ -164,6 +163,9 @@ fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
         },
         corpus: CorpusProjectionConfig {
             mode: lethe_projection_corpus::CorpusMode::WorkspaceFiltered,
+            index_dir: db.with_extension("corpus-index"),
+            writer_heap_bytes: 32 * 1024 * 1024,
+            rebuild_page_size: 512,
         },
         freshness: FreshnessConfig {
             threshold_seconds: std::collections::BTreeMap::from([
@@ -227,19 +229,33 @@ fn test_mcp_oauth() -> McpOAuthConfig {
 }
 
 fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppService {
+    let persistence: Arc<Mutex<Box<dyn lethe_storage_api::StoragePorts>>> =
+        Arc::new(Mutex::new(Box::new(persistence)));
+    let corpus_config = config.corpus.projector_config();
+    let search_index = super::search_index::SearchIndexManager::bootstrap(
+        lethe_search_index::IndexRoot::new(
+            &config.corpus.index_dir,
+            config.corpus.writer_heap_bytes,
+            corpus_config.fingerprint(),
+        )
+        .unwrap(),
+        lethe_projection_corpus::CorpusProjector::new(corpus_config),
+        config.corpus.rebuild_page_size,
+        Arc::clone(&persistence),
+    );
     AppService {
         core: Arc::new(Mutex::new(
-            AppCore::from_persisted(
+            AppCore::new_with_config(
                 vec![],
                 vec![],
                 vec![],
-                config.corpus.projector_config(),
                 super::freshness_thresholds(&config),
                 config.channels.clone(),
             )
             .unwrap(),
         )),
-        persistence: Arc::new(Mutex::new(Box::new(persistence))),
+        persistence,
+        search_index,
         config: Arc::new(config.clone()),
         slack_sources: vec![SlackSourceRuntime {
             config: config.slack_sources[0].clone(),
@@ -265,6 +281,18 @@ fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppSe
             std::time::Duration::from_secs(60),
         )),
         audit_log: Arc::new(InMemoryAuditLog::new()),
+        non_corpus_rebuild_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }
+}
+
+fn wait_for_search_index_ready(service: &AppService) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while service.search_index.health_dependency().status != "ok" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "search index did not become ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -307,49 +335,115 @@ fn bootstrap_rebuilds_snapshot_from_persisted_observations() {
     let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
     let observation = Observation {
         id: Observation::new_id(),
-        schema: SchemaRef::new("schema:claude-message"),
+        schema: SchemaRef::new("schema:slack-message"),
         schema_version: SemVer::new("1.0.0"),
-        observer: ObserverRef::new("obs:claude-importer"),
-        source_system: Some(SourceSystemRef::new("sys:claude-ai")),
+        observer: ObserverRef::new("obs:slack-crawler"),
+        source_system: Some(SourceSystemRef::new("sys:slack")),
         actor: None,
         authority_model: AuthorityModel::LakeAuthoritative,
         capture_model: CaptureModel::Event,
-        subject: EntityRef::new("conversation:claude:bootstrap"),
+        subject: EntityRef::new("message:slack:C01ABC-bootstrap"),
         target: None,
-        payload: serde_json::json!({"text": "persisted bootstrap needle"}),
+        payload: serde_json::json!({
+            "channel_id": "C01ABC",
+            "channel_name": "general",
+            "ts": "bootstrap",
+            "thread_ts": "bootstrap",
+            "user_id": "U-BOOTSTRAP",
+            "user_name": "Bootstrap User",
+            "email": "bootstrap@example.test",
+            "text": "persisted bootstrap needle",
+        }),
         attachments: vec![],
         published: Utc::now(),
         recorded_at: Utc::now(),
         consent: None,
-        idempotency_key: IdempotencyKey::new("claude:bootstrap:needle"),
+        idempotency_key: IdempotencyKey::new("slack:C01ABC:bootstrap"),
         meta: serde_json::json!({
             "canonical_json": serde_json::json!({
-                "source": "claude-ai",
+                "source": "slack",
                 "object_id": "bootstrap-needle",
                 "body": "persisted bootstrap needle"
             }).to_string(),
-            "source_container": "claude-bootstrap",
+            "source_container": "C01ABC",
         }),
     };
     persistence.persist_observation(&observation).unwrap();
-    persistence
-        .materialize_projection(
-            &ProjectionRef::new("proj:person-page"),
-            &serde_json::to_value(ProjectionSnapshot::default()).unwrap(),
-        )
-        .unwrap();
     drop(persistence);
 
     let mut config = test_config(db.clone(), blobs.clone());
     config.corpus.mode = lethe_projection_corpus::CorpusMode::PersonalAllText;
-    let service = AppService::bootstrap(config).unwrap();
-    let response = service
-        .corpus_grep_response(&lethe_api::api::grep::GrepRequest {
-            pattern: "bootstrap needle".into(),
-            limit: Some(3),
-            ..lethe_api::api::grep::GrepRequest::default()
-        })
+    let service = AppService::bootstrap(config.clone()).unwrap();
+    let built_at = service.core_lock().unwrap().snapshot.built_at;
+    let materialized = service
+        .persistence_lock()
+        .unwrap()
+        .projection_records(&ProjectionRef::new("proj:person-page"))
+        .unwrap()
         .unwrap();
+    assert_eq!(materialized["format_version"], 4);
+    assert_eq!(materialized["observation_count"], 1);
+    assert_eq!(materialized["last_append_seq"], 1);
+    assert_eq!(materialized["person_message_count"], 1);
+    assert_eq!(materialized["reply_slo_count"], 0);
+    assert!(
+        materialized["snapshot"]["person_page"]["messages"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        materialized["snapshot"]["reply_slo"]["rows"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        materialized["snapshot"]["reply_slo"]["overdue"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        service
+            .persistence_lock()
+            .unwrap()
+            .projection_item_count(&ProjectionRef::new("proj:person-page"))
+            .unwrap(),
+        1
+    );
+    let person_id = service.core_lock().unwrap().snapshot.person_page.profiles[0]
+        .person_id
+        .as_str()
+        .to_owned();
+    assert_eq!(
+        service
+            .person_messages_response(&person_id, None, None)
+            .unwrap()
+            .data
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(materialized["snapshot"].get("corpus").is_none());
+    let request = lethe_api::api::grep::GrepRequest {
+        pattern: "bootstrap needle".into(),
+        limit: Some(3),
+        ..lethe_api::api::grep::GrepRequest::default()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let response = loop {
+        match service.corpus_grep_response(&request) {
+            Ok(response) => break response,
+            Err(SelfHostError::SearchIndexUnavailable { .. })
+                if std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => panic!("corpus index did not become ready: {error}"),
+        }
+    };
 
     assert_eq!(response.data.matches.len(), 1);
     assert!(
@@ -357,6 +451,40 @@ fn bootstrap_rebuilds_snapshot_from_persisted_observations() {
             .data
             .projection_watermark
             .starts_with("proj:corpus:")
+    );
+    let (combined_response, source_summaries) = service
+        .corpus_grep_response_with_source_summaries(&request)
+        .unwrap();
+    assert_eq!(combined_response.data.matches.len(), 1);
+    assert_eq!(
+        source_summaries
+            .iter()
+            .map(|summary| summary.records)
+            .sum::<usize>(),
+        1
+    );
+    drop(service);
+
+    let restarted = AppService::bootstrap(config).unwrap();
+    assert_eq!(restarted.core_lock().unwrap().snapshot.built_at, built_at);
+    assert!(
+        restarted
+            .core_lock()
+            .unwrap()
+            .snapshot
+            .person_page
+            .messages
+            .is_empty()
+    );
+    assert_eq!(
+        restarted
+            .person_messages_response(&person_id, None, None)
+            .unwrap()
+            .data
+            .as_array()
+            .unwrap()
+            .len(),
+        1
     );
 
     let _ = std::fs::remove_dir_all(root);
@@ -609,45 +737,7 @@ fn ingest_draft_duplicate_is_decided_by_persistence_without_cache_append() {
         .unwrap();
 
     let config = test_config(db.clone(), blobs.clone());
-    let service = AppService {
-        core: Arc::new(Mutex::new(
-            AppCore::from_persisted(
-                vec![],
-                vec![],
-                vec![],
-                config.corpus.projector_config(),
-                super::freshness_thresholds(&config),
-                config.channels.clone(),
-            )
-            .unwrap(),
-        )),
-        persistence: Arc::new(Mutex::new(Box::new(persistence))),
-        config: Arc::new(config.clone()),
-        slack_sources: vec![SlackSourceRuntime {
-            config: config.slack_sources[0].clone(),
-            client: HttpSlackClient::new(config.slack_sources[0].bot_token.expose().to_owned())
-                .unwrap(),
-            replies_client: HttpSlackClient::new(
-                config.slack_sources[0].thread_token.expose().to_owned(),
-            )
-            .unwrap(),
-        }],
-        google_sources: vec![GoogleSourceRuntime {
-            config: config.google_sources[0].clone(),
-            client: HttpGoogleSlidesClient::new(&config.google_sources[0]).unwrap(),
-        }],
-        slide_analyzer: config
-            .slide_ai
-            .as_ref()
-            .map(|slide_ai| GeminiSlideAnalyzer::new(slide_ai.api_key.expose(), &slide_ai.model))
-            .transpose()
-            .unwrap(),
-        resilient_executor: Arc::new(ResilientExecutor::new(
-            3,
-            std::time::Duration::from_secs(60),
-        )),
-        audit_log: Arc::new(InMemoryAuditLog::new()),
-    };
+    let service = test_service(config, persistence);
 
     let draft = ObservationDraft {
         schema: SchemaRef::new("schema:slack-message"),
@@ -682,7 +772,6 @@ fn ingest_draft_duplicate_is_decided_by_persistence_without_cache_append() {
 
     let result = service.ingest_draft(draft).unwrap();
     assert!(matches!(result, IngestResult::Duplicate { .. }));
-    assert_eq!(service.core_lock().unwrap().lake.len(), 0);
     assert_eq!(
         service
             .persistence_lock()
@@ -692,6 +781,1221 @@ fn ingest_draft_duplicate_is_decided_by_persistence_without_cache_append() {
             .len(),
         1
     );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn app_core_holds_only_materialized_non_corpus_state() {
+    let core = AppCore::new(vec![], vec![], vec![]).unwrap();
+    let snapshot = serde_json::to_value(&core.snapshot).unwrap();
+
+    assert!(snapshot.get("corpus").is_none());
+    assert!(core.snapshot.lineage.input_refs.is_empty());
+    assert_eq!(core.observation_stats.count, 0);
+    assert_eq!(core.observation_stats.max_append_seq, 0);
+}
+
+#[test]
+fn materialized_snapshot_selection_is_versioned_strict_and_stats_bound() {
+    let stats = lethe_storage_api::ObservationStats {
+        count: 0,
+        max_append_seq: 0,
+    };
+    let materialized =
+        super::MaterializedProjectionSnapshot::build(vec![], vec![], vec![], vec![], stats)
+            .unwrap();
+    let fingerprint = materialized.supplemental_fingerprint.clone();
+    let value = serde_json::to_value(&materialized).unwrap();
+
+    assert!(
+        super::current_materialized_snapshot(value.clone(), stats, &fingerprint, 0, 0)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        super::current_materialized_snapshot(
+            value.clone(),
+            lethe_storage_api::ObservationStats {
+                count: 1,
+                max_append_seq: 1,
+            },
+            &fingerprint,
+            0,
+            0,
+        )
+        .unwrap()
+        .is_none()
+    );
+
+    let mut version_mismatch = value.clone();
+    version_mismatch["format_version"] = serde_json::json!(5);
+    assert!(
+        super::current_materialized_snapshot(version_mismatch, stats, &fingerprint, 0, 0)
+            .unwrap()
+            .is_none()
+    );
+
+    let mut malformed_current = value;
+    malformed_current["unexpected"] = serde_json::json!(true);
+    assert!(matches!(
+        super::current_materialized_snapshot(malformed_current, stats, &fingerprint, 0, 0),
+        Err(SelfHostError::Json(_))
+    ));
+
+    assert!(matches!(
+        super::current_materialized_snapshot(
+            serde_json::to_value(&materialized).unwrap(),
+            stats,
+            &fingerprint,
+            1,
+            0,
+        ),
+        Err(SelfHostError::Ingestion(_))
+    ));
+    assert!(matches!(
+        super::current_materialized_snapshot(
+            serde_json::to_value(&materialized).unwrap(),
+            stats,
+            &fingerprint,
+            0,
+            1,
+        ),
+        Err(SelfHostError::Ingestion(_))
+    ));
+}
+
+#[test]
+fn materialized_person_message_manifest_rejects_resident_rows_and_count_drift() {
+    let published = chrono::DateTime::parse_from_rfc3339("2026-07-13T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    let observation = wave2_slack_observation(
+        "U-VALIDATE",
+        "Validate User",
+        Some("validate@example.test"),
+        "validate",
+        published,
+    );
+    let stats = lethe_storage_api::ObservationStats {
+        count: 1,
+        max_append_seq: 1,
+    };
+    let materialized = super::MaterializedProjectionSnapshot::build_at(
+        vec![observation],
+        vec![],
+        vec![],
+        vec![],
+        stats,
+        published,
+    )
+    .unwrap();
+    assert!(materialized.snapshot.person_page.messages.is_empty());
+    assert_eq!(materialized.person_message_count, 1);
+
+    assert_eq!(materialized.reply_slo_count, 1);
+    assert!(materialized.snapshot.reply_slo.rows.is_empty());
+    assert!(materialized.snapshot.reply_slo.overdue.is_empty());
+    let (item, reply_slo_item) = match pending_projection_item_commit(&materialized) {
+        lethe_storage_api::ProjectionItemCommit::Replace { items } => (
+            items
+                .iter()
+                .find(|item| item.owner_key != super::REPLY_SLO_ITEM_OWNER)
+                .unwrap()
+                .clone(),
+            items
+                .iter()
+                .find(|item| item.owner_key == super::REPLY_SLO_ITEM_OWNER)
+                .unwrap()
+                .clone(),
+        ),
+        lethe_storage_api::ProjectionItemCommit::Delta { .. } => panic!("expected replace"),
+    };
+    let mut resident = materialized.clone();
+    resident
+        .snapshot
+        .person_page
+        .messages
+        .push(super::person_message_from_projection_item(&item).unwrap());
+    assert!(matches!(
+        resident.validate(),
+        Err(SelfHostError::Ingestion(_))
+    ));
+
+    let mut count_drift = materialized.clone();
+    count_drift.person_message_count = 2;
+    assert!(matches!(
+        count_drift.validate(),
+        Err(SelfHostError::Ingestion(_))
+    ));
+
+    let mut reply_count_drift = materialized.clone();
+    reply_count_drift.reply_slo_count = 2;
+    assert!(matches!(
+        reply_count_drift.validate(),
+        Err(SelfHostError::Ingestion(_))
+    ));
+
+    let mut resident_reply = materialized.clone();
+    resident_reply
+        .snapshot
+        .reply_slo
+        .rows
+        .push(super::reply_slo_from_projection_item(&reply_slo_item).unwrap());
+    assert!(matches!(
+        resident_reply.validate(),
+        Err(SelfHostError::Ingestion(_))
+    ));
+
+    let mut pending_drift = materialized;
+    pending_drift
+        .pending_item_commit
+        .as_mut()
+        .unwrap()
+        .base_person_message_count = 1;
+    assert!(matches!(
+        pending_drift.validate(),
+        Err(SelfHostError::Ingestion(_))
+    ));
+}
+
+fn freshness_only_observation(
+    schema: &str,
+    source_system: &str,
+    key: &str,
+    published: chrono::DateTime<Utc>,
+) -> Observation {
+    Observation {
+        id: Observation::new_id(),
+        schema: SchemaRef::new(schema),
+        schema_version: SemVer::new("1.0.0"),
+        observer: ObserverRef::new("obs:bulk-test"),
+        source_system: Some(SourceSystemRef::new(source_system)),
+        actor: None,
+        authority_model: AuthorityModel::LakeAuthoritative,
+        capture_model: CaptureModel::Event,
+        subject: EntityRef::new(format!("message:{key}")),
+        target: None,
+        payload: serde_json::json!({"text": key}),
+        attachments: vec![],
+        published,
+        recorded_at: published + chrono::Duration::seconds(1),
+        consent: None,
+        idempotency_key: IdempotencyKey::new(key),
+        meta: serde_json::json!({
+            "canonical_json": serde_json::json!({
+                "source": source_system,
+                "object_id": key,
+                "body": key,
+            }).to_string(),
+            "source_container": "bulk-test",
+        }),
+    }
+}
+
+#[test]
+fn non_corpus_delta_classification_is_an_explicit_closed_whitelist() {
+    let published = chrono::DateTime::parse_from_rfc3339("2026-07-13T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    for schema in [
+        "schema:claude-message",
+        "schema:chatgpt-message",
+        "schema:github-event",
+        "schema:coding-agent-message",
+        "schema:gmail-message",
+        "schema:discord-message",
+    ] {
+        let observation = freshness_only_observation(schema, "sys:claude-ai", schema, published);
+        assert_eq!(
+            super::classify_non_corpus_delta(&[observation]),
+            super::NonCorpusDeltaKind::FreshnessOnly
+        );
+    }
+
+    let unknown = freshness_only_observation(
+        "schema:future-message",
+        "sys:claude-ai",
+        "unknown",
+        published,
+    );
+    assert_eq!(
+        super::classify_non_corpus_delta(&[unknown]),
+        super::NonCorpusDeltaKind::FullRebuild
+    );
+
+    let mut reply_relevant = freshness_only_observation(
+        "schema:gmail-message",
+        "sys:gmail",
+        "reply-relevant",
+        published,
+    );
+    reply_relevant.meta["communication_sender_id"] = serde_json::json!("sender@example.test");
+    assert_eq!(
+        super::classify_non_corpus_delta(&[reply_relevant.clone()]),
+        super::NonCorpusDeltaKind::FreshnessOnly
+    );
+    reply_relevant.meta["communication_channel_id"] = serde_json::json!("chan:gmail");
+    reply_relevant.meta["communication_thread_ref"] = serde_json::json!("gmail:thread:1");
+    reply_relevant.meta["communication"] = serde_json::json!({
+        "reply_due_at": "2026-07-13T01:00:00Z"
+    });
+    assert_eq!(
+        super::classify_non_corpus_delta(&[reply_relevant]),
+        super::NonCorpusDeltaKind::FullRebuild
+    );
+}
+
+fn apply_projection_item_commit(
+    rows: &mut std::collections::BTreeMap<String, lethe_storage_api::ProjectionItem>,
+    commit: &lethe_storage_api::ProjectionItemCommit,
+) {
+    match commit {
+        lethe_storage_api::ProjectionItemCommit::Replace { items } => {
+            rows.clear();
+            for item in items {
+                assert!(rows.insert(item.item_key.clone(), item.clone()).is_none());
+            }
+        }
+        lethe_storage_api::ProjectionItemCommit::Delta {
+            inserts,
+            updates,
+            deletes,
+        } => {
+            for item_key in deletes {
+                rows.remove(item_key);
+            }
+            for item in updates.iter().chain(inserts) {
+                rows.insert(item.item_key.clone(), item.clone());
+            }
+        }
+    }
+}
+
+fn pending_projection_item_commit(
+    materialized: &super::MaterializedProjectionSnapshot,
+) -> &lethe_storage_api::ProjectionItemCommit {
+    &materialized
+        .pending_item_commit
+        .as_ref()
+        .expect("new materialization must carry an item commit")
+        .commit
+}
+
+#[test]
+fn freshness_only_incremental_materialization_matches_full_rebuild() {
+    let first_at = chrono::DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    let final_at = chrono::DateTime::parse_from_rfc3339("2026-07-13T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    let thresholds = vec![
+        lethe_projection_cognition::FreshnessThreshold {
+            source_id: "sys:chatgpt".to_owned(),
+            max_age_seconds: 86_400,
+        },
+        lethe_projection_cognition::FreshnessThreshold {
+            source_id: "sys:claude-ai".to_owned(),
+            max_age_seconds: 86_400,
+        },
+    ];
+    let initial = freshness_only_observation(
+        "schema:claude-message",
+        "sys:claude-ai",
+        "initial",
+        first_at,
+    );
+    let appended = vec![
+        freshness_only_observation(
+            "schema:chatgpt-message",
+            "sys:chatgpt",
+            "appended-chatgpt",
+            final_at - chrono::Duration::hours(1),
+        ),
+        freshness_only_observation(
+            "schema:claude-message",
+            "sys:claude-ai",
+            "appended-claude",
+            final_at - chrono::Duration::hours(2),
+        ),
+    ];
+    let initial_materialized = super::MaterializedProjectionSnapshot::build_at(
+        vec![initial.clone()],
+        vec![],
+        thresholds.clone(),
+        vec![],
+        lethe_storage_api::ObservationStats {
+            count: 1,
+            max_append_seq: 7,
+        },
+        first_at,
+    )
+    .unwrap();
+    let core = AppCore::from_materialized(
+        initial_materialized,
+        vec![],
+        vec![],
+        thresholds.clone(),
+        vec![],
+    )
+    .unwrap();
+    let final_stats = lethe_storage_api::ObservationStats {
+        count: 3,
+        max_append_seq: 12,
+    };
+    let incremental = super::MaterializedProjectionSnapshot::compact_incremental_delta(
+        &core,
+        &appended,
+        final_stats,
+        final_at,
+    )
+    .unwrap();
+    let super::MaterializedDeltaResult::Applied(incremental) = incremental else {
+        panic!("freshness-only delta unexpectedly required full rebuild");
+    };
+
+    let mut all = vec![initial];
+    all.extend(appended.iter().cloned());
+    all.reverse();
+    let all = all
+        .into_iter()
+        .map(|observation| {
+            serde_json::from_str::<Observation>(&serde_json::to_string(&observation).unwrap())
+                .unwrap()
+        })
+        .collect();
+    let full = super::MaterializedProjectionSnapshot::build_at(
+        all,
+        vec![],
+        thresholds,
+        vec![],
+        final_stats,
+        final_at,
+    )
+    .unwrap();
+
+    assert_eq!(
+        incremental.canonical_observation_fingerprint,
+        full.canonical_observation_fingerprint
+    );
+    assert_eq!(
+        incremental.snapshot.lineage.build_id,
+        full.snapshot.lineage.build_id
+    );
+    assert_eq!(
+        serde_json::to_value(incremental).unwrap(),
+        serde_json::to_value(full).unwrap()
+    );
+}
+
+fn freshness_only_draft(key: &str) -> ObservationDraft {
+    ObservationDraft {
+        schema: SchemaRef::new("schema:claude-message"),
+        schema_version: SemVer::new("1.0.0"),
+        observer: ObserverRef::new("obs:claude-ai-importer"),
+        source_system: Some(SourceSystemRef::new("sys:claude-ai")),
+        authority_model: AuthorityModel::LakeAuthoritative,
+        capture_model: CaptureModel::Event,
+        subject: EntityRef::new(format!("conversation:claude:{key}")),
+        target: None,
+        payload: serde_json::json!({"text": key}),
+        attachments: vec![],
+        published: Utc::now(),
+        idempotency_key: IdempotencyKey::new(key),
+        meta: serde_json::json!({
+            "canonical_json": serde_json::json!({
+                "source": "claude-ai",
+                "object_id": key,
+                "body": key,
+            }).to_string(),
+            "source_container": "claude-import",
+        }),
+    }
+}
+
+fn wave2_slack_observation(
+    user_id: &str,
+    user_name: &str,
+    email: Option<&str>,
+    key: &str,
+    published: chrono::DateTime<Utc>,
+) -> Observation {
+    let reply_due_at = published + chrono::Duration::minutes(30);
+    Observation {
+        id: Observation::new_id(),
+        schema: SchemaRef::new("schema:slack-message"),
+        schema_version: SemVer::new("1.0.0"),
+        observer: ObserverRef::new("obs:slack-crawler"),
+        source_system: Some(SourceSystemRef::new("sys:slack")),
+        actor: None,
+        authority_model: AuthorityModel::LakeAuthoritative,
+        capture_model: CaptureModel::Event,
+        subject: EntityRef::new(format!("message:slack:C01ABC-{key}")),
+        target: None,
+        payload: serde_json::json!({
+            "channel_id": "C01ABC",
+            "channel_name": "general",
+            "ts": key,
+            "thread_ts": key,
+            "user_id": user_id,
+            "user_name": user_name,
+            "email": email,
+            "text": format!("wave2 message {key}"),
+            "permalink": format!("https://example.test/C01ABC/{key}"),
+            "is_public_channel": true,
+            "visibility_status": "public",
+            "is_bot": false,
+            "ingress_kind": "channel",
+            "mentions": [],
+            "message_type": "message",
+            "authority": 1,
+        }),
+        attachments: vec![],
+        published,
+        recorded_at: published + chrono::Duration::seconds(1),
+        consent: None,
+        idempotency_key: IdempotencyKey::new(format!("slack:C01ABC:{key}")),
+        meta: serde_json::json!({
+            "canonical_json": serde_json::json!({
+                "sender": user_id,
+                "body": format!("wave2 message {key}"),
+                "event_time": key,
+            }).to_string(),
+            "source_container": "C01ABC",
+            "communication_channel_kind": "slack",
+            "communication_channel_external_id": "C01ABC",
+            "communication_channel_id": "chan:slack-test:C01ABC",
+            "communication_sender_id": user_id,
+            "communication_thread_ref": format!("slack:thread:{key}"),
+            "communication": {
+                "reply_due_at": reply_due_at.to_rfc3339(),
+            },
+        }),
+    }
+}
+
+#[test]
+fn paged_materialization_matches_full_build_and_publishes_atomically() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-paged-materialization-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let built_at = chrono::DateTime::parse_from_rfc3339("2026-07-13T12:00:00Z")
+        .unwrap()
+        .to_utc();
+    let observations = vec![
+        wave2_slack_observation(
+            "U01",
+            "Alice",
+            Some("alice@example.test"),
+            "1.000001",
+            built_at - chrono::Duration::hours(3),
+        ),
+        freshness_only_observation(
+            "schema:claude-message",
+            "sys:claude-ai",
+            "paged-claude",
+            built_at - chrono::Duration::hours(2),
+        ),
+        wave2_slack_observation(
+            "U02",
+            "Bob",
+            Some("bob@example.test"),
+            "2.000001",
+            built_at - chrono::Duration::hours(1),
+        ),
+    ];
+    for observation in &observations {
+        persistence.persist_observation(observation).unwrap();
+    }
+    let stats = persistence.observation_stats().unwrap();
+    let thresholds = vec![
+        lethe_projection_cognition::FreshnessThreshold {
+            source_id: "chan:slack-test:C01ABC".to_owned(),
+            max_age_seconds: 172_800,
+        },
+        lethe_projection_cognition::FreshnessThreshold {
+            source_id: "sys:claude-ai".to_owned(),
+            max_age_seconds: 172_800,
+        },
+    ];
+    let full = super::MaterializedProjectionSnapshot::build_at(
+        observations,
+        vec![],
+        thresholds.clone(),
+        vec![],
+        stats,
+        built_at,
+    )
+    .unwrap();
+    let mut expected_rows = std::collections::BTreeMap::new();
+    apply_projection_item_commit(&mut expected_rows, pending_projection_item_commit(&full));
+    let expected_manifest = serde_json::to_value(&full).unwrap();
+
+    for page_size in [1, 128] {
+        let paged = super::rebuild_materialized_snapshot_paged(
+            &persistence,
+            &[],
+            &thresholds,
+            &[],
+            stats,
+            page_size,
+            built_at,
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_value(&paged).unwrap(), expected_manifest);
+        assert_eq!(
+            persistence
+                .projection_records(&ProjectionRef::new("proj:person-page"))
+                .unwrap()
+                .unwrap(),
+            expected_manifest
+        );
+
+        let owners = expected_rows
+            .values()
+            .map(|item| item.owner_key.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        for owner in owners {
+            let actual = persistence
+                .projection_items_by_owner(&ProjectionRef::new("proj:person-page"), &owner)
+                .unwrap()
+                .into_iter()
+                .map(|item| (item.item_key.clone(), item))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let expected = expected_rows
+                .values()
+                .filter(|item| item.owner_key == owner)
+                .cloned()
+                .map(|item| (item.item_key.clone(), item))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert_eq!(actual, expected);
+        }
+        let staging = ProjectionRef::new(super::NON_CORPUS_REBUILD_STAGING_PROJECTION_ID);
+        assert_eq!(persistence.projection_item_count(&staging).unwrap(), 0);
+        assert!(persistence.projection_records(&staging).unwrap().is_none());
+    }
+
+    drop(persistence);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn supplemental_delta_matches_full_build_and_updates_one_reply_row() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-supplemental-delta-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let published = chrono::DateTime::parse_from_rfc3339("2026-07-13T08:00:00Z")
+        .unwrap()
+        .to_utc();
+    let observation = wave2_slack_observation(
+        "U01",
+        "Alice",
+        Some("alice@example.test"),
+        "10.000001",
+        published,
+    );
+    persistence.persist_observation(&observation).unwrap();
+    drop(persistence);
+
+    let mut config = test_config(db.clone(), blobs.clone());
+    config.corpus.mode = lethe_projection_corpus::CorpusMode::PersonalAllText;
+    let thresholds = super::freshness_thresholds(&config);
+    let channels = config.channels.clone();
+    let service = AppService::bootstrap(config).unwrap();
+    let draft_id = SupplementalId::new("sup:00000000-0000-7000-8000-000000000201");
+    let draft = service
+        .write_supplemental(super::SupplementalWriteRequest {
+            id: draft_id.clone(),
+            kind: "reply-draft@1".to_owned(),
+            derived_from: InputAnchorSet {
+                observations: vec![observation.id.clone()],
+                blobs: Vec::new(),
+                supplementals: Vec::new(),
+            },
+            payload: serde_json::json!({
+                "channel": "slack",
+                "recipient": "U01",
+                "body": "reply body",
+                "drafted_at": "2026-07-13T08:05:00Z",
+                "thread_ref": "slack:thread:10.000001"
+            }),
+            created_by: ActorRef::new("actor:test"),
+            mutability: Mutability::AppendOnly,
+            model_version: None,
+            consent_metadata: None,
+            lineage: None,
+        })
+        .unwrap();
+    let pending_item = service
+        .persistence_lock()
+        .unwrap()
+        .projection_item_by_key(
+            &ProjectionRef::new("proj:person-page"),
+            &format!("reply-slo:{}", observation.id),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(
+        super::reply_slo_from_projection_item(&pending_item)
+            .unwrap()
+            .sent_at
+            .is_none()
+    );
+
+    let send = service
+        .write_supplemental(super::SupplementalWriteRequest {
+            id: SupplementalId::new("sup:00000000-0000-7000-8000-000000000202"),
+            kind: "send-record@1".to_owned(),
+            derived_from: InputAnchorSet {
+                observations: Vec::new(),
+                blobs: Vec::new(),
+                supplementals: vec![draft_id],
+            },
+            payload: serde_json::json!({
+                "channel": "slack",
+                "sent_at": "2026-07-13T08:10:00Z",
+                "mode": "approved"
+            }),
+            created_by: ActorRef::new("actor:test"),
+            mutability: Mutability::AppendOnly,
+            model_version: None,
+            consent_metadata: None,
+            lineage: None,
+        })
+        .unwrap();
+    let sent_item = service
+        .persistence_lock()
+        .unwrap()
+        .projection_item_by_key(
+            &ProjectionRef::new("proj:person-page"),
+            &format!("reply-slo:{}", observation.id),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        super::reply_slo_from_projection_item(&sent_item)
+            .unwrap()
+            .sent_at,
+        Some(
+            chrono::DateTime::parse_from_rfc3339("2026-07-13T08:10:00Z")
+                .unwrap()
+                .to_utc()
+        )
+    );
+
+    let core = service.core_lock().unwrap();
+    let stats = core.observation_stats;
+    let final_built_at = core.snapshot.built_at;
+    drop(core);
+    let full = super::MaterializedProjectionSnapshot::build_at(
+        vec![observation],
+        vec![draft, send],
+        thresholds,
+        channels,
+        stats,
+        final_built_at,
+    )
+    .unwrap();
+    let persisted_manifest = service
+        .persistence_lock()
+        .unwrap()
+        .projection_records(&ProjectionRef::new("proj:person-page"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted_manifest, serde_json::to_value(&full).unwrap());
+    let mut expected_rows = std::collections::BTreeMap::new();
+    apply_projection_item_commit(&mut expected_rows, pending_projection_item_commit(&full));
+    assert_eq!(expected_rows[&sent_item.item_key], sent_item);
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn wave2_slack_incremental_materialization_matches_normalized_full_rebuild() {
+    let initial_at = chrono::DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    let final_at = chrono::DateTime::parse_from_rfc3339("2026-07-13T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    let thresholds = vec![lethe_projection_cognition::FreshnessThreshold {
+        source_id: "chan:slack-test:C01ABC".to_owned(),
+        max_age_seconds: 172_800,
+    }];
+    let initial = vec![
+        wave2_slack_observation(
+            "U01",
+            "Alice",
+            Some("alice@example.test"),
+            "1.000001",
+            initial_at,
+        ),
+        wave2_slack_observation(
+            "U02",
+            "Bob",
+            Some("bob@example.test"),
+            "2.000001",
+            initial_at + chrono::Duration::minutes(1),
+        ),
+    ];
+    let appended = vec![
+        wave2_slack_observation(
+            "U01",
+            "Alice Updated",
+            Some("alice@example.test"),
+            "3.000001",
+            final_at - chrono::Duration::minutes(2),
+        ),
+        wave2_slack_observation(
+            "U03",
+            "Carol",
+            None,
+            "4.000001",
+            final_at - chrono::Duration::minutes(1),
+        ),
+    ];
+    assert_eq!(
+        super::classify_non_corpus_delta(&appended),
+        super::NonCorpusDeltaKind::SlackMessage
+    );
+    let initial_materialized = super::MaterializedProjectionSnapshot::build_at(
+        initial.clone(),
+        vec![],
+        thresholds.clone(),
+        vec![],
+        lethe_storage_api::ObservationStats {
+            count: 2,
+            max_append_seq: 2,
+        },
+        initial_at,
+    )
+    .unwrap();
+    assert_eq!(
+        initial_materialized
+            .snapshot
+            .identity
+            .resolved_persons
+            .len(),
+        2
+    );
+    assert!(
+        initial_materialized
+            .snapshot
+            .person_page
+            .messages
+            .is_empty()
+    );
+    assert_eq!(initial_materialized.person_message_count, 2);
+    let mut incremental_message_rows = std::collections::BTreeMap::new();
+    apply_projection_item_commit(
+        &mut incremental_message_rows,
+        pending_projection_item_commit(&initial_materialized),
+    );
+    let core = AppCore::from_materialized(
+        initial_materialized,
+        vec![],
+        vec![],
+        thresholds.clone(),
+        vec![],
+    )
+    .unwrap();
+    let final_stats = lethe_storage_api::ObservationStats {
+        count: 4,
+        max_append_seq: 4,
+    };
+    let incremental = super::MaterializedProjectionSnapshot::compact_incremental_delta(
+        &core,
+        &appended,
+        final_stats,
+        final_at,
+    )
+    .unwrap();
+    let super::MaterializedDeltaResult::Applied(incremental) = incremental else {
+        panic!("Wave2-compatible Slack delta unexpectedly required full rebuild");
+    };
+    apply_projection_item_commit(
+        &mut incremental_message_rows,
+        pending_projection_item_commit(&incremental),
+    );
+
+    let mut all = initial;
+    all.extend(appended);
+    let full = super::MaterializedProjectionSnapshot::build_at(
+        all,
+        vec![],
+        thresholds,
+        vec![],
+        final_stats,
+        final_at,
+    )
+    .unwrap();
+
+    assert_eq!(incremental.snapshot.identity.resolved_persons.len(), 3);
+    assert_eq!(incremental.snapshot.person_page.profiles.len(), 3);
+    assert!(incremental.snapshot.person_page.messages.is_empty());
+    assert_eq!(incremental.person_message_count, 4);
+    assert_eq!(incremental.reply_slo_count, 4);
+    assert!(incremental.snapshot.reply_slo.rows.is_empty());
+    assert!(incremental.snapshot.reply_slo.overdue.is_empty());
+    assert_eq!(incremental.compact_state.identity_candidates.len(), 3);
+    let mut full_message_rows = std::collections::BTreeMap::new();
+    apply_projection_item_commit(
+        &mut full_message_rows,
+        pending_projection_item_commit(&full),
+    );
+    assert_eq!(incremental_message_rows, full_message_rows);
+    assert_eq!(
+        serde_json::to_value(incremental).unwrap(),
+        serde_json::to_value(full).unwrap()
+    );
+}
+
+fn wave2_slack_draft(index: usize) -> ObservationDraft {
+    let user_index = index % 100;
+    let user_id = format!("U{user_index:04}");
+    let key = format!("{index:010}.000001");
+    ObservationDraft {
+        schema: SchemaRef::new("schema:slack-message"),
+        schema_version: SemVer::new("1.0.0"),
+        observer: ObserverRef::new("obs:slack-crawler"),
+        source_system: Some(SourceSystemRef::new("sys:slack")),
+        authority_model: AuthorityModel::LakeAuthoritative,
+        capture_model: CaptureModel::Event,
+        subject: EntityRef::new(format!("message:slack:C01ABC-{key}")),
+        target: None,
+        payload: serde_json::json!({
+            "channel_id": "C01ABC",
+            "channel_name": "general",
+            "ts": key,
+            "thread_ts": key,
+            "user_id": user_id,
+            "user_name": format!("User {user_index}"),
+            "email": format!("user-{user_index}@example.test"),
+            "text": format!("Wave2 bulk message {index}"),
+            "permalink": format!("https://example.test/C01ABC/{key}"),
+            "is_public_channel": true,
+            "visibility_status": "public",
+            "is_bot": false,
+            "ingress_kind": "channel",
+            "mentions": [],
+            "message_type": "message",
+            "authority": 1,
+        }),
+        attachments: vec![],
+        published: Utc::now(),
+        idempotency_key: IdempotencyKey::new(format!("slack:C01ABC:{key}")),
+        meta: serde_json::json!({
+            "canonical_json": serde_json::json!({
+                "sender": user_id,
+                "body": format!("Wave2 bulk message {index}"),
+                "event_time": key,
+            }).to_string(),
+            "source_container": "C01ABC",
+            "communication_channel_kind": "slack",
+            "communication_channel_external_id": "C01ABC",
+            "communication_sender_id": user_id,
+            "communication_thread_ref": format!("slack:thread:{key}"),
+        }),
+    }
+}
+
+#[test]
+fn duplicate_bulk_records_do_not_change_incremental_fingerprint() {
+    let root = std::env::temp_dir().join(format!("lethe-self-host-test-{}", uuid::Uuid::now_v7()));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let mut config = test_config(db, blobs);
+    config.corpus.mode = lethe_projection_corpus::CorpusMode::PersonalAllText;
+    let service = test_service(config, persistence);
+    wait_for_search_index_ready(&service);
+
+    let first = service
+        .ingest_observation_drafts(vec![wave2_slack_draft(0)], "slack-test")
+        .unwrap();
+    assert_eq!(first.ingested, 1);
+    let (before, before_item_count) = {
+        let persistence = service.persistence_lock().unwrap();
+        (
+            persistence
+                .projection_records(&ProjectionRef::new("proj:person-page"))
+                .unwrap()
+                .unwrap(),
+            persistence
+                .projection_item_count(&ProjectionRef::new("proj:person-page"))
+                .unwrap(),
+        )
+    };
+
+    let duplicate = service
+        .ingest_observation_drafts(vec![wave2_slack_draft(0)], "slack-test")
+        .unwrap();
+    assert_eq!(duplicate.ingested, 0);
+    assert_eq!(duplicate.duplicates, 1);
+    let (after, after_item_count) = {
+        let persistence = service.persistence_lock().unwrap();
+        (
+            persistence
+                .projection_records(&ProjectionRef::new("proj:person-page"))
+                .unwrap()
+                .unwrap(),
+            persistence
+                .projection_item_count(&ProjectionRef::new("proj:person-page"))
+                .unwrap(),
+        )
+    };
+
+    assert_eq!(
+        before["canonical_observation_fingerprint"],
+        after["canonical_observation_fingerprint"]
+    );
+    assert_eq!(before["observation_count"], after["observation_count"]);
+    assert_eq!(before["reply_slo_count"], 1);
+    assert_eq!(after["reply_slo_count"], 1);
+    assert_eq!(before_item_count, 2);
+    assert_eq!(after_item_count, before_item_count);
+    assert_eq!(
+        service
+            .non_corpus_rebuild_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn person_message_item_sql_failure_does_not_install_manifest_in_core() {
+    let root = std::env::temp_dir().join(format!("lethe-self-host-test-{}", uuid::Uuid::now_v7()));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let mut config = test_config(db.clone(), blobs);
+    config.corpus.mode = lethe_projection_corpus::CorpusMode::PersonalAllText;
+    let service = test_service(config, persistence);
+
+    wait_for_search_index_ready(&service);
+
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_person_message_item
+             BEFORE INSERT ON projection_materialization_items
+             WHEN NEW.projection_id = 'proj:person-page'
+             BEGIN
+                 SELECT RAISE(FAIL, 'forced person message item failure');
+             END;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = service
+        .ingest_observation_drafts(vec![wave2_slack_draft(1)], "slack-test")
+        .unwrap_err();
+    assert!(
+        matches!(error, SelfHostError::Storage(_)),
+        "unexpected error: {error:?}"
+    );
+    let core = service.core_lock().unwrap();
+    assert_eq!(core.observation_stats.count, 0);
+    assert_eq!(core.person_message_count, 0);
+    assert_eq!(core.reply_slo_count, 0);
+    assert!(core.snapshot.person_page.profiles.is_empty());
+    assert!(core.snapshot.person_page.messages.is_empty());
+    assert!(core.snapshot.reply_slo.rows.is_empty());
+    drop(core);
+    let persistence = service.persistence_lock().unwrap();
+    assert_eq!(persistence.observation_stats().unwrap().count, 1);
+    assert!(
+        persistence
+            .projection_records(&ProjectionRef::new("proj:person-page"))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        persistence
+            .projection_item_count(&ProjectionRef::new("proj:person-page"))
+            .unwrap(),
+        0
+    );
+    drop(persistence);
+    drop(service);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn five_thousand_corpus_only_records_do_not_trigger_full_observation_load() {
+    let root = std::env::temp_dir().join(format!("lethe-self-host-test-{}", uuid::Uuid::now_v7()));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let mut config = test_config(db, blobs);
+    config.corpus.mode = lethe_projection_corpus::CorpusMode::PersonalAllText;
+    let service = test_service(config, persistence);
+    let drafts = (0..5_000)
+        .map(|index| freshness_only_draft(&format!("bulk-{index:05}")))
+        .collect();
+
+    let report = service
+        .ingest_observation_drafts(drafts, "bulk-memory-test")
+        .unwrap();
+
+    assert_eq!(report.ingested, 5_000);
+    assert_eq!(report.duplicates, 0);
+    assert_eq!(report.quarantined, 0);
+    assert_eq!(service.core_lock().unwrap().observation_stats.count, 5_000);
+    assert_eq!(
+        service
+            .non_corpus_rebuild_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "freshness-only bulk import must not call load_observations"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn five_thousand_wave2_slack_records_use_compact_identity_without_full_load() {
+    let root = std::env::temp_dir().join(format!("lethe-self-host-test-{}", uuid::Uuid::now_v7()));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let mut config = test_config(db, blobs);
+    config.corpus.mode = lethe_projection_corpus::CorpusMode::PersonalAllText;
+    let service = test_service(config.clone(), persistence);
+    let drafts = (0..5_000).map(wave2_slack_draft).collect();
+
+    let report = service
+        .ingest_observation_drafts(drafts, "slack-test")
+        .unwrap();
+
+    assert_eq!(report.ingested, 5_000);
+    assert_eq!(report.duplicates, 0);
+    assert_eq!(report.quarantined, 0);
+    let core = service.core_lock().unwrap();
+    assert_eq!(core.observation_stats.count, 5_000);
+    assert_eq!(core.compact_state.identity_candidates.len(), 100);
+    assert_eq!(core.snapshot.identity.resolved_persons.len(), 100);
+    assert_eq!(core.snapshot.person_page.profiles.len(), 100);
+    assert!(core.snapshot.person_page.messages.is_empty());
+    assert_eq!(core.person_message_count, 5_000);
+    assert_eq!(core.reply_slo_count, 5_000);
+    assert!(core.snapshot.reply_slo.rows.is_empty());
+    assert!(core.snapshot.reply_slo.overdue.is_empty());
+    let person_id = core.snapshot.person_page.profiles[0]
+        .person_id
+        .as_str()
+        .to_owned();
+    let expected_owner_messages = core
+        .snapshot
+        .person_page
+        .activities
+        .iter()
+        .find(|activity| activity.person_id.as_str() == person_id)
+        .unwrap()
+        .total_messages;
+    drop(core);
+    {
+        let persistence = service.persistence_lock().unwrap();
+        assert_eq!(
+            persistence
+                .projection_item_count(&ProjectionRef::new("proj:person-page"))
+                .unwrap(),
+            10_000
+        );
+        assert_eq!(
+            persistence
+                .projection_item_count_by_owner(
+                    &ProjectionRef::new("proj:person-page"),
+                    super::REPLY_SLO_ITEM_OWNER,
+                )
+                .unwrap(),
+            5_000
+        );
+        assert_eq!(
+            persistence
+                .projection_item_count_by_owner(
+                    &ProjectionRef::new("proj:person-page"),
+                    &person_id,
+                )
+                .unwrap(),
+            u64::try_from(expected_owner_messages).unwrap()
+        );
+    }
+    let messages = service
+        .person_messages_response(&person_id, None, None)
+        .unwrap();
+    assert_eq!(
+        messages.data.as_array().unwrap().len(),
+        expected_owner_messages
+    );
+    let detail = service
+        .person_detail_response(&person_id, None, None)
+        .unwrap();
+    assert_eq!(
+        detail.data["recent_messages"].as_array().unwrap().len(),
+        expected_owner_messages
+    );
+    let timeline = service
+        .person_timeline_response(&person_id, None, None)
+        .unwrap();
+    assert_eq!(
+        timeline.data.as_array().unwrap().len(),
+        expected_owner_messages
+    );
+    assert_eq!(service.reply_slo_response().unwrap().data.rows.len(), 5_000);
+    assert_eq!(
+        service
+            .non_corpus_rebuild_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "Wave2-compatible Slack bulk import must not call load_observations"
+    );
+    let built_at = service.core_lock().unwrap().snapshot.built_at;
+    drop(service);
+
+    let restarted = AppService::bootstrap(config).unwrap();
+    let restarted_core = restarted.core_lock().unwrap();
+    assert_eq!(restarted_core.snapshot.built_at, built_at);
+    assert!(restarted_core.snapshot.person_page.messages.is_empty());
+    assert_eq!(restarted_core.person_message_count, 5_000);
+    assert_eq!(restarted_core.reply_slo_count, 5_000);
+    assert!(restarted_core.snapshot.reply_slo.rows.is_empty());
+    assert!(restarted_core.snapshot.reply_slo.overdue.is_empty());
+    drop(restarted_core);
+    assert_eq!(
+        restarted
+            .non_corpus_rebuild_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        restarted
+            .person_messages_response(&person_id, None, None)
+            .unwrap()
+            .data
+            .as_array()
+            .unwrap()
+            .len(),
+        expected_owner_messages
+    );
+    assert_eq!(
+        restarted.reply_slo_response().unwrap().data.rows.len(),
+        5_000
+    );
+    drop(restarted);
 
     let _ = std::fs::remove_dir_all(root);
 }

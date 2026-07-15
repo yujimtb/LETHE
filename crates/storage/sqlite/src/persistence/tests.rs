@@ -55,6 +55,35 @@ fn persist_and_reload_observation() {
     let _ = fs::remove_dir_all(tmp);
 }
 
+#[test]
+fn observation_stats_report_empty_and_appended_high_water() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+
+    assert_eq!(
+        store.observation_stats().unwrap(),
+        lethe_storage_api::ObservationStats {
+            count: 0,
+            max_append_seq: 0,
+        }
+    );
+
+    let observation = sample_observation();
+    store.append_observation_idempotent(&observation).unwrap();
+
+    assert_eq!(
+        store.observation_stats().unwrap(),
+        lethe_storage_api::ObservationStats {
+            count: 1,
+            max_append_seq: 1,
+        }
+    );
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
 fn sample_supplemental(observation_id: &lethe_core::domain::ObservationId) -> SupplementalRecord {
     SupplementalRecord {
         id: SupplementalId::new("sup:test"),
@@ -73,6 +102,15 @@ fn sample_supplemental(observation_id: &lethe_core::domain::ObservationId) -> Su
         consent_metadata: None,
         lineage: None,
     }
+}
+
+fn sample_supplemental_with_id(
+    id: &str,
+    observation_id: &lethe_core::domain::ObservationId,
+) -> SupplementalRecord {
+    let mut record = sample_supplemental(observation_id);
+    record.id = SupplementalId::new(id);
+    record
 }
 
 #[test]
@@ -299,7 +337,7 @@ fn rehome_mode_b_reserializes_identity_and_canonical_json() {
     let (identity_key, canonical_json, json): (String, String, String) = store
         .conn
         .query_row(
-            "SELECT identity_key, canonical_json, observation_json FROM observations WHERE id = ?1",
+            "SELECT identity_key, canonical_json_sha256, observation_json FROM observations WHERE id = ?1",
             [observation.id.as_str()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -307,7 +345,7 @@ fn rehome_mode_b_reserializes_identity_and_canonical_json() {
     let stored = serde_json::from_str::<Observation>(&json).unwrap();
 
     assert_eq!(identity_key, new_key.as_str());
-    assert_eq!(canonical_json, new_canonical_json);
+    assert_eq!(canonical_json, canonical_json_sha256(&new_canonical_json));
     assert_eq!(stored.idempotency_key, new_key);
     assert_eq!(
         stored.meta[CANONICAL_JSON_META_KEY].as_str(),
@@ -355,6 +393,894 @@ fn migration_ledger_records_current_schema_version() {
         )
         .unwrap();
     assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+fn projection_item(item_key: &str, owner_key: &str, sort_key: &str) -> ProjectionItem {
+    ProjectionItem {
+        item_key: item_key.to_owned(),
+        owner_key: owner_key.to_owned(),
+        sort_key: sort_key.to_owned(),
+        value: serde_json::json!({"item": item_key}),
+    }
+}
+
+#[test]
+fn projection_item_replace_reopens_with_owner_isolation_and_stable_order() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let projection = lethe_core::domain::ProjectionRef::new("proj:item-test");
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+
+    store
+        .commit_projection_items(
+            &projection,
+            &serde_json::json!({"generation": 1}),
+            &ProjectionItemCommit::Replace {
+                items: vec![projection_item("obsolete", "owner-a", "999")],
+            },
+        )
+        .unwrap();
+    store
+        .commit_projection_items(
+            &projection,
+            &serde_json::json!({"generation": 2}),
+            &ProjectionItemCommit::Replace {
+                items: vec![
+                    projection_item("item-z", "owner-a", "001"),
+                    projection_item("item-b", "owner-a", "000"),
+                    projection_item("item-a", "owner-a", "001"),
+                    projection_item("item-other", "owner-b", "000"),
+                ],
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        store
+            .projection_items_by_owner(&projection, "owner-a")
+            .unwrap()
+            .into_iter()
+            .map(|item| item.item_key)
+            .collect::<Vec<_>>(),
+        vec!["item-b", "item-a", "item-z"]
+    );
+    assert_eq!(
+        store
+            .projection_items_by_owner(&projection, "owner-b")
+            .unwrap()
+            .into_iter()
+            .map(|item| item.item_key)
+            .collect::<Vec<_>>(),
+        vec!["item-other"]
+    );
+    assert_eq!(
+        store
+            .projection_item_count_by_owner(&projection, "owner-a")
+            .unwrap(),
+        3
+    );
+    assert_eq!(store.projection_item_count(&projection).unwrap(), 4);
+    assert_eq!(
+        store
+            .projection_item_count_by_owner(&projection, "missing-owner")
+            .unwrap(),
+        0
+    );
+    drop(store);
+
+    let reopened = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    assert_eq!(
+        reopened.projection_records(&projection).unwrap(),
+        Some(serde_json::json!({"generation": 2}))
+    );
+    assert_eq!(
+        reopened
+            .projection_items_by_owner(&projection, "owner-a")
+            .unwrap()
+            .into_iter()
+            .map(|item| item.item_key)
+            .collect::<Vec<_>>(),
+        vec!["item-b", "item-a", "item-z"]
+    );
+    assert!(
+        reopened
+            .projection_items_by_owner(&projection, "owner-b ")
+            .unwrap()
+            .is_empty(),
+        "owner lookup must use exact equality"
+    );
+    drop(reopened);
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn projection_item_delta_inserts_updates_and_deletes_atomically() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let projection = lethe_core::domain::ProjectionRef::new("proj:item-delta");
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    store
+        .commit_projection_items(
+            &projection,
+            &serde_json::json!({"generation": 1}),
+            &ProjectionItemCommit::Replace {
+                items: vec![
+                    projection_item("item-a", "owner-a", "001"),
+                    projection_item("item-b", "owner-a", "002"),
+                ],
+            },
+        )
+        .unwrap();
+
+    let mut updated = projection_item("item-b", "owner-b", "003");
+    updated.value = serde_json::json!({"updated": true});
+    store
+        .commit_projection_items(
+            &projection,
+            &serde_json::json!({"generation": 2}),
+            &ProjectionItemCommit::Delta {
+                inserts: vec![projection_item("item-c", "owner-a", "000")],
+                updates: vec![updated.clone()],
+                deletes: vec!["item-a".to_owned()],
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        store.projection_records(&projection).unwrap(),
+        Some(serde_json::json!({"generation": 2}))
+    );
+    assert_eq!(
+        store
+            .projection_items_by_owner(&projection, "owner-a")
+            .unwrap(),
+        vec![projection_item("item-c", "owner-a", "000")]
+    );
+    assert_eq!(
+        store
+            .projection_items_by_owner(&projection, "owner-b")
+            .unwrap(),
+        vec![updated]
+    );
+    assert_eq!(
+        store
+            .projection_item_count_by_owner(&projection, "owner-a")
+            .unwrap(),
+        1
+    );
+    assert_eq!(store.projection_item_count(&projection).unwrap(), 2);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn supplemental_and_projection_delta_commit_atomically() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let projection = lethe_core::domain::ProjectionRef::new("proj:supplemental-atomic");
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    let original = projection_item("item-a", "owner-a", "001");
+    store
+        .commit_projection_items(
+            &projection,
+            &serde_json::json!({"generation": 1}),
+            &ProjectionItemCommit::Replace {
+                items: vec![original],
+            },
+        )
+        .unwrap();
+    let observation = sample_observation();
+    let supplemental = sample_supplemental_with_id("sup:atomic-success", &observation.id);
+    let mut updated = projection_item("item-a", "owner-b", "002");
+    updated.value = serde_json::json!({"updated": true});
+    let inserted = projection_item("item-b", "owner-b", "003");
+    let manifest = serde_json::json!({"generation": 2, "item_count": 2});
+
+    store
+        .commit_supplemental_and_projection(
+            &supplemental,
+            &projection,
+            &manifest,
+            &ProjectionItemCommit::Delta {
+                inserts: vec![inserted.clone()],
+                updates: vec![updated.clone()],
+                deletes: vec![],
+            },
+        )
+        .unwrap();
+
+    let stored = store.supplemental_by_id(&supplemental.id).unwrap().unwrap();
+    assert_eq!(stored.id, supplemental.id);
+    assert_eq!(stored.payload, supplemental.payload);
+    assert_eq!(
+        store.projection_records(&projection).unwrap(),
+        Some(manifest)
+    );
+    assert_eq!(
+        store.projection_item_by_key(&projection, "item-a").unwrap(),
+        Some(updated)
+    );
+    assert_eq!(
+        store.projection_item_by_key(&projection, "item-b").unwrap(),
+        Some(inserted)
+    );
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn supplemental_projection_duplicate_id_rolls_back_projection_delta_and_manifest() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let projection = lethe_core::domain::ProjectionRef::new("proj:supplemental-duplicate");
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    let original_manifest = serde_json::json!({"generation": 1});
+    let original_item = projection_item("item-a", "owner-a", "001");
+    store
+        .commit_projection_items(
+            &projection,
+            &original_manifest,
+            &ProjectionItemCommit::Replace {
+                items: vec![original_item.clone()],
+            },
+        )
+        .unwrap();
+    let observation = sample_observation();
+    let original_supplemental =
+        sample_supplemental_with_id("sup:atomic-duplicate", &observation.id);
+    store.persist_supplemental(&original_supplemental).unwrap();
+    let mut duplicate = original_supplemental.clone();
+    duplicate.payload = serde_json::json!({"bio_text": "must not replace"});
+
+    let error = store
+        .commit_supplemental_and_projection(
+            &duplicate,
+            &projection,
+            &serde_json::json!({"generation": 2}),
+            &ProjectionItemCommit::Delta {
+                inserts: vec![projection_item("item-b", "owner-a", "002")],
+                updates: vec![projection_item("item-a", "owner-b", "003")],
+                deletes: vec![],
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        PersistenceError::SchemaInvariant(message)
+            if message.contains("supplemental append requires absent id")
+    ));
+    assert_eq!(
+        store
+            .supplemental_by_id(&original_supplemental.id)
+            .unwrap()
+            .unwrap()
+            .payload,
+        original_supplemental.payload
+    );
+    assert_eq!(
+        store.projection_records(&projection).unwrap(),
+        Some(original_manifest)
+    );
+    assert_eq!(
+        store.projection_item_by_key(&projection, "item-a").unwrap(),
+        Some(original_item)
+    );
+    assert!(
+        store
+            .projection_item_by_key(&projection, "item-b")
+            .unwrap()
+            .is_none()
+    );
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn supplemental_projection_item_precondition_failures_roll_back_everything() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let projection = lethe_core::domain::ProjectionRef::new("proj:supplemental-item-failure");
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    let original_manifest = serde_json::json!({"generation": 1});
+    let original_item = projection_item("item-a", "owner-a", "001");
+    store
+        .commit_projection_items(
+            &projection,
+            &original_manifest,
+            &ProjectionItemCommit::Replace {
+                items: vec![original_item.clone()],
+            },
+        )
+        .unwrap();
+    let observation = sample_observation();
+    let cases = [
+        (
+            sample_supplemental_with_id("sup:atomic-update-missing", &observation.id),
+            ProjectionItemCommit::Delta {
+                inserts: vec![],
+                updates: vec![projection_item("missing", "owner-a", "002")],
+                deletes: vec![],
+            },
+            "delta update requires existing item_key missing",
+        ),
+        (
+            sample_supplemental_with_id("sup:atomic-insert-conflict", &observation.id),
+            ProjectionItemCommit::Delta {
+                inserts: vec![projection_item("item-a", "owner-b", "003")],
+                updates: vec![],
+                deletes: vec![],
+            },
+            "delta insert requires absent item_key item-a",
+        ),
+    ];
+
+    for (record, item_delta, expected_message) in cases {
+        let error = store
+            .commit_supplemental_and_projection(
+                &record,
+                &projection,
+                &serde_json::json!({"generation": 999}),
+                &item_delta,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PersistenceError::SchemaInvariant(message)
+                if message.contains(expected_message)
+        ));
+        assert!(store.supplemental_by_id(&record.id).unwrap().is_none());
+        assert_eq!(
+            store.projection_records(&projection).unwrap(),
+            Some(original_manifest.clone())
+        );
+        assert_eq!(
+            store.projection_item_by_key(&projection, "item-a").unwrap(),
+            Some(original_item.clone())
+        );
+        assert_eq!(store.projection_item_count(&projection).unwrap(), 1);
+    }
+
+    let replace_record =
+        sample_supplemental_with_id("sup:atomic-replace-rejected", &observation.id);
+    assert!(matches!(
+        store.commit_supplemental_and_projection(
+            &replace_record,
+            &projection,
+            &serde_json::json!({"generation": 999}),
+            &ProjectionItemCommit::Replace { items: vec![] },
+        ),
+        Err(PersistenceError::SchemaInvariant(message))
+            if message.contains("requires a projection item delta")
+    ));
+    assert!(
+        store
+            .supplemental_by_id(&replace_record.id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store.projection_records(&projection).unwrap(),
+        Some(original_manifest)
+    );
+    assert_eq!(
+        store.projection_item_by_key(&projection, "item-a").unwrap(),
+        Some(original_item)
+    );
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn supplemental_projection_manifest_sql_failure_rolls_back_supplemental_and_items() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let projection = lethe_core::domain::ProjectionRef::new("proj:supplemental-manifest-failure");
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    let original_manifest = serde_json::json!({"generation": 1});
+    let original_item = projection_item("item-a", "owner-a", "001");
+    store
+        .commit_projection_items(
+            &projection,
+            &original_manifest,
+            &ProjectionItemCommit::Replace {
+                items: vec![original_item.clone()],
+            },
+        )
+        .unwrap();
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER reject_supplemental_projection_manifest
+             BEFORE UPDATE ON projection_materializations
+             WHEN OLD.projection_id = 'proj:supplemental-manifest-failure'
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced supplemental projection manifest failure');
+             END;",
+        )
+        .unwrap();
+    let observation = sample_observation();
+    let supplemental = sample_supplemental_with_id("sup:atomic-manifest-failure", &observation.id);
+
+    assert!(matches!(
+        store.commit_supplemental_and_projection(
+            &supplemental,
+            &projection,
+            &serde_json::json!({"generation": 2}),
+            &ProjectionItemCommit::Delta {
+                inserts: vec![projection_item("item-b", "owner-a", "002")],
+                updates: vec![],
+                deletes: vec![],
+            },
+        ),
+        Err(PersistenceError::Sqlite(_))
+    ));
+    assert!(
+        store
+            .supplemental_by_id(&supplemental.id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store.projection_records(&projection).unwrap(),
+        Some(original_manifest)
+    );
+    assert_eq!(
+        store.projection_item_by_key(&projection, "item-a").unwrap(),
+        Some(original_item)
+    );
+    assert!(
+        store
+            .projection_item_by_key(&projection, "item-b")
+            .unwrap()
+            .is_none()
+    );
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn invalid_projection_item_commits_do_not_change_manifest_or_items() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let projection = lethe_core::domain::ProjectionRef::new("proj:item-invalid");
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    let original_manifest = serde_json::json!({"generation": 1});
+    let original_item = projection_item("item-a", "owner-a", "001");
+    store
+        .commit_projection_items(
+            &projection,
+            &original_manifest,
+            &ProjectionItemCommit::Replace {
+                items: vec![original_item.clone()],
+            },
+        )
+        .unwrap();
+
+    let invalid_commits = vec![
+        ProjectionItemCommit::Replace {
+            items: vec![projection_item(" ", "owner-a", "001")],
+        },
+        ProjectionItemCommit::Replace {
+            items: vec![projection_item("item-b", "\t", "001")],
+        },
+        ProjectionItemCommit::Replace {
+            items: vec![projection_item("item-b", "owner-a", "\n")],
+        },
+        ProjectionItemCommit::Replace {
+            items: vec![
+                projection_item("duplicate", "owner-a", "001"),
+                projection_item("duplicate", "owner-b", "002"),
+            ],
+        },
+        ProjectionItemCommit::Delta {
+            inserts: vec![projection_item("same", "owner-a", "001")],
+            updates: vec![],
+            deletes: vec!["same".to_owned()],
+        },
+        ProjectionItemCommit::Delta {
+            inserts: vec![],
+            updates: vec![],
+            deletes: vec!["delete".to_owned(), "delete".to_owned()],
+        },
+        ProjectionItemCommit::Delta {
+            inserts: vec![projection_item("same", "owner-a", "001")],
+            updates: vec![projection_item("same", "owner-b", "002")],
+            deletes: vec![],
+        },
+    ];
+    for invalid in invalid_commits {
+        assert!(
+            store
+                .commit_projection_items(
+                    &projection,
+                    &serde_json::json!({"generation": 999}),
+                    &invalid,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.projection_records(&projection).unwrap(),
+            Some(original_manifest.clone())
+        );
+        assert_eq!(
+            store
+                .projection_items_by_owner(&projection, "owner-a")
+                .unwrap(),
+            vec![original_item.clone()]
+        );
+    }
+    assert!(store.projection_items_by_owner(&projection, " ").is_err());
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn projection_item_delta_precondition_failures_roll_back_manifest_and_items() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let projection = lethe_core::domain::ProjectionRef::new("proj:item-preconditions");
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    let original_manifest = serde_json::json!({"generation": 1});
+    let original_item = projection_item("item-a", "owner-a", "001");
+    store
+        .commit_projection_items(
+            &projection,
+            &original_manifest,
+            &ProjectionItemCommit::Replace {
+                items: vec![original_item.clone()],
+            },
+        )
+        .unwrap();
+
+    let cases = [
+        (
+            ProjectionItemCommit::Delta {
+                inserts: vec![
+                    projection_item("item-new", "owner-a", "002"),
+                    projection_item("item-a", "owner-a", "003"),
+                ],
+                updates: vec![],
+                deletes: vec![],
+            },
+            "delta insert requires absent item_key item-a",
+        ),
+        (
+            ProjectionItemCommit::Delta {
+                inserts: vec![],
+                updates: vec![
+                    projection_item("item-a", "owner-b", "004"),
+                    projection_item("item-missing", "owner-a", "005"),
+                ],
+                deletes: vec![],
+            },
+            "delta update requires existing item_key item-missing",
+        ),
+        (
+            ProjectionItemCommit::Delta {
+                inserts: vec![],
+                updates: vec![],
+                deletes: vec!["item-a".to_owned(), "item-missing".to_owned()],
+            },
+            "delta delete requires existing item_key item-missing",
+        ),
+    ];
+
+    for (commit, expected_message) in cases {
+        let error = store
+            .commit_projection_items(
+                &projection,
+                &serde_json::json!({"generation": 999}),
+                &commit,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                PersistenceError::SchemaInvariant(message)
+                    if message.contains(expected_message)
+            ),
+            "unexpected delta precondition error"
+        );
+        assert_eq!(
+            store.projection_records(&projection).unwrap(),
+            Some(original_manifest.clone())
+        );
+        assert_eq!(
+            store
+                .projection_items_by_owner(&projection, "owner-a")
+                .unwrap(),
+            vec![original_item.clone()]
+        );
+        assert!(
+            store
+                .projection_items_by_owner(&projection, "owner-b")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn projection_item_staging_pages_publish_atomically_and_consume_staging() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let target = lethe_core::domain::ProjectionRef::new("proj:item-publish-target");
+    let staging = lethe_core::domain::ProjectionRef::new("proj:item-publish-staging");
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    store
+        .commit_projection_items(
+            &target,
+            &serde_json::json!({"generation": 1}),
+            &ProjectionItemCommit::Replace {
+                items: vec![projection_item("old", "owner-old", "999")],
+            },
+        )
+        .unwrap();
+    store
+        .commit_projection_items(
+            &staging,
+            &serde_json::json!({"page": 0}),
+            &ProjectionItemCommit::Replace { items: vec![] },
+        )
+        .unwrap();
+    store
+        .commit_projection_items(
+            &staging,
+            &serde_json::json!({"page": 1}),
+            &ProjectionItemCommit::Delta {
+                inserts: vec![
+                    projection_item("item-b", "owner-a", "002"),
+                    projection_item("item-a", "owner-a", "001"),
+                ],
+                updates: vec![],
+                deletes: vec![],
+            },
+        )
+        .unwrap();
+    store
+        .commit_projection_items(
+            &staging,
+            &serde_json::json!({"page": 2}),
+            &ProjectionItemCommit::Delta {
+                inserts: vec![projection_item("item-c", "owner-b", "001")],
+                updates: vec![],
+                deletes: vec![],
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        store.projection_item_by_key(&staging, "item-b").unwrap(),
+        Some(projection_item("item-b", "owner-a", "002"))
+    );
+    assert!(
+        store
+            .projection_item_by_key(&staging, "missing")
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.projection_item_by_key(&staging, " ").is_err());
+
+    let final_manifest = serde_json::json!({"generation": 2, "item_count": 3});
+    store
+        .publish_projection_items_from_staging(&target, &staging, &final_manifest, 3)
+        .unwrap();
+
+    assert_eq!(
+        store.projection_records(&target).unwrap(),
+        Some(final_manifest)
+    );
+    assert_eq!(
+        store.projection_items_by_owner(&target, "owner-a").unwrap(),
+        vec![
+            projection_item("item-a", "owner-a", "001"),
+            projection_item("item-b", "owner-a", "002"),
+        ]
+    );
+    assert_eq!(
+        store.projection_items_by_owner(&target, "owner-b").unwrap(),
+        vec![projection_item("item-c", "owner-b", "001")]
+    );
+    assert_eq!(store.projection_item_count(&target).unwrap(), 3);
+    assert_eq!(store.projection_records(&staging).unwrap(), None);
+    assert_eq!(store.projection_item_count(&staging).unwrap(), 0);
+    assert!(
+        store
+            .projection_item_by_key(&staging, "item-a")
+            .unwrap()
+            .is_none()
+    );
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn projection_item_staging_publish_preconditions_and_sql_failure_preserve_both_sides() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let target = lethe_core::domain::ProjectionRef::new("proj:item-publish-target");
+    let staging = lethe_core::domain::ProjectionRef::new("proj:item-publish-staging");
+    let missing = lethe_core::domain::ProjectionRef::new("proj:item-publish-missing");
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    let original_manifest = serde_json::json!({"generation": 1});
+    let original_item = projection_item("old", "owner-old", "999");
+    let staged_items = vec![
+        projection_item("stage-a", "owner-a", "001"),
+        projection_item("stage-b", "owner-a", "002"),
+    ];
+    store
+        .commit_projection_items(
+            &target,
+            &original_manifest,
+            &ProjectionItemCommit::Replace {
+                items: vec![original_item.clone()],
+            },
+        )
+        .unwrap();
+
+    assert!(matches!(
+        store.publish_projection_items_from_staging(
+            &target,
+            &target,
+            &serde_json::json!({"generation": 2}),
+            1,
+        ),
+        Err(PersistenceError::SchemaInvariant(message))
+            if message.contains("must differ")
+    ));
+    assert!(matches!(
+        store.publish_projection_items_from_staging(
+            &target,
+            &missing,
+            &serde_json::json!({"generation": 2}),
+            0,
+        ),
+        Err(PersistenceError::SchemaInvariant(message))
+            if message.contains("does not exist")
+    ));
+
+    store
+        .commit_projection_items(
+            &staging,
+            &serde_json::json!({"page": 1}),
+            &ProjectionItemCommit::Replace {
+                items: staged_items.clone(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        store.publish_projection_items_from_staging(
+            &target,
+            &staging,
+            &serde_json::json!({"generation": 2}),
+            3,
+        ),
+        Err(PersistenceError::SchemaInvariant(message))
+            if message.contains("contains 2 items, expected 3")
+    ));
+    assert_eq!(
+        store.projection_records(&target).unwrap(),
+        Some(original_manifest.clone())
+    );
+    assert_eq!(
+        store
+            .projection_items_by_owner(&target, "owner-old")
+            .unwrap(),
+        vec![original_item.clone()]
+    );
+    assert_eq!(store.projection_item_count(&staging).unwrap(), 2);
+
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER reject_staging_publish
+             BEFORE INSERT ON projection_materialization_items
+             WHEN NEW.projection_id = 'proj:item-publish-target'
+                  AND NEW.item_key = 'stage-b'
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced staging publish failure');
+             END;",
+        )
+        .unwrap();
+    assert!(matches!(
+        store.publish_projection_items_from_staging(
+            &target,
+            &staging,
+            &serde_json::json!({"generation": 2}),
+            2,
+        ),
+        Err(PersistenceError::Sqlite(_))
+    ));
+    assert_eq!(
+        store.projection_records(&target).unwrap(),
+        Some(original_manifest)
+    );
+    assert_eq!(
+        store
+            .projection_items_by_owner(&target, "owner-old")
+            .unwrap(),
+        vec![original_item]
+    );
+    assert_eq!(
+        store
+            .projection_items_by_owner(&staging, "owner-a")
+            .unwrap(),
+        staged_items
+    );
+    assert_eq!(
+        store.projection_records(&staging).unwrap(),
+        Some(serde_json::json!({"page": 1}))
+    );
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn projection_item_sql_failure_rolls_back_manifest_and_all_mutations() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let projection = lethe_core::domain::ProjectionRef::new("proj:item-rollback");
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    let original_manifest = serde_json::json!({"generation": 1});
+    let original_item = projection_item("item-a", "owner-a", "001");
+    store
+        .commit_projection_items(
+            &projection,
+            &original_manifest,
+            &ProjectionItemCommit::Replace {
+                items: vec![original_item.clone()],
+            },
+        )
+        .unwrap();
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER reject_projection_item
+             BEFORE INSERT ON projection_materialization_items
+             WHEN NEW.item_key = 'item-fail'
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced projection item failure');
+             END;",
+        )
+        .unwrap();
+
+    let result = store.commit_projection_items(
+        &projection,
+        &serde_json::json!({"generation": 2}),
+        &ProjectionItemCommit::Delta {
+            inserts: vec![
+                projection_item("item-before-failure", "owner-a", "002"),
+                projection_item("item-fail", "owner-a", "003"),
+            ],
+            updates: vec![],
+            deletes: vec!["item-a".to_owned()],
+        },
+    );
+    assert!(matches!(result, Err(PersistenceError::Sqlite(_))));
+    assert_eq!(
+        store.projection_records(&projection).unwrap(),
+        Some(original_manifest)
+    );
+    assert_eq!(
+        store
+            .projection_items_by_owner(&projection, "owner-a")
+            .unwrap(),
+        vec![original_item]
+    );
 
     let _ = fs::remove_dir_all(tmp);
 }

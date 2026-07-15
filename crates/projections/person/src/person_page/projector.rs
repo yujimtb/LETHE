@@ -20,6 +20,15 @@ pub struct PersonPageProjector;
 pub const CONSENT_DECISION_SCHEMA: &str = "schema:consent-decision";
 
 impl PersonPageProjector {
+    pub fn project_frontend_profiles(
+        identity: &IdentityResolutionOutput,
+        observations: &[Observation],
+        supplemental_records: &[&SupplementalRecord],
+    ) -> HashMap<String, (DateTime<Utc>, FrontendProfile)> {
+        let person_identifiers = Self::build_person_identifier_map(identity);
+        Self::build_frontend_profile_map(observations, supplemental_records, &person_identifiers)
+    }
+
     /// Build person page output from identity resolution and observations.
     ///
     /// Only uses `resolved_persons` with confirmed status (not pending candidates).
@@ -35,11 +44,8 @@ impl PersonPageProjector {
 
         // Build person-id → identifiers map for matching.
         let person_identifiers = Self::build_person_identifier_map(identity);
-        let frontend_profiles = Self::build_frontend_profile_map(
-            observations,
-            supplemental_records,
-            &person_identifiers,
-        );
+        let frontend_profiles =
+            Self::project_frontend_profiles(identity, observations, supplemental_records);
 
         for person in &identity.resolved_persons {
             if Self::consent_status_for_person(person, observations) == ConsentStatus::OptedOut {

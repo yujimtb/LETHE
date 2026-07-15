@@ -43,6 +43,13 @@ $allowedLocalDependencies = @{
         "lethe-profile-model"
     )
     "lethe-storage-sqlite" = @("lethe-core", "lethe-runtime", "lethe-storage-api")
+    "lethe-search-index" = @(
+        "lethe-api",
+        "lethe-core",
+        "lethe-projection-corpus",
+        "lethe-storage-api",
+        "lethe-storage-sqlite"
+    )
 }
 
 $violations = [System.Collections.Generic.List[string]]::new()

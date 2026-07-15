@@ -1,0 +1,73 @@
+[[channels]]
+id = "chan:persistent-index-benchmark:C01BENCH"
+kind = "slack"
+source_instance_id = "persistent-index-benchmark"
+external_id = "C01BENCH"
+connection_ref = "persistent-index-benchmark"
+default_consent_scope = "personal"
+reply_slo_seconds = 1800
+freshness_threshold_seconds = 129600
+break_glass_channel = false
+break_glass_senders = []
+enabled = true
+
+[server]
+bind_addr = "0.0.0.0:8080"
+mcp_bind_addr = "0.0.0.0:8090"
+
+[mcp]
+resource_url = "https://persistent-index-benchmark.invalid/mcp"
+protected_resource_metadata_url = "https://persistent-index-benchmark.invalid/.well-known/oauth-protected-resource"
+oauth_issuer = "https://persistent-index-benchmark.invalid/"
+oauth_audience = "https://persistent-index-benchmark.invalid/mcp"
+oauth_jwks_path = "/etc/lethe/mcp-jwks.json"
+
+[storage]
+database_path = "/var/lib/lethe/lethe.sqlite3"
+blob_dir = "/var/lib/lethe/blobs"
+encryption_key_env = "LETHE_BENCH_STORAGE_ENCRYPTION_KEY"
+
+[routing]
+key_order = "year_month_source_container_published"
+
+[runtime]
+poll_seconds = 300
+
+[limits]
+max_blob_bytes = 10485760
+max_payload_bytes = 1048576
+max_sync_items = 10000
+max_page_size = 100
+max_leaf_observations = 100000
+retention_days = 3650
+
+[corpus]
+mode = "workspace_filtered"
+index_dir = "/var/lib/lethe/corpus-index"
+writer_heap_bytes = 33554432
+rebuild_page_size = 4096
+
+[freshness.threshold_seconds]
+"chan:persistent-index-benchmark:C01BENCH" = 129600
+
+[ops]
+backfill_nightly_budget_items = 10000
+
+[supplemental]
+reject_unregistered_kinds = true
+
+[[api_tokens]]
+token_env = "LETHE_BENCH_READ_TOKEN"
+scopes = ["read:corpus"]
+
+[[api_tokens]]
+token_env = "LETHE_BENCH_WRITE_TOKEN"
+scopes = ["write:observations"]
+
+[[api_tokens]]
+token_env = "LETHE_BENCH_HEALTH_TOKEN"
+scopes = ["admin:health"]
+
+[sources]
+slack = []
+google_slides = []
