@@ -8,7 +8,8 @@ use axum::{Json, Router};
 use serde::Deserialize;
 
 use crate::self_host::app::{
-    AppService, ImportReport, SelfHostError, SupplementalWriteRequest, WriteEnvelope,
+    AppService, BulkImportSessionReport, ImportReport, SelfHostError, SupplementalWriteRequest,
+    WriteEnvelope,
 };
 use lethe_adapter_api::traits::ObservationDraft;
 use lethe_api::api::envelope::{ErrorResponse, ResponseEnvelope};
@@ -26,6 +27,14 @@ pub fn build_router(service: AppService) -> Router {
         .route(
             "/api/import/observation-drafts",
             post(import_observation_drafts).layer(DefaultBodyLimit::max(128 * 1024 * 1024)),
+        )
+        .route(
+            "/api/import/bulk-sessions/begin",
+            post(begin_bulk_import_session),
+        )
+        .route(
+            "/api/import/bulk-sessions/{session_id}/end",
+            post(end_bulk_import_session),
         )
         .route("/projections/claim-queue", get(claim_queue))
         .route("/projections/decisions", get(decisions))
@@ -123,6 +132,8 @@ struct CardQueueQuery {
 #[derive(Debug, Deserialize)]
 struct ImportObservationDraftsRequest {
     source_instance_id: String,
+    #[serde(default)]
+    bulk_session_id: Option<String>,
     drafts: Vec<ObservationDraft>,
 }
 
@@ -156,10 +167,37 @@ async fn import_observation_drafts(
 ) -> Result<Json<ImportReport>, ApiError> {
     service.authorize_headers(&headers, "write:observations")?;
     let report = tokio::task::spawn_blocking(move || {
-        service.ingest_observation_drafts(request.drafts, &request.source_instance_id)
+        service.ingest_observation_drafts_with_session(
+            request.drafts,
+            &request.source_instance_id,
+            request.bulk_session_id.as_deref(),
+        )
     })
     .await
     .map_err(|err| ApiError::internal(err.to_string()))??;
+    Ok(Json(report))
+}
+
+async fn begin_bulk_import_session(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+) -> Result<Json<BulkImportSessionReport>, ApiError> {
+    service.authorize_headers(&headers, "write:observations")?;
+    let report = tokio::task::spawn_blocking(move || service.begin_bulk_import_session())
+        .await
+        .map_err(|err| ApiError::internal(err.to_string()))??;
+    Ok(Json(report))
+}
+
+async fn end_bulk_import_session(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Result<Json<BulkImportSessionReport>, ApiError> {
+    service.authorize_headers(&headers, "write:observations")?;
+    let report = tokio::task::spawn_blocking(move || service.end_bulk_import_session(&session_id))
+        .await
+        .map_err(|err| ApiError::internal(err.to_string()))??;
     Ok(Json(report))
 }
 
@@ -297,8 +335,13 @@ async fn projection_lineage(
     headers: HeaderMap,
     Path(projection_id): Path<String>,
 ) -> Result<Json<lethe_engine::projection::lineage::LineageManifest>, ApiError> {
-    service.authorize_headers(&headers, "read:persons")?;
     ensure_known_projection(&projection_id)?;
+    let scope = match projection_id.as_str() {
+        "proj:person-page" => "read:persons",
+        "proj:answer-log" => "read:answer-log",
+        _ => "read:corpus",
+    };
+    service.authorize_headers(&headers, scope)?;
     Ok(Json(service.lineage_manifest(&projection_id)?))
 }
 async fn projection_records(
@@ -508,9 +551,27 @@ impl From<SelfHostError> for ApiError {
                     body
                 },
             },
+            SelfHostError::BulkImportSessionConflict { code, detail } => Self {
+                status: StatusCode::CONFLICT,
+                body: ErrorResponse {
+                    error: code.to_owned(),
+                    detail: Some(detail),
+                    details: None,
+                    retry_after: None,
+                },
+            },
             SelfHostError::ProjectionStale(detail) => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 body: ErrorResponse::projection_stale(&detail, 30),
+            },
+            SelfHostError::SearchIndexUnavailable { code, detail } => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                body: ErrorResponse {
+                    error: code.to_owned(),
+                    detail: Some(detail),
+                    details: None,
+                    retry_after: Some(5),
+                },
             },
             SelfHostError::SupplementalValidation { code, detail } => {
                 Self::unprocessable_entity(code, detail)
@@ -581,5 +642,49 @@ fn ensure_known_projection(projection_id: &str) -> Result<(), ApiError> {
         | "proj:plan-state"
         | "proj:card-queue" => Ok(()),
         _ => Err(ApiError::not_found()),
+    }
+}
+
+#[cfg(test)]
+mod search_index_error_tests {
+    use super::*;
+
+    #[test]
+    fn search_index_unavailable_maps_to_retryable_http_503() {
+        let error = ApiError::from(SelfHostError::SearchIndexUnavailable {
+            code: "search_index_rebuilding",
+            detail: "generation is rebuilding".to_owned(),
+        });
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.body.error, "search_index_rebuilding");
+        assert_eq!(
+            error.body.detail.as_deref(),
+            Some("generation is rebuilding")
+        );
+        assert_eq!(error.body.retry_after, Some(5));
+    }
+
+    #[test]
+    fn deferred_non_corpus_projection_maps_to_retryable_http_503() {
+        let error = ApiError::from(SelfHostError::ProjectionStale(
+            "proj:person-page is stale".to_owned(),
+        ));
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.body.error, "projection_stale");
+        assert_eq!(error.body.retry_after, Some(30));
+    }
+
+    #[test]
+    fn bulk_import_session_conflict_preserves_machine_readable_code() {
+        let error = ApiError::from(SelfHostError::BulkImportSessionConflict {
+            code: "bulk_import_session_mismatch",
+            detail: "wrong session".to_owned(),
+        });
+
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.body.error, "bulk_import_session_mismatch");
+        assert_eq!(error.body.detail.as_deref(), Some("wrong session"));
     }
 }

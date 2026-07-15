@@ -8,9 +8,9 @@ use lethe_core::domain::{
     ActorRef, AuthorityModel, CaptureModel, EntityRef, IdempotencyKey, Mutability, Observation,
     ObserverRef, SchemaRef, SemVer, SourceSystemRef, SupplementalId, SupplementalRecord,
 };
-use lethe_projection_corpus::{CorpusConfig, CorpusMode};
+use lethe_projection_corpus::CorpusMode;
 use lethe_runtime::runtime::partition::RoutingKeyOrder;
-use lethe_selfhost::self_host::app::{AppService, ProjectionSnapshot};
+use lethe_selfhost::self_host::app::AppService;
 use lethe_selfhost::self_host::config::{
     ApiTokenConfig, CorpusProjectionConfig, FreshnessConfig, GoogleConfig, JsonWebKey,
     JsonWebKeySet, McpOAuthConfig, OpsConfig, ResourceLimits, SecretString, SelfHostConfig,
@@ -140,34 +140,11 @@ fn supplemental_read_write_config(
 }
 
 fn test_config_with_corpus(db: PathBuf, blobs: PathBuf, corpus_mode: CorpusMode) -> SelfHostConfig {
-    if db.exists() {
-        let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
-        let observations = persistence.load_observations().unwrap();
-        if !observations.is_empty() {
-            let snapshot = ProjectionSnapshot::build(
-                observations,
-                persistence.load_supplementals().unwrap(),
-                CorpusConfig {
-                    mode: corpus_mode,
-                    ..CorpusConfig::default()
-                },
-                Vec::new(),
-                Vec::new(),
-            )
-            .unwrap();
-            persistence
-                .materialize_projection(
-                    &lethe_core::domain::ProjectionRef::new("proj:person-page"),
-                    &serde_json::to_value(snapshot).unwrap(),
-                )
-                .unwrap();
-        }
-    }
     SelfHostConfig {
         bind_addr: "127.0.0.1:0".into(),
         mcp_bind_addr: "127.0.0.1:0".into(),
         mcp_oauth: test_mcp_oauth(),
-        database_path: db,
+        database_path: db.clone(),
         blob_dir: blobs,
         secret_encryption_key: [7; 32],
         poll_interval: std::time::Duration::from_secs(300),
@@ -189,7 +166,12 @@ fn test_config_with_corpus(db: PathBuf, blobs: PathBuf, corpus_mode: CorpusMode)
             max_leaf_observations: 100_000,
             retention_days: 30,
         },
-        corpus: CorpusProjectionConfig { mode: corpus_mode },
+        corpus: CorpusProjectionConfig {
+            mode: corpus_mode,
+            index_dir: db.with_extension("corpus-index"),
+            writer_heap_bytes: 32 * 1024 * 1024,
+            rebuild_page_size: 512,
+        },
         freshness: FreshnessConfig {
             threshold_seconds: std::collections::BTreeMap::from([(
                 "sys:slack".to_owned(),
@@ -238,6 +220,159 @@ fn test_config_with_corpus(db: PathBuf, blobs: PathBuf, corpus_mode: CorpusMode)
     }
 }
 
+fn wait_for_search_index_ready(service: &AppService) {
+    wait_for_search_index_status(service, "ok");
+}
+
+fn wait_for_search_index_status(service: &AppService, expected: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let health = service.health().unwrap();
+        if health.dependencies.iter().any(|dependency| {
+            dependency.name == "corpus_search_index" && dependency.status == expected
+        }) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "search index did not reach {expected}: {:?}",
+            health.dependencies
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn failed_search_index_returns_explicit_http_503_instead_of_empty_results() {
+    let (root, db, blobs) = temp_paths();
+    std::fs::create_dir_all(&root).unwrap();
+    let unusable_index_path = root.join("corpus-index-is-a-file");
+    std::fs::write(&unusable_index_path, b"not a directory").unwrap();
+    let mut config = test_config(db, blobs);
+    config.corpus.index_dir = unusable_index_path;
+    let service = AppService::bootstrap(config).unwrap();
+    wait_for_search_index_status(&service, "failed");
+    let app = build_router(service);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    let response = runtime
+        .block_on(async {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/projections/proj:corpus/grep")
+                    .header("authorization", "Bearer test-api-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"pattern": "needle", "limit": 20}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+        })
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = runtime
+        .block_on(async { axum::body::to_bytes(response.into_body(), usize::MAX).await })
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "search_index_failed");
+    assert!(
+        json["detail"]
+            .as_str()
+            .is_some_and(|detail| !detail.is_empty())
+    );
+    assert_eq!(json["retry_after"], 5);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+fn bootstrap_ready(config: SelfHostConfig) -> AppService {
+    let service = AppService::bootstrap(config).unwrap();
+    wait_for_search_index_ready(&service);
+    service
+}
+
+#[test]
+fn corpus_lineage_uses_corpus_scope_without_granting_person_lineage() {
+    let (root, db, blobs) = temp_paths();
+    let mut config = test_config(db, blobs);
+    config.api_tokens = vec![
+        ApiTokenConfig {
+            token: SecretString::new("corpus-only-token").unwrap(),
+            scopes: vec!["read:corpus".into()],
+        },
+        ApiTokenConfig {
+            token: SecretString::new("answer-log-only-token").unwrap(),
+            scopes: vec!["read:answer-log".into()],
+        },
+    ];
+    let service = bootstrap_ready(config);
+    let app = build_router(service);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    let corpus = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/projections/proj:corpus/lineage")
+                        .header("authorization", "Bearer corpus-only-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(corpus.status(), StatusCode::OK);
+
+    let person = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/projections/proj:person-page/lineage")
+                        .header("authorization", "Bearer corpus-only-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(person.status(), StatusCode::FORBIDDEN);
+
+    let answer_log = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/projections/proj:answer-log/lineage")
+                        .header("authorization", "Bearer answer-log-only-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(answer_log.status(), StatusCode::OK);
+
+    let answer_log_with_corpus_scope = runtime
+        .block_on(async {
+            app.oneshot(
+                Request::builder()
+                    .uri("/api/projections/proj:answer-log/lineage")
+                    .header("authorization", "Bearer corpus-only-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        })
+        .unwrap();
+    assert_eq!(answer_log_with_corpus_scope.status(), StatusCode::FORBIDDEN);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 fn test_mcp_oauth() -> McpOAuthConfig {
     McpOAuthConfig {
         resource_url: "https://mcp.example.test".into(),
@@ -262,6 +397,12 @@ fn test_mcp_oauth() -> McpOAuthConfig {
 }
 
 fn corpus_slack_observation(channel: &str, text: &str, key: &str, is_bot: bool) -> Observation {
+    let source_sequence = key.as_bytes().iter().fold(1_u64, |accumulator, byte| {
+        accumulator
+            .checked_mul(257)
+            .and_then(|value| value.checked_add(u64::from(*byte)))
+            .expect("test Slack timestamp must fit u64")
+    });
     Observation {
         id: Observation::new_id(),
         schema: SchemaRef::new("schema:slack-message"),
@@ -282,7 +423,7 @@ fn corpus_slack_observation(channel: &str, text: &str, key: &str, is_bot: bool) 
             "channel_name": channel,
             "is_public_channel": true,
             "is_bot": is_bot,
-            "ts": format!("{}.000000", key.len() + 1),
+            "ts": format!("{source_sequence}.000000"),
             "thread_ts": "1.000000",
             "permalink": format!("https://slack.example/{channel}/{key}"),
         }),
@@ -734,7 +875,7 @@ fn self_host_persons_endpoint_returns_projection_data() {
         ))
         .unwrap();
 
-    let app = build_router(AppService::bootstrap(test_config(db, blobs)).unwrap());
+    let app = build_router(bootstrap_ready(test_config(db, blobs)));
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let response = runtime
@@ -787,7 +928,16 @@ fn self_host_persons_endpoint_returns_projection_data() {
         .unwrap();
     let lineage_json: serde_json::Value = serde_json::from_slice(&lineage_body).unwrap();
     assert_eq!(lineage_json["projection_id"], "proj:person-page");
-    assert_eq!(lineage_json["input_refs"].as_array().unwrap().len(), 2);
+    assert!(lineage_json["input_refs"].as_array().unwrap().is_empty());
+    assert_eq!(
+        lineage_json["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|source| source["source_ref"] == "lake")
+            .unwrap()["record_count"],
+        2
+    );
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -912,7 +1062,7 @@ fn personal_corpus_grep_hits_all_text_source_types() {
         persistence.persist_observation(&observation).unwrap();
     }
 
-    let app = build_router(AppService::bootstrap(personal_test_config(db, blobs)).unwrap());
+    let app = build_router(bootstrap_ready(personal_test_config(db, blobs)));
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let response = runtime
         .block_on(async {
@@ -1008,7 +1158,7 @@ fn coding_agent_get_thread_preserves_parent_child_sessions() {
     persistence.persist_observation(&main).unwrap();
     persistence.persist_observation(&child).unwrap();
 
-    let app = build_router(AppService::bootstrap(personal_test_config(db, blobs)).unwrap());
+    let app = build_router(bootstrap_ready(personal_test_config(db, blobs)));
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let grep_response = runtime
         .block_on(async {
@@ -1142,7 +1292,7 @@ fn opted_out_person_is_excluded_by_filtering_projection() {
         })
         .unwrap();
 
-    let app = build_router(AppService::bootstrap(test_config(db, blobs)).unwrap());
+    let app = build_router(bootstrap_ready(test_config(db, blobs)));
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let response = runtime
         .block_on(async {
@@ -1234,7 +1384,7 @@ fn projection_blob_endpoint_requires_auth_and_rejects_raw_cas_access() {
         .unwrap()
         .to_string();
 
-    let app = build_router(AppService::bootstrap(test_config(db, blobs)).unwrap());
+    let app = build_router(bootstrap_ready(test_config(db, blobs)));
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let unauthenticated_response = runtime
@@ -1323,7 +1473,7 @@ fn self_host_person_detail_hides_restricted_identities() {
         ))
         .unwrap();
 
-    let app = build_router(AppService::bootstrap(test_config(db, blobs)).unwrap());
+    let app = build_router(bootstrap_ready(test_config(db, blobs)));
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let list_response = runtime
@@ -1408,7 +1558,7 @@ fn corpus_grep_filters_before_exposure_and_supports_pagination() {
         .persist_observation(&form_response_content_observation("form-secret"))
         .unwrap();
 
-    let app = build_router(AppService::bootstrap(test_config(db, blobs)).unwrap());
+    let app = build_router(bootstrap_ready(test_config(db, blobs)));
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let response = runtime
         .block_on(async {
@@ -1501,7 +1651,7 @@ fn prior_qa_search_returns_answer_log_as_non_primary_source() {
         ))
         .unwrap();
 
-    let app = build_router(AppService::bootstrap(test_config(db, blobs)).unwrap());
+    let app = build_router(bootstrap_ready(test_config(db, blobs)));
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let response = runtime
         .block_on(async {
@@ -1568,7 +1718,7 @@ fn supplemental_post_requires_write_scope_and_does_not_write_on_forbidden() {
     );
     persistence.persist_observation(&observation).unwrap();
 
-    let app = build_router(AppService::bootstrap(test_config(db.clone(), blobs.clone())).unwrap());
+    let app = build_router(bootstrap_ready(test_config(db.clone(), blobs.clone())));
     let body = claim_supplemental_body(&supplemental_id(), &observation);
     let (status, json) = post_supplemental(app, "test-api-token", body);
 
@@ -1593,9 +1743,10 @@ fn supplemental_post_returns_201_and_persists_across_restart() {
     );
     persistence.persist_observation(&observation).unwrap();
 
-    let app = build_router(
-        AppService::bootstrap(supplemental_write_config(db.clone(), blobs.clone())).unwrap(),
-    );
+    let app = build_router(bootstrap_ready(supplemental_write_config(
+        db.clone(),
+        blobs.clone(),
+    )));
     let id = supplemental_id();
     let (status, json) = post_supplemental(
         app,
@@ -1609,9 +1760,10 @@ fn supplemental_post_returns_201_and_persists_across_restart() {
     assert_eq!(json["data"]["created_by"], "actor:extraction-pass");
     assert!(json["data"]["created_at"].as_str().is_some());
 
-    let _restarted = build_router(
-        AppService::bootstrap(supplemental_write_config(db.clone(), blobs.clone())).unwrap(),
-    );
+    let _restarted = build_router(bootstrap_ready(supplemental_write_config(
+        db.clone(),
+        blobs.clone(),
+    )));
     let persisted = persistence.load_supplementals().unwrap();
     assert_eq!(persisted.len(), 1);
     assert_eq!(persisted[0].id, id);
@@ -1632,9 +1784,10 @@ fn supplemental_post_maps_store_invariants_to_422_details() {
         "sup-invalid",
     );
     persistence.persist_observation(&observation).unwrap();
-    let app = build_router(
-        AppService::bootstrap(supplemental_write_config(db.clone(), blobs.clone())).unwrap(),
-    );
+    let app = build_router(bootstrap_ready(supplemental_write_config(
+        db.clone(),
+        blobs.clone(),
+    )));
 
     let mut empty_anchor = claim_supplemental_body(&supplemental_id(), &observation);
     empty_anchor["derived_from"] = serde_json::json!({
@@ -1683,9 +1836,10 @@ fn supplemental_post_same_id_conflicts_but_same_content_different_uuid_is_allowe
         "sup-conflict",
     );
     persistence.persist_observation(&observation).unwrap();
-    let app = build_router(
-        AppService::bootstrap(supplemental_write_config(db.clone(), blobs.clone())).unwrap(),
-    );
+    let app = build_router(bootstrap_ready(supplemental_write_config(
+        db.clone(),
+        blobs.clone(),
+    )));
 
     let first_id = supplemental_id();
     let first_body = claim_supplemental_body(&first_id, &observation);
@@ -1722,9 +1876,10 @@ fn supplemental_post_rejects_claim_missing_verification_mode_before_write() {
         "sup-schema",
     );
     persistence.persist_observation(&observation).unwrap();
-    let app = build_router(
-        AppService::bootstrap(supplemental_write_config(db.clone(), blobs.clone())).unwrap(),
-    );
+    let app = build_router(bootstrap_ready(supplemental_write_config(
+        db.clone(),
+        blobs.clone(),
+    )));
     let mut body = claim_supplemental_body(&supplemental_id(), &observation);
     body["payload"] = serde_json::json!({
         "statement": "verification mode is missing"
@@ -1750,9 +1905,10 @@ fn supplemental_post_rejects_claim_missing_verification_mode_before_write() {
 fn supplemental_post_validates_registered_briefing_feedback_schema() {
     let (root, db, blobs) = temp_paths();
     let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
-    let app = build_router(
-        AppService::bootstrap(supplemental_write_config(db.clone(), blobs.clone())).unwrap(),
-    );
+    let app = build_router(bootstrap_ready(supplemental_write_config(
+        db.clone(),
+        blobs.clone(),
+    )));
     let body = briefing_feedback_supplemental_body(&supplemental_id(), "ok");
 
     let (status, json) = post_supplemental(app, "write-token", body);
@@ -1786,14 +1942,11 @@ fn supplemental_post_updates_claim_queue_projection_state() {
     );
     persistence.persist_observation(&observation).unwrap();
 
-    let app = build_router(
-        AppService::bootstrap(supplemental_read_write_config(
-            db,
-            blobs,
-            CorpusMode::WorkspaceFiltered,
-        ))
-        .unwrap(),
-    );
+    let app = build_router(bootstrap_ready(supplemental_read_write_config(
+        db,
+        blobs,
+        CorpusMode::WorkspaceFiltered,
+    )));
     let claim_id = supplemental_id();
     let (status, json) = post_supplemental(
         app.clone(),
@@ -1854,12 +2007,11 @@ fn supplemental_post_updates_claim_queue_projection_state() {
 #[test]
 fn decision_post_anchored_to_imported_codex_observation_is_searchable() {
     let (root, db, blobs) = temp_paths();
-    let service = AppService::bootstrap(supplemental_read_write_config(
+    let service = bootstrap_ready(supplemental_read_write_config(
         db.clone(),
         blobs.clone(),
         CorpusMode::PersonalAllText,
-    ))
-    .unwrap();
+    ));
     let batch = CodexImporter::new(SemVer::new("1.0.0"))
         .import_jsonl_str(&codex_integration_jsonl(), "codex/sessions/track-i.jsonl")
         .unwrap();
@@ -1981,7 +2133,7 @@ fn claim_queue_api_filters_pages_and_searches_decisions() {
         persistence.persist_supplemental(&supplemental).unwrap();
     }
 
-    let app = build_router(AppService::bootstrap(test_config(db, blobs)).unwrap());
+    let app = build_router(bootstrap_ready(test_config(db, blobs)));
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let first_page = runtime
         .block_on(async {
@@ -2067,7 +2219,7 @@ fn claim_queue_api_filters_pages_and_searches_decisions() {
 #[test]
 fn api_rejects_unauthenticated_projection_access() {
     let (root, db, blobs) = temp_paths();
-    let app = build_router(AppService::bootstrap(test_config(db, blobs)).unwrap());
+    let app = build_router(bootstrap_ready(test_config(db, blobs)));
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let response = runtime
@@ -2094,7 +2246,7 @@ fn timeline_endpoint_rejects_missing_timeline_scope() {
         token: SecretString::new("person-only-token").unwrap(),
         scopes: vec!["read:persons".into()],
     }];
-    let app = build_router(AppService::bootstrap(config).unwrap());
+    let app = build_router(bootstrap_ready(config));
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let response = runtime

@@ -7,7 +7,7 @@ use lethe_core::domain::EntityRef;
 use lethe_policy::governance::types::ConfidenceLevel;
 
 /// A single identifier from a source system.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SourceIdentifier {
     pub source: String,
     pub identifier_type: IdentifierType,
@@ -15,7 +15,7 @@ pub struct SourceIdentifier {
 }
 
 /// Kind of identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentifierType {
     Email,
@@ -24,6 +24,56 @@ pub enum IdentifierType {
     ArbitraryKey,
     UserId,
     DisplayName,
+}
+
+/// Canonical key used by the incremental identity index.
+///
+/// Email and display-name claims intentionally use a global namespace so that
+/// equivalent cross-source claims share one bucket. Source-internal IDs keep
+/// their source family as the namespace and therefore cannot collide across
+/// connectors.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentifierKey {
+    pub identifier_type: IdentifierType,
+    pub namespace: String,
+    pub normalized_value: String,
+}
+
+impl IdentifierKey {
+    pub fn from_identifier(identifier: &SourceIdentifier) -> Result<Self, String> {
+        let source = identifier.source.trim();
+        if source.is_empty() {
+            return Err("identifier source must not be blank".to_owned());
+        }
+        let value = identifier.value.trim();
+        if value.is_empty() {
+            return Err("identifier value must not be blank".to_owned());
+        }
+
+        let (namespace, normalized_value) = match identifier.identifier_type {
+            IdentifierType::Email | IdentifierType::DisplayName => {
+                ("global".to_owned(), value.to_lowercase())
+            }
+            IdentifierType::SlackId
+            | IdentifierType::ExternalId
+            | IdentifierType::ArbitraryKey
+            | IdentifierType::UserId => (source.to_lowercase(), value.to_owned()),
+        };
+        Ok(Self {
+            identifier_type: identifier.identifier_type,
+            namespace,
+            normalized_value,
+        })
+    }
+
+    pub fn is_high_confidence(&self) -> bool {
+        self.identifier_type == IdentifierType::Email
+    }
+
+    pub fn is_medium_confidence(&self) -> bool {
+        self.identifier_type == IdentifierType::DisplayName
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,5 +195,26 @@ mod tests {
             let back: IdentifierType = serde_json::from_str(&json).unwrap();
             assert_eq!(identifier_type, back);
         }
+    }
+
+    #[test]
+    fn identifier_key_normalizes_email_and_names_but_namespaces_source_ids() {
+        let email = IdentifierKey::from_identifier(&SourceIdentifier {
+            source: "Slack".into(),
+            identifier_type: IdentifierType::Email,
+            value: "  USER@Example.COM  ".into(),
+        })
+        .unwrap();
+        assert_eq!(email.namespace, "global");
+        assert_eq!(email.normalized_value, "user@example.com");
+
+        let user = IdentifierKey::from_identifier(&SourceIdentifier {
+            source: "Slack".into(),
+            identifier_type: IdentifierType::UserId,
+            value: " U123 ".into(),
+        })
+        .unwrap();
+        assert_eq!(user.namespace, "slack");
+        assert_eq!(user.normalized_value, "U123");
     }
 }

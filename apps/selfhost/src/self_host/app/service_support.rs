@@ -9,7 +9,10 @@ impl AppService {
         let core = self.core_lock()?;
         Ok(
             HealthResponse::from_catalog(&core.catalog, env!("CARGO_PKG_VERSION")).with_runtime(
-                Vec::new(),
+                vec![
+                    self.bulk_import_health_dependency()?,
+                    self.search_index.health_dependency(),
+                ],
                 LastSyncHealth {
                     completed_at: core.last_sync_at,
                     error: core.last_sync_error.clone(),
@@ -20,7 +23,7 @@ impl AppService {
     }
 
     pub fn deep_health(&self) -> Result<HealthResponse, SelfHostError> {
-        let dependency = match self.persistence_lock()?.deep_check() {
+        let storage_dependency = match self.persistence_lock()?.deep_check() {
             Ok(()) => DependencyHealthInfo {
                 name: "storage".to_owned(),
                 status: "ok".to_owned(),
@@ -35,7 +38,11 @@ impl AppService {
         let core = self.core_lock()?;
         Ok(
             HealthResponse::from_catalog(&core.catalog, env!("CARGO_PKG_VERSION")).with_runtime(
-                vec![dependency],
+                vec![
+                    storage_dependency,
+                    self.bulk_import_health_dependency()?,
+                    self.search_index.deep_health_dependency(),
+                ],
                 LastSyncHealth {
                     completed_at: core.last_sync_at,
                     error: core.last_sync_error.clone(),
@@ -74,6 +81,7 @@ impl AppService {
         built_at: DateTime<Utc>,
         lineage: &LineageManifest,
     ) -> Result<ProjectionMetadata, SelfHostError> {
+        self.ensure_projection_fresh(catalog, projection_id)?;
         let projection_id = ProjectionRef::new(projection_id);
         let entry = catalog
             .get(&projection_id)
@@ -90,17 +98,31 @@ impl AppService {
 
     pub fn lineage_manifest(&self, projection_id: &str) -> Result<LineageManifest, SelfHostError> {
         let core = self.core_lock()?;
+        self.ensure_projection_fresh(&core.catalog, projection_id)?;
         match projection_id {
             "proj:person-page" => Ok(core.snapshot.lineage.clone()),
-            "proj:corpus" => Ok(build_projection_lineage(
-                "proj:corpus",
-                core.lake.list(),
-                core.snapshot.corpus.len(),
-                core.snapshot.built_at,
-            )),
+            "proj:corpus" => {
+                drop(core);
+                let metadata = self.search_index.execute(|index| index.metadata())?;
+                Ok(build_projection_lineage(
+                    "proj:corpus",
+                    &metadata.projection_watermark,
+                    ObservationStats {
+                        count: metadata.observation_count,
+                        max_append_seq: metadata.last_append_seq,
+                    },
+                    usize::try_from(metadata.record_count).map_err(|_| {
+                        SelfHostError::Ingestion(
+                            "corpus record count does not fit usize".to_owned(),
+                        )
+                    })?,
+                    metadata.committed_at,
+                ))
+            }
             "proj:answer-log" => Ok(build_projection_lineage(
                 "proj:answer-log",
-                core.lake.list(),
+                &core.snapshot.lineage.build_id,
+                core.observation_stats,
                 core.snapshot.answer_log.len(),
                 core.snapshot.built_at,
             )),
@@ -112,15 +134,19 @@ impl AppService {
             )),
             "proj:freshness" => Ok(build_projection_lineage(
                 "proj:freshness",
-                core.lake.list(),
+                &core.snapshot.lineage.build_id,
+                core.observation_stats,
                 core.snapshot.freshness.sources.len(),
                 core.snapshot.built_at,
             )),
             "proj:reply-slo" => Ok(build_mixed_projection_lineage(
                 "proj:reply-slo",
-                core.lake.list(),
+                &core.snapshot.lineage.build_id,
+                core.observation_stats,
                 &core.supplemental.list(),
-                core.snapshot.reply_slo.rows.len(),
+                usize::try_from(core.reply_slo_count).map_err(|_| {
+                    SelfHostError::Ingestion("reply SLO count does not fit usize".to_owned())
+                })?,
                 core.snapshot.built_at,
             )),
             "proj:break-glass" => Ok(build_channel_registry_projection_lineage(
@@ -153,6 +179,7 @@ impl AppService {
         read_mode: Option<&str>,
         pin: Option<&str>,
     ) -> Result<ReadMode, SelfHostError> {
+        self.ensure_projection_fresh(catalog, projection_id)?;
         let spec = &catalog
             .get(&ProjectionRef::new(projection_id))
             .ok_or_else(|| SelfHostError::NotFound(projection_id.to_string()))?
@@ -183,22 +210,72 @@ impl AppService {
         &self,
         core: &mut AppCore,
     ) -> Result<(), SelfHostError> {
-        let (observations, supplementals) = {
-            let store = self.persistence_lock()?;
-            (store.load_observations()?, store.load_supplementals()?)
-        };
-        let snapshot = ProjectionSnapshot::build(
-            observations,
-            supplementals,
-            core.corpus_config.clone(),
-            core.freshness_thresholds.clone(),
-            core.registry.list_channels().into_iter().cloned().collect(),
-        )?;
-        let snapshot_value = serde_json::to_value(&snapshot)?;
-        self.persistence_lock()?
-            .materialize_projection(&ProjectionRef::new("proj:person-page"), &snapshot_value)?;
-        core.snapshot = snapshot;
-        Ok(())
+        #[cfg(test)]
+        self.non_corpus_rebuild_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let result = (|| {
+            let materialized = {
+                let store = self.persistence_lock()?;
+                let supplementals = store.load_supplementals()?;
+                let stats = store.observation_stats()?;
+                rebuild_materialized_snapshot_paged(
+                    store.as_ref(),
+                    &supplementals,
+                    &core.freshness_thresholds,
+                    &core
+                        .registry
+                        .list_channels()
+                        .into_iter()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    stats,
+                    self.config.corpus.rebuild_page_size,
+                    Utc::now(),
+                )?
+            };
+            core.install_materialized(materialized);
+            Ok(())
+        })();
+        if result.is_err() {
+            core.mark_non_corpus_materializations_stale();
+        }
+        result
+    }
+
+    pub(super) fn materialize_after_observation_append(
+        &self,
+        core: &mut AppCore,
+        appended_observations: &[Observation],
+    ) -> Result<(), SelfHostError> {
+        let result = (|| match classify_non_corpus_delta(appended_observations) {
+            NonCorpusDeltaKind::FreshnessOnly | NonCorpusDeltaKind::SlackMessage => {
+                let persistence = self.persistence_lock()?;
+                let stats = persistence.observation_stats()?;
+                let lookup = StorageComponentProjectionLookup {
+                    storage: persistence.as_ref(),
+                };
+                let commit = apply_compact_incremental_delta(
+                    core,
+                    appended_observations,
+                    stats,
+                    Utc::now(),
+                    &lookup,
+                )?;
+                let manifest = core.manifest_value()?;
+                persistence.commit_projection_items(
+                    &ProjectionRef::new("proj:person-page"),
+                    &manifest,
+                    &commit,
+                )?;
+                core.activate_non_corpus_projections();
+                Ok(())
+            }
+            NonCorpusDeltaKind::FullRebuild => self.refresh_materialized_snapshot(core),
+        })();
+        if result.is_err() {
+            core.mark_non_corpus_materializations_stale();
+        }
+        result
     }
 
     pub(super) fn ingest_draft(
@@ -212,19 +289,21 @@ impl AppService {
                 self.config.resource_limits.max_payload_bytes
             )));
         }
-        let mut core = self.core_lock()?;
-        let observation = match core.prepare_observation(draft) {
-            Ok(observation) => observation,
-            Err(IngestResult::Rejected { message, .. }) => {
-                return Err(SelfHostError::Ingestion(message));
+        let observation = {
+            let core = self.core_lock()?;
+            match prepare_draft(&core, draft) {
+                Ok(observation) => observation,
+                Err(IngestResult::Rejected { message, .. }) => {
+                    return Err(SelfHostError::Ingestion(message));
+                }
+                Err(IngestResult::Quarantined { ticket }) => {
+                    return Err(SelfHostError::Ingestion(ticket.reason));
+                }
+                Err(result) => return Ok(result),
             }
-            Err(IngestResult::Quarantined { ticket }) => {
-                return Err(SelfHostError::Ingestion(ticket.reason));
-            }
-            Err(result) => return Ok(result),
         };
 
-        let result = self.append_prepared_observation(&mut core, observation)?;
+        let result = self.append_prepared_observation(observation)?;
 
         match &result {
             IngestResult::Rejected { message, .. } => {
@@ -239,7 +318,6 @@ impl AppService {
 
     pub(super) fn append_prepared_observation(
         &self,
-        core: &mut AppCore,
         observation: Observation,
     ) -> Result<IngestResult, SelfHostError> {
         let recorded_at = observation.recorded_at;
@@ -247,22 +325,45 @@ impl AppService {
         let durable_outcome = self.persistence_lock()?.append_observation(&observation)?;
 
         let result = match durable_outcome {
-            DurableAppendOutcome::Appended(id) => match core.lake.append_idempotent(observation) {
-                lethe_engine::lake::store::AppendOutcome::Appended(_) => {
-                    self.emit_audit(
-                        "actor:self-host",
-                        AuditEventKind::WriteExecution,
-                        serde_json::json!({"observation_id": id.as_str()}),
-                    );
-                    IngestResult::Ingested { id, recorded_at }
-                }
-                lethe_engine::lake::store::AppendOutcome::Duplicate(existing_id)
-                | lethe_engine::lake::store::AppendOutcome::Conflict(existing_id) => {
-                    return Err(SelfHostError::Ingestion(format!(
-                        "SQLite accepted observation {id}, but cache already contains {existing_id}"
-                    )));
-                }
+            DurableAppendOutcome::Appended(id) => {
+                self.emit_audit(
+                    "actor:self-host",
+                    AuditEventKind::WriteExecution,
+                    serde_json::json!({"observation_id": id.as_str()}),
+                );
+                IngestResult::Ingested { id, recorded_at }
+            }
+            DurableAppendOutcome::Duplicate(existing_id) => IngestResult::Duplicate { existing_id },
+            DurableAppendOutcome::CanonicalCollision(existing_id) => IngestResult::Quarantined {
+                ticket: lethe_core::domain::QuarantineTicket {
+                    id: uuid::Uuid::now_v7().to_string(),
+                    reason: format!(
+                        "sha256-collision: existing observation {existing_id} has different canonical_json"
+                    ),
+                },
             },
+        };
+        Ok(result)
+    }
+
+    pub(super) fn append_prepared_slack_observation(
+        &self,
+        observation: Observation,
+        thread: &SlackThreadKey,
+    ) -> Result<IngestResult, SelfHostError> {
+        let recorded_at = observation.recorded_at;
+        let durable_outcome = self
+            .persistence_lock()?
+            .append_slack_observation(&observation, thread)?;
+        let result = match durable_outcome {
+            DurableAppendOutcome::Appended(id) => {
+                self.emit_audit(
+                    "actor:self-host",
+                    AuditEventKind::WriteExecution,
+                    serde_json::json!({"observation_id": id.as_str()}),
+                );
+                IngestResult::Ingested { id, recorded_at }
+            }
             DurableAppendOutcome::Duplicate(existing_id) => IngestResult::Duplicate { existing_id },
             DurableAppendOutcome::CanonicalCollision(existing_id) => IngestResult::Quarantined {
                 ticket: lethe_core::domain::QuarantineTicket {
@@ -290,19 +391,35 @@ impl AppService {
         blob_ref: &BlobRef,
     ) -> Result<Option<Vec<u8>>, SelfHostError> {
         let core = self.core_lock()?;
-        let filtered_projection =
-            self.apply_filter(serde_json::to_value(&core.snapshot.person_page)?);
-        if !json_contains_string(&filtered_projection, blob_ref.as_str()) {
+        self.ensure_projection_fresh(&core.catalog, "proj:person-page")?;
+        let referenced = core.person_components.values().any(|component| {
+            component.consent != ConsentStatus::OptedOut
+                && (component.slide_blob_refs.contains(blob_ref.as_str())
+                    || component
+                        .frontend_profile
+                        .as_ref()
+                        .and_then(|profile| profile.thumbnail_ref.as_deref())
+                        == Some(blob_ref.as_str()))
+        });
+        drop(core);
+        self.emit_audit(
+            "actor:self-host",
+            AuditEventKind::ReadRestricted,
+            serde_json::json!({
+                "decision": "filtering-before-exposure",
+                "masked_fields": [],
+            }),
+        );
+        if !referenced {
             return Ok(None);
         }
-        drop(core);
         Ok(self.persistence_lock()?.get_blob(blob_ref)?)
     }
 
-    pub(super) fn ingest_slack_message(
+    pub(super) fn ingest_slack_message<A: SlackClient, F: SlackClient>(
         &self,
-        slack_adapter: &SlackAdapter<HttpSlackClient>,
-        file_client: &HttpSlackClient,
+        slack_adapter: &SlackAdapter<A>,
+        file_client: &F,
         source_instance_id: &str,
         channel_id: &str,
         mut message: lethe_adapter_slack::slack::client::SlackMessage,
@@ -344,49 +461,85 @@ impl AppService {
         if is_latest {
             *latest_ts = Some(message.ts.clone());
         }
-        self.ingest_draft(namespace_draft(
-            slack_adapter.map_message(&message)?,
-            source_instance_id,
-        ))
+        let thread = thread_root_ts(&message).map(|thread_ts| SlackThreadKey {
+            source_instance: source_instance_id.to_owned(),
+            channel_id: channel_id.to_owned(),
+            thread_ts: thread_ts.to_owned(),
+        });
+        let draft = namespace_draft(slack_adapter.map_message(&message)?, source_instance_id);
+        let Some(thread) = thread else {
+            return self.ingest_draft(draft);
+        };
+        let payload_bytes = serde_json::to_vec(&draft.payload)?.len();
+        if payload_bytes > self.config.resource_limits.max_payload_bytes {
+            return Err(SelfHostError::Ingestion(format!(
+                "payload size {payload_bytes} exceeds configured maximum {}",
+                self.config.resource_limits.max_payload_bytes
+            )));
+        }
+        let observation = {
+            let core = self.core_lock()?;
+            match prepare_draft(&core, draft) {
+                Ok(observation) => observation,
+                Err(IngestResult::Rejected { message, .. }) => {
+                    return Err(SelfHostError::Ingestion(message));
+                }
+                Err(IngestResult::Quarantined { ticket }) => {
+                    return Err(SelfHostError::Ingestion(ticket.reason));
+                }
+                Err(result) => return Ok(result),
+            }
+        };
+        self.append_prepared_slack_observation(observation, &thread)
     }
 
-    pub(super) fn sync_thread_replies(
+    pub(super) fn sync_thread_replies<A: SlackClient, F: SlackClient, R: SlackClient>(
         &self,
-        slack_adapter: &SlackAdapter<HttpSlackClient>,
-        source: &SlackSourceRuntime,
-        channel_id: &str,
-        thread_ts: &str,
-    ) -> Result<(usize, usize), SelfHostError> {
-        let cursor_key = format!(
-            "{}:{}",
-            source.config.id,
-            thread_cursor_key(channel_id, thread_ts)
-        );
-        let reply_oldest = non_empty_state(self.persistence_lock()?.get_state(&cursor_key)?)
-            .unwrap_or_else(|| thread_ts.to_string());
+        slack_adapter: &SlackAdapter<A>,
+        file_client: &F,
+        replies_client: &R,
+        thread: &SlackThreadCatalogEntry,
+        generation: u64,
+    ) -> Result<(usize, usize, usize), SelfHostError> {
+        let key = &thread.key;
         let policy = self.slack_adapter_config();
         let replies = self.resilient_executor.execute(
-            &format!("slack:{}:{channel_id}:replies", source.config.id),
+            &format!("slack:{}:{}:replies", key.source_instance, key.channel_id),
             &policy.retry,
             &policy.rate_limit,
             || {
-                source.replies_client.conversations_replies(
-                    channel_id,
-                    thread_ts,
-                    Some(reply_oldest.as_str()),
+                replies_client.conversations_replies(
+                    &key.channel_id,
+                    &key.thread_ts,
+                    Some(thread.reply_cursor.as_str()),
                 )
             },
         )?;
-        let mut latest_reply_ts = Some(reply_oldest);
+        let cursor_value = slack_ts_value(&thread.reply_cursor)?;
+        let mut latest_reply_ts = Some(thread.reply_cursor.clone());
         let mut ingested = 0usize;
         let mut duplicates = 0usize;
+        let mut fetched = 0usize;
 
-        for reply in replies.into_iter().filter(|reply| reply.ts != thread_ts) {
+        for reply in replies
+            .into_iter()
+            .filter(|reply| reply.ts != key.thread_ts)
+        {
+            if slack_ts_value(&reply.ts)? <= cursor_value {
+                continue;
+            }
+            if reply.thread_ts.as_deref() != Some(key.thread_ts.as_str()) {
+                return Err(SelfHostError::Ingestion(format!(
+                    "Slack thread {} reply {} has mismatched thread_ts",
+                    key.thread_ts, reply.ts
+                )));
+            }
+            fetched += 1;
             match self.ingest_slack_message(
                 slack_adapter,
-                &source.replies_client,
-                &source.config.id,
-                channel_id,
+                file_client,
+                &key.source_instance,
+                &key.channel_id,
                 reply,
                 &mut latest_reply_ts,
             )? {
@@ -396,39 +549,44 @@ impl AppService {
             }
         }
 
-        if let Some(latest_reply_ts) = latest_reply_ts.as_deref() {
-            self.persistence_lock()?
-                .set_state(&cursor_key, latest_reply_ts)?;
-        }
+        let latest_reply_ts = latest_reply_ts.expect("thread reply cursor is always initialized");
+        let delay = if fetched > 0 {
+            1
+        } else {
+            IDLE_THREAD_RECHECK_INTERVAL
+        };
+        let next_poll_generation = generation.checked_add(delay).ok_or_else(|| {
+            SelfHostError::Ingestion("Slack thread next poll generation overflowed u64".to_owned())
+        })?;
+        self.persistence_lock()?.complete_slack_thread_poll(
+            key,
+            generation,
+            &latest_reply_ts,
+            fetched > 0,
+            next_poll_generation,
+        )?;
 
-        Ok((ingested, duplicates))
+        Ok((ingested, duplicates, fetched))
     }
 
-    pub(super) fn known_thread_roots(
-        &self,
-        channel_id: &str,
-    ) -> Result<BTreeSet<String>, SelfHostError> {
-        let mut roots = BTreeSet::new();
-        let mut cursor = 0u64;
+    pub(super) fn refresh_slack_thread_catalog(&self) -> Result<(), SelfHostError> {
+        let mut cursor = self
+            .persistence_lock()?
+            .slack_thread_discovery_high_water()?;
         loop {
             let page = self.persistence_lock()?.observation_page(cursor, 512)?;
             if page.is_empty() {
-                break;
+                return Ok(());
             }
-            let observations = page
-                .iter()
-                .map(|stored| stored.observation.clone())
-                .collect::<Vec<_>>();
-            roots.extend(known_thread_roots_from_observations(
-                &observations,
-                channel_id,
-            ));
-            cursor = page
+            let high_water = page
                 .last()
-                .map(|stored| stored.append_seq)
-                .unwrap_or(cursor);
+                .expect("non-empty observation discovery page must have a tail")
+                .append_seq;
+            let threads = discovered_slack_threads(&page)?;
+            self.persistence_lock()?
+                .commit_slack_thread_discovery(high_water, &threads)?;
+            cursor = high_water;
         }
-        Ok(roots)
     }
 
     pub(super) fn extract_student_profile_from_png(
@@ -580,29 +738,18 @@ pub(super) fn namespace_draft(
 }
 
 pub(super) fn build_person_page_lineage(
-    observations: &[Observation],
-    supplementals: &[&lethe_core::domain::SupplementalRecord],
+    canonical_observation_fingerprint: &str,
+    stats: ObservationStats,
+    supplemental_fingerprint: &str,
+    supplemental_count: usize,
     output_count: usize,
     built_at: DateTime<Utc>,
 ) -> LineageManifest {
-    let mut observation_refs = observations
-        .iter()
-        .map(|observation| format!("observation:{}", observation.id))
-        .collect::<Vec<_>>();
-    let mut supplemental_refs = supplementals
-        .iter()
-        .map(|record| format!("supplemental:{}", record.id))
-        .collect::<Vec<_>>();
-    observation_refs.sort();
-    supplemental_refs.sort();
-
-    let mut hasher = Sha256::new();
-    hasher.update(b"proj:person-page@1.0.0\n");
-    for input_ref in observation_refs.iter().chain(&supplemental_refs) {
-        hasher.update(input_ref.as_bytes());
-        hasher.update(b"\n");
-    }
-    let build_id = format!("build-{}", hex::encode(hasher.finalize()));
+    let build_id = person_page_build_id(
+        canonical_observation_fingerprint,
+        stats.count,
+        supplemental_fingerprint,
+    );
     let mut lineage = LineageManifest::new(
         ProjectionRef::new("proj:person-page"),
         SemVer::new("1.0.0"),
@@ -613,39 +760,35 @@ pub(super) fn build_person_page_lineage(
     lineage.deterministic = true;
     lineage.add_source(SourceSnapshot {
         source_ref: "lake".to_string(),
-        watermark_position: Some(observations.len()),
-        record_count: observations.len(),
+        watermark_position: Some(
+            usize::try_from(stats.max_append_seq)
+                .expect("canonical append sequence must fit usize"),
+        ),
+        record_count: usize::try_from(stats.count)
+            .expect("canonical observation count must fit usize"),
     });
     lineage.add_source(SourceSnapshot {
-        source_ref: "supplemental:slide-analysis".to_string(),
+        source_ref: "supplemental".to_string(),
         watermark_position: None,
-        record_count: supplementals.len(),
+        record_count: supplemental_count,
     });
-    for input_ref in observation_refs.into_iter().chain(supplemental_refs) {
-        lineage.add_input_ref(input_ref);
-    }
     lineage
 }
 
 pub(super) fn build_projection_lineage(
     projection_id: &str,
-    observations: &[Observation],
+    canonical_build_id: &str,
+    stats: ObservationStats,
     output_count: usize,
     built_at: DateTime<Utc>,
 ) -> LineageManifest {
-    let mut input_refs = observations
-        .iter()
-        .map(|observation| format!("observation:{}", observation.id))
-        .collect::<Vec<_>>();
-    input_refs.sort();
-
     let mut hasher = Sha256::new();
     hasher.update(projection_id.as_bytes());
     hasher.update(b"@1.0.0\n");
-    for input_ref in &input_refs {
-        hasher.update(input_ref.as_bytes());
-        hasher.update(b"\n");
-    }
+    hasher.update(canonical_build_id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(stats.count.to_be_bytes());
+    hasher.update(stats.max_append_seq.to_be_bytes());
     let build_id = format!("build-{}", hex::encode(hasher.finalize()));
     let mut lineage = LineageManifest::new(
         ProjectionRef::new(projection_id),
@@ -657,12 +800,13 @@ pub(super) fn build_projection_lineage(
     lineage.deterministic = true;
     lineage.add_source(SourceSnapshot {
         source_ref: "lake".to_string(),
-        watermark_position: Some(observations.len()),
-        record_count: observations.len(),
+        watermark_position: Some(
+            usize::try_from(stats.max_append_seq)
+                .expect("canonical append sequence must fit usize"),
+        ),
+        record_count: usize::try_from(stats.count)
+            .expect("canonical observation count must fit usize"),
     });
-    for input_ref in input_refs {
-        lineage.add_input_ref(input_ref);
-    }
     lineage
 }
 
@@ -707,25 +851,25 @@ pub(super) fn build_supplemental_projection_lineage(
 
 pub(super) fn build_mixed_projection_lineage(
     projection_id: &str,
-    observations: &[Observation],
+    canonical_build_id: &str,
+    stats: ObservationStats,
     supplementals: &[&lethe_core::domain::SupplementalRecord],
     output_count: usize,
     built_at: DateTime<Utc>,
 ) -> LineageManifest {
-    let mut input_refs = observations
+    let mut input_refs = supplementals
         .iter()
-        .map(|observation| format!("observation:{}", observation.id))
-        .chain(
-            supplementals
-                .iter()
-                .map(|record| format!("supplemental:{}", record.id)),
-        )
+        .map(|record| format!("supplemental:{}", record.id))
         .collect::<Vec<_>>();
     input_refs.sort();
 
     let mut hasher = Sha256::new();
     hasher.update(projection_id.as_bytes());
     hasher.update(b"@1.0.0\n");
+    hasher.update(canonical_build_id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(stats.count.to_be_bytes());
+    hasher.update(stats.max_append_seq.to_be_bytes());
     for input_ref in &input_refs {
         hasher.update(input_ref.as_bytes());
         hasher.update(b"\n");
@@ -741,8 +885,12 @@ pub(super) fn build_mixed_projection_lineage(
     lineage.deterministic = true;
     lineage.add_source(SourceSnapshot {
         source_ref: "lake".to_string(),
-        watermark_position: Some(observations.len()),
-        record_count: observations.len(),
+        watermark_position: Some(
+            usize::try_from(stats.max_append_seq)
+                .expect("canonical append sequence must fit usize"),
+        ),
+        record_count: usize::try_from(stats.count)
+            .expect("canonical observation count must fit usize"),
     });
     lineage.add_source(SourceSnapshot {
         source_ref: "supplemental".to_string(),
@@ -798,30 +946,10 @@ pub(super) fn consent_status_for_person_id(
     core: &AppCore,
     person_id: &str,
 ) -> Result<ConsentStatus, SelfHostError> {
-    let person = core
-        .snapshot
-        .identity
-        .resolved_persons
-        .iter()
-        .find(|person| person.person_id.as_str() == person_id)
-        .ok_or_else(|| SelfHostError::NotFound(person_id.to_string()))?;
-    Ok(PersonPageProjector::consent_status_for_person(
-        person,
-        core.lake.list(),
-    ))
-}
-
-pub(super) fn json_contains_string(value: &serde_json::Value, needle: &str) -> bool {
-    match value {
-        serde_json::Value::String(value) => value == needle,
-        serde_json::Value::Array(values) => values
-            .iter()
-            .any(|value| json_contains_string(value, needle)),
-        serde_json::Value::Object(values) => values
-            .values()
-            .any(|value| json_contains_string(value, needle)),
-        _ => false,
-    }
+    core.person_consents
+        .get(person_id)
+        .cloned()
+        .ok_or_else(|| SelfHostError::NotFound(person_id.to_string()))
 }
 
 pub(super) fn lineage_ref(lineage: &LineageManifest) -> String {

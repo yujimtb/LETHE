@@ -27,6 +27,12 @@ pub struct StoredObservation {
     pub observation: Observation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservationStats {
+    pub count: u64,
+    pub max_append_seq: u64,
+}
+
 #[derive(Debug, Clone)]
 pub enum RehomeMode {
     StoredIdentity,
@@ -60,6 +66,118 @@ pub struct SyncMetricRecord {
     pub latency_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SlackThreadKey {
+    pub source_instance: String,
+    pub channel_id: String,
+    pub thread_ts: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredSlackThread {
+    pub key: SlackThreadKey,
+    pub observation_append_seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlackThreadCatalogEntry {
+    pub key: SlackThreadKey,
+    pub reply_cursor: String,
+    pub active: bool,
+    pub next_poll_generation: u64,
+    pub discovered_append_seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionItem {
+    pub item_key: String,
+    pub owner_key: String,
+    pub sort_key: String,
+    pub value: serde_json::Value,
+}
+
+impl ProjectionItem {
+    pub fn validate(&self) -> StorageResult<()> {
+        validate_projection_item_key("item_key", &self.item_key)?;
+        validate_projection_item_key("owner_key", &self.owner_key)?;
+        validate_projection_item_key("sort_key", &self.sort_key)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectionItemCommit {
+    Replace {
+        items: Vec<ProjectionItem>,
+    },
+    Delta {
+        inserts: Vec<ProjectionItem>,
+        updates: Vec<ProjectionItem>,
+        deletes: Vec<String>,
+    },
+}
+
+impl ProjectionItemCommit {
+    pub fn validate(&self) -> StorageResult<()> {
+        let mut operations = std::collections::BTreeMap::new();
+        match self {
+            Self::Replace { items } => {
+                validate_projection_item_operations(items, "replace", &mut operations)?;
+            }
+            Self::Delta {
+                inserts,
+                updates,
+                deletes,
+            } => {
+                validate_projection_item_operations(inserts, "insert", &mut operations)?;
+                validate_projection_item_operations(updates, "update", &mut operations)?;
+                for item_key in deletes {
+                    validate_projection_item_key("delete item_key", item_key)?;
+                    register_projection_item_operation(item_key, "delete", &mut operations)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_projection_item_operations(
+    items: &[ProjectionItem],
+    operation: &'static str,
+    operations: &mut std::collections::BTreeMap<String, &'static str>,
+) -> StorageResult<()> {
+    for item in items {
+        item.validate()?;
+        register_projection_item_operation(&item.item_key, operation, operations)?;
+    }
+    Ok(())
+}
+
+fn register_projection_item_operation(
+    item_key: &str,
+    operation: &'static str,
+    operations: &mut std::collections::BTreeMap<String, &'static str>,
+) -> StorageResult<()> {
+    if let Some(previous) = operations.insert(item_key.to_owned(), operation) {
+        return Err(StorageError::Invariant(if previous == operation {
+            format!("projection item commit contains duplicate {operation} item_key {item_key}")
+        } else {
+            format!(
+                "projection item commit contains conflicting operations {previous} and {operation} for item_key {item_key}"
+            )
+        }));
+    }
+    Ok(())
+}
+
+fn validate_projection_item_key(field: &str, value: &str) -> StorageResult<()> {
+    if value.trim().is_empty() {
+        return Err(StorageError::Invariant(format!(
+            "projection item {field} must not be blank"
+        )));
+    }
+    Ok(())
+}
+
 pub trait ObservationStore: Send {
     fn append_observation(&self, observation: &Observation) -> StorageResult<AppendOutcome>;
     fn append_observations(
@@ -72,6 +190,7 @@ pub trait ObservationStore: Send {
             .collect()
     }
     fn load_observations(&self) -> StorageResult<Vec<Observation>>;
+    fn observation_stats(&self) -> StorageResult<ObservationStats>;
     fn rehome_observation(
         &self,
         observation: &Observation,
@@ -119,6 +238,45 @@ pub trait ProjectionMaterializer: Send {
         &self,
         projection: &ProjectionRef,
     ) -> StorageResult<Option<serde_json::Value>>;
+    fn commit_projection_items(
+        &self,
+        projection: &ProjectionRef,
+        manifest: &serde_json::Value,
+        commit: &ProjectionItemCommit,
+    ) -> StorageResult<()>;
+    fn publish_projection_items_from_staging(
+        &self,
+        target: &ProjectionRef,
+        staging: &ProjectionRef,
+        manifest: &serde_json::Value,
+        expected_item_count: u64,
+    ) -> StorageResult<()>;
+    fn projection_item_by_key(
+        &self,
+        projection: &ProjectionRef,
+        item_key: &str,
+    ) -> StorageResult<Option<ProjectionItem>>;
+    fn projection_items_by_owner(
+        &self,
+        projection: &ProjectionRef,
+        owner_key: &str,
+    ) -> StorageResult<Vec<ProjectionItem>>;
+    fn projection_item_count_by_owner(
+        &self,
+        projection: &ProjectionRef,
+        owner_key: &str,
+    ) -> StorageResult<u64>;
+    fn projection_item_count(&self, projection: &ProjectionRef) -> StorageResult<u64>;
+}
+
+pub trait SupplementalProjectionCommitter: Send {
+    fn commit_supplemental_and_projection(
+        &self,
+        record: &SupplementalRecord,
+        projection: &ProjectionRef,
+        manifest: &serde_json::Value,
+        item_delta: &ProjectionItemCommit,
+    ) -> StorageResult<()>;
 }
 
 pub trait RuntimeStateStore: Send {
@@ -138,6 +296,41 @@ pub trait RuntimeStateStore: Send {
     fn deep_check(&self) -> StorageResult<()>;
 }
 
+pub trait SlackThreadCatalogStore: Send {
+    fn append_slack_observation(
+        &self,
+        observation: &Observation,
+        thread: &SlackThreadKey,
+    ) -> StorageResult<AppendOutcome>;
+    fn slack_thread_discovery_high_water(&self) -> StorageResult<u64>;
+    fn commit_slack_thread_discovery(
+        &self,
+        high_water: u64,
+        threads: &[DiscoveredSlackThread],
+    ) -> StorageResult<()>;
+    fn advance_slack_thread_poll_generation(&self) -> StorageResult<u64>;
+    fn slack_threads_to_poll(
+        &self,
+        source_instance: &str,
+        channel_id: &str,
+        generation: u64,
+        limit: usize,
+    ) -> StorageResult<Vec<SlackThreadCatalogEntry>>;
+    fn complete_slack_thread_poll(
+        &self,
+        key: &SlackThreadKey,
+        generation: u64,
+        reply_cursor: &str,
+        active: bool,
+        next_poll_generation: u64,
+    ) -> StorageResult<()>;
+    fn slack_thread_catalog(
+        &self,
+        source_instance: &str,
+        channel_id: &str,
+    ) -> StorageResult<Vec<SlackThreadCatalogEntry>>;
+}
+
 pub trait ProjectionWatermarkStore: Send {
     fn projection_leaf_watermark(
         &self,
@@ -155,7 +348,9 @@ pub trait StoragePorts:
     + BlobStore
     + SupplementalStore
     + ProjectionMaterializer
+    + SupplementalProjectionCommitter
     + RuntimeStateStore
+    + SlackThreadCatalogStore
     + ProjectionWatermarkStore
 {
 }
@@ -165,9 +360,76 @@ impl<T> StoragePorts for T where
         + BlobStore
         + SupplementalStore
         + ProjectionMaterializer
+        + SupplementalProjectionCommitter
         + RuntimeStateStore
+        + SlackThreadCatalogStore
         + ProjectionWatermarkStore
 {
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(item_key: &str) -> ProjectionItem {
+        ProjectionItem {
+            item_key: item_key.to_owned(),
+            owner_key: "owner".to_owned(),
+            sort_key: "sort".to_owned(),
+            value: serde_json::json!({"item_key": item_key}),
+        }
+    }
+
+    #[test]
+    fn projection_item_delta_accepts_disjoint_explicit_operations() {
+        ProjectionItemCommit::Delta {
+            inserts: vec![item("insert")],
+            updates: vec![item("update")],
+            deletes: vec!["delete".to_owned()],
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn projection_item_delta_rejects_duplicate_and_conflicting_operations() {
+        let invalid = [
+            ProjectionItemCommit::Delta {
+                inserts: vec![item("same"), item("same")],
+                updates: vec![],
+                deletes: vec![],
+            },
+            ProjectionItemCommit::Delta {
+                inserts: vec![],
+                updates: vec![item("same"), item("same")],
+                deletes: vec![],
+            },
+            ProjectionItemCommit::Delta {
+                inserts: vec![],
+                updates: vec![],
+                deletes: vec!["same".to_owned(), "same".to_owned()],
+            },
+            ProjectionItemCommit::Delta {
+                inserts: vec![item("same")],
+                updates: vec![item("same")],
+                deletes: vec![],
+            },
+            ProjectionItemCommit::Delta {
+                inserts: vec![item("same")],
+                updates: vec![],
+                deletes: vec!["same".to_owned()],
+            },
+            ProjectionItemCommit::Delta {
+                inserts: vec![],
+                updates: vec![item("same")],
+                deletes: vec!["same".to_owned()],
+            },
+        ];
+
+        for commit in invalid {
+            assert!(matches!(commit.validate(), Err(StorageError::Invariant(_))));
+        }
+    }
 }
 
 pub mod conformance {
@@ -203,11 +465,22 @@ pub mod conformance {
     }
 
     pub fn observation_store_round_trip<T: ObservationStore>(store: &T) {
+        assert_eq!(
+            store.observation_stats().unwrap(),
+            ObservationStats {
+                count: 0,
+                max_append_seq: 0,
+            }
+        );
+
         let observation = sample_observation("conformance:observation");
         assert!(matches!(
             store.append_observation(&observation).unwrap(),
             AppendOutcome::Appended(_)
         ));
+        let stats_after_append = store.observation_stats().unwrap();
+        assert_eq!(stats_after_append.count, 1);
+        assert!(stats_after_append.max_append_seq > 0);
         let loaded = store.observation_by_id(&observation.id).unwrap().unwrap();
         assert_eq!(loaded.observation.id, observation.id);
         assert!(matches!(
@@ -220,6 +493,9 @@ pub mod conformance {
             store.append_observations(&bulk).unwrap().as_slice(),
             [AppendOutcome::Appended(_)]
         ));
+        let stats_after_bulk = store.observation_stats().unwrap();
+        assert_eq!(stats_after_bulk.count, 2);
+        assert!(stats_after_bulk.max_append_seq > stats_after_append.max_append_seq);
     }
 
     pub fn blob_store_round_trip<T: BlobStore>(store: &T) {
@@ -240,5 +516,87 @@ pub mod conformance {
             materializer.projection_records(&projection).unwrap(),
             Some(records)
         );
+
+        let manifest = serde_json::json!({"version": 1, "watermark": 2});
+        let items = vec![
+            ProjectionItem {
+                item_key: "item-b".to_owned(),
+                owner_key: "owner-a".to_owned(),
+                sort_key: "002".to_owned(),
+                value: serde_json::json!({"body": "b"}),
+            },
+            ProjectionItem {
+                item_key: "item-a".to_owned(),
+                owner_key: "owner-a".to_owned(),
+                sort_key: "001".to_owned(),
+                value: serde_json::json!({"body": "a"}),
+            },
+        ];
+        materializer
+            .commit_projection_items(
+                &projection,
+                &manifest,
+                &ProjectionItemCommit::Replace {
+                    items: items.clone(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            materializer.projection_records(&projection).unwrap(),
+            Some(manifest)
+        );
+        assert_eq!(
+            materializer
+                .projection_items_by_owner(&projection, "owner-a")
+                .unwrap()
+                .into_iter()
+                .map(|item| item.item_key)
+                .collect::<Vec<_>>(),
+            vec!["item-a", "item-b"]
+        );
+        assert_eq!(
+            materializer
+                .projection_item_count_by_owner(&projection, "owner-a")
+                .unwrap(),
+            2
+        );
+        assert_eq!(materializer.projection_item_count(&projection).unwrap(), 2);
+        assert_eq!(
+            materializer
+                .projection_item_by_key(&projection, "item-a")
+                .unwrap(),
+            Some(items[1].clone())
+        );
+
+        let staging = ProjectionRef::new("proj:conformance-staging");
+        materializer
+            .commit_projection_items(
+                &staging,
+                &serde_json::json!({"page": 0}),
+                &ProjectionItemCommit::Replace { items: vec![] },
+            )
+            .unwrap();
+        materializer
+            .commit_projection_items(
+                &staging,
+                &serde_json::json!({"page": 1}),
+                &ProjectionItemCommit::Delta {
+                    inserts: vec![items[0].clone()],
+                    updates: vec![],
+                    deletes: vec![],
+                },
+            )
+            .unwrap();
+        let published_manifest = serde_json::json!({"version": 2, "item_count": 1});
+        materializer
+            .publish_projection_items_from_staging(&projection, &staging, &published_manifest, 1)
+            .unwrap();
+        assert_eq!(
+            materializer.projection_records(&projection).unwrap(),
+            Some(published_manifest)
+        );
+        assert_eq!(materializer.projection_item_count(&projection).unwrap(), 1);
+        assert_eq!(materializer.projection_records(&staging).unwrap(), None);
+        assert_eq!(materializer.projection_item_count(&staging).unwrap(), 0);
     }
 }

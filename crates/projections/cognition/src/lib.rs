@@ -202,6 +202,14 @@ impl CognitionStateProjector {
 
     pub fn resume_snapshot(&self, records: &[SupplementalRecord]) -> ResumeSnapshotProjection {
         let claim_queue = ClaimQueueProjector.project_records(records);
+        self.resume_snapshot_with_claim_queue(records, &claim_queue)
+    }
+
+    pub fn resume_snapshot_with_claim_queue(
+        &self,
+        records: &[SupplementalRecord],
+        claim_queue: &lethe_projection_claim_queue::ClaimQueueProjection,
+    ) -> ResumeSnapshotProjection {
         let mut projects: BTreeMap<String, ResumeProjectAccumulator> = BTreeMap::new();
         let mut sorted = records.to_vec();
         sorted.sort_by(|left, right| {
@@ -271,8 +279,26 @@ impl CognitionStateProjector {
     }
 
     pub fn plan_state(&self, records: &[SupplementalRecord]) -> PlanStateProjection {
-        let resume = self.resume_snapshot(records);
         let claim_queue = ClaimQueueProjector.project_records(records);
+        let resume = self.resume_snapshot_with_claim_queue(records, &claim_queue);
+        self.plan_state_with_claim_queue(resume, &claim_queue)
+    }
+
+    pub fn project_with_claim_queue(
+        &self,
+        records: &[SupplementalRecord],
+        claim_queue: &lethe_projection_claim_queue::ClaimQueueProjection,
+    ) -> (ResumeSnapshotProjection, PlanStateProjection) {
+        let resume = self.resume_snapshot_with_claim_queue(records, claim_queue);
+        let plan = self.plan_state_with_claim_queue(resume.clone(), claim_queue);
+        (resume, plan)
+    }
+
+    fn plan_state_with_claim_queue(
+        &self,
+        resume: ResumeSnapshotProjection,
+        claim_queue: &lethe_projection_claim_queue::ClaimQueueProjection,
+    ) -> PlanStateProjection {
         let decisions = current_decisions_by_project(&claim_queue.decisions);
         let mut projects = resume
             .projects
@@ -401,67 +427,231 @@ impl CardQueueProjector {
     }
 
     pub fn project_records(&self, records: &[SupplementalRecord]) -> CardQueueProjection {
-        let mut sorted = records.to_vec();
-        sorted.sort_by(|left, right| {
-            left.created_at
-                .cmp(&right.created_at)
-                .then_with(|| left.id.as_str().cmp(right.id.as_str()))
-        });
-        let mut cards = BTreeMap::<String, ReplyCard>::new();
-        let mut audit_log = Vec::new();
+        CardQueueReducer::from_records(records).projection(self.now)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CardQueueReducer {
+    records: BTreeMap<String, SupplementalRecord>,
+    drafts: BTreeMap<String, SupplementalRecord>,
+    events_by_draft: BTreeMap<String, BTreeMap<(DateTime<Utc>, String), SupplementalRecord>>,
+    cards: BTreeMap<String, ReplyCard>,
+    audit_by_event: BTreeMap<(DateTime<Utc>, String), Vec<ProjectionAuditEvent>>,
+    expiries: BTreeMap<DateTime<Utc>, BTreeSet<String>>,
+}
+
+impl CardQueueReducer {
+    pub fn from_records(records: &[SupplementalRecord]) -> Self {
+        let mut reducer = Self::default();
+        let mut sorted = records
+            .iter()
+            .filter(|record| is_card_queue_kind(&record.kind))
+            .cloned()
+            .collect::<Vec<_>>();
+        sorted.sort_by(record_order);
         for record in sorted
             .iter()
             .filter(|record| record.kind == "reply-draft@1")
         {
-            let Some(channel) = string_field(&record.payload, "channel") else {
-                continue;
-            };
-            let Some(recipient) = string_field(&record.payload, "recipient") else {
-                continue;
-            };
-            let Some(body) = string_field(&record.payload, "body") else {
-                continue;
-            };
-            cards.insert(
-                record.id.as_str().to_owned(),
-                ReplyCard {
-                    draft_id: record.id.clone(),
-                    channel: channel.to_owned(),
-                    recipient: recipient.to_owned(),
-                    body: body.to_owned(),
-                    state: CardState::Pending,
-                    created_at: record.created_at,
-                    updated_at: record.created_at,
-                    approval_id: None,
-                    approval_interface: None,
-                    sent_record_id: None,
-                    automatic_send: false,
-                },
-            );
+            reducer.upsert_record(record.clone());
         }
-
         for record in sorted
-            .iter()
+            .into_iter()
             .filter(|record| record.kind != "reply-draft@1")
         {
-            match record.kind.as_str() {
-                "reply-approval@1" => apply_approval(record, &mut cards, &mut audit_log),
-                "send-record@1" => apply_send(record, &mut cards, &mut audit_log),
-                _ => {}
-            }
+            reducer.upsert_record(record);
         }
+        reducer
+    }
 
-        for card in cards.values_mut() {
-            if card.state == CardState::Pending
-                && expires_at(records, &card.draft_id).is_some_and(|expires| expires < self.now)
-            {
-                card.state = CardState::Expired;
-                card.updated_at = self.now;
+    pub fn upsert_record(&mut self, record: SupplementalRecord) {
+        if !is_card_queue_kind(&record.kind) {
+            return;
+        }
+        if self.records.contains_key(record.id.as_str()) {
+            self.records.insert(record.id.as_str().to_owned(), record);
+            self.rebuild();
+            return;
+        }
+        self.records
+            .insert(record.id.as_str().to_owned(), record.clone());
+        match record.kind.as_str() {
+            "reply-draft@1" => {
+                let draft_id = record.id.as_str().to_owned();
+                self.drafts.insert(draft_id.clone(), record);
+                self.recompute_card(&draft_id);
+            }
+            "reply-approval@1" | "send-record@1" => {
+                let key = record_key(&record);
+                let Some(draft_id) = single_draft_anchor(&record) else {
+                    self.audit_by_event.insert(
+                        key,
+                        vec![audit_event(
+                            &record,
+                            "missing_draft_anchor",
+                            if record.kind == "reply-approval@1" {
+                                "approval has no draft anchor"
+                            } else {
+                                "send record has no draft anchor"
+                            },
+                        )],
+                    );
+                    return;
+                };
+                let draft_id = draft_id.as_str().to_owned();
+                self.events_by_draft
+                    .entry(draft_id.clone())
+                    .or_default()
+                    .insert(key, record);
+                self.recompute_card(&draft_id);
+            }
+            _ => unreachable!("card queue kind routing is exhaustive"),
+        }
+    }
+
+    pub fn remove_record(&mut self, id: &SupplementalId) {
+        if self.records.remove(id.as_str()).is_some() {
+            self.rebuild();
+        }
+    }
+
+    pub fn draft(&self, id: &SupplementalId) -> Option<&SupplementalRecord> {
+        self.drafts.get(id.as_str())
+    }
+
+    pub fn projection(&self, now: DateTime<Utc>) -> CardQueueProjection {
+        let mut cards = self.cards.clone();
+        for (_, draft_ids) in self.expiries.range(..now) {
+            for draft_id in draft_ids {
+                if let Some(card) = cards.get_mut(draft_id)
+                    && card.state == CardState::Pending
+                {
+                    card.state = CardState::Expired;
+                    card.updated_at = now;
+                }
             }
         }
         CardQueueProjection {
             cards: cards.into_values().collect(),
-            audit_log,
+            audit_log: self
+                .audit_by_event
+                .values()
+                .flat_map(|events| events.iter().cloned())
+                .collect(),
+        }
+    }
+
+    fn rebuild(&mut self) {
+        let records = self.records.values().cloned().collect::<Vec<_>>();
+        *self = Self::from_records(&records);
+    }
+
+    fn recompute_card(&mut self, draft_id: &str) {
+        for draft_ids in self.expiries.values_mut() {
+            draft_ids.remove(draft_id);
+        }
+        self.expiries.retain(|_, draft_ids| !draft_ids.is_empty());
+        if let Some(events) = self.events_by_draft.get(draft_id) {
+            for key in events.keys() {
+                self.audit_by_event.remove(key);
+            }
+        }
+
+        let Some(draft) = self.drafts.get(draft_id) else {
+            if let Some(events) = self.events_by_draft.get(draft_id) {
+                for (key, event) in events {
+                    self.audit_by_event.insert(
+                        key.clone(),
+                        vec![audit_event(
+                            event,
+                            "unknown_draft_anchor",
+                            if event.kind == "reply-approval@1" {
+                                "approval anchors unknown draft"
+                            } else {
+                                "send record anchors unknown draft"
+                            },
+                        )],
+                    );
+                }
+            }
+            self.cards.remove(draft_id);
+            return;
+        };
+        let Some(channel) = string_field(&draft.payload, "channel") else {
+            self.mark_events_unknown(draft_id);
+            self.cards.remove(draft_id);
+            return;
+        };
+        let Some(recipient) = string_field(&draft.payload, "recipient") else {
+            self.mark_events_unknown(draft_id);
+            self.cards.remove(draft_id);
+            return;
+        };
+        let Some(body) = string_field(&draft.payload, "body") else {
+            self.mark_events_unknown(draft_id);
+            self.cards.remove(draft_id);
+            return;
+        };
+        let mut cards = BTreeMap::from([(
+            draft_id.to_owned(),
+            ReplyCard {
+                draft_id: draft.id.clone(),
+                channel: channel.to_owned(),
+                recipient: recipient.to_owned(),
+                body: body.to_owned(),
+                state: CardState::Pending,
+                created_at: draft.created_at,
+                updated_at: draft.created_at,
+                approval_id: None,
+                approval_interface: None,
+                sent_record_id: None,
+                automatic_send: false,
+            },
+        )]);
+        if let Some(events) = self.events_by_draft.get(draft_id) {
+            for (key, event) in events {
+                let mut audit = Vec::new();
+                match event.kind.as_str() {
+                    "reply-approval@1" => apply_approval(event, &mut cards, &mut audit),
+                    "send-record@1" => apply_send(event, &mut cards, &mut audit),
+                    _ => unreachable!("card event routing is exhaustive"),
+                }
+                if !audit.is_empty() {
+                    self.audit_by_event.insert(key.clone(), audit);
+                }
+            }
+        }
+        let card = cards
+            .remove(draft_id)
+            .expect("replayed draft card must remain present");
+        if card.state == CardState::Pending
+            && let Some(expires_at) = draft_expiry(draft)
+        {
+            self.expiries
+                .entry(expires_at)
+                .or_default()
+                .insert(draft_id.to_owned());
+        }
+        self.cards.insert(draft_id.to_owned(), card);
+    }
+
+    fn mark_events_unknown(&mut self, draft_id: &str) {
+        if let Some(events) = self.events_by_draft.get(draft_id) {
+            for (key, event) in events {
+                self.audit_by_event.insert(
+                    key.clone(),
+                    vec![audit_event(
+                        event,
+                        "unknown_draft_anchor",
+                        if event.kind == "reply-approval@1" {
+                            "approval anchors unknown draft"
+                        } else {
+                            "send record anchors unknown draft"
+                        },
+                    )],
+                );
+            }
         }
     }
 }
@@ -520,36 +710,15 @@ impl ReplySloProjector {
         observations: &[Observation],
         records: &[SupplementalRecord],
     ) -> ReplySloProjection {
-        let draft_to_observation = records
-            .iter()
-            .filter(|record| record.kind == "reply-draft@1")
-            .filter_map(|record| {
-                let observation_id = record.derived_from.observations.first()?;
-                Some((record.id.as_str().to_owned(), observation_id.clone()))
-            })
-            .collect::<BTreeMap<_, _>>();
+        let join_index = ReplySloJoinIndex::from_records(records);
+        self.project_observations(observations, &join_index)
+    }
 
-        let mut sent_by_observation = BTreeMap::<String, DateTime<Utc>>::new();
-        for record in records
-            .iter()
-            .filter(|record| record.kind == "send-record@1")
-        {
-            let Some(draft_id) = single_draft_anchor(record) else {
-                continue;
-            };
-            let Some(observation_id) = draft_to_observation.get(draft_id.as_str()) else {
-                continue;
-            };
-            let Some(sent_at) = string_field(&record.payload, "sent_at").and_then(parse_datetime)
-            else {
-                continue;
-            };
-            sent_by_observation
-                .entry(observation_id.as_str().to_owned())
-                .and_modify(|current| *current = (*current).min(sent_at))
-                .or_insert(sent_at);
-        }
-
+    pub fn project_observations(
+        &self,
+        observations: &[Observation],
+        join_index: &ReplySloJoinIndex,
+    ) -> ReplySloProjection {
         let mut rows = observations
             .iter()
             .filter_map(|observation| {
@@ -561,7 +730,10 @@ impl ReplySloProjector {
                     .pointer("/communication/reply_due_at")
                     .and_then(serde_json::Value::as_str)
                     .and_then(parse_datetime)?;
-                let sent_at = sent_by_observation.get(observation.id.as_str()).copied();
+                let sent_at = join_index
+                    .sent_by_observation
+                    .get(observation.id.as_str())
+                    .copied();
                 let latency_seconds =
                     sent_at.map(|sent_at| (sent_at - observation.published).num_seconds());
                 let status = match sent_at {
@@ -601,6 +773,88 @@ impl ReplySloProjector {
             .cloned()
             .collect();
         ReplySloProjection { rows, overdue }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ReplySloJoinIndex {
+    records: BTreeMap<String, SupplementalRecord>,
+    draft_to_observation: BTreeMap<String, ObservationId>,
+    sent_by_observation: BTreeMap<String, DateTime<Utc>>,
+}
+
+impl ReplySloJoinIndex {
+    pub fn from_records(records: &[SupplementalRecord]) -> Self {
+        let mut index = Self::default();
+        let mut relevant = records
+            .iter()
+            .filter(|record| matches!(record.kind.as_str(), "reply-draft@1" | "send-record@1"))
+            .cloned()
+            .collect::<Vec<_>>();
+        relevant.sort_by(record_order);
+        for record in relevant
+            .iter()
+            .filter(|record| record.kind == "reply-draft@1")
+        {
+            index.upsert_record(record.clone());
+        }
+        for record in relevant
+            .into_iter()
+            .filter(|record| record.kind == "send-record@1")
+        {
+            index.upsert_record(record);
+        }
+        index
+    }
+
+    pub fn upsert_record(&mut self, record: SupplementalRecord) {
+        if !matches!(record.kind.as_str(), "reply-draft@1" | "send-record@1") {
+            return;
+        }
+        if self.records.contains_key(record.id.as_str()) {
+            self.records.insert(record.id.as_str().to_owned(), record);
+            self.rebuild();
+            return;
+        }
+        self.records
+            .insert(record.id.as_str().to_owned(), record.clone());
+        match record.kind.as_str() {
+            "reply-draft@1" => {
+                if let Some(observation_id) = record.derived_from.observations.first() {
+                    self.draft_to_observation
+                        .insert(record.id.as_str().to_owned(), observation_id.clone());
+                }
+            }
+            "send-record@1" => {
+                let Some(draft_id) = single_draft_anchor(&record) else {
+                    return;
+                };
+                let Some(observation_id) = self.draft_to_observation.get(draft_id.as_str()) else {
+                    return;
+                };
+                let Some(sent_at) =
+                    string_field(&record.payload, "sent_at").and_then(parse_datetime)
+                else {
+                    return;
+                };
+                self.sent_by_observation
+                    .entry(observation_id.as_str().to_owned())
+                    .and_modify(|current| *current = (*current).min(sent_at))
+                    .or_insert(sent_at);
+            }
+            _ => unreachable!("reply SLO kind routing is exhaustive"),
+        }
+    }
+
+    pub fn remove_record(&mut self, id: &SupplementalId) {
+        if self.records.remove(id.as_str()).is_some() {
+            self.rebuild();
+        }
+    }
+
+    fn rebuild(&mut self) {
+        let records = self.records.values().cloned().collect::<Vec<_>>();
+        *self = Self::from_records(&records);
     }
 }
 
@@ -767,12 +1021,22 @@ fn single_draft_anchor(record: &SupplementalRecord) -> Option<&SupplementalId> {
     record.derived_from.supplementals.first()
 }
 
-fn expires_at(records: &[SupplementalRecord], draft_id: &SupplementalId) -> Option<DateTime<Utc>> {
-    records
-        .iter()
-        .find(|record| &record.id == draft_id)
-        .and_then(|record| string_field(&record.payload, "expires_at"))
-        .and_then(|raw| raw.parse::<DateTime<Utc>>().ok())
+fn is_card_queue_kind(kind: &str) -> bool {
+    matches!(kind, "reply-draft@1" | "reply-approval@1" | "send-record@1")
+}
+
+fn record_order(left: &SupplementalRecord, right: &SupplementalRecord) -> std::cmp::Ordering {
+    left.created_at
+        .cmp(&right.created_at)
+        .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+}
+
+fn record_key(record: &SupplementalRecord) -> (DateTime<Utc>, String) {
+    (record.created_at, record.id.as_str().to_owned())
+}
+
+fn draft_expiry(draft: &SupplementalRecord) -> Option<DateTime<Utc>> {
+    string_field(&draft.payload, "expires_at").and_then(parse_datetime)
 }
 
 fn audit_event(record: &SupplementalRecord, code: &str, message: &str) -> ProjectionAuditEvent {
@@ -1140,6 +1404,125 @@ mod tests {
     }
 
     #[test]
+    fn card_queue_incremental_reducer_matches_full_replay_after_every_record() {
+        let draft_id = "sup:draft-incremental";
+        let expiring_id = "sup:draft-expiring";
+        let records = vec![
+            supplemental(
+                draft_id,
+                "reply-draft@1",
+                serde_json::json!({
+                    "channel": "slack",
+                    "recipient": "U01",
+                    "body": "hello",
+                    "expires_at": at(5),
+                }),
+                obs_anchor("obs:1"),
+                at(1),
+            ),
+            supplemental(
+                expiring_id,
+                "reply-draft@1",
+                serde_json::json!({
+                    "channel": "slack",
+                    "recipient": "U02",
+                    "body": "expires",
+                    "expires_at": at(4),
+                }),
+                obs_anchor("obs:2"),
+                at(2),
+            ),
+            supplemental(
+                "sup:approval-incremental",
+                "reply-approval@1",
+                serde_json::json!({"decision": "approved", "interface": "api"}),
+                sup_anchor(draft_id),
+                at(3),
+            ),
+            supplemental(
+                "sup:send-incremental",
+                "send-record@1",
+                serde_json::json!({"mode": "approved", "sent_at": at(4)}),
+                sup_anchor(draft_id),
+                at(4),
+            ),
+        ];
+        let now = at(10);
+        let mut reducer = CardQueueReducer::default();
+        let mut prefix = Vec::new();
+        for record in records {
+            prefix.push(record.clone());
+            reducer.upsert_record(record);
+            assert_eq!(
+                serde_json::to_value(reducer.projection(now)).unwrap(),
+                serde_json::to_value(CardQueueProjector::new(now).project_records(&prefix))
+                    .unwrap()
+            );
+        }
+        assert_eq!(
+            reducer
+                .projection(now)
+                .cards
+                .iter()
+                .find(|card| card.draft_id.as_str() == expiring_id)
+                .unwrap()
+                .state,
+            CardState::Expired
+        );
+    }
+
+    #[test]
+    fn reply_slo_incremental_join_index_matches_full_replay() {
+        let incoming = communication_observation("obs:incoming", "chan:gmail", at(1), at(8));
+        let records = vec![
+            supplemental(
+                "sup:draft-slo",
+                "reply-draft@1",
+                serde_json::json!({
+                    "channel": "gmail",
+                    "recipient": "sender@example.test",
+                    "body": "reply",
+                }),
+                obs_anchor(incoming.id.as_str()),
+                at(2),
+            ),
+            supplemental(
+                "sup:send-slo-late",
+                "send-record@1",
+                serde_json::json!({"mode": "automatic", "sent_at": at(7)}),
+                sup_anchor("sup:draft-slo"),
+                at(7),
+            ),
+            supplemental(
+                "sup:send-slo-earlier",
+                "send-record@1",
+                serde_json::json!({"mode": "automatic", "sent_at": at(6)}),
+                sup_anchor("sup:draft-slo"),
+                at(8),
+            ),
+        ];
+        let now = at(10);
+        let mut index = ReplySloJoinIndex::default();
+        let mut prefix = Vec::new();
+        for record in records {
+            prefix.push(record.clone());
+            index.upsert_record(record);
+            assert_eq!(
+                serde_json::to_value(
+                    ReplySloProjector::new(now)
+                        .project_observations(std::slice::from_ref(&incoming), &index)
+                )
+                .unwrap(),
+                serde_json::to_value(
+                    ReplySloProjector::new(now)
+                        .project_records(std::slice::from_ref(&incoming), &prefix)
+                )
+                .unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn plan_state_excludes_superseded_decisions_and_calculates_ages() {
         let records = vec![
             supplemental(
@@ -1229,5 +1612,111 @@ mod tests {
         assert_eq!(projection.rows[0].latency_seconds, Some(20));
         assert_eq!(projection.rows[0].status, ReplySloStatus::SentOnTime);
         assert!(projection.overdue.is_empty());
+    }
+
+    #[test]
+    fn reply_slo_indexed_and_incremental_projection_match_full_rebuild() {
+        let observations = vec![
+            communication_observation(
+                "obs:on-time",
+                "chan:gmail:inbox",
+                at(0),
+                at(0) + chrono::Duration::minutes(30),
+            ),
+            communication_observation(
+                "obs:late",
+                "chan:gmail:inbox",
+                at(1),
+                at(1) + chrono::Duration::minutes(30),
+            ),
+            communication_observation(
+                "obs:unsent",
+                "chan:gmail:inbox",
+                at(2),
+                at(2) + chrono::Duration::minutes(30),
+            ),
+        ];
+        let records = vec![
+            supplemental(
+                "sup:draft-on-time",
+                "reply-draft@1",
+                serde_json::json!({"drafted_at": at(3)}),
+                obs_anchor("obs:on-time"),
+                at(3),
+            ),
+            supplemental(
+                "sup:draft-late",
+                "reply-draft@1",
+                serde_json::json!({"drafted_at": at(4)}),
+                obs_anchor("obs:late"),
+                at(4),
+            ),
+            supplemental(
+                "sup:draft-unsent",
+                "reply-draft@1",
+                serde_json::json!({"drafted_at": at(5)}),
+                obs_anchor("obs:unsent"),
+                at(5),
+            ),
+            supplemental(
+                "sup:send-on-time-later",
+                "send-record@1",
+                serde_json::json!({"sent_at": at(0) + chrono::Duration::minutes(25)}),
+                sup_anchor("sup:draft-on-time"),
+                at(20),
+            ),
+            supplemental(
+                "sup:send-late",
+                "send-record@1",
+                serde_json::json!({"sent_at": at(1) + chrono::Duration::minutes(40)}),
+                sup_anchor("sup:draft-late"),
+                at(21),
+            ),
+            supplemental(
+                "sup:send-on-time-earliest",
+                "send-record@1",
+                serde_json::json!({"sent_at": at(0) + chrono::Duration::minutes(20)}),
+                sup_anchor("sup:draft-on-time"),
+                at(22),
+            ),
+        ];
+        let projector = ReplySloProjector::new(at(0) + chrono::Duration::hours(1));
+        let full = projector.project_records(&observations, &records);
+
+        let join_index = ReplySloJoinIndex::from_records(&records);
+        let indexed = projector.project_observations(&observations, &join_index);
+        assert_eq!(
+            serde_json::to_value(&indexed).unwrap(),
+            serde_json::to_value(&full).unwrap()
+        );
+
+        let mut incremental_index = ReplySloJoinIndex::default();
+        for record in &records {
+            incremental_index.upsert_record(record.clone());
+        }
+        let incremental = projector.project_observations(&observations, &incremental_index);
+        assert_eq!(
+            serde_json::to_value(&incremental).unwrap(),
+            serde_json::to_value(&full).unwrap()
+        );
+        assert_eq!(incremental.rows[0].status, ReplySloStatus::SentOnTime);
+        assert_eq!(incremental.rows[1].status, ReplySloStatus::SentLate);
+        assert_eq!(incremental.rows[2].status, ReplySloStatus::Overdue);
+        assert_eq!(incremental.overdue.len(), 2);
+
+        let earlier_send = supplemental(
+            "sup:send-temporary",
+            "send-record@1",
+            serde_json::json!({"sent_at": at(10)}),
+            sup_anchor("sup:draft-on-time"),
+            at(23),
+        );
+        incremental_index.upsert_record(earlier_send.clone());
+        incremental_index.remove_record(&earlier_send.id);
+        let after_remove = projector.project_observations(&observations, &incremental_index);
+        assert_eq!(
+            serde_json::to_value(&after_remove).unwrap(),
+            serde_json::to_value(&indexed).unwrap()
+        );
     }
 }

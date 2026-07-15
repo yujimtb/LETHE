@@ -20,6 +20,15 @@ pub struct PersonPageProjector;
 pub const CONSENT_DECISION_SCHEMA: &str = "schema:consent-decision";
 
 impl PersonPageProjector {
+    pub fn project_frontend_profiles(
+        identity: &IdentityResolutionOutput,
+        observations: &[Observation],
+        supplemental_records: &[&SupplementalRecord],
+    ) -> HashMap<String, (DateTime<Utc>, FrontendProfile)> {
+        let person_identifiers = Self::build_person_identifier_map(identity);
+        Self::build_frontend_profile_map(observations, supplemental_records, &person_identifiers)
+    }
+
     /// Build person page output from identity resolution and observations.
     ///
     /// Only uses `resolved_persons` with confirmed status (not pending candidates).
@@ -35,11 +44,8 @@ impl PersonPageProjector {
 
         // Build person-id → identifiers map for matching.
         let person_identifiers = Self::build_person_identifier_map(identity);
-        let frontend_profiles = Self::build_frontend_profile_map(
-            observations,
-            supplemental_records,
-            &person_identifiers,
-        );
+        let frontend_profiles =
+            Self::project_frontend_profiles(identity, observations, supplemental_records);
 
         for person in &identity.resolved_persons {
             if Self::consent_status_for_person(person, observations) == ConsentStatus::OptedOut {
@@ -93,6 +99,7 @@ impl PersonPageProjector {
                 last_activity: activity.last_activity,
                 profile_updated_at,
                 frontend_profile,
+                frontend_profile_created_at: frontend_profile_updated_at,
             };
 
             profiles.push(profile);
@@ -230,10 +237,13 @@ impl PersonPageProjector {
             let created_at = record.created_at;
             let richness_score = frontend_profile.profile.richness_score();
             match results.get(person_id.as_str()) {
-                Some((current_score, current_created_at, _))
+                Some((current_score, current_created_at, current_profile))
                     if *current_score > richness_score
                         || (*current_score == richness_score
-                            && *current_created_at >= created_at) => {}
+                            && (*current_created_at > created_at
+                                || (*current_created_at == created_at
+                                    && current_profile.source_document_id
+                                        >= frontend_profile.source_document_id))) => {}
                 _ => {
                     results.insert(
                         person_id.as_str().to_string(),
@@ -293,8 +303,6 @@ impl PersonPageProjector {
     ) -> (Vec<PersonSlide>, Vec<PersonMessage>) {
         let mut slides = Vec::new();
         let mut messages = Vec::new();
-        let mut slide_counter = 0u64;
-        let mut msg_counter = 0u64;
 
         for obs in observations {
             let belongs = Self::observation_belongs_to(obs, person, identifier_map);
@@ -303,7 +311,9 @@ impl PersonPageProjector {
             }
 
             if obs.schema == SchemaRef::new("schema:workspace-object-snapshot") {
-                slide_counter += 1;
+                let Some(claim) = Self::slide_claim(obs, person, identifier_map) else {
+                    continue;
+                };
                 let title = obs
                     .payload
                     .get("title")
@@ -317,7 +327,8 @@ impl PersonPageProjector {
                     .map(String::from);
 
                 slides.push(PersonSlide {
-                    id: format!("ps:{}:{slide_counter}", person.person_id),
+                    id: format!("ps:{}:{claim}", obs.id),
+                    source_observation_id: obs.id.as_str().to_owned(),
                     person_id: person.person_id.clone(),
                     document_id: obs.subject.as_str().to_string(),
                     title,
@@ -328,9 +339,9 @@ impl PersonPageProjector {
                     last_modified: Some(obs.published),
                 });
             } else if obs.schema == SchemaRef::new("schema:slide-analysis-result") {
-                slide_counter += 1;
                 slides.push(PersonSlide {
-                    id: format!("ps:{}:{slide_counter}", person.person_id),
+                    id: format!("ps:{}:analysis", obs.id),
+                    source_observation_id: obs.id.as_str().to_owned(),
                     person_id: person.person_id.clone(),
                     document_id: obs
                         .target
@@ -360,7 +371,6 @@ impl PersonPageProjector {
                     last_modified: Some(obs.published),
                 });
             } else if obs.schema == SchemaRef::new("schema:slack-message") {
-                msg_counter += 1;
                 let text = obs
                     .payload
                     .get("text")
@@ -382,7 +392,8 @@ impl PersonPageProjector {
                     .map(String::from);
 
                 messages.push(PersonMessage {
-                    id: format!("pm:{}:{msg_counter}", person.person_id),
+                    id: format!("pm:{}", obs.id),
+                    source_observation_id: obs.id.as_str().to_owned(),
                     person_id: person.person_id.clone(),
                     channel,
                     text,
@@ -396,12 +407,51 @@ impl PersonPageProjector {
         (slides, messages)
     }
 
+    fn slide_claim(
+        observation: &Observation,
+        person: &ResolvedPerson,
+        identifier_map: &HashMap<String, EntityRef>,
+    ) -> Option<String> {
+        let mut claims = Vec::new();
+        if observation
+            .payload
+            .pointer("/relations/owner")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|owner| identifier_map.get(owner) == Some(&person.person_id))
+        {
+            claims.push("owner".to_owned());
+        }
+        if let Some(editors) = observation
+            .payload
+            .pointer("/relations/editors")
+            .and_then(serde_json::Value::as_array)
+        {
+            for (index, editor) in editors.iter().enumerate() {
+                if editor
+                    .as_str()
+                    .is_some_and(|email| identifier_map.get(email) == Some(&person.person_id))
+                {
+                    claims.push(format!("editor-{index:020}"));
+                }
+            }
+        }
+        claims.into_iter().min()
+    }
+
     /// Check if an observation belongs to a person.
     fn observation_belongs_to(
         obs: &Observation,
         person: &ResolvedPerson,
         identifier_map: &HashMap<String, EntityRef>,
     ) -> bool {
+        if obs.schema == SchemaRef::new("schema:slack-message") {
+            return obs
+                .payload
+                .get("user_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|user_id| identifier_map.get(user_id) == Some(&person.person_id));
+        }
+
         // Check via user_id in payload.
         if let Some(user_id) = obs.payload.get("user_id").and_then(|v| v.as_str())
             && identifier_map.get(user_id) == Some(&person.person_id)
@@ -649,6 +699,12 @@ mod tests {
         assert_eq!(output.profiles[0].display_name, "田中太郎");
         assert_eq!(output.messages.len(), 2);
         assert_eq!(output.slides.len(), 1);
+        assert_eq!(output.messages[0].id, format!("pm:{}", observations[0].id));
+        assert_eq!(output.messages[1].id, format!("pm:{}", observations[1].id));
+        assert_eq!(
+            output.slides[0].id,
+            format!("ps:{}:editor-{:020}", observations[2].id, 0)
+        );
         assert_eq!(output.activities.len(), 1);
         assert_eq!(output.activities[0].total_messages, 2);
         assert_eq!(output.activities[0].total_slides_related, 1);

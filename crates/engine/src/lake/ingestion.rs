@@ -48,37 +48,19 @@ pub const COMM_CHANNEL_EXTERNAL_ID_META_KEY: &str = "communication_channel_exter
 pub const COMM_SENDER_ID_META_KEY: &str = "communication_sender_id";
 pub const COMM_THREAD_REF_META_KEY: &str = "communication_thread_ref";
 
-/// The Ingestion Gate coordinates validation → dedup → append.
-pub struct IngestionGate<'a> {
-    pub registry: &'a RegistryStore,
-    pub lake: &'a mut LakeStore,
-    pub blobs: &'a BlobStore,
+/// Validates and normalizes an ingestion request without accessing the lake.
+pub struct ObservationPreparer<'a> {
+    registry: &'a RegistryStore,
+    blobs: &'a BlobStore,
 }
 
-impl IngestionGate<'_> {
-    /// Run the full ingestion pipeline (steps 1–9 from the spec).
-    pub fn ingest(&mut self, req: IngestRequest) -> IngestResult {
-        let obs = match self.prepare_observation(req) {
-            Ok(obs) => obs,
-            Err(result) => return result,
-        };
-        let recorded_at = obs.recorded_at;
-
-        match self.lake.append_idempotent(obs) {
-            AppendOutcome::Appended(id) => IngestResult::Ingested { id, recorded_at },
-            AppendOutcome::Duplicate(existing_id) => IngestResult::Duplicate { existing_id },
-            AppendOutcome::Conflict(existing_id) => IngestResult::Quarantined {
-                ticket: QuarantineTicket {
-                    id: uuid::Uuid::now_v7().to_string(),
-                    reason: format!(
-                        "sha256-collision: existing observation {existing_id} has different canonical_json"
-                    ),
-                },
-            },
-        }
+impl<'a> ObservationPreparer<'a> {
+    pub fn new(registry: &'a RegistryStore, blobs: &'a BlobStore) -> Self {
+        Self { registry, blobs }
     }
 
-    pub fn prepare_observation(&self, mut req: IngestRequest) -> Result<Observation, IngestResult> {
+    /// Validate and normalize a request into an Observation ready for durable append.
+    pub fn prepare(&self, mut req: IngestRequest) -> Result<Observation, IngestResult> {
         let recorded_at = Utc::now();
 
         // Step 1: Authenticate observer (must be registered).
@@ -204,7 +186,7 @@ impl IngestionGate<'_> {
             });
         }
 
-        // Step 5: Idempotency check is handled by LakeStore.append().
+        // Step 5: Idempotency is decided by the append boundary.
 
         // Step 6: Verify blob refs exist (if any).
         for br in &req.attachments {
@@ -234,8 +216,8 @@ impl IngestionGate<'_> {
             Err(ticket) => return Err(IngestResult::Quarantined { ticket }),
         };
 
-        // Step 9: Build Observation and append.
-        let obs = Observation {
+        // Step 9: Build the Observation. Appending is the caller's responsibility.
+        Ok(Observation {
             id: Observation::new_id(),
             schema: req.schema,
             schema_version: req.schema_version,
@@ -253,9 +235,7 @@ impl IngestionGate<'_> {
             consent,
             idempotency_key: req.idempotency_key,
             meta: req.meta,
-        };
-
-        Ok(obs)
+        })
     }
 
     fn apply_channel_context(
@@ -378,6 +358,37 @@ impl IngestionGate<'_> {
         Ok(Some(lethe_core::domain::ConsentRef::new(
             channel.default_consent_scope.clone(),
         )))
+    }
+}
+
+/// The Ingestion Gate coordinates validation → dedup → append.
+pub struct IngestionGate<'a> {
+    pub registry: &'a RegistryStore,
+    pub lake: &'a mut LakeStore,
+    pub blobs: &'a BlobStore,
+}
+
+impl IngestionGate<'_> {
+    /// Run the full ingestion pipeline (steps 1–9 from the spec).
+    pub fn ingest(&mut self, req: IngestRequest) -> IngestResult {
+        let obs = match ObservationPreparer::new(self.registry, self.blobs).prepare(req) {
+            Ok(obs) => obs,
+            Err(result) => return result,
+        };
+        let recorded_at = obs.recorded_at;
+
+        match self.lake.append_idempotent(obs) {
+            AppendOutcome::Appended(id) => IngestResult::Ingested { id, recorded_at },
+            AppendOutcome::Duplicate(existing_id) => IngestResult::Duplicate { existing_id },
+            AppendOutcome::Conflict(existing_id) => IngestResult::Quarantined {
+                ticket: QuarantineTicket {
+                    id: uuid::Uuid::now_v7().to_string(),
+                    reason: format!(
+                        "sha256-collision: existing observation {existing_id} has different canonical_json"
+                    ),
+                },
+            },
+        }
     }
 }
 
@@ -559,6 +570,78 @@ mod tests {
                 "source_instance": "slack-test",
             }),
         }
+    }
+
+    fn comparable_observation(observation: &Observation) -> serde_json::Value {
+        let mut value = serde_json::to_value(observation).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("id");
+        object.remove("recorded_at");
+        value
+    }
+
+    #[test]
+    fn preparer_and_gate_produce_equivalent_observations() {
+        let reg = setup_registry();
+        let blobs = BlobStore::new();
+        let request = valid_request();
+        let prepared = ObservationPreparer::new(&reg, &blobs)
+            .prepare(request.clone())
+            .unwrap();
+        let mut lake = LakeStore::new();
+        let result = IngestionGate {
+            registry: &reg,
+            lake: &mut lake,
+            blobs: &blobs,
+        }
+        .ingest(request);
+
+        let IngestResult::Ingested { id, recorded_at } = result else {
+            panic!("gate must ingest a request accepted by the preparer");
+        };
+        let appended = &lake.list()[0];
+        assert_eq!(id, appended.id);
+        assert_eq!(recorded_at, appended.recorded_at);
+        assert_eq!(
+            comparable_observation(&prepared),
+            comparable_observation(appended)
+        );
+    }
+
+    #[test]
+    fn preparer_and_gate_return_the_same_validation_rejection() {
+        let reg = setup_registry();
+        let blobs = BlobStore::new();
+        let mut request = valid_request();
+        request.observer = ObserverRef::new("obs:unknown");
+        let direct = ObservationPreparer::new(&reg, &blobs)
+            .prepare(request.clone())
+            .unwrap_err();
+        let mut lake = LakeStore::new();
+        let gated = IngestionGate {
+            registry: &reg,
+            lake: &mut lake,
+            blobs: &blobs,
+        }
+        .ingest(request);
+
+        match (direct, gated) {
+            (
+                IngestResult::Rejected {
+                    class: direct_class,
+                    message: direct_message,
+                },
+                IngestResult::Rejected {
+                    class: gated_class,
+                    message: gated_message,
+                },
+            ) => {
+                assert_eq!(direct_class, gated_class);
+                assert_eq!(direct_message, gated_message);
+            }
+            other => panic!("preparer and gate must return the same rejection: {other:?}"),
+        }
+        assert!(lake.is_empty());
     }
 
     #[test]

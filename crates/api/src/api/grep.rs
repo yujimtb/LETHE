@@ -1,6 +1,5 @@
 //! Grep API request/response types and linear-time regex search engine.
 
-use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -12,6 +11,8 @@ use unicode_normalization::UnicodeNormalization;
 
 pub const SNIPPET_MAX_CHARS: usize = 240;
 pub const MATCHED_RANGES_LIMIT: usize = 20;
+const DEFAULT_LIMIT: usize = 100;
+const DEFAULT_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GrepRequest {
@@ -182,24 +183,172 @@ pub enum GrepError {
     TimedOut(u64),
 }
 
+/// Decoded keyset boundary carried by an opaque grep cursor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GrepCursorBoundary {
+    timestamp: DateTime<Utc>,
+    record_id: String,
+}
+
+impl GrepCursorBoundary {
+    pub fn timestamp(&self) -> DateTime<Utc> {
+        self.timestamp
+    }
+
+    pub fn record_id(&self) -> &str {
+        &self.record_id
+    }
+}
+
+/// Validated grep request reusable by persistent and in-memory search backends.
+#[derive(Debug)]
+pub struct PreparedGrepQuery {
+    filters: GrepFilters,
+    normalization: NormalizationMode,
+    order: GrepOrder,
+    limit: usize,
+    cursor: Option<GrepCursorBoundary>,
+    matcher: QueryMatcher,
+    required_literal_ngrams: Vec<String>,
+    required_literal_ngram_groups: Vec<Vec<String>>,
+    timeout: Duration,
+}
+
+impl PreparedGrepQuery {
+    pub fn compile(request: &GrepRequest, max_limit: usize) -> Result<Self, GrepError> {
+        let limit = request.limit.unwrap_or(DEFAULT_LIMIT);
+        if limit == 0 || limit > max_limit {
+            return Err(GrepError::InvalidLimit(max_limit));
+        }
+
+        let cursor = request.cursor.as_deref().map(decode_cursor).transpose()?;
+        let pattern = match request.normalization {
+            NormalizationMode::Nfkc => normalize(&request.pattern),
+            NormalizationMode::None => request.pattern.clone(),
+        };
+        let matcher = QueryMatcher::compile(pattern)?;
+        let required_literal_ngrams = if request.normalization == NormalizationMode::Nfkc {
+            matcher.required_literal_ngrams()
+        } else {
+            Vec::new()
+        };
+        let required_literal_ngram_groups = if request.normalization == NormalizationMode::Nfkc {
+            matcher.required_literal_ngram_groups()
+        } else {
+            Vec::new()
+        };
+
+        Ok(Self {
+            filters: request.filters.clone(),
+            normalization: request.normalization,
+            order: request.order,
+            limit,
+            cursor,
+            matcher,
+            required_literal_ngrams,
+            required_literal_ngram_groups,
+            timeout: DEFAULT_TIMEOUT,
+        })
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn filters(&self) -> &GrepFilters {
+        &self.filters
+    }
+
+    pub fn normalization(&self) -> NormalizationMode {
+        self.normalization
+    }
+
+    pub fn order(&self) -> GrepOrder {
+        self.order
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Number of verified matches needed to decide whether another page exists.
+    pub fn limit_with_sentinel(&self) -> usize {
+        self.limit.saturating_add(1)
+    }
+
+    pub fn cursor_boundary(&self) -> Option<&GrepCursorBoundary> {
+        self.cursor.as_ref()
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Safe NFKC literal n-grams that may be ANDed to narrow index candidates.
+    ///
+    /// Each literal contributes every safe window at width
+    /// `min(3, char_count)`, so one- and two-character terms remain available
+    /// to the candidate planner. A persistent backend may select the rarest
+    /// required window because every exact match contains every returned
+    /// window. Regex terms and normalization-none queries contribute no
+    /// candidate constraint.
+    pub fn required_literal_ngrams(&self) -> &[String] {
+        &self.required_literal_ngrams
+    }
+
+    /// Returns safe n-gram candidates grouped by independently required query
+    /// term. A persistent backend may select one rarest n-gram from each
+    /// non-empty group and intersect those terms before loading stored fields.
+    pub fn required_literal_ngram_groups(&self) -> &[Vec<String>] {
+        &self.required_literal_ngram_groups
+    }
+
+    pub fn is_after_cursor(&self, record: &GrepRecord) -> bool {
+        self.cursor
+            .as_ref()
+            .is_none_or(|cursor| is_after_cursor(record, cursor, self.order))
+    }
+
+    pub fn matches_record(&self, record: &GrepRecord) -> Option<GrepMatch> {
+        filters_match(record, &self.filters).then_some(())?;
+        match_record(record, &self.matcher, self.normalization)
+    }
+
+    pub fn finish(
+        &self,
+        mut verified_matches: Vec<GrepMatch>,
+        projection_watermark: String,
+    ) -> Result<GrepResponse, GrepError> {
+        let complete = verified_matches.len() <= self.limit;
+        if !complete {
+            verified_matches.truncate(self.limit);
+        }
+        let next_cursor = if complete {
+            None
+        } else {
+            verified_matches.last().map(encode_cursor).transpose()?
+        };
+        Ok(GrepResponse {
+            matches: verified_matches,
+            next_cursor,
+            complete,
+            projection_watermark,
+        })
+    }
+}
+
 pub struct GrepEngine {
     max_limit: usize,
     timeout: Duration,
-    use_trigram_index: bool,
 }
 
 impl GrepEngine {
     pub fn new(max_limit: usize) -> Self {
         Self {
             max_limit,
-            timeout: Duration::from_millis(500),
-            use_trigram_index: true,
+            timeout: DEFAULT_TIMEOUT,
         }
-    }
-
-    pub fn without_trigram_index(mut self) -> Self {
-        self.use_trigram_index = false;
-        self
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -213,33 +362,13 @@ impl GrepEngine {
         request: &GrepRequest,
         projection_watermark: String,
     ) -> Result<GrepResponse, GrepError> {
-        let limit = request.limit.unwrap_or(100);
-        if limit == 0 || limit > self.max_limit {
-            return Err(GrepError::InvalidLimit(self.max_limit));
-        }
-        let cursor = request.cursor.as_deref().map(decode_cursor).transpose()?;
-        let pattern = match request.normalization {
-            NormalizationMode::Nfkc => normalize(&request.pattern),
-            NormalizationMode::None => request.pattern.clone(),
-        };
-        let matcher = QueryMatcher::compile(pattern)?;
-        let filtered = records
+        let prepared =
+            PreparedGrepQuery::compile(request, self.max_limit)?.with_timeout(self.timeout);
+        let mut candidates = records
             .iter()
-            .filter(|record| filters_match(record, &request.filters))
+            .filter(|record| filters_match(record, prepared.filters()))
             .collect::<Vec<_>>();
-        let index = self
-            .use_trigram_index
-            .then(|| TrigramIndex::build_refs(&filtered));
-        let candidate_indices = index
-            .as_ref()
-            .and_then(|index| index.candidate_indices_for_matcher(&matcher))
-            .unwrap_or_else(|| (0..filtered.len()).collect());
-
-        let mut candidates = candidate_indices
-            .into_iter()
-            .map(|idx| filtered[idx])
-            .collect::<Vec<_>>();
-        match request.order {
+        match prepared.order() {
             GrepOrder::DateDesc => candidates.sort_by(|left, right| {
                 right
                     .timestamp
@@ -256,48 +385,25 @@ impl GrepEngine {
         let start = Instant::now();
         let mut matches = Vec::new();
         for record in candidates {
-            if start.elapsed() > self.timeout {
-                return Err(GrepError::TimedOut(self.timeout.as_millis() as u64));
+            if start.elapsed() > prepared.timeout() {
+                return Err(GrepError::TimedOut(prepared.timeout().as_millis() as u64));
             }
-            if cursor
-                .as_ref()
-                .is_some_and(|cursor| !is_after_cursor(record, cursor, request.order))
-            {
+            if !prepared.is_after_cursor(record) {
                 continue;
             }
-            if let Some(matched) = match_record(record, &matcher, request.normalization) {
+            if let Some(matched) = prepared.matches_record(record) {
                 matches.push(matched);
-                if matches.len() > limit {
+                if matches.len() >= prepared.limit_with_sentinel() {
                     break;
                 }
             }
         }
-        let complete = matches.len() <= limit;
-        if !complete {
-            matches.truncate(limit);
-        }
-        let next_cursor = if complete {
-            None
-        } else {
-            matches.last().map(encode_cursor).transpose()?
-        };
-        Ok(GrepResponse {
-            matches,
-            next_cursor,
-            complete,
-            projection_watermark,
-        })
+        prepared.finish(matches, projection_watermark)
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct GrepCursor {
-    timestamp: DateTime<Utc>,
-    record_id: String,
-}
-
 fn encode_cursor(record: &GrepMatch) -> Result<String, GrepError> {
-    let cursor = GrepCursor {
+    let cursor = GrepCursorBoundary {
         timestamp: record.timestamp,
         record_id: record.record_id.clone(),
     };
@@ -305,14 +411,14 @@ fn encode_cursor(record: &GrepMatch) -> Result<String, GrepError> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
-fn decode_cursor(cursor: &str) -> Result<GrepCursor, GrepError> {
+fn decode_cursor(cursor: &str) -> Result<GrepCursorBoundary, GrepError> {
     let bytes = URL_SAFE_NO_PAD
         .decode(cursor)
         .map_err(|_| GrepError::InvalidCursor)?;
     serde_json::from_slice(&bytes).map_err(|_| GrepError::InvalidCursor)
 }
 
-fn is_after_cursor(record: &GrepRecord, cursor: &GrepCursor, order: GrepOrder) -> bool {
+fn is_after_cursor(record: &GrepRecord, cursor: &GrepCursorBoundary, order: GrepOrder) -> bool {
     match order {
         GrepOrder::DateDesc => {
             record.timestamp < cursor.timestamp
@@ -327,72 +433,7 @@ fn is_after_cursor(record: &GrepRecord, cursor: &GrepCursor, order: GrepOrder) -
     }
 }
 
-#[derive(Debug)]
-struct TrigramIndex {
-    postings: HashMap<String, Vec<usize>>,
-}
-
-impl TrigramIndex {
-    fn build_refs(records: &[&GrepRecord]) -> Self {
-        let mut postings: HashMap<String, Vec<usize>> = HashMap::new();
-        for (idx, record) in records.iter().enumerate() {
-            let mut seen = HashSet::new();
-            for trigram in trigrams(&record.normalized_text) {
-                if seen.insert(trigram.clone()) {
-                    postings.entry(trigram).or_default().push(idx);
-                }
-            }
-        }
-        Self { postings }
-    }
-
-    fn candidate_indices(&self, normalized_pattern: &str) -> Option<Vec<usize>> {
-        let required = plain_literal_trigrams(normalized_pattern)?;
-        let mut iter = required.iter();
-        let first = self
-            .postings
-            .get(iter.next()?)?
-            .iter()
-            .copied()
-            .collect::<HashSet<_>>();
-        let intersection = iter.fold(first, |acc, trigram| {
-            let Some(posting) = self.postings.get(trigram) else {
-                return HashSet::new();
-            };
-            let posting = posting.iter().copied().collect::<HashSet<_>>();
-            acc.intersection(&posting).copied().collect()
-        });
-        let mut result = intersection.into_iter().collect::<Vec<_>>();
-        result.sort_unstable();
-        Some(result)
-    }
-
-    fn candidate_indices_for_matcher(&self, matcher: &QueryMatcher) -> Option<Vec<usize>> {
-        match matcher {
-            QueryMatcher::Single(term) => self.candidate_indices(term.candidate_text()),
-            QueryMatcher::Multi(terms) => {
-                let mut candidates = None::<HashSet<usize>>;
-                for term in terms {
-                    let Some(indices) = self.candidate_indices(term.candidate_text()) else {
-                        continue;
-                    };
-                    let indices = indices.into_iter().collect::<HashSet<_>>();
-                    candidates = Some(match candidates {
-                        Some(existing) => existing.intersection(&indices).copied().collect(),
-                        None => indices,
-                    });
-                }
-                candidates.map(|indices| {
-                    let mut indices = indices.into_iter().collect::<Vec<_>>();
-                    indices.sort_unstable();
-                    indices
-                })
-            }
-        }
-    }
-}
-
-fn plain_literal_trigrams(pattern: &str) -> Option<Vec<String>> {
+fn plain_literal_ngrams(pattern: &str) -> Option<Vec<String>> {
     if pattern.chars().any(|ch| {
         matches!(
             ch,
@@ -401,17 +442,18 @@ fn plain_literal_trigrams(pattern: &str) -> Option<Vec<String>> {
     }) {
         return None;
     }
-    let trigrams = trigrams(pattern);
-    (!trigrams.is_empty()).then_some(trigrams)
+    let ngrams = literal_ngrams(pattern);
+    (!ngrams.is_empty()).then_some(ngrams)
 }
 
-fn trigrams(value: &str) -> Vec<String> {
+fn literal_ngrams(value: &str) -> Vec<String> {
     let chars = value.chars().collect::<Vec<_>>();
-    if chars.len() < 3 {
+    if chars.is_empty() {
         return Vec::new();
     }
+    let width = chars.len().min(3);
     chars
-        .windows(3)
+        .windows(width)
         .map(|window| window.iter().collect::<String>())
         .collect()
 }
@@ -475,6 +517,29 @@ impl QueryMatcher {
                 Regex::new(&pattern).map_err(|err| GrepError::InvalidPattern(err.to_string()))?;
             Ok(Self::Single(TermMatcher::Regex { pattern, regex }))
         }
+    }
+
+    fn required_literal_ngrams(&self) -> Vec<String> {
+        self.required_literal_ngram_groups()
+            .into_iter()
+            .flatten()
+            .fold(Vec::new(), |mut required, ngram| {
+                if !required.contains(&ngram) {
+                    required.push(ngram);
+                }
+                required
+            })
+    }
+
+    fn required_literal_ngram_groups(&self) -> Vec<Vec<String>> {
+        let terms = match self {
+            Self::Single(term) => std::slice::from_ref(term),
+            Self::Multi(terms) => terms.as_slice(),
+        };
+        terms
+            .iter()
+            .filter_map(|term| plain_literal_ngrams(term.candidate_text()))
+            .collect()
     }
 
     fn find_ranges(&self, haystack: &str) -> Option<Vec<MatchedRange>> {
@@ -544,7 +609,7 @@ impl TermMatcher {
 
 fn split_query_terms(query: &str) -> Vec<String> {
     query
-        .split(|ch| matches!(ch, ' ' | '\t' | '\u{3000}'))
+        .split([' ', '\t', '\u{3000}'])
         .filter(|term| !term.is_empty())
         .map(str::to_owned)
         .collect()
@@ -694,7 +759,7 @@ mod tests {
     }
 
     #[test]
-    fn trigram_index_and_full_scan_return_same_matches() {
+    fn prepared_query_and_reference_engine_return_same_matches() {
         let records = vec![
             record("r1", "忘れ物は受付"),
             record("r2", "別の文章"),
@@ -704,14 +769,141 @@ mod tests {
             pattern: "忘れ物".into(),
             ..GrepRequest::default()
         };
-        let indexed = GrepEngine::new(100)
+        let prepared = PreparedGrepQuery::compile(&request, 100).unwrap();
+        assert_eq!(prepared.required_literal_ngrams(), ["忘れ物"]);
+
+        let manually_verified = records
+            .iter()
+            .filter_map(|record| prepared.matches_record(record))
+            .collect::<Vec<_>>();
+        let prepared_response = prepared.finish(manually_verified, "wm".into()).unwrap();
+        let reference_response = GrepEngine::new(100)
             .search(&records, &request, "wm".into())
             .unwrap();
-        let full_scan = GrepEngine::new(100)
-            .without_trigram_index()
-            .search(&records, &request, "wm".into())
+
+        assert_eq!(prepared_response.matches, reference_response.matches);
+    }
+
+    #[test]
+    fn prepared_query_only_exposes_safe_nfkc_literal_ngrams() {
+        let request = GrepRequest {
+            pattern: "ａｌｐｈａ be.* xy gamma".into(),
+            ..GrepRequest::default()
+        };
+        let prepared = PreparedGrepQuery::compile(&request, 100).unwrap();
+        assert_eq!(
+            prepared.required_literal_ngrams(),
+            ["alp", "lph", "pha", "xy", "gam", "amm", "mma"]
+        );
+
+        let without_normalization = PreparedGrepQuery::compile(
+            &GrepRequest {
+                normalization: NormalizationMode::None,
+                ..request
+            },
+            100,
+        )
+        .unwrap();
+        assert!(without_normalization.required_literal_ngrams().is_empty());
+    }
+
+    #[test]
+    fn prepared_query_indexes_one_and_two_character_literals() {
+        let prepared = PreparedGrepQuery::compile(
+            &GrepRequest {
+                pattern: "納期 x".into(),
+                ..GrepRequest::default()
+            },
+            100,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.required_literal_ngrams(), ["納期", "x"]);
+    }
+
+    #[test]
+    fn prepared_query_exposes_boundaries_and_finishes_limit_plus_one() {
+        let newest = record_at("r3", "needle newest", "2026-01-03T00:00:00Z");
+        let older = record_at("r2", "needle older", "2026-01-02T00:00:00Z");
+        let prepared = PreparedGrepQuery::compile(
+            &GrepRequest {
+                pattern: "needle".into(),
+                limit: Some(1),
+                ..GrepRequest::default()
+            },
+            100,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.order(), GrepOrder::DateDesc);
+        assert_eq!(prepared.limit(), 1);
+        assert_eq!(prepared.limit_with_sentinel(), 2);
+        assert_eq!(prepared.timeout(), Duration::from_millis(500));
+        assert!(prepared.cursor_boundary().is_none());
+
+        let response = prepared
+            .finish(
+                vec![
+                    prepared.matches_record(&newest).unwrap(),
+                    prepared.matches_record(&older).unwrap(),
+                ],
+                "wm-prepared".into(),
+            )
             .unwrap();
-        assert_eq!(indexed.matches, full_scan.matches);
+        assert_eq!(response.matches.len(), 1);
+        assert_eq!(response.matches[0].record_id, "r3");
+        assert!(!response.complete);
+        assert_eq!(response.projection_watermark, "wm-prepared");
+
+        let next = PreparedGrepQuery::compile(
+            &GrepRequest {
+                pattern: "needle".into(),
+                limit: Some(1),
+                cursor: response.next_cursor,
+                ..GrepRequest::default()
+            },
+            100,
+        )
+        .unwrap()
+        .with_timeout(Duration::from_secs(2));
+        let boundary = next.cursor_boundary().unwrap();
+        assert_eq!(boundary.record_id(), "r3");
+        assert_eq!(boundary.timestamp(), newest.timestamp);
+        assert_eq!(next.timeout(), Duration::from_secs(2));
+        assert!(!next.is_after_cursor(&newest));
+        assert!(next.is_after_cursor(&older));
+    }
+
+    #[test]
+    fn prepared_query_compile_validates_limit_cursor_and_pattern() {
+        let invalid_limit = PreparedGrepQuery::compile(
+            &GrepRequest {
+                pattern: "needle".into(),
+                limit: Some(0),
+                ..GrepRequest::default()
+            },
+            100,
+        );
+        assert!(matches!(invalid_limit, Err(GrepError::InvalidLimit(100))));
+
+        let invalid_cursor = PreparedGrepQuery::compile(
+            &GrepRequest {
+                pattern: "needle".into(),
+                cursor: Some("1".into()),
+                ..GrepRequest::default()
+            },
+            100,
+        );
+        assert!(matches!(invalid_cursor, Err(GrepError::InvalidCursor)));
+
+        let invalid_pattern = PreparedGrepQuery::compile(
+            &GrepRequest {
+                pattern: r"(a)\1".into(),
+                ..GrepRequest::default()
+            },
+            100,
+        );
+        assert!(matches!(invalid_pattern, Err(GrepError::InvalidPattern(_))));
     }
 
     #[test]
@@ -846,7 +1038,7 @@ mod tests {
     }
 
     #[test]
-    fn type_filter_is_applied_with_trigram_index() {
+    fn type_filter_is_applied_by_prepared_and_reference_search() {
         let records = vec![
             record_with_type("r1", "claude-ai", "needle from claude"),
             record_with_type("r2", "github-commit", "needle from github"),
@@ -860,17 +1052,19 @@ mod tests {
             },
             ..GrepRequest::default()
         };
-        let indexed = GrepEngine::new(100)
-            .search(&records, &request, "wm".into())
-            .unwrap();
-        let full_scan = GrepEngine::new(100)
-            .without_trigram_index()
+        let prepared = PreparedGrepQuery::compile(&request, 100).unwrap();
+        let prepared_matches = records
+            .iter()
+            .filter_map(|record| prepared.matches_record(record))
+            .collect::<Vec<_>>();
+        let prepared_response = prepared.finish(prepared_matches, "wm".into()).unwrap();
+        let reference_response = GrepEngine::new(100)
             .search(&records, &request, "wm".into())
             .unwrap();
 
-        assert_eq!(indexed.matches, full_scan.matches);
-        assert_eq!(indexed.matches.len(), 1);
-        assert_eq!(indexed.matches[0].source_type, "github-commit");
+        assert_eq!(prepared_response.matches, reference_response.matches);
+        assert_eq!(reference_response.matches.len(), 1);
+        assert_eq!(reference_response.matches[0].source_type, "github-commit");
     }
 
     #[test]

@@ -1,0 +1,12 @@
+{
+  "keys": [
+    {
+      "kty": "EC",
+      "kid": "persistent-index-benchmark-disabled-mcp",
+      "alg": "ES256",
+      "crv": "P-256",
+      "x": "dFAtPj8GyYxjKve4ai_3ia2Ij9PmnkYu160g3DwOIi0",
+      "y": "3GIq41Gvch5Ma9fgNQRQdxrrdKKCweYT4fAHjMjwosg"
+    }
+  ]
+}

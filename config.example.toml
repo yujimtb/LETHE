@@ -99,6 +99,9 @@ retention_days = 30
 # Corpus mode controls which text-bearing observations are exposed to grep/MCP.
 [corpus]
 mode = "workspace_filtered"
+index_dir = "./data/corpus-index"
+writer_heap_bytes = 33554432
+rebuild_page_size = 512
 
 # Per-source freshness thresholds in seconds. Keys must match configured channel
 # ids or source system ids used by imported observations.

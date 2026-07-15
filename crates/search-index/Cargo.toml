@@ -1,0 +1,25 @@
+[package]
+name = "lethe-search-index"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chrono.workspace = true
+lethe-api = { path = "../api" }
+lethe-core = { path = "../core" }
+lethe-projection-corpus = { path = "../projections/corpus" }
+lethe-storage-api = { path = "../storage/api" }
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tantivy.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+lethe-storage-sqlite = { path = "../storage/sqlite" }
+pretty_assertions.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

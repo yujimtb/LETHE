@@ -239,6 +239,7 @@ def write_config(
     config_path: Path, db_path: Path, blob_dir: Path, http_port: int, mcp_port: int
 ) -> None:
     jwks_path = config_path.with_name("mcp-jwks.json")
+    index_dir = config_path.with_name("corpus-index")
     jwks_path.write_text(
         json.dumps(
             {
@@ -293,6 +294,9 @@ retention_days = 3650
 
 [corpus]
 mode = "personal_all_text"
+index_dir = "{toml_path(index_dir)}"
+writer_heap_bytes = 33554432
+rebuild_page_size = 512
 
 [freshness.threshold_seconds]
 "sys:claude-ai" = 129600

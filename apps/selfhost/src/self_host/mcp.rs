@@ -391,22 +391,23 @@ fn call_tool(
             let args: SearchLakeArguments = parse_arguments(params.arguments)?;
             ensure_not_blank("query", &args.query)?;
             let limit = mcp_limit(args.limit)?;
-            let source_type_summaries = service.corpus_source_type_summaries()?;
-            validate_source_types(&args.source_types, &source_type_summaries)?;
+            let requested_source_types = args.source_types.clone();
             validate_time_range(args.from.as_ref(), args.to.as_ref())?;
-            let response = service.corpus_grep_response(&lethe_api::api::grep::GrepRequest {
-                pattern: args.query,
-                filters: lethe_api::api::grep::GrepFilters {
-                    types: args.source_types,
-                    from: args.from,
-                    to: args.to,
-                    ..lethe_api::api::grep::GrepFilters::default()
-                },
-                order: args.order.map(search_lake_order).unwrap_or_default(),
-                limit: Some(limit.effective_limit),
-                cursor: args.cursor,
-                ..lethe_api::api::grep::GrepRequest::default()
-            })?;
+            let (response, source_type_summaries) = service
+                .corpus_grep_response_with_source_summaries(&lethe_api::api::grep::GrepRequest {
+                    pattern: args.query,
+                    filters: lethe_api::api::grep::GrepFilters {
+                        types: args.source_types,
+                        from: args.from,
+                        to: args.to,
+                        ..lethe_api::api::grep::GrepFilters::default()
+                    },
+                    order: args.order.map(search_lake_order).unwrap_or_default(),
+                    limit: Some(limit.effective_limit),
+                    cursor: args.cursor,
+                    ..lethe_api::api::grep::GrepRequest::default()
+                })?;
+            validate_source_types(&requested_source_types, &source_type_summaries)?;
             let response = mcp_search_lake_response(response);
             tool_result_with_limit_and_available_source_types(
                 response,
@@ -768,6 +769,9 @@ impl From<SelfHostError> for JsonRpcAppError {
             SelfHostError::ProjectionStale(detail) => {
                 Self::internal(format!("ProjectionStale: {detail}"))
             }
+            SelfHostError::SearchIndexUnavailable { code, detail } => {
+                Self::internal(format!("{code}: {detail}"))
+            }
             SelfHostError::ReadMode(detail) => Self::invalid_params(detail),
             SelfHostError::SupplementalValidation { code, detail } => {
                 Self::invalid_params(format!("SupplementalValidation:{code}: {detail}"))
@@ -777,6 +781,25 @@ impl From<SelfHostError> for JsonRpcAppError {
             }
             other => Self::internal(other.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod search_index_error_tests {
+    use super::*;
+
+    #[test]
+    fn search_index_unavailable_maps_to_explicit_json_rpc_internal_error() {
+        let error = JsonRpcAppError::from(SelfHostError::SearchIndexUnavailable {
+            code: "search_index_failed",
+            detail: "checksum validation failed".to_owned(),
+        });
+
+        assert_eq!(error.code, -32000);
+        assert_eq!(
+            error.message,
+            "search_index_failed: checksum validation failed"
+        );
     }
 }
 
@@ -814,10 +837,10 @@ impl McpHttpError {
 impl IntoResponse for McpHttpError {
     fn into_response(self) -> Response {
         let mut response = (self.status, Json(self.body)).into_response();
-        if let Some(authenticate) = self.authenticate {
-            if let Ok(value) = HeaderValue::from_str(&authenticate) {
-                response.headers_mut().insert(WWW_AUTHENTICATE, value);
-            }
+        if let Some(authenticate) = self.authenticate
+            && let Ok(value) = HeaderValue::from_str(&authenticate)
+        {
+            response.headers_mut().insert(WWW_AUTHENTICATE, value);
         }
         response
     }

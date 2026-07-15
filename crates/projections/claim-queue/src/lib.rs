@@ -195,6 +195,15 @@ impl ClaimQueueProjector {
     pub fn project_records(&self, inputs: &[SupplementalRecord]) -> ClaimQueueProjection {
         let mut records = inputs.to_vec();
         sort_records_observation_order(&mut records);
+        self.project_ordered_records(&records)
+    }
+
+    pub fn project_ordered_records(&self, records: &[SupplementalRecord]) -> ClaimQueueProjection {
+        debug_assert!(
+            records
+                .windows(2)
+                .all(|pair| record_observation_order(&pair[0], &pair[1]).is_le())
+        );
         let by_id = records
             .iter()
             .cloned()
@@ -202,17 +211,17 @@ impl ClaimQueueProjector {
             .collect::<HashMap<_, _>>();
 
         let mut audit_log = Vec::new();
-        let claim_accumulators = deduplicate_claims(&records, &by_id, &mut audit_log);
+        let claim_accumulators = deduplicate_claims(records, &by_id, &mut audit_log);
         let id_to_representative = claim_id_map(&claim_accumulators);
         let state_accumulators = fold_claim_states(
-            &records,
+            records,
             &claim_accumulators,
             &id_to_representative,
             &mut audit_log,
         );
         let claims = claim_views(claim_accumulators, state_accumulators);
         let groups = claim_groups(&claims);
-        let decisions = decision_views(&records, &mut audit_log);
+        let decisions = decision_views(records, &mut audit_log);
 
         ClaimQueueProjection {
             claims,
@@ -221,6 +230,15 @@ impl ClaimQueueProjector {
             audit_log,
         }
     }
+}
+
+fn record_observation_order(
+    left: &SupplementalRecord,
+    right: &SupplementalRecord,
+) -> std::cmp::Ordering {
+    left.created_at
+        .cmp(&right.created_at)
+        .then_with(|| left.id.as_str().cmp(right.id.as_str()))
 }
 
 impl Projector for ClaimQueueProjector {
@@ -280,6 +298,7 @@ fn deduplicate_claims(
     audit_log: &mut Vec<ProjectionAuditEvent>,
 ) -> Vec<ClaimAccumulator> {
     let mut by_key: BTreeMap<ClaimDedupKey, ClaimAccumulator> = BTreeMap::new();
+    let mut source_root_memo = HashMap::new();
     for record in records.iter().filter(|record| record.kind == CLAIM_KIND) {
         let Some(statement) = string_field(&record.payload, "statement") else {
             audit_log.push(audit_event(
@@ -313,7 +332,11 @@ fn deduplicate_claims(
                 ClaimAccumulator {
                     representative: record.clone(),
                     absorbed: Vec::new(),
-                    source_refs: group_source_refs(&record.derived_from, by_id),
+                    source_refs: group_source_refs(
+                        &record.derived_from,
+                        by_id,
+                        &mut source_root_memo,
+                    ),
                     payload_hash,
                     project: string_field(&record.payload, "project")
                         .unwrap_or("uncategorized")
@@ -610,11 +633,13 @@ fn decision_views(
         .collect::<Vec<_>>();
 
     let replacement_map = decision_replacement_map(&decisions, audit_log);
+    let mut replacement_memo = HashMap::new();
     for decision in &mut decisions {
         decision.superseded_by = current_replacement(
             &decision.id,
             decision.created_at,
             &replacement_map,
+            &mut replacement_memo,
             audit_log,
         );
     }
@@ -649,19 +674,19 @@ fn decision_replacement_map(
                     .cmp(&right.created_at)
                     .then_with(|| left.id.as_str().cmp(right.id.as_str()))
             });
-            if replacements.len() > 1 {
-                if let Some(last) = replacements.last() {
-                    audit_log.push(ProjectionAuditEvent {
-                        record_id: last.id.clone(),
-                        target_claim_id: None,
-                        code: "ambiguous_decision_supersedes".to_owned(),
-                        message: format!(
-                            "multiple decisions supersede {}; newest replacement was selected",
-                            superseded
-                        ),
-                        created_at: last.created_at,
-                    });
-                }
+            if replacements.len() > 1
+                && let Some(last) = replacements.last()
+            {
+                audit_log.push(ProjectionAuditEvent {
+                    record_id: last.id.clone(),
+                    target_claim_id: None,
+                    code: "ambiguous_decision_supersedes".to_owned(),
+                    message: format!(
+                        "multiple decisions supersede {}; newest replacement was selected",
+                        superseded
+                    ),
+                    created_at: last.created_at,
+                });
             }
             replacements
                 .last()
@@ -674,13 +699,38 @@ fn current_replacement(
     id: &SupplementalId,
     created_at: DateTime<Utc>,
     replacement_map: &HashMap<String, SupplementalId>,
+    memo: &mut HashMap<String, ReplacementResolution>,
     audit_log: &mut Vec<ProjectionAuditEvent>,
 ) -> Option<SupplementalId> {
-    let mut seen = HashSet::new();
-    let mut current = id.clone();
-    let mut replacement = None;
-    while let Some(next) = replacement_map.get(current.as_str()) {
-        if !seen.insert(current.as_str().to_owned()) {
+    let mut path = Vec::new();
+    let mut path_positions = HashMap::new();
+    let mut current = id.as_str().to_owned();
+    loop {
+        if let Some(resolution) = memo.get(&current).cloned() {
+            for path_id in path {
+                memo.insert(path_id, resolution.clone());
+            }
+            return match resolution {
+                ReplacementResolution::Current(current) if current.as_str() != id.as_str() => {
+                    Some(current)
+                }
+                ReplacementResolution::Current(_) => None,
+                ReplacementResolution::Cycle => {
+                    audit_log.push(ProjectionAuditEvent {
+                        record_id: id.clone(),
+                        target_claim_id: None,
+                        code: "decision_supersedes_cycle".to_owned(),
+                        message: "decision supersedes chain contains a cycle".to_owned(),
+                        created_at,
+                    });
+                    None
+                }
+            };
+        }
+        if path_positions.insert(current.clone(), path.len()).is_some() {
+            for path_id in path {
+                memo.insert(path_id, ReplacementResolution::Cycle);
+            }
             audit_log.push(ProjectionAuditEvent {
                 record_id: id.clone(),
                 target_claim_id: None,
@@ -690,21 +740,35 @@ fn current_replacement(
             });
             return None;
         }
-        replacement = Some(next.clone());
-        current = next.clone();
+        path.push(current.clone());
+        let Some(next) = replacement_map.get(&current) else {
+            let terminal = SupplementalId::new(current);
+            for path_id in path {
+                memo.insert(path_id, ReplacementResolution::Current(terminal.clone()));
+            }
+            return (terminal.as_str() != id.as_str()).then_some(terminal);
+        };
+        current = next.as_str().to_owned();
     }
-    replacement
+}
+
+#[derive(Debug, Clone)]
+enum ReplacementResolution {
+    Current(SupplementalId),
+    Cycle,
 }
 
 fn group_source_refs(
     anchors: &InputAnchorSet,
     by_id: &HashMap<String, SupplementalRecord>,
+    memo: &mut HashMap<String, BTreeSet<String>>,
 ) -> Vec<String> {
     let mut observation_refs = BTreeSet::new();
     let mut visited_supplementals = HashSet::new();
     collect_observation_roots(
         anchors,
         by_id,
+        memo,
         &mut visited_supplementals,
         &mut observation_refs,
     );
@@ -717,6 +781,7 @@ fn group_source_refs(
 fn collect_observation_roots(
     anchors: &InputAnchorSet,
     by_id: &HashMap<String, SupplementalRecord>,
+    memo: &mut HashMap<String, BTreeSet<String>>,
     visited_supplementals: &mut HashSet<String>,
     observation_refs: &mut BTreeSet<String>,
 ) {
@@ -724,17 +789,26 @@ fn collect_observation_roots(
         observation_refs.insert(format!("observation:{}", observation.as_str()));
     }
     for supplemental in &anchors.supplementals {
+        if let Some(cached) = memo.get(supplemental.as_str()) {
+            observation_refs.extend(cached.iter().cloned());
+            continue;
+        }
         if !visited_supplementals.insert(supplemental.as_str().to_owned()) {
             continue;
         }
         if let Some(record) = by_id.get(supplemental.as_str()) {
+            let mut roots = BTreeSet::new();
             collect_observation_roots(
                 &record.derived_from,
                 by_id,
+                memo,
                 visited_supplementals,
-                observation_refs,
+                &mut roots,
             );
+            observation_refs.extend(roots.iter().cloned());
+            memo.insert(supplemental.as_str().to_owned(), roots);
         }
+        visited_supplementals.remove(supplemental.as_str());
     }
 }
 
@@ -819,7 +893,7 @@ fn normalize_search_text(value: &str) -> String {
 
 fn split_query_terms(query: &str) -> Vec<String> {
     query
-        .split(|ch| matches!(ch, ' ' | '\t' | '\u{3000}'))
+        .split([' ', '\t', '\u{3000}'])
         .filter(|term| !term.is_empty())
         .map(str::to_owned)
         .collect()
@@ -866,11 +940,7 @@ fn supplemental_id_array_field(value: &serde_json::Value, field: &str) -> Vec<Su
 }
 
 fn sort_records_observation_order(records: &mut [SupplementalRecord]) {
-    records.sort_by(|left, right| {
-        left.created_at
-            .cmp(&right.created_at)
-            .then_with(|| left.id.as_str().cmp(right.id.as_str()))
-    });
+    records.sort_by(record_observation_order);
 }
 
 fn audit_event(
@@ -1162,6 +1232,76 @@ mod tests {
         assert_eq!(
             old.superseded_by.as_ref().map(SupplementalId::as_str),
             Some("sup:decision-b")
+        );
+    }
+
+    #[test]
+    fn long_shared_supersedes_chain_is_path_compressed_without_changing_results() {
+        let mut records = Vec::new();
+        for index in 0..40 {
+            let id = format!("sup:decision-{index:02}");
+            let supersedes = (index > 0)
+                .then(|| format!("sup:decision-{:02}", index - 1))
+                .into_iter()
+                .collect::<Vec<_>>();
+            records.push(decision(
+                &id,
+                "obs:conversation",
+                &format!("Decision {index}"),
+                "chain",
+                supersedes.iter().map(String::as_str).collect(),
+                at(index + 1),
+            ));
+        }
+
+        let projection = ClaimQueueProjector.project_records(&records);
+        for decision in &projection.decisions {
+            if decision.id.as_str() == "sup:decision-39" {
+                assert!(decision.superseded_by.is_none());
+            } else {
+                assert_eq!(
+                    decision.superseded_by.as_ref().map(SupplementalId::as_str),
+                    Some("sup:decision-39")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn supersedes_cycle_audit_is_preserved_by_memoized_resolution() {
+        let records = vec![
+            decision(
+                "sup:cycle-a",
+                "obs:conversation",
+                "Cycle A",
+                "cycle",
+                vec!["sup:cycle-b"],
+                at(1),
+            ),
+            decision(
+                "sup:cycle-b",
+                "obs:conversation",
+                "Cycle B",
+                "cycle",
+                vec!["sup:cycle-a"],
+                at(2),
+            ),
+        ];
+
+        let projection = ClaimQueueProjector.project_records(&records);
+        assert!(
+            projection
+                .decisions
+                .iter()
+                .all(|decision| decision.superseded_by.is_none())
+        );
+        assert_eq!(
+            projection
+                .audit_log
+                .iter()
+                .filter(|event| event.code == "decision_supersedes_cycle")
+                .count(),
+            2
         );
     }
 

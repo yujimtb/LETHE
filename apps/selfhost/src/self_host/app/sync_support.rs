@@ -38,58 +38,87 @@ pub(super) fn latest_revision_to_capture(
 pub(super) fn thread_root_ts(
     message: &lethe_adapter_slack::slack::client::SlackMessage,
 ) -> Option<&str> {
-    if message.reply_count == 0 {
-        return None;
+    if let Some(thread_ts) = message.thread_ts.as_deref() {
+        return Some(thread_ts);
     }
-
-    Some(message.thread_ts.as_deref().unwrap_or(message.ts.as_str()))
+    (message.reply_count > 0).then_some(message.ts.as_str())
 }
 
-pub(super) fn thread_cursor_key(channel_id: &str, thread_ts: &str) -> String {
-    format!("slack:{channel_id}:thread:{thread_ts}:oldest_ts")
-}
+pub(super) const IDLE_THREAD_RECHECK_INTERVAL: u64 = 8;
 
-pub(super) fn known_thread_roots_from_observations(
-    observations: &[Observation],
-    channel_id: &str,
-) -> BTreeSet<String> {
-    observations
-        .iter()
-        .filter_map(|observation| {
-            if observation.schema.as_str() != "schema:slack-message" {
-                return None;
-            }
-
-            if observation
-                .payload
-                .get("channel_id")
-                .and_then(|value| value.as_str())
-                != Some(channel_id)
-            {
-                return None;
-            }
-
-            let ts = observation
-                .payload
-                .get("ts")
-                .and_then(|value| value.as_str())?;
-            let thread_ts = observation
-                .payload
-                .get("thread_ts")
-                .and_then(|value| value.as_str());
-            let reply_count = observation
-                .payload
-                .get("reply_count")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0);
-
-            if thread_ts == Some(ts) || (thread_ts.is_none() && reply_count > 0) {
-                return Some(ts.to_string());
-            }
-
-            None
+pub(super) fn discovered_slack_threads(
+    observations: &[StoredObservation],
+) -> Result<Vec<DiscoveredSlackThread>, SelfHostError> {
+    let mut threads = HashMap::<SlackThreadKey, u64>::new();
+    for stored in observations {
+        let observation = &stored.observation;
+        if observation.schema.as_str() != "schema:slack-message" {
+            continue;
+        }
+        let source_instance = required_slack_catalog_field(
+            observation.meta.get("source_instance"),
+            "meta.source_instance",
+            &observation.id,
+        )?;
+        let channel_id = required_slack_catalog_field(
+            observation.payload.get("channel_id"),
+            "payload.channel_id",
+            &observation.id,
+        )?;
+        let ts = required_slack_catalog_field(
+            observation.payload.get("ts"),
+            "payload.ts",
+            &observation.id,
+        )?;
+        let thread_ts = observation
+            .payload
+            .get("thread_ts")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                (observation
+                    .payload
+                    .get("reply_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+                    > 0)
+                .then_some(ts)
+            });
+        let Some(thread_ts) = thread_ts else {
+            continue;
+        };
+        let key = SlackThreadKey {
+            source_instance: source_instance.to_owned(),
+            channel_id: channel_id.to_owned(),
+            thread_ts: thread_ts.to_owned(),
+        };
+        threads
+            .entry(key)
+            .and_modify(|append_seq| *append_seq = (*append_seq).min(stored.append_seq))
+            .or_insert(stored.append_seq);
+    }
+    Ok(threads
+        .into_iter()
+        .map(|(key, observation_append_seq)| DiscoveredSlackThread {
+            key,
+            observation_append_seq,
         })
-        .collect()
+        .collect())
+}
+
+fn required_slack_catalog_field<'a>(
+    value: Option<&'a serde_json::Value>,
+    field: &str,
+    observation_id: &lethe_core::domain::ObservationId,
+) -> Result<&'a str, SelfHostError> {
+    value
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            SelfHostError::Ingestion(format!(
+                "Slack observation {observation_id} requires non-blank {field} for thread catalog discovery"
+            ))
+        })
 }
 
 pub(super) fn non_empty_state(value: Option<String>) -> Option<String> {

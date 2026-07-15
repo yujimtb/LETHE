@@ -35,6 +35,8 @@ impl AppService {
         &self,
         request: SupplementalWriteRequest,
     ) -> Result<SupplementalRecord, SelfHostError> {
+        let _bulk_import_operation = self.bulk_import_operation_lock()?;
+        self.ensure_bulk_import_session_inactive("supplemental write")?;
         validate_supplemental_id(&request.id)?;
 
         let payload_bytes = serde_json::to_vec(&request.payload)?.len();
@@ -97,6 +99,7 @@ impl AppService {
         }
 
         let mut core = self.core_lock()?;
+        self.ensure_projection_fresh(&core.catalog, "proj:person-page")?;
         if core.supplemental.get(&record.id).is_some() {
             return Err(append_only_conflict(&record.id));
         }
@@ -114,13 +117,37 @@ impl AppService {
                 "supplemental missing after store write".to_owned(),
             ));
         };
-
-        if let Err(error) = self.persistence_lock()?.put_supplemental(&persisted_record) {
+        let projection_result = (|| {
+            let store = self.persistence_lock()?;
+            let item_commit =
+                apply_supplemental_delta(&mut core, store.as_ref(), &persisted_record, Utc::now())?;
+            let manifest = core.manifest_value()?;
+            Ok::<_, SelfHostError>((item_commit, manifest))
+        })();
+        let (item_commit, manifest) = match projection_result {
+            Ok(result) => result,
+            Err(error) => {
+                core.rollback_supplemental(rollback);
+                core.mark_non_corpus_materializations_stale();
+                return Err(error);
+            }
+        };
+        let commit_result = (|| {
+            self.persistence_lock()?
+                .commit_supplemental_and_projection(
+                    &persisted_record,
+                    &ProjectionRef::new("proj:person-page"),
+                    &manifest,
+                    &item_commit,
+                )?;
+            Ok::<_, SelfHostError>(())
+        })();
+        if let Err(error) = commit_result {
             core.rollback_supplemental(rollback);
-            return Err(SelfHostError::Storage(error));
+            core.mark_non_corpus_materializations_stale();
+            return Err(error);
         }
-
-        self.refresh_materialized_snapshot(&mut core)?;
+        core.activate_non_corpus_projections();
 
         drop(core);
         self.emit_audit(

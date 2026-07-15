@@ -23,6 +23,8 @@ pub struct PersonProfile {
     pub profile_updated_at: DateTime<Utc>,
     #[serde(skip)]
     pub frontend_profile: Option<FrontendProfile>,
+    #[serde(skip)]
+    pub frontend_profile_created_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +49,8 @@ pub struct IdentityInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonSlide {
     pub id: String,
+    #[serde(skip)]
+    pub source_observation_id: String,
     pub person_id: EntityRef,
     pub document_id: String,
     pub title: String,
@@ -63,6 +67,8 @@ pub struct PersonSlide {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonMessage {
     pub id: String,
+    #[serde(skip)]
+    pub source_observation_id: String,
     pub person_id: EntityRef,
     pub channel: String,
     pub text: String,
@@ -162,6 +168,7 @@ mod tests {
             last_activity: None,
             profile_updated_at: Utc::now(),
             frontend_profile: None,
+            frontend_profile_created_at: None,
         };
         let json = serde_json::to_string(&profile).unwrap();
         assert!(json.contains("person:test-1"));

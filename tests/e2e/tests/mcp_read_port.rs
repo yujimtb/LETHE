@@ -13,9 +13,9 @@ use lethe_core::domain::{
     ActorRef, AuthorityModel, CaptureModel, EntityRef, IdempotencyKey, Mutability, Observation,
     ObserverRef, SchemaRef, SemVer, SourceSystemRef, SupplementalId, SupplementalRecord,
 };
-use lethe_projection_corpus::{CorpusConfig, CorpusMode};
+use lethe_projection_corpus::CorpusMode;
 use lethe_runtime::runtime::partition::RoutingKeyOrder;
-use lethe_selfhost::self_host::app::{AppService, ProjectionSnapshot};
+use lethe_selfhost::self_host::app::AppService;
 use lethe_selfhost::self_host::config::{
     ApiTokenConfig, CorpusProjectionConfig, FreshnessConfig, GoogleConfig, JsonWebKey,
     JsonWebKeySet, McpOAuthConfig, OpsConfig, ResourceLimits, SecretString, SelfHostConfig,
@@ -118,6 +118,12 @@ fn observation(text: &str, key: &str) -> Observation {
 }
 
 fn observation_at(text: &str, key: &str, published: DateTime<Utc>) -> Observation {
+    let source_sequence = key.as_bytes().iter().fold(1_u64, |accumulator, byte| {
+        accumulator
+            .checked_mul(257)
+            .and_then(|value| value.checked_add(u64::from(*byte)))
+            .expect("test Slack timestamp must fit u64")
+    });
     Observation {
         id: Observation::new_id(),
         schema: SchemaRef::new("schema:slack-message"),
@@ -138,7 +144,7 @@ fn observation_at(text: &str, key: &str, published: DateTime<Utc>) -> Observatio
             "channel_name": "123_event",
             "is_public_channel": true,
             "is_bot": false,
-            "ts": format!("{}.000000", key.len() + 1),
+            "ts": format!("{source_sequence}.000000"),
             "thread_ts": "1.000000",
             "permalink": format!("https://slack.example/123_event/{key}"),
         }),
@@ -187,34 +193,11 @@ fn chatgpt_fixture_drafts() -> Vec<ObservationDraft> {
 }
 
 fn test_config(db: PathBuf, blobs: PathBuf, oauth: McpOAuthConfig) -> SelfHostConfig {
-    if db.exists() {
-        let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
-        let observations = persistence.load_observations().unwrap();
-        if !observations.is_empty() {
-            let snapshot = ProjectionSnapshot::build(
-                observations,
-                persistence.load_supplementals().unwrap(),
-                CorpusConfig {
-                    mode: CorpusMode::WorkspaceFiltered,
-                    ..CorpusConfig::default()
-                },
-                Vec::new(),
-                Vec::new(),
-            )
-            .unwrap();
-            persistence
-                .materialize_projection(
-                    &lethe_core::domain::ProjectionRef::new("proj:person-page"),
-                    &serde_json::to_value(snapshot).unwrap(),
-                )
-                .unwrap();
-        }
-    }
     SelfHostConfig {
         bind_addr: "127.0.0.1:8080".into(),
         mcp_bind_addr: "127.0.0.1:8090".into(),
         mcp_oauth: oauth,
-        database_path: db,
+        database_path: db.clone(),
         blob_dir: blobs,
         secret_encryption_key: [7; 32],
         poll_interval: std::time::Duration::from_secs(300),
@@ -233,6 +216,9 @@ fn test_config(db: PathBuf, blobs: PathBuf, oauth: McpOAuthConfig) -> SelfHostCo
         },
         corpus: CorpusProjectionConfig {
             mode: CorpusMode::WorkspaceFiltered,
+            index_dir: db.with_extension("corpus-index"),
+            writer_heap_bytes: 32 * 1024 * 1024,
+            rebuild_page_size: 512,
         },
         freshness: FreshnessConfig {
             threshold_seconds: std::collections::BTreeMap::from([(
@@ -259,6 +245,69 @@ fn service_with_records(oauth: McpOAuthConfig) -> (PathBuf, AppService) {
     (root, service)
 }
 
+fn wait_for_search_index_ready(service: &AppService) {
+    wait_for_search_index_status(service, "ok");
+}
+
+fn wait_for_search_index_status(service: &AppService, expected: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let health = service.health().unwrap();
+        if health.dependencies.iter().any(|dependency| {
+            dependency.name == "corpus_search_index" && dependency.status == expected
+        }) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "search index did not reach {expected}: {:?}",
+            health.dependencies
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn failed_search_index_returns_explicit_mcp_internal_error() {
+    let (signer, oauth) = signer_and_oauth();
+    let (root, db, blobs) = temp_paths();
+    std::fs::create_dir_all(&root).unwrap();
+    let unusable_index_path = root.join("corpus-index-is-a-file");
+    std::fs::write(&unusable_index_path, b"not a directory").unwrap();
+    let mut config = test_config(db, blobs, oauth);
+    config.corpus.index_dir = unusable_index_path;
+    let service = AppService::bootstrap(config).unwrap();
+    wait_for_search_index_status(&service, "failed");
+    let app = build_mcp_router(service);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    let response = runtime
+        .block_on(async {
+            app.oneshot(mcp_request(
+                &valid_token(&signer),
+                tool_call("search_lake", serde_json::json!({"query": "needle"})),
+            ))
+            .await
+        })
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(&runtime, response);
+    assert_eq!(json["error"]["code"], -32000);
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("search_index_failed"))
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+fn bootstrap_ready(config: SelfHostConfig) -> AppService {
+    let service = AppService::bootstrap(config).unwrap();
+    wait_for_search_index_ready(&service);
+    service
+}
+
 fn service_with_matching_records(oauth: McpOAuthConfig, count: usize) -> (PathBuf, AppService) {
     let (root, db, blobs) = temp_paths();
     let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
@@ -270,7 +319,7 @@ fn service_with_matching_records(oauth: McpOAuthConfig, count: usize) -> (PathBu
             ))
             .unwrap();
     }
-    let service = AppService::bootstrap(test_config(db, blobs, oauth)).unwrap();
+    let service = bootstrap_ready(test_config(db, blobs, oauth));
     (root, service)
 }
 
@@ -283,7 +332,7 @@ fn service_with_observations(
     for observation in observations {
         persistence.persist_observation(&observation).unwrap();
     }
-    let service = AppService::bootstrap(test_config(db, blobs, oauth)).unwrap();
+    let service = bootstrap_ready(test_config(db, blobs, oauth));
     (root, service)
 }
 
@@ -304,7 +353,7 @@ fn service_with_records_and_first_id(
     persistence
         .persist_supplemental(&decision_supplemental(&first_id))
         .unwrap();
-    let service = AppService::bootstrap(test_config(db, blobs, oauth)).unwrap();
+    let service = bootstrap_ready(test_config(db, blobs, oauth));
     (root, service, first_id)
 }
 
@@ -534,6 +583,10 @@ fn mcp_jwt_validation_accepts_auth0_permissions_claim_for_refreshed_tokens() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let json = response_json(&runtime, response);
+    assert!(
+        json.get("error").is_none(),
+        "unexpected MCP error: {json:#}"
+    );
     let matches = json["result"]["structuredContent"]["data"]["matches"]
         .as_array()
         .unwrap();
@@ -1168,7 +1221,7 @@ fn write_supplemental_requires_write_scope_and_refreshes_projection() {
 fn chatgpt_fixture_import_then_mcp_write_decision_is_searchable() {
     let (signer, oauth) = signer_and_oauth();
     let (_root, db, blobs) = temp_paths();
-    let service = AppService::bootstrap(test_config(db.clone(), blobs.clone(), oauth)).unwrap();
+    let service = bootstrap_ready(test_config(db.clone(), blobs.clone(), oauth));
     let report = service
         .ingest_observation_drafts(chatgpt_fixture_drafts(), "chatgpt-e2e")
         .unwrap();

@@ -110,7 +110,9 @@ Lake を物理分割（sharding）する場合の routing layer・partition rule
 
 現行 Rust self-host 実装では、SQLite が durable store です。起動時に `partition_log.initialize` を 1 件だけ記録し、`routing_keyspec` / `identity_keyspec` の完全形を pin します。`partition_log` は append-only で、UPDATE / DELETE は DB trigger で拒否します。
 
-`observations` table は `append_seq INTEGER PRIMARY KEY AUTOINCREMENT` を leaf-local cursor とし、`identity_key TEXT NOT NULL UNIQUE` と `canonical_json TEXT NOT NULL` を持ちます。self-host の通常 ingest は SQLite INSERT を先に行い、成功した行だけを in-memory Lake cache に反映します。`identity_key` UNIQUE 違反時は stored `canonical_json` と incoming `canonical_json` の exact compare で `Duplicate(existing_id)` / collision quarantine を分けます。
+`observations` table は `append_seq INTEGER PRIMARY KEY AUTOINCREMENT` を leaf-local cursor とし、`identity_key TEXT NOT NULL UNIQUE` と `canonical_json_sha256 TEXT NOT NULL` を持ちます。canonical JSON 本文は Observation metadata を正本とします。self-host の通常 ingest は SQLite INSERT を先に行い、成功した行だけを in-memory Lake cache に反映します。`identity_key` UNIQUE 違反時は digest と canonical JSON 本文を exact compare し、`Duplicate(existing_id)` / collision quarantine を分けます。
+
+Slack thread discovery は schema version 6 の `slack_thread_catalog` と `slack_thread_catalog_state` を使います。catalog key は `(source_instance, channel_id, thread_ts)`、discovery cursor は canonical `append_seq` の global high-water です。Slack message append と thread upsert、または backfill page の catalog upsert と high-water 更新は、それぞれ同じ SQLite transaction で commit します。通常 poll は high-water より後の Observation tail と indexed active/due queue だけを処理します。新規 reply があった thread は次世代も active、空だった thread は 8 世代後に due とし、古い thread に後から付いた reply も再確認します。
 
 sharding runtime の実装対応:
 

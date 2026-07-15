@@ -1,7 +1,7 @@
 use super::*;
 use lethe_projection_claim_queue::{ClaimGroup, ClaimState, DecisionView, ProjectionAuditEvent};
 use lethe_projection_cognition::{CardState, ReplyCard};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CorpusSourceTypeSummary {
@@ -39,6 +39,114 @@ pub struct CardQueuePage {
 }
 
 impl AppService {
+    fn persisted_person_messages(
+        &self,
+        person_id: &str,
+        expected_count: usize,
+        compact_state: &CompactProjectionState,
+    ) -> Result<Vec<PersonMessage>, SelfHostError> {
+        let members = compact_state
+            .identity
+            .component_members_for_person(person_id)
+            .ok_or_else(|| SelfHostError::NotFound(person_id.to_owned()))?;
+        let persistence = self.persistence_lock()?;
+        let mut messages = Vec::new();
+        for node_id in members {
+            let items = persistence.projection_items_by_owner(
+                &ProjectionRef::new("proj:person-page"),
+                &identity_node_owner(*node_id),
+            )?;
+            messages.extend(
+                items
+                    .iter()
+                    .filter(|item| item.item_key.starts_with("pm:"))
+                    .map(|item| person_message_from_projection_item(item, compact_state))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        messages.sort_by(|left, right| left.id.cmp(&right.id));
+        if messages.len() != expected_count {
+            return Err(SelfHostError::Ingestion(format!(
+                "person message row count for {person_id} is {}, expected {expected_count}",
+                messages.len()
+            )));
+        }
+        let mut previous_append_seq = None;
+        for message in &messages {
+            let append_seq = person_message_append_seq(message)?;
+            if previous_append_seq.is_some_and(|previous| previous >= append_seq) {
+                return Err(SelfHostError::Ingestion(format!(
+                    "person message rows for {person_id} are not in strict append order"
+                )));
+            }
+            previous_append_seq = Some(append_seq);
+        }
+        Ok(messages)
+    }
+
+    fn persisted_person_slides(
+        &self,
+        person_id: &str,
+        expected_count: usize,
+        compact_state: &CompactProjectionState,
+    ) -> Result<Vec<PersonSlide>, SelfHostError> {
+        let members = compact_state
+            .identity
+            .component_members_for_person(person_id)
+            .ok_or_else(|| SelfHostError::NotFound(person_id.to_owned()))?;
+        let persistence = self.persistence_lock()?;
+        let mut slides = Vec::new();
+        for node_id in members {
+            let items = persistence.projection_items_by_owner(
+                &ProjectionRef::new("proj:person-page"),
+                &identity_node_owner(*node_id),
+            )?;
+            slides.extend(
+                items
+                    .iter()
+                    .filter(|item| item.item_key.starts_with("ps:"))
+                    .map(|item| person_slide_from_projection_item(item, compact_state))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        slides.sort_by(|left, right| left.id.cmp(&right.id));
+        if slides.len() != expected_count {
+            return Err(SelfHostError::Ingestion(format!(
+                "person slide row count for {person_id} is {}, expected {expected_count}",
+                slides.len()
+            )));
+        }
+        Ok(slides)
+    }
+
+    fn persisted_reply_slo(
+        &self,
+        expected_count: u64,
+    ) -> Result<ReplySloProjection, SelfHostError> {
+        let items = self.persistence_lock()?.projection_items_by_owner(
+            &ProjectionRef::new("proj:person-page"),
+            REPLY_SLO_ITEM_OWNER,
+        )?;
+        let actual_count = u64::try_from(items.len()).map_err(|_| {
+            SelfHostError::Ingestion("reply SLO row count does not fit u64".to_owned())
+        })?;
+        if actual_count != expected_count {
+            return Err(SelfHostError::Ingestion(format!(
+                "reply SLO row count is {actual_count}, expected {expected_count}"
+            )));
+        }
+        let rows = items
+            .iter()
+            .map(reply_slo_from_projection_item)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut projection = ReplySloProjection {
+            rows,
+            overdue: Vec::new(),
+        };
+        refresh_reply_slo_statuses(&mut projection, Utc::now());
+        Ok(projection)
+    }
+
     pub fn persons_response(
         &self,
         read_mode: Option<&str>,
@@ -59,18 +167,13 @@ impl AppService {
         )?;
 
         let mut list: Vec<PersonListItem> = core
-            .snapshot
-            .person_page
-            .profiles
-            .iter()
-            .filter_map(|profile| {
-                let activity = core
-                    .snapshot
-                    .person_page
-                    .activities
-                    .iter()
-                    .find(|activity| activity.person_id == profile.person_id)?;
-                Some(PersonPageProjector::to_list_item(profile, activity))
+            .person_components
+            .values()
+            .filter_map(|component| {
+                Some(PersonPageProjector::to_list_item(
+                    component.profile.as_ref()?,
+                    component.activity.as_ref()?,
+                ))
             })
             .collect();
         list.sort_by(|left, right| right.last_activity.cmp(&left.last_activity));
@@ -98,40 +201,32 @@ impl AppService {
     ) -> Result<ResponseEnvelope<serde_json::Value>, SelfHostError> {
         let core = self.core_lock()?;
         let mode = self.resolve_read_mode(&core.catalog, "proj:person-page", read_mode, pin)?;
-        let profile = core
-            .snapshot
-            .person_page
-            .profiles
-            .iter()
-            .find(|profile| profile.person_id.as_str() == person_id)
+        let component = core
+            .person_components
+            .get(person_id)
+            .ok_or_else(|| SelfHostError::NotFound(person_id.to_string()))?;
+        let profile = component
+            .profile
+            .as_ref()
             .ok_or_else(|| SelfHostError::NotFound(person_id.to_string()))?;
         self.authorize_read(
             EntityRef::new(person_id.to_string()),
             consent_status_for_person_id(&core, person_id)?,
         )?;
-        let slides: Vec<_> = core
-            .snapshot
-            .person_page
-            .slides
-            .iter()
-            .filter(|slide| slide.person_id == profile.person_id)
-            .cloned()
-            .collect();
-        let messages: Vec<_> = core
-            .snapshot
-            .person_page
-            .messages
-            .iter()
-            .filter(|message| message.person_id == profile.person_id)
-            .cloned()
-            .collect();
-        let activity = core
-            .snapshot
-            .person_page
-            .activities
-            .iter()
-            .find(|activity| activity.person_id == profile.person_id)
+        let activity = component
+            .activity
+            .as_ref()
             .ok_or_else(|| SelfHostError::NotFound(format!("activity for {person_id}")))?;
+        let slides = self.persisted_person_slides(
+            person_id,
+            activity.total_slides_related,
+            &core.compact_state,
+        )?;
+        let messages = self.persisted_person_messages(
+            person_id,
+            activity.total_messages,
+            &core.compact_state,
+        )?;
 
         let detail: PersonDetailResponse =
             PersonPageProjector::to_detail(profile, &slides, &messages, activity);
@@ -159,14 +254,16 @@ impl AppService {
             EntityRef::new(person_id.to_string()),
             consent_status_for_person_id(&core, person_id)?,
         )?;
-        let slides: Vec<_> = core
-            .snapshot
-            .person_page
-            .slides
-            .iter()
-            .filter(|slide| slide.person_id.as_str() == person_id)
-            .cloned()
-            .collect();
+        let activity = core
+            .person_components
+            .get(person_id)
+            .and_then(|component| component.activity.as_ref())
+            .ok_or_else(|| SelfHostError::NotFound(format!("activity for {person_id}")))?;
+        let slides = self.persisted_person_slides(
+            person_id,
+            activity.total_slides_related,
+            &core.compact_state,
+        )?;
 
         Ok(ResponseEnvelope {
             data: self.apply_filter(serde_json::to_value(slides)?),
@@ -192,14 +289,16 @@ impl AppService {
             EntityRef::new(person_id.to_string()),
             consent_status_for_person_id(&core, person_id)?,
         )?;
-        let messages: Vec<_> = core
-            .snapshot
-            .person_page
-            .messages
-            .iter()
-            .filter(|message| message.person_id.as_str() == person_id)
-            .cloned()
-            .collect();
+        let activity = core
+            .person_components
+            .get(person_id)
+            .and_then(|component| component.activity.as_ref())
+            .ok_or_else(|| SelfHostError::NotFound(format!("activity for {person_id}")))?;
+        let messages = self.persisted_person_messages(
+            person_id,
+            activity.total_messages,
+            &core.compact_state,
+        )?;
 
         Ok(ResponseEnvelope {
             data: self.apply_filter(serde_json::to_value(messages)?),
@@ -225,15 +324,24 @@ impl AppService {
             EntityRef::new(person_id.to_string()),
             consent_status_for_person_id(&core, person_id)?,
         )?;
+        let activity = core
+            .person_components
+            .get(person_id)
+            .and_then(|component| component.activity.as_ref())
+            .ok_or_else(|| SelfHostError::NotFound(format!("activity for {person_id}")))?;
+        let messages = self.persisted_person_messages(
+            person_id,
+            activity.total_messages,
+            &core.compact_state,
+        )?;
         let mut events = Vec::new();
 
-        for slide in core
-            .snapshot
-            .person_page
-            .slides
-            .iter()
-            .filter(|slide| slide.person_id.as_str() == person_id)
-        {
+        let slides = self.persisted_person_slides(
+            person_id,
+            activity.total_slides_related,
+            &core.compact_state,
+        )?;
+        for slide in &slides {
             if let Some(ts) = slide.last_modified {
                 events.push(TimelineEvent {
                     event_type: "slide".into(),
@@ -246,13 +354,7 @@ impl AppService {
             }
         }
 
-        for message in core
-            .snapshot
-            .person_page
-            .messages
-            .iter()
-            .filter(|message| message.person_id.as_str() == person_id)
-        {
+        for message in &messages {
             events.push(TimelineEvent {
                 event_type: "message".into(),
                 document_id: None,
@@ -289,15 +391,17 @@ impl AppService {
                 self.config.resource_limits.max_page_size
             )));
         }
+        let ((page, total), metadata) = self.search_index.execute(|index| {
+            index.read_with_metadata(|snapshot| {
+                snapshot.records_page(pagination.offset, pagination.limit)
+            })
+        })?;
+        let total = usize::try_from(total).map_err(|_| {
+            SelfHostError::Ingestion("corpus record count does not fit usize".to_owned())
+        })?;
+        let lineage = corpus_index_lineage(&metadata)?;
         let core = self.core_lock()?;
         let mode = self.resolve_read_mode(&core.catalog, "proj:corpus", read_mode, pin)?;
-        let lineage = build_projection_lineage(
-            "proj:corpus",
-            core.lake.list(),
-            core.snapshot.corpus.len(),
-            core.snapshot.built_at,
-        );
-        let (page, total) = paginate(&core.snapshot.corpus, pagination);
         let payload = serde_json::to_value(PaginatedResponse::from_slice(page, total, pagination))?;
         Ok(ResponseEnvelope {
             data: payload,
@@ -305,7 +409,7 @@ impl AppService {
                 &core.catalog,
                 "proj:corpus",
                 mode,
-                core.snapshot.built_at,
+                metadata.committed_at,
                 &lineage,
             )?,
         })
@@ -315,85 +419,109 @@ impl AppService {
         &self,
         request: &lethe_api::api::grep::GrepRequest,
     ) -> Result<ResponseEnvelope<lethe_api::api::grep::GrepResponse>, SelfHostError> {
+        let (response, metadata) = self.search_index.execute(|index| {
+            index.search_with_metadata(request, self.config.resource_limits.max_page_size)
+        })?;
+        let lineage = corpus_index_lineage(&metadata)?;
         let core = self.core_lock()?;
         let mode = self.resolve_read_mode(&core.catalog, "proj:corpus", None, None)?;
-        let records = core
-            .snapshot
-            .corpus
-            .iter()
-            .cloned()
-            .map(grep_record_from_corpus)
-            .collect::<Vec<_>>();
-        let lineage = build_projection_lineage(
-            "proj:corpus",
-            core.lake.list(),
-            core.snapshot.corpus.len(),
-            core.snapshot.built_at,
-        );
-        let response =
-            lethe_api::api::grep::GrepEngine::new(self.config.resource_limits.max_page_size)
-                .search(
-                    &records,
-                    request,
-                    lethe_projection_corpus::projection_watermark(&core.snapshot.corpus),
-                )
-                .map_err(|err| SelfHostError::ReadMode(err.to_string()))?;
         Ok(ResponseEnvelope {
             data: response,
             projection_metadata: self.projection_metadata(
                 &core.catalog,
                 "proj:corpus",
                 mode,
-                core.snapshot.built_at,
+                metadata.committed_at,
                 &lineage,
             )?,
         })
     }
 
+    pub fn corpus_grep_response_with_source_summaries(
+        &self,
+        request: &lethe_api::api::grep::GrepRequest,
+    ) -> Result<
+        (
+            ResponseEnvelope<lethe_api::api::grep::GrepResponse>,
+            Vec<CorpusSourceTypeSummary>,
+        ),
+        SelfHostError,
+    > {
+        let ((response, source_type_counts), metadata) = self.search_index.execute(|index| {
+            index.read_with_metadata(|snapshot| {
+                Ok((
+                    snapshot.search(request, self.config.resource_limits.max_page_size)?,
+                    snapshot.source_type_counts()?,
+                ))
+            })
+        })?;
+        let source_summaries = source_type_counts
+            .into_iter()
+            .map(|(source_type, records)| {
+                Ok(CorpusSourceTypeSummary {
+                    source_type,
+                    records: usize::try_from(records).map_err(|_| {
+                        SelfHostError::Ingestion(
+                            "source type record count does not fit usize".to_owned(),
+                        )
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>, SelfHostError>>()?;
+        let lineage = corpus_index_lineage(&metadata)?;
+        let core = self.core_lock()?;
+        let mode = self.resolve_read_mode(&core.catalog, "proj:corpus", None, None)?;
+        let envelope = ResponseEnvelope {
+            data: response,
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:corpus",
+                mode,
+                metadata.committed_at,
+                &lineage,
+            )?,
+        };
+        Ok((envelope, source_summaries))
+    }
+
     pub fn corpus_source_type_summaries(
         &self,
     ) -> Result<Vec<CorpusSourceTypeSummary>, SelfHostError> {
-        let core = self.core_lock()?;
-        let mut counts = BTreeMap::<String, usize>::new();
-        for record in &core.snapshot.corpus {
-            *counts.entry(record.source_type.clone()).or_insert(0) += 1;
-        }
-        Ok(counts
+        let counts = self
+            .search_index
+            .execute(|index| index.source_type_counts())?;
+        counts
             .into_iter()
-            .map(|(source_type, records)| CorpusSourceTypeSummary {
-                source_type,
-                records,
+            .map(|(source_type, records)| {
+                Ok(CorpusSourceTypeSummary {
+                    source_type,
+                    records: usize::try_from(records).map_err(|_| {
+                        SelfHostError::Ingestion(
+                            "source type record count does not fit usize".to_owned(),
+                        )
+                    })?,
+                })
             })
-            .collect())
+            .collect()
     }
 
     pub fn corpus_record_response(
         &self,
         record_id: &str,
     ) -> Result<ResponseEnvelope<lethe_api::api::grep::RecordDetailResponse>, SelfHostError> {
+        let (record, metadata) = self
+            .search_index
+            .execute(|index| index.read_with_metadata(|snapshot| snapshot.record(record_id)))?;
+        let record = record.ok_or_else(|| SelfHostError::NotFound(record_id.to_owned()))?;
+        let lineage = corpus_index_lineage(&metadata)?;
         let core = self.core_lock()?;
-        let record = core
-            .snapshot
-            .corpus
-            .iter()
-            .find(|record| record.record_id == record_id)
-            .cloned()
-            .ok_or_else(|| SelfHostError::NotFound(record_id.to_owned()))?;
-        let lineage = build_projection_lineage(
-            "proj:corpus",
-            core.lake.list(),
-            core.snapshot.corpus.len(),
-            core.snapshot.built_at,
-        );
         Ok(ResponseEnvelope {
-            data: lethe_api::api::grep::RecordDetailResponse {
-                record: grep_record_from_corpus(record),
-            },
+            data: lethe_api::api::grep::RecordDetailResponse { record },
             projection_metadata: self.projection_metadata(
                 &core.catalog,
                 "proj:corpus",
                 ReadMode::OperationalLatest,
-                core.snapshot.built_at,
+                metadata.committed_at,
                 &lineage,
             )?,
         })
@@ -403,21 +531,21 @@ impl AppService {
         &self,
         thread_ref: &str,
     ) -> Result<ResponseEnvelope<lethe_api::api::grep::ThreadResponse>, SelfHostError> {
+        let (response, metadata) = self.search_index.execute(|index| {
+            index.read_with_metadata(|snapshot| {
+                build_index_thread_response(snapshot, thread_ref, None)
+            })
+        })?;
+        let response = response.ok_or_else(|| SelfHostError::NotFound(thread_ref.to_owned()))?;
+        let lineage = corpus_index_lineage(&metadata)?;
         let core = self.core_lock()?;
-        let response = build_corpus_thread_response(&core.snapshot.corpus, thread_ref)?;
-        let lineage = build_projection_lineage(
-            "proj:corpus",
-            core.lake.list(),
-            core.snapshot.corpus.len(),
-            core.snapshot.built_at,
-        );
         Ok(ResponseEnvelope {
             data: response,
             projection_metadata: self.projection_metadata(
                 &core.catalog,
                 "proj:corpus",
                 ReadMode::OperationalLatest,
-                core.snapshot.built_at,
+                metadata.committed_at,
                 &lineage,
             )?,
         })
@@ -435,22 +563,22 @@ impl AppService {
                 self.config.resource_limits.max_page_size
             )));
         }
+        let offset = parse_cursor(cursor)?;
+        let (response, metadata) = self.search_index.execute(|index| {
+            index.read_with_metadata(|snapshot| {
+                build_index_thread_response(snapshot, thread_ref, Some((offset, limit)))
+            })
+        })?;
+        let response = response.ok_or_else(|| SelfHostError::NotFound(thread_ref.to_owned()))?;
+        let lineage = corpus_index_lineage(&metadata)?;
         let core = self.core_lock()?;
-        let response = build_corpus_thread_response(&core.snapshot.corpus, thread_ref)?;
-        let response = page_thread_response(response, limit, cursor)?;
-        let lineage = build_projection_lineage(
-            "proj:corpus",
-            core.lake.list(),
-            core.snapshot.corpus.len(),
-            core.snapshot.built_at,
-        );
         Ok(ResponseEnvelope {
             data: response,
             projection_metadata: self.projection_metadata(
                 &core.catalog,
                 "proj:corpus",
                 ReadMode::OperationalLatest,
-                core.snapshot.built_at,
+                metadata.committed_at,
                 &lineage,
             )?,
         })
@@ -460,32 +588,23 @@ impl AppService {
         &self,
         request: &lethe_api::api::grep::ResolveLinkRequest,
     ) -> Result<ResponseEnvelope<lethe_api::api::grep::ResolveLinkResponse>, SelfHostError> {
+        let (record, metadata) = self.search_index.execute(|index| {
+            index.read_with_metadata(|snapshot| snapshot.resolve_link(&request.url))
+        })?;
+        let record = record.ok_or_else(|| SelfHostError::NotFound(request.url.clone()))?;
+        let lineage = corpus_index_lineage(&metadata)?;
         let core = self.core_lock()?;
-        let record = core
-            .snapshot
-            .corpus
-            .iter()
-            .find(|record| {
-                record.anchor_url == request.url || request.url.starts_with(&record.anchor_url)
-            })
-            .ok_or_else(|| SelfHostError::NotFound(request.url.clone()))?;
-        let lineage = build_projection_lineage(
-            "proj:corpus",
-            core.lake.list(),
-            core.snapshot.corpus.len(),
-            core.snapshot.built_at,
-        );
         Ok(ResponseEnvelope {
             data: lethe_api::api::grep::ResolveLinkResponse {
-                record_id: record.record_id.clone(),
-                source_type: record.source_type.clone(),
-                anchor_url: record.anchor_url.clone(),
+                record_id: record.record_id,
+                source_type: record.source_type,
+                anchor_url: record.anchor_url,
             },
             projection_metadata: self.projection_metadata(
                 &core.catalog,
                 "proj:corpus",
                 ReadMode::OperationalLatest,
-                core.snapshot.built_at,
+                metadata.committed_at,
                 &lineage,
             )?,
         })
@@ -509,7 +628,8 @@ impl AppService {
         let matches = projector.search(&core.snapshot.answer_log, &request.query, limit);
         let lineage = build_projection_lineage(
             "proj:answer-log",
-            core.lake.list(),
+            &core.snapshot.lineage.build_id,
+            core.observation_stats,
             core.snapshot.answer_log.len(),
             core.snapshot.built_at,
         );
@@ -657,7 +777,8 @@ impl AppService {
         let mode = self.resolve_read_mode(&core.catalog, "proj:freshness", None, None)?;
         let lineage = build_projection_lineage(
             "proj:freshness",
-            core.lake.list(),
+            &core.snapshot.lineage.build_id,
+            core.observation_stats,
             core.snapshot.freshness.sources.len(),
             core.snapshot.built_at,
         );
@@ -680,15 +801,19 @@ impl AppService {
         let core = self.core_lock()?;
         self.ensure_projection_fresh(&core.catalog, "proj:reply-slo")?;
         let mode = self.resolve_read_mode(&core.catalog, "proj:reply-slo", None, None)?;
+        let reply_slo = self.persisted_reply_slo(core.reply_slo_count)?;
         let lineage = build_mixed_projection_lineage(
             "proj:reply-slo",
-            core.lake.list(),
+            &core.snapshot.lineage.build_id,
+            core.observation_stats,
             &core.supplemental.list(),
-            core.snapshot.reply_slo.rows.len(),
+            usize::try_from(core.reply_slo_count).map_err(|_| {
+                SelfHostError::Ingestion("reply SLO count does not fit usize".to_owned())
+            })?,
             core.snapshot.built_at,
         );
         Ok(ResponseEnvelope {
-            data: core.snapshot.reply_slo.clone(),
+            data: reply_slo,
             projection_metadata: self.projection_metadata(
                 &core.catalog,
                 "proj:reply-slo",
@@ -852,210 +977,234 @@ fn parse_cursor(cursor: Option<&str>) -> Result<usize, SelfHostError> {
     }
 }
 
-fn grep_record_from_corpus(record: CorpusRecord) -> GrepRecord {
-    GrepRecord {
-        record_id: record.record_id,
-        source_type: record.source_type,
-        anchor_url: record.anchor_url,
-        source_title: record.source_title,
-        source_location: record.source_location,
-        timestamp: record.timestamp,
-        text: record.text,
-        normalized_text: record.normalized_text,
-        thread_ts: record.thread_ts,
-        container: record.container,
-        metadata: record.metadata,
-    }
+fn corpus_index_lineage(
+    metadata: &lethe_search_index::IndexCommitMetadata,
+) -> Result<LineageManifest, SelfHostError> {
+    let output_count = usize::try_from(metadata.record_count).map_err(|_| {
+        SelfHostError::Ingestion("corpus record count does not fit usize".to_owned())
+    })?;
+    usize::try_from(metadata.observation_count)
+        .map_err(|_| SelfHostError::Ingestion("observation count does not fit usize".to_owned()))?;
+    usize::try_from(metadata.last_append_seq)
+        .map_err(|_| SelfHostError::Ingestion("append sequence does not fit usize".to_owned()))?;
+    Ok(build_projection_lineage(
+        "proj:corpus",
+        &metadata.projection_watermark,
+        ObservationStats {
+            count: metadata.observation_count,
+            max_append_seq: metadata.last_append_seq,
+        },
+        output_count,
+        metadata.committed_at,
+    ))
 }
 
-fn build_corpus_thread_response(
-    corpus: &[CorpusRecord],
+fn build_index_thread_response(
+    index: &lethe_search_index::PersistentCorpusIndex,
     thread_ref: &str,
-) -> Result<lethe_api::api::grep::ThreadResponse, SelfHostError> {
-    if let Some(record) = corpus.iter().find(|record| record.record_id == thread_ref) {
-        if is_coding_agent_record(record) {
-            return coding_agent_thread_response(corpus, record);
-        }
-        if let Some(thread_ts) = record.thread_ts.as_deref() {
-            if record.source_type == "slack" {
-                return slack_thread_response(corpus, thread_ts);
-            }
-            return generic_thread_response(corpus, &record.source_type, thread_ts);
-        }
-        return Ok(lethe_api::api::grep::ThreadResponse {
-            thread_ts: record.record_id.clone(),
-            records: vec![grep_record_from_corpus(record.clone())],
-            complete: true,
-            limit: 1,
-            next_cursor: None,
-            structure: None,
-        });
+    page: Option<(usize, usize)>,
+) -> Result<Option<lethe_api::api::grep::ThreadResponse>, lethe_search_index::IndexError> {
+    if let Some(record) = index.record(thread_ref)? {
+        return thread_response_for_seed(index, record, page);
     }
-    if let Some(record) = corpus.iter().find(|record| {
-        is_coding_agent_record(record) && metadata_str(record, "thread_key") == Some(thread_ref)
-    }) {
-        return coding_agent_thread_response(corpus, record);
+    if let Some(record) = index.coding_record_by_thread_key(thread_ref)? {
+        return coding_agent_thread_response(index, &record, page).map(Some);
     }
-    if let Some(record) = corpus.iter().find(|record| {
-        is_coding_agent_record(record) && metadata_str(record, "session_id") == Some(thread_ref)
-    }) {
-        return coding_agent_thread_response(corpus, record);
+    if let Some(record) = index.coding_record_by_session_id(thread_ref)? {
+        return coding_agent_thread_response(index, &record, page).map(Some);
     }
-    if let Some(record) = corpus.iter().find(|record| {
-        record.thread_ts.as_deref() == Some(thread_ref)
-            || metadata_str(record, "thread_key") == Some(thread_ref)
-    }) {
-        if record.source_type != "slack" {
-            return generic_thread_response(corpus, &record.source_type, thread_ref);
-        }
+    if let Some(record) = index.record_by_thread_ref(thread_ref)?
+        && record.source_type != "slack"
+    {
+        return generic_thread_response(index, &record.source_type, thread_ref, page);
     }
-
-    slack_thread_response(corpus, thread_ref)
+    slack_thread_response(index, thread_ref, page)
 }
 
-fn generic_thread_response(
-    corpus: &[CorpusRecord],
-    source_type: &str,
-    thread_ref: &str,
-) -> Result<lethe_api::api::grep::ThreadResponse, SelfHostError> {
-    let mut records = corpus
-        .iter()
-        .filter(|record| record.source_type == source_type)
-        .filter(|record| {
-            record.thread_ts.as_deref() == Some(thread_ref)
-                || metadata_str(record, "thread_key") == Some(thread_ref)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if records.is_empty() {
-        return Err(SelfHostError::NotFound(thread_ref.to_owned()));
+fn thread_response_for_seed(
+    index: &lethe_search_index::PersistentCorpusIndex,
+    record: GrepRecord,
+    page: Option<(usize, usize)>,
+) -> Result<Option<lethe_api::api::grep::ThreadResponse>, lethe_search_index::IndexError> {
+    if is_coding_agent_record(&record) {
+        return coding_agent_thread_response(index, &record, page).map(Some);
     }
-    records.sort_by(|left, right| {
-        left.timestamp
-            .cmp(&right.timestamp)
-            .then_with(|| left.record_id.cmp(&right.record_id))
-    });
-    let limit = records.len();
-    Ok(lethe_api::api::grep::ThreadResponse {
-        thread_ts: thread_ref.to_owned(),
-        records: records.into_iter().map(grep_record_from_corpus).collect(),
+    if let Some(thread_ts) = record.thread_ts.as_deref() {
+        if record.source_type == "slack" {
+            return slack_thread_response(index, thread_ts, page);
+        }
+        return generic_thread_response(index, &record.source_type, thread_ts, page);
+    }
+
+    let (records, limit) = match page {
+        Some((0, limit)) => (vec![record.clone()], limit),
+        Some((_offset, limit)) => (Vec::new(), limit),
+        None => (vec![record.clone()], 1),
+    };
+    Ok(Some(lethe_api::api::grep::ThreadResponse {
+        thread_ts: record.record_id,
+        records,
         complete: true,
         limit,
         next_cursor: None,
+        structure: None,
+    }))
+}
+
+fn generic_thread_response(
+    index: &lethe_search_index::PersistentCorpusIndex,
+    source_type: &str,
+    thread_ref: &str,
+    page: Option<(usize, usize)>,
+) -> Result<Option<lethe_api::api::grep::ThreadResponse>, lethe_search_index::IndexError> {
+    let loaded = load_index_page(
+        page,
+        |offset, limit| {
+            index.thread_records_page(
+                source_type,
+                thread_ref,
+                lethe_api::api::grep::GrepOrder::DateAsc,
+                offset,
+                limit,
+            )
+        },
+        || {
+            index.thread_records_all(
+                source_type,
+                thread_ref,
+                lethe_api::api::grep::GrepOrder::DateAsc,
+            )
+        },
+    )?;
+    if loaded.total == 0 {
+        return Ok(None);
+    }
+    Ok(Some(lethe_api::api::grep::ThreadResponse {
+        thread_ts: thread_ref.to_owned(),
+        records: loaded.items,
+        complete: loaded.complete,
+        limit: loaded.limit,
+        next_cursor: loaded.next_cursor,
         structure: Some(lethe_api::api::grep::ThreadStructure {
             thread_key: thread_ref.to_owned(),
             source_type: source_type.to_owned(),
             root_session: None,
             sidechains: Vec::new(),
         }),
-    })
+    }))
 }
 
 fn slack_thread_response(
-    corpus: &[CorpusRecord],
+    index: &lethe_search_index::PersistentCorpusIndex,
     thread_ref: &str,
-) -> Result<lethe_api::api::grep::ThreadResponse, SelfHostError> {
-    let records = corpus
-        .iter()
-        .filter(|record| record.source_type == "slack")
-        .filter(|record| record.thread_ts.as_deref() == Some(thread_ref))
-        .cloned()
-        .map(grep_record_from_corpus)
-        .collect::<Vec<_>>();
-    if records.is_empty() {
-        return Err(SelfHostError::NotFound(thread_ref.to_owned()));
+    page: Option<(usize, usize)>,
+) -> Result<Option<lethe_api::api::grep::ThreadResponse>, lethe_search_index::IndexError> {
+    let loaded = load_index_page(
+        page,
+        |offset, limit| {
+            index.thread_records_page(
+                "slack",
+                thread_ref,
+                lethe_api::api::grep::GrepOrder::DateDesc,
+                offset,
+                limit,
+            )
+        },
+        || {
+            index.thread_records_all(
+                "slack",
+                thread_ref,
+                lethe_api::api::grep::GrepOrder::DateDesc,
+            )
+        },
+    )?;
+    if loaded.total == 0 {
+        return Ok(None);
     }
-    Ok(lethe_api::api::grep::ThreadResponse {
+    Ok(Some(lethe_api::api::grep::ThreadResponse {
         thread_ts: thread_ref.to_owned(),
-        limit: records.len(),
-        records,
-        complete: true,
-        next_cursor: None,
+        records: loaded.items,
+        complete: loaded.complete,
+        limit: loaded.limit,
+        next_cursor: loaded.next_cursor,
         structure: None,
-    })
+    }))
 }
 
 fn coding_agent_thread_response(
-    corpus: &[CorpusRecord],
-    seed: &CorpusRecord,
-) -> Result<lethe_api::api::grep::ThreadResponse, SelfHostError> {
+    index: &lethe_search_index::PersistentCorpusIndex,
+    seed: &GrepRecord,
+    page: Option<(usize, usize)>,
+) -> Result<lethe_api::api::grep::ThreadResponse, lethe_search_index::IndexError> {
     let source_type = seed.source_type.clone();
     let seed_session = metadata_owned(seed, "session_id").ok_or_else(|| {
-        SelfHostError::ReadMode(format!(
+        lethe_search_index::IndexError::InvalidReadRequest(format!(
             "coding-agent corpus record {} has no session_id metadata",
             seed.record_id
         ))
     })?;
-    let records = corpus
-        .iter()
-        .filter(|record| record.source_type == source_type)
-        .filter(|record| metadata_str(record, "session_id").is_some())
-        .collect::<Vec<_>>();
-    let parent_by_session = parent_session_map(&records)?;
-    let root_session = root_session_for(&seed_session, &parent_by_session)?;
-    let included_sessions = descendant_sessions(&root_session, &parent_by_session);
-
-    let mut thread_records = records
-        .into_iter()
-        .filter(|record| {
-            metadata_str(record, "session_id")
-                .is_some_and(|session_id| included_sessions.contains(session_id))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    thread_records.sort_by(|left, right| {
-        left.timestamp
-            .cmp(&right.timestamp)
-            .then_with(|| left.record_id.cmp(&right.record_id))
-    });
+    let CodingSessionGraph {
+        root_session,
+        parent_by_session,
+        included_sessions,
+    } = coding_session_graph(index, &source_type, &seed_session)?;
+    let session_ids = included_sessions.into_iter().collect::<Vec<_>>();
+    let loaded = load_index_page(
+        page,
+        |offset, limit| index.coding_records_page(&source_type, &session_ids, offset, limit),
+        || index.coding_records_all(&source_type, &session_ids),
+    )?;
+    if loaded.total == 0 {
+        return Err(lethe_search_index::IndexError::InvalidDocument(format!(
+            "coding-agent thread {source_type}:session:{root_session} has no records"
+        )));
+    }
 
     let mut sessions: BTreeMap<String, lethe_api::api::grep::ThreadSession> = BTreeMap::new();
-    for record in &thread_records {
+    for record in &loaded.items {
         let session_id = metadata_owned(record, "session_id").ok_or_else(|| {
-            SelfHostError::ReadMode(format!(
+            lethe_search_index::IndexError::InvalidDocument(format!(
                 "coding-agent corpus record {} has no session_id metadata",
                 record.record_id
             ))
         })?;
-        let parent_session_id = parent_by_session.get(&session_id).cloned().flatten();
+        let parent_session_id = parent_by_session.get(&session_id).cloned().ok_or_else(|| {
+            lethe_search_index::IndexError::InvalidDocument(format!(
+                "coding-agent session graph omitted {session_id}"
+            ))
+        })?;
         let is_sidechain = session_id != root_session
             || metadata_bool(record, "is_sidechain")
             || parent_session_id.is_some();
-        sessions
-            .entry(session_id.clone())
-            .or_insert_with(|| lethe_api::api::grep::ThreadSession {
+        let session = sessions.entry(session_id.clone()).or_insert_with(|| {
+            lethe_api::api::grep::ThreadSession {
                 session_id,
                 parent_session_id,
                 is_sidechain,
                 record_ids: Vec::new(),
-            })
-            .record_ids
-            .push(record.record_id.clone());
+            }
+        });
+        session.is_sidechain |= is_sidechain;
+        session.record_ids.push(record.record_id.clone());
     }
-    if !sessions.contains_key(&root_session) {
-        sessions.insert(
-            root_session.clone(),
-            lethe_api::api::grep::ThreadSession {
-                session_id: root_session.clone(),
-                parent_session_id: parent_by_session.get(&root_session).cloned().flatten(),
-                is_sidechain: false,
-                record_ids: Vec::new(),
-            },
-        );
-    }
+    sessions
+        .entry(root_session.clone())
+        .or_insert_with(|| lethe_api::api::grep::ThreadSession {
+            session_id: root_session.clone(),
+            parent_session_id: parent_by_session.get(&root_session).cloned().flatten(),
+            is_sidechain: false,
+            record_ids: Vec::new(),
+        });
     let root = sessions.remove(&root_session);
     let sidechains = sessions.into_values().collect::<Vec<_>>();
     let thread_key = format!("{source_type}:session:{root_session}");
 
     Ok(lethe_api::api::grep::ThreadResponse {
         thread_ts: thread_key.clone(),
-        limit: thread_records.len(),
-        records: thread_records
-            .into_iter()
-            .map(grep_record_from_corpus)
-            .collect(),
-        complete: true,
-        next_cursor: None,
+        records: loaded.items,
+        complete: loaded.complete,
+        limit: loaded.limit,
+        next_cursor: loaded.next_cursor,
         structure: Some(lethe_api::api::grep::ThreadStructure {
             thread_key,
             source_type,
@@ -1065,125 +1214,174 @@ fn coding_agent_thread_response(
     })
 }
 
-fn page_thread_response(
-    mut response: lethe_api::api::grep::ThreadResponse,
-    limit: usize,
-    cursor: Option<&str>,
-) -> Result<lethe_api::api::grep::ThreadResponse, SelfHostError> {
-    let offset = parse_cursor(cursor)?;
-    let total = response.records.len();
-    let start = offset.min(total);
-    let end = (start + limit).min(total);
-    let page_records = response.records[start..end].to_vec();
-    let page_ids = page_records
-        .iter()
-        .map(|record| record.record_id.clone())
-        .collect::<BTreeSet<_>>();
-
-    response.records = page_records;
-    response.limit = limit;
-    response.complete = end >= total;
-    response.next_cursor = (!response.complete).then(|| end.to_string());
-    if let Some(structure) = response.structure.as_mut() {
-        retain_thread_structure_page(structure, &page_ids);
-    }
-    Ok(response)
+struct CodingSessionGraph {
+    root_session: String,
+    parent_by_session: BTreeMap<String, Option<String>>,
+    included_sessions: BTreeSet<String>,
 }
 
-fn retain_thread_structure_page(
-    structure: &mut lethe_api::api::grep::ThreadStructure,
-    page_ids: &BTreeSet<String>,
-) {
-    if let Some(root) = structure.root_session.as_mut() {
-        root.record_ids
-            .retain(|record_id| page_ids.contains(record_id));
-    }
-    for sidechain in &mut structure.sidechains {
-        sidechain
-            .record_ids
-            .retain(|record_id| page_ids.contains(record_id));
-    }
-    structure
-        .sidechains
-        .retain(|sidechain| !sidechain.record_ids.is_empty());
-}
-
-fn parent_session_map(
-    records: &[&CorpusRecord],
-) -> Result<BTreeMap<String, Option<String>>, SelfHostError> {
-    let mut parent_by_session = BTreeMap::new();
-    for record in records {
-        let Some(session_id) = metadata_owned(record, "session_id") else {
-            continue;
-        };
-        let parent_session_id = metadata_owned(record, "parent_session_id");
-        match parent_by_session.get(&session_id) {
-            Some(existing) if existing != &parent_session_id => {
-                return Err(SelfHostError::ReadMode(format!(
-                    "conflicting parent_session_id metadata for coding-agent session {session_id}"
-                )));
-            }
-            Some(_) => {}
-            None => {
-                parent_by_session.insert(session_id, parent_session_id);
-            }
-        }
-    }
-    Ok(parent_by_session)
-}
-
-fn root_session_for(
+fn coding_session_graph(
+    index: &lethe_search_index::PersistentCorpusIndex,
+    source_type: &str,
     seed_session: &str,
-    parent_by_session: &BTreeMap<String, Option<String>>,
-) -> Result<String, SelfHostError> {
+) -> Result<CodingSessionGraph, lethe_search_index::IndexError> {
+    let mut parent_by_session = BTreeMap::new();
+    let mut ascent = BTreeSet::new();
     let mut current = seed_session.to_owned();
-    let mut seen = BTreeSet::new();
-    while let Some(Some(parent)) = parent_by_session.get(&current) {
-        if !seen.insert(current.clone()) {
-            return Err(SelfHostError::ReadMode(format!(
+    let root_session = loop {
+        if !ascent.insert(current.clone()) {
+            return Err(lethe_search_index::IndexError::InvalidReadRequest(format!(
                 "cycle in coding-agent parent_session_id metadata at {current}"
             )));
         }
-        current = parent.clone();
-    }
-    Ok(current)
-}
+        let edges = index.coding_source_session_edges_all(source_type, &current)?;
+        if edges.is_empty() {
+            parent_by_session.entry(current.clone()).or_insert(None);
+            break current;
+        }
+        let parent = consistent_session_parent(source_type, &current, &edges)?;
+        insert_session_parent(&mut parent_by_session, &current, parent.clone())?;
+        match parent {
+            Some(parent) => current = parent,
+            None => break current,
+        }
+    };
 
-fn descendant_sessions(
-    root_session: &str,
-    parent_by_session: &BTreeMap<String, Option<String>>,
-) -> BTreeSet<String> {
-    let mut included = BTreeSet::from([root_session.to_owned()]);
-    loop {
-        let before = included.len();
-        for (session_id, parent) in parent_by_session {
-            if parent
-                .as_ref()
-                .is_some_and(|parent| included.contains(parent))
+    let mut included = BTreeSet::from([root_session.clone()]);
+    let mut pending = VecDeque::from([root_session.clone()]);
+    while let Some(parent) = pending.pop_front() {
+        let edges = index.coding_child_session_edges_all(source_type, &parent)?;
+        for edge in edges {
+            if edge.source_type != source_type
+                || edge.parent_session_id.as_deref() != Some(parent.as_str())
             {
-                included.insert(session_id.clone());
+                return Err(lethe_search_index::IndexError::InvalidDocument(format!(
+                    "coding-agent child-session index disagrees at {}",
+                    edge.session_id
+                )));
+            }
+            insert_session_parent(
+                &mut parent_by_session,
+                &edge.session_id,
+                edge.parent_session_id.clone(),
+            )?;
+            if included.insert(edge.session_id.clone()) {
+                pending.push_back(edge.session_id);
             }
         }
-        if included.len() == before {
-            break;
-        }
     }
-    included
+    if !included.contains(seed_session) {
+        return Err(lethe_search_index::IndexError::InvalidDocument(format!(
+            "coding-agent session graph does not reach seed {seed_session}"
+        )));
+    }
+    Ok(CodingSessionGraph {
+        root_session,
+        parent_by_session,
+        included_sessions: included,
+    })
 }
 
-fn is_coding_agent_record(record: &CorpusRecord) -> bool {
+fn consistent_session_parent(
+    source_type: &str,
+    session_id: &str,
+    edges: &[lethe_search_index::CodingSessionEdge],
+) -> Result<Option<String>, lethe_search_index::IndexError> {
+    let expected = edges[0].parent_session_id.clone();
+    for edge in edges {
+        if edge.source_type != source_type
+            || edge.session_id != session_id
+            || edge.parent_session_id != expected
+        {
+            return Err(lethe_search_index::IndexError::InvalidReadRequest(format!(
+                "conflicting parent_session_id metadata for coding-agent session {session_id}"
+            )));
+        }
+    }
+    Ok(expected)
+}
+
+fn insert_session_parent(
+    parent_by_session: &mut BTreeMap<String, Option<String>>,
+    session_id: &str,
+    parent: Option<String>,
+) -> Result<(), lethe_search_index::IndexError> {
+    match parent_by_session.get(session_id) {
+        Some(existing) if existing != &parent => {
+            Err(lethe_search_index::IndexError::InvalidReadRequest(format!(
+                "conflicting parent_session_id metadata for coding-agent session {session_id}"
+            )))
+        }
+        Some(_) => Ok(()),
+        None => {
+            parent_by_session.insert(session_id.to_owned(), parent);
+            Ok(())
+        }
+    }
+}
+
+struct LoadedIndexPage<T> {
+    items: Vec<T>,
+    total: usize,
+    limit: usize,
+    complete: bool,
+    next_cursor: Option<String>,
+}
+
+fn load_index_page<T>(
+    page: Option<(usize, usize)>,
+    mut fetch_page: impl FnMut(usize, usize) -> Result<(Vec<T>, u64), lethe_search_index::IndexError>,
+    fetch_all: impl FnOnce() -> Result<Vec<T>, lethe_search_index::IndexError>,
+) -> Result<LoadedIndexPage<T>, lethe_search_index::IndexError> {
+    match page {
+        Some((offset, limit)) => {
+            let (items, total) = fetch_page(offset, limit)?;
+            let total = usize::try_from(total).map_err(|_| {
+                lethe_search_index::IndexError::InvalidReadRequest(
+                    "thread record count does not fit usize".to_owned(),
+                )
+            })?;
+            let end = offset.checked_add(items.len()).ok_or_else(|| {
+                lethe_search_index::IndexError::InvalidReadRequest(
+                    "thread cursor overflowed usize".to_owned(),
+                )
+            })?;
+            let complete = offset >= total || end >= total;
+            Ok(LoadedIndexPage {
+                items,
+                total,
+                limit,
+                complete,
+                next_cursor: (!complete).then(|| end.to_string()),
+            })
+        }
+        None => {
+            let items = fetch_all()?;
+            let total = items.len();
+            Ok(LoadedIndexPage {
+                items,
+                total,
+                limit: total,
+                complete: true,
+                next_cursor: None,
+            })
+        }
+    }
+}
+
+fn is_coding_agent_record(record: &GrepRecord) -> bool {
     matches!(record.source_type.as_str(), "claude-code" | "codex")
 }
 
-fn metadata_str<'a>(record: &'a CorpusRecord, key: &str) -> Option<&'a str> {
+fn metadata_str<'a>(record: &'a GrepRecord, key: &str) -> Option<&'a str> {
     record.metadata.get(key).and_then(serde_json::Value::as_str)
 }
 
-fn metadata_owned(record: &CorpusRecord, key: &str) -> Option<String> {
+fn metadata_owned(record: &GrepRecord, key: &str) -> Option<String> {
     metadata_str(record, key).map(str::to_owned)
 }
 
-fn metadata_bool(record: &CorpusRecord, key: &str) -> bool {
+fn metadata_bool(record: &GrepRecord, key: &str) -> bool {
     record
         .metadata
         .get(key)
