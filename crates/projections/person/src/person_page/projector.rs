@@ -99,6 +99,7 @@ impl PersonPageProjector {
                 last_activity: activity.last_activity,
                 profile_updated_at,
                 frontend_profile,
+                frontend_profile_created_at: frontend_profile_updated_at,
             };
 
             profiles.push(profile);
@@ -236,10 +237,13 @@ impl PersonPageProjector {
             let created_at = record.created_at;
             let richness_score = frontend_profile.profile.richness_score();
             match results.get(person_id.as_str()) {
-                Some((current_score, current_created_at, _))
+                Some((current_score, current_created_at, current_profile))
                     if *current_score > richness_score
                         || (*current_score == richness_score
-                            && *current_created_at >= created_at) => {}
+                            && (*current_created_at > created_at
+                                || (*current_created_at == created_at
+                                    && current_profile.source_document_id
+                                        >= frontend_profile.source_document_id))) => {}
                 _ => {
                     results.insert(
                         person_id.as_str().to_string(),

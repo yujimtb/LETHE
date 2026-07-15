@@ -243,52 +243,35 @@ impl AppService {
         core: &mut AppCore,
         appended_observations: &[Observation],
     ) -> Result<(), SelfHostError> {
-        let result = match classify_non_corpus_delta(appended_observations) {
+        let result = (|| match classify_non_corpus_delta(appended_observations) {
             NonCorpusDeltaKind::FreshnessOnly | NonCorpusDeltaKind::SlackMessage => {
-                let materialized = {
-                    let persistence = self.persistence_lock()?;
-                    let stats = persistence.observation_stats()?;
-                    let lookup = StorageComponentProjectionLookup {
-                        storage: persistence.as_ref(),
-                    };
-                    MaterializedProjectionSnapshot::compact_incremental_delta(
-                        core,
-                        appended_observations,
-                        stats,
-                        Utc::now(),
-                        &lookup,
-                    )?
+                let persistence = self.persistence_lock()?;
+                let stats = persistence.observation_stats()?;
+                let lookup = StorageComponentProjectionLookup {
+                    storage: persistence.as_ref(),
                 };
-                self.persist_materialized_snapshot(core, *materialized)
+                let commit = apply_compact_incremental_delta(
+                    core,
+                    appended_observations,
+                    stats,
+                    Utc::now(),
+                    &lookup,
+                )?;
+                let manifest = core.manifest_value()?;
+                persistence.commit_projection_items(
+                    &ProjectionRef::new("proj:person-page"),
+                    &manifest,
+                    &commit,
+                )?;
+                core.activate_non_corpus_projections();
+                Ok(())
             }
             NonCorpusDeltaKind::FullRebuild => self.refresh_materialized_snapshot(core),
-        };
+        })();
         if result.is_err() {
             core.mark_non_corpus_materializations_stale();
         }
         result
-    }
-
-    fn persist_materialized_snapshot(
-        &self,
-        core: &mut AppCore,
-        mut materialized: MaterializedProjectionSnapshot,
-    ) -> Result<(), SelfHostError> {
-        materialized.validate()?;
-        let pending_commit = materialized.pending_item_commit.take().ok_or_else(|| {
-            SelfHostError::Ingestion(
-                "new proj:person-page materialization has no pending projection item commit"
-                    .to_owned(),
-            )
-        })?;
-        let snapshot_value = serde_json::to_value(&materialized)?;
-        self.persistence_lock()?.commit_projection_items(
-            &ProjectionRef::new("proj:person-page"),
-            &snapshot_value,
-            &pending_commit.commit,
-        )?;
-        core.install_materialized(materialized);
-        Ok(())
     }
 
     pub(super) fn ingest_draft(
@@ -373,12 +356,27 @@ impl AppService {
         blob_ref: &BlobRef,
     ) -> Result<Option<Vec<u8>>, SelfHostError> {
         let core = self.core_lock()?;
-        let filtered_projection =
-            self.apply_filter(serde_json::to_value(&core.snapshot.person_page)?);
-        if !json_contains_string(&filtered_projection, blob_ref.as_str()) {
+        let referenced = core.person_components.values().any(|component| {
+            component.consent != ConsentStatus::OptedOut
+                && (component.slide_blob_refs.contains(blob_ref.as_str())
+                    || component
+                        .frontend_profile
+                        .as_ref()
+                        .and_then(|profile| profile.thumbnail_ref.as_deref())
+                        == Some(blob_ref.as_str()))
+        });
+        drop(core);
+        self.emit_audit(
+            "actor:self-host",
+            AuditEventKind::ReadRestricted,
+            serde_json::json!({
+                "decision": "filtering-before-exposure",
+                "masked_fields": [],
+            }),
+        );
+        if !referenced {
             return Ok(None);
         }
-        drop(core);
         Ok(self.persistence_lock()?.get_blob(blob_ref)?)
     }
 
@@ -875,19 +873,6 @@ pub(super) fn consent_status_for_person_id(
         .get(person_id)
         .cloned()
         .ok_or_else(|| SelfHostError::NotFound(person_id.to_string()))
-}
-
-pub(super) fn json_contains_string(value: &serde_json::Value, needle: &str) -> bool {
-    match value {
-        serde_json::Value::String(value) => value == needle,
-        serde_json::Value::Array(values) => values
-            .iter()
-            .any(|value| json_contains_string(value, needle)),
-        serde_json::Value::Object(values) => values
-            .values()
-            .any(|value| json_contains_string(value, needle)),
-        _ => false,
-    }
 }
 
 pub(super) fn lineage_ref(lineage: &LineageManifest) -> String {

@@ -965,6 +965,7 @@ mod tests {
                     companion_to_slide_object_id: None,
                 },
             }),
+            frontend_profile_created_at: None,
         }
     }
 }

@@ -136,11 +136,42 @@ impl IdentityState {
         Some(person_id(component.public_seed))
     }
 
+    pub fn resolved_person_for_node(
+        &self,
+        node_id: IdentityNodeId,
+        projector_version: &str,
+    ) -> Option<ResolvedPerson> {
+        let root = self.root_of(node_id)?;
+        let component = self.components.get(&root)?;
+        Some(resolved_person(component, projector_version))
+    }
+
+    pub fn resolved_person(
+        &self,
+        person_id: &str,
+        projector_version: &str,
+    ) -> Option<ResolvedPerson> {
+        let seed = person_seed(person_id)?;
+        let root = self.root_of(seed)?;
+        let component = self.components.get(&root)?;
+        (component.public_seed == seed).then(|| resolved_person(component, projector_version))
+    }
+
     pub fn component_members(&self, node_id: IdentityNodeId) -> Option<&BTreeSet<IdentityNodeId>> {
         let root = self.root_of(node_id)?;
         self.components
             .get(&root)
             .map(|component| &component.members)
+    }
+
+    pub fn component_members_for_person(
+        &self,
+        person_id: &str,
+    ) -> Option<&BTreeSet<IdentityNodeId>> {
+        let seed = person_seed(person_id)?;
+        let root = self.root_of(seed)?;
+        let component = self.components.get(&root)?;
+        (component.public_seed == seed).then_some(&component.members)
     }
 
     pub fn apply_new(
@@ -317,42 +348,17 @@ impl IdentityState {
         let mut resolved_persons = Vec::with_capacity(components.len());
         let mut person_identifiers = Vec::new();
         for component in components {
-            let public_id = person_id(component.public_seed);
-            let canonical_name = component
-                .display_names
-                .iter()
-                .next()
-                .map(|(_, name)| name.clone())
-                .unwrap_or_else(|| format!("person-{}", component.public_seed));
-            let mut aliases = component
-                .display_names
-                .values()
-                .cloned()
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
-            aliases.sort();
-            let identifiers = component.identifiers.iter().cloned().collect::<Vec<_>>();
-            let sources = component.sources.iter().cloned().collect::<Vec<_>>();
-            for (index, identifier) in identifiers.iter().enumerate() {
+            let person = resolved_person(component, projector_version);
+            for (index, identifier) in person.identifiers.iter().enumerate() {
                 person_identifiers.push(PersonIdentifierRow {
                     identifier_id: format!("pi:{}:{index}", component.public_seed),
-                    person_id: EntityRef::new(&public_id),
+                    person_id: person.person_id.clone(),
                     source: identifier.source.clone(),
                     identifier_type: identifier.identifier_type,
                     identifier_value: identifier.value.clone(),
                 });
             }
-            resolved_persons.push(ResolvedPerson {
-                person_id: EntityRef::new(&public_id),
-                canonical_name,
-                aliases,
-                identifiers,
-                confidence: ConfidenceLevel::High,
-                sources,
-                resolved_at: component.resolved_at,
-                resolved_by: format!("projector:identity-resolution:v{projector_version}"),
-            });
+            resolved_persons.push(person);
         }
 
         IdentityResolutionOutput {
@@ -502,6 +508,37 @@ fn person_id(public_seed: IdentityNodeId) -> String {
     format!("person:component-{public_seed}")
 }
 
+fn person_seed(person_id: &str) -> Option<IdentityNodeId> {
+    person_id.strip_prefix("person:component-")?.parse().ok()
+}
+
+fn resolved_person(component: &IdentityComponent, projector_version: &str) -> ResolvedPerson {
+    let public_id = person_id(component.public_seed);
+    let canonical_name = component
+        .display_names
+        .iter()
+        .next()
+        .map(|(_, name)| name.clone())
+        .unwrap_or_else(|| format!("person-{}", component.public_seed));
+    let aliases = component
+        .display_names
+        .values()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    ResolvedPerson {
+        person_id: EntityRef::new(&public_id),
+        canonical_name,
+        aliases,
+        identifiers: component.identifiers.iter().cloned().collect(),
+        confidence: ConfidenceLevel::High,
+        sources: component.sources.iter().cloned().collect(),
+        resolved_at: component.resolved_at,
+        resolved_by: format!("projector:identity-resolution:v{projector_version}"),
+    }
+}
+
 mod identifier_bucket_serde {
     use super::*;
     use serde::{Deserializer, Serializer};
@@ -622,5 +659,95 @@ mod tests {
         }
         let output = state.resolution("1.0.0");
         assert_eq!(output.candidates.len(), 2);
+    }
+
+    #[test]
+    fn persisted_state_continues_with_the_same_partition_as_full_replay() {
+        let prefix = [
+            candidate("slack", "a@example.test", "A", 1),
+            candidate("google", "b@example.test", "B", 2),
+            candidate("slides", "a@example.test", "A2", 3),
+        ];
+        let suffix = [
+            candidate("discord", "c@example.test", "C", 4),
+            candidate("github", "b@example.test", "B2", 5),
+        ];
+
+        let mut resumed = IdentityState::default();
+        for value in &prefix {
+            resumed.apply_new(value.clone()).unwrap();
+        }
+        let encoded = serde_json::to_vec(&resumed).unwrap();
+        let mut resumed: IdentityState = serde_json::from_slice(&encoded).unwrap();
+        for value in &suffix {
+            resumed.apply_new(value.clone()).unwrap();
+        }
+
+        let mut replayed = IdentityState::default();
+        for value in prefix.iter().chain(&suffix) {
+            replayed.apply_new(value.clone()).unwrap();
+        }
+        resumed.validate().unwrap();
+        replayed.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(resumed.resolution("1.0.0")).unwrap(),
+            serde_json::to_value(replayed.resolution("1.0.0")).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(resumed).unwrap(),
+            serde_json::to_value(replayed).unwrap()
+        );
+    }
+
+    #[test]
+    fn balanced_unions_keep_parent_depth_logarithmic() {
+        const NODE_COUNT: usize = 64;
+        let mut state = IdentityState::default();
+        for index in 0..NODE_COUNT {
+            state
+                .apply_new(candidate(
+                    &format!("source-{index}"),
+                    &format!("user-{index}@example.test"),
+                    &format!("User {index}"),
+                    i64::try_from(index).unwrap(),
+                ))
+                .unwrap();
+        }
+        let mut width = 1;
+        while width < NODE_COUNT {
+            for base in (0..NODE_COUNT).step_by(width * 2) {
+                let right = base + width;
+                state
+                    .apply_update(
+                        u64::try_from(right).unwrap(),
+                        candidate(
+                            &format!("source-{right}"),
+                            &format!("user-{base}@example.test"),
+                            &format!("User {right}"),
+                            i64::try_from(NODE_COUNT + width + base).unwrap(),
+                        ),
+                    )
+                    .unwrap();
+            }
+            width *= 2;
+        }
+        state.validate().unwrap();
+        assert_eq!(state.resolution("1.0.0").resolved_persons.len(), 1);
+        let maximum_depth = (0..NODE_COUNT)
+            .map(|index| {
+                let mut node = u64::try_from(index).unwrap();
+                let mut depth = 0;
+                while state.parent[usize::try_from(node).unwrap()] != node {
+                    node = state.parent[usize::try_from(node).unwrap()];
+                    depth += 1;
+                }
+                depth
+            })
+            .max()
+            .unwrap();
+        assert!(
+            maximum_depth <= 6,
+            "maximum parent depth was {maximum_depth}"
+        );
     }
 }

@@ -43,14 +43,28 @@ impl AppService {
         &self,
         person_id: &str,
         expected_count: usize,
+        compact_state: &CompactProjectionState,
     ) -> Result<Vec<PersonMessage>, SelfHostError> {
-        let items = self
-            .persistence_lock()?
-            .projection_items_by_owner(&ProjectionRef::new("proj:person-page"), person_id)?;
-        let messages = items
-            .iter()
-            .map(person_message_from_projection_item)
-            .collect::<Result<Vec<_>, _>>()?;
+        let members = compact_state
+            .identity
+            .component_members_for_person(person_id)
+            .ok_or_else(|| SelfHostError::NotFound(person_id.to_owned()))?;
+        let persistence = self.persistence_lock()?;
+        let mut messages = Vec::new();
+        for node_id in members {
+            let items = persistence.projection_items_by_owner(
+                &ProjectionRef::new("proj:person-page"),
+                &identity_node_owner(*node_id),
+            )?;
+            messages.extend(
+                items
+                    .iter()
+                    .filter(|item| item.item_key.starts_with("pm:"))
+                    .map(|item| person_message_from_projection_item(item, compact_state))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        messages.sort_by(|left, right| left.id.cmp(&right.id));
         if messages.len() != expected_count {
             return Err(SelfHostError::Ingestion(format!(
                 "person message row count for {person_id} is {}, expected {expected_count}",
@@ -68,6 +82,41 @@ impl AppService {
             previous_append_seq = Some(append_seq);
         }
         Ok(messages)
+    }
+
+    fn persisted_person_slides(
+        &self,
+        person_id: &str,
+        expected_count: usize,
+        compact_state: &CompactProjectionState,
+    ) -> Result<Vec<PersonSlide>, SelfHostError> {
+        let members = compact_state
+            .identity
+            .component_members_for_person(person_id)
+            .ok_or_else(|| SelfHostError::NotFound(person_id.to_owned()))?;
+        let persistence = self.persistence_lock()?;
+        let mut slides = Vec::new();
+        for node_id in members {
+            let items = persistence.projection_items_by_owner(
+                &ProjectionRef::new("proj:person-page"),
+                &identity_node_owner(*node_id),
+            )?;
+            slides.extend(
+                items
+                    .iter()
+                    .filter(|item| item.item_key.starts_with("ps:"))
+                    .map(|item| person_slide_from_projection_item(item, compact_state))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        slides.sort_by(|left, right| left.id.cmp(&right.id));
+        if slides.len() != expected_count {
+            return Err(SelfHostError::Ingestion(format!(
+                "person slide row count for {person_id} is {}, expected {expected_count}",
+                slides.len()
+            )));
+        }
+        Ok(slides)
     }
 
     fn persisted_reply_slo(
@@ -118,18 +167,13 @@ impl AppService {
         )?;
 
         let mut list: Vec<PersonListItem> = core
-            .snapshot
-            .person_page
-            .profiles
-            .iter()
-            .filter_map(|profile| {
-                let activity = core
-                    .snapshot
-                    .person_page
-                    .activities
-                    .iter()
-                    .find(|activity| activity.person_id == profile.person_id)?;
-                Some(PersonPageProjector::to_list_item(profile, activity))
+            .person_components
+            .values()
+            .filter_map(|component| {
+                Some(PersonPageProjector::to_list_item(
+                    component.profile.as_ref()?,
+                    component.activity.as_ref()?,
+                ))
             })
             .collect();
         list.sort_by(|left, right| right.last_activity.cmp(&left.last_activity));
@@ -157,33 +201,32 @@ impl AppService {
     ) -> Result<ResponseEnvelope<serde_json::Value>, SelfHostError> {
         let core = self.core_lock()?;
         let mode = self.resolve_read_mode(&core.catalog, "proj:person-page", read_mode, pin)?;
-        let profile = core
-            .snapshot
-            .person_page
-            .profiles
-            .iter()
-            .find(|profile| profile.person_id.as_str() == person_id)
+        let component = core
+            .person_components
+            .get(person_id)
+            .ok_or_else(|| SelfHostError::NotFound(person_id.to_string()))?;
+        let profile = component
+            .profile
+            .as_ref()
             .ok_or_else(|| SelfHostError::NotFound(person_id.to_string()))?;
         self.authorize_read(
             EntityRef::new(person_id.to_string()),
             consent_status_for_person_id(&core, person_id)?,
         )?;
-        let slides: Vec<_> = core
-            .snapshot
-            .person_page
-            .slides
-            .iter()
-            .filter(|slide| slide.person_id == profile.person_id)
-            .cloned()
-            .collect();
-        let activity = core
-            .snapshot
-            .person_page
-            .activities
-            .iter()
-            .find(|activity| activity.person_id == profile.person_id)
+        let activity = component
+            .activity
+            .as_ref()
             .ok_or_else(|| SelfHostError::NotFound(format!("activity for {person_id}")))?;
-        let messages = self.persisted_person_messages(person_id, activity.total_messages)?;
+        let slides = self.persisted_person_slides(
+            person_id,
+            activity.total_slides_related,
+            &core.compact_state,
+        )?;
+        let messages = self.persisted_person_messages(
+            person_id,
+            activity.total_messages,
+            &core.compact_state,
+        )?;
 
         let detail: PersonDetailResponse =
             PersonPageProjector::to_detail(profile, &slides, &messages, activity);
@@ -211,14 +254,16 @@ impl AppService {
             EntityRef::new(person_id.to_string()),
             consent_status_for_person_id(&core, person_id)?,
         )?;
-        let slides: Vec<_> = core
-            .snapshot
-            .person_page
-            .slides
-            .iter()
-            .filter(|slide| slide.person_id.as_str() == person_id)
-            .cloned()
-            .collect();
+        let activity = core
+            .person_components
+            .get(person_id)
+            .and_then(|component| component.activity.as_ref())
+            .ok_or_else(|| SelfHostError::NotFound(format!("activity for {person_id}")))?;
+        let slides = self.persisted_person_slides(
+            person_id,
+            activity.total_slides_related,
+            &core.compact_state,
+        )?;
 
         Ok(ResponseEnvelope {
             data: self.apply_filter(serde_json::to_value(slides)?),
@@ -245,13 +290,15 @@ impl AppService {
             consent_status_for_person_id(&core, person_id)?,
         )?;
         let activity = core
-            .snapshot
-            .person_page
-            .activities
-            .iter()
-            .find(|activity| activity.person_id.as_str() == person_id)
+            .person_components
+            .get(person_id)
+            .and_then(|component| component.activity.as_ref())
             .ok_or_else(|| SelfHostError::NotFound(format!("activity for {person_id}")))?;
-        let messages = self.persisted_person_messages(person_id, activity.total_messages)?;
+        let messages = self.persisted_person_messages(
+            person_id,
+            activity.total_messages,
+            &core.compact_state,
+        )?;
 
         Ok(ResponseEnvelope {
             data: self.apply_filter(serde_json::to_value(messages)?),
@@ -278,22 +325,23 @@ impl AppService {
             consent_status_for_person_id(&core, person_id)?,
         )?;
         let activity = core
-            .snapshot
-            .person_page
-            .activities
-            .iter()
-            .find(|activity| activity.person_id.as_str() == person_id)
+            .person_components
+            .get(person_id)
+            .and_then(|component| component.activity.as_ref())
             .ok_or_else(|| SelfHostError::NotFound(format!("activity for {person_id}")))?;
-        let messages = self.persisted_person_messages(person_id, activity.total_messages)?;
+        let messages = self.persisted_person_messages(
+            person_id,
+            activity.total_messages,
+            &core.compact_state,
+        )?;
         let mut events = Vec::new();
 
-        for slide in core
-            .snapshot
-            .person_page
-            .slides
-            .iter()
-            .filter(|slide| slide.person_id.as_str() == person_id)
-        {
+        let slides = self.persisted_person_slides(
+            person_id,
+            activity.total_slides_related,
+            &core.compact_state,
+        )?;
+        for slide in &slides {
             if let Some(ts) = slide.last_modified {
                 events.push(TimelineEvent {
                     event_type: "slide".into(),

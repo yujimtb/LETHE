@@ -23,6 +23,8 @@ pub struct PersonProfile {
     pub profile_updated_at: DateTime<Utc>,
     #[serde(skip)]
     pub frontend_profile: Option<FrontendProfile>,
+    #[serde(skip)]
+    pub frontend_profile_created_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +168,7 @@ mod tests {
             last_activity: None,
             profile_updated_at: Utc::now(),
             frontend_profile: None,
+            frontend_profile_created_at: None,
         };
         let json = serde_json::to_string(&profile).unwrap();
         assert!(json.contains("person:test-1"));

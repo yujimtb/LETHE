@@ -381,38 +381,33 @@ fn bootstrap_rebuilds_snapshot_from_persisted_observations() {
         .projection_records(&ProjectionRef::new("proj:person-page"))
         .unwrap()
         .unwrap();
-    assert_eq!(materialized["format_version"], 6);
+    assert_eq!(materialized["format_version"], 7);
     assert_eq!(materialized["observation_count"], 1);
     assert_eq!(materialized["last_append_seq"], 1);
     assert_eq!(materialized["person_message_count"], 1);
     assert_eq!(materialized["reply_slo_count"], 0);
-    assert!(
-        materialized["snapshot"]["person_page"]["messages"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        materialized["snapshot"]["reply_slo"]["rows"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        materialized["snapshot"]["reply_slo"]["overdue"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
+    assert!(materialized["snapshot"].get("person_page").is_none());
+    assert!(materialized["snapshot"].get("reply_slo").is_none());
     assert_eq!(
         service
             .persistence_lock()
             .unwrap()
             .projection_item_count(&ProjectionRef::new("proj:person-page"))
             .unwrap(),
-        1
+        materialized["identity_event_count"].as_u64().unwrap()
+            + materialized["person_component_count"].as_u64().unwrap()
+            + materialized["person_slide_count"].as_u64().unwrap()
+            + materialized["person_message_count"].as_u64().unwrap()
+            + materialized["reply_slo_count"].as_u64().unwrap()
     );
-    let person_id = service.core_lock().unwrap().snapshot.person_page.profiles[0]
+    let person_id = service
+        .core_lock()
+        .unwrap()
+        .person_components
+        .values()
+        .next()
+        .unwrap()
+        .person
         .person_id
         .as_str()
         .to_owned();
@@ -798,6 +793,12 @@ fn app_core_holds_only_materialized_non_corpus_state() {
 
 #[test]
 fn materialized_snapshot_selection_is_versioned_strict_and_stats_bound() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-materialized-selection-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let persistence =
+        SqlitePersistence::open(&root.join("lethe.db"), &root.join("blobs"), &[7; 32]).unwrap();
     let stats = lethe_storage_api::ObservationStats {
         count: 0,
         max_append_seq: 0,
@@ -806,15 +807,23 @@ fn materialized_snapshot_selection_is_versioned_strict_and_stats_bound() {
         super::MaterializedProjectionSnapshot::build(vec![], vec![], vec![], vec![], stats)
             .unwrap();
     let fingerprint = materialized.supplemental_fingerprint.clone();
-    let value = serde_json::to_value(&materialized).unwrap();
+    let value = materialized.manifest_value().unwrap();
 
     assert!(
-        super::current_materialized_snapshot(value.clone(), stats, &fingerprint, 0, 0)
-            .unwrap()
-            .is_some()
+        super::current_materialized_snapshot(
+            &persistence,
+            value.clone(),
+            stats,
+            &fingerprint,
+            0,
+            0
+        )
+        .unwrap()
+        .is_some()
     );
     assert!(
         super::current_materialized_snapshot(
+            &persistence,
             value.clone(),
             lethe_storage_api::ObservationStats {
                 count: 1,
@@ -829,23 +838,38 @@ fn materialized_snapshot_selection_is_versioned_strict_and_stats_bound() {
     );
 
     let mut version_mismatch = value.clone();
-    version_mismatch["format_version"] = serde_json::json!(7);
+    version_mismatch["format_version"] = serde_json::json!(6);
     assert!(
-        super::current_materialized_snapshot(version_mismatch, stats, &fingerprint, 0, 0)
-            .unwrap()
-            .is_none()
+        super::current_materialized_snapshot(
+            &persistence,
+            version_mismatch,
+            stats,
+            &fingerprint,
+            0,
+            0
+        )
+        .unwrap()
+        .is_none()
     );
 
     let mut malformed_current = value;
     malformed_current["unexpected"] = serde_json::json!(true);
     assert!(matches!(
-        super::current_materialized_snapshot(malformed_current, stats, &fingerprint, 0, 0),
+        super::current_materialized_snapshot(
+            &persistence,
+            malformed_current,
+            stats,
+            &fingerprint,
+            0,
+            0
+        ),
         Err(SelfHostError::Json(_))
     ));
 
     assert!(matches!(
         super::current_materialized_snapshot(
-            serde_json::to_value(&materialized).unwrap(),
+            &persistence,
+            materialized.manifest_value().unwrap(),
             stats,
             &fingerprint,
             1,
@@ -855,7 +879,8 @@ fn materialized_snapshot_selection_is_versioned_strict_and_stats_bound() {
     ));
     assert!(matches!(
         super::current_materialized_snapshot(
-            serde_json::to_value(&materialized).unwrap(),
+            &persistence,
+            materialized.manifest_value().unwrap(),
             stats,
             &fingerprint,
             0,
@@ -863,6 +888,7 @@ fn materialized_snapshot_selection_is_versioned_strict_and_stats_bound() {
         ),
         Err(SelfHostError::Ingestion(_))
     ));
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -900,7 +926,7 @@ fn materialized_person_message_manifest_rejects_resident_rows_and_count_drift() 
         lethe_storage_api::ProjectionItemCommit::Replace { items } => (
             items
                 .iter()
-                .find(|item| item.owner_key != super::REPLY_SLO_ITEM_OWNER)
+                .find(|item| item.item_key.starts_with("pm:"))
                 .unwrap()
                 .clone(),
             items
@@ -912,11 +938,9 @@ fn materialized_person_message_manifest_rejects_resident_rows_and_count_drift() 
         lethe_storage_api::ProjectionItemCommit::Delta { .. } => panic!("expected replace"),
     };
     let mut resident = materialized.clone();
-    resident
-        .snapshot
-        .person_page
-        .messages
-        .push(super::person_message_from_projection_item(&item).unwrap());
+    resident.snapshot.person_page.messages.push(
+        super::person_message_from_projection_item(&item, &materialized.compact_state).unwrap(),
+    );
     assert!(matches!(
         resident.validate(),
         Err(SelfHostError::Ingestion(_))
@@ -948,11 +972,12 @@ fn materialized_person_message_manifest_rejects_resident_rows_and_count_drift() 
     ));
 
     let mut pending_drift = materialized;
-    pending_drift
-        .pending_item_commit
-        .as_mut()
-        .unwrap()
-        .base_person_message_count = 1;
+    pending_drift.pending_item_commit.as_mut().unwrap().commit =
+        lethe_storage_api::ProjectionItemCommit::Delta {
+            inserts: Vec::new(),
+            updates: Vec::new(),
+            deletes: Vec::new(),
+        };
     assert!(matches!(
         pending_drift.validate(),
         Err(SelfHostError::Ingestion(_))
@@ -1163,7 +1188,7 @@ fn freshness_only_incremental_materialization_matches_full_rebuild() {
         first_at,
     )
     .unwrap();
-    let core = AppCore::from_materialized(
+    let mut core = AppCore::from_materialized(
         initial_materialized,
         vec![],
         vec![],
@@ -1175,14 +1200,18 @@ fn freshness_only_incremental_materialization_matches_full_rebuild() {
         count: 3,
         max_append_seq: 12,
     };
-    let incremental = super::MaterializedProjectionSnapshot::compact_incremental_delta(
-        &core,
+    let incremental_commit = super::apply_compact_incremental_delta(
+        &mut core,
         &appended,
         final_stats,
         final_at,
         &TestComponentProjectionLookup::default(),
     )
     .unwrap();
+    assert!(matches!(
+        incremental_commit,
+        lethe_storage_api::ProjectionItemCommit::Delta { .. }
+    ));
 
     let mut all = vec![initial];
     all.extend(appended.iter().cloned());
@@ -1205,16 +1234,16 @@ fn freshness_only_incremental_materialization_matches_full_rebuild() {
     .unwrap();
 
     assert_eq!(
-        incremental.canonical_observation_fingerprint,
+        core.canonical_observation_fingerprint,
         full.canonical_observation_fingerprint
     );
     assert_eq!(
-        incremental.snapshot.lineage.build_id,
+        core.snapshot.lineage.build_id,
         full.snapshot.lineage.build_id
     );
     assert_eq!(
-        serde_json::to_value(incremental).unwrap(),
-        serde_json::to_value(full).unwrap()
+        core.manifest_value().unwrap(),
+        full.manifest_value().unwrap()
     );
 }
 
@@ -1452,9 +1481,9 @@ fn slack_late_bridge_reprojects_only_affected_components_and_matches_full_rebuil
     let bridge_message_id = format!("pm:{:020}:{}", 4, initial[3].id);
     assert_eq!(
         incremental_rows[&bridge_message_id].owner_key,
-        "person:component-3"
+        "identity-node:00000000000000000003"
     );
-    let core =
+    let mut core =
         AppCore::from_materialized(initial_materialized, vec![], vec![], vec![], vec![]).unwrap();
     let mut all = initial.clone();
     all.push(appended.clone());
@@ -1464,8 +1493,8 @@ fn slack_late_bridge_reprojects_only_affected_components_and_matches_full_rebuil
         max_append_seq: 5,
     };
 
-    let incremental = super::MaterializedProjectionSnapshot::compact_incremental_delta(
-        &core,
+    let incremental_commit = super::apply_compact_incremental_delta(
+        &mut core,
         std::slice::from_ref(&appended),
         final_stats,
         final_at,
@@ -1476,20 +1505,17 @@ fn slack_late_bridge_reprojects_only_affected_components_and_matches_full_rebuil
         inserts: _,
         updates,
         deletes,
-    } = pending_projection_item_commit(&incremental)
+    } = &incremental_commit
     else {
         panic!("component re-projection must publish a delta");
     };
     assert!(
-        updates
+        !updates
             .iter()
             .any(|item| item.item_key == bridge_message_id)
     );
     assert!(!deletes.contains(&bridge_message_id));
-    apply_projection_item_commit(
-        &mut incremental_rows,
-        pending_projection_item_commit(&incremental),
-    );
+    apply_projection_item_commit(&mut incremental_rows, &incremental_commit);
     let full = super::MaterializedProjectionSnapshot::build_at(
         all,
         vec![],
@@ -1510,15 +1536,23 @@ fn slack_late_bridge_reprojects_only_affected_components_and_matches_full_rebuil
         .collect::<std::collections::BTreeSet<_>>();
     assert!(!requested.contains(initial[0].id.as_str()));
     assert!(!requested.contains(initial[1].id.as_str()));
-    assert_eq!(requested.len(), 3);
+    assert_eq!(requested.len(), 1);
     assert_eq!(
         incremental_rows[&bridge_message_id].owner_key,
-        "person:component-2"
+        "identity-node:00000000000000000003"
     );
     assert_eq!(incremental_rows, full_rows);
     assert_eq!(
-        serde_json::to_value(incremental).unwrap(),
-        serde_json::to_value(full).unwrap()
+        core.manifest_value().unwrap(),
+        full.manifest_value().unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&core.compact_state).unwrap(),
+        serde_json::to_value(&full.compact_state).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&core.person_components).unwrap(),
+        serde_json::to_value(&full.person_components).unwrap()
     );
 }
 
@@ -1569,7 +1603,7 @@ fn slack_identifier_consent_change_reprojects_component_and_matches_full_rebuild
         &mut incremental_rows,
         pending_projection_item_commit(&initial_materialized),
     );
-    let core =
+    let mut core =
         AppCore::from_materialized(initial_materialized, vec![], vec![], vec![], vec![]).unwrap();
     let mut all = initial.clone();
     all.push(appended.clone());
@@ -1579,18 +1613,15 @@ fn slack_identifier_consent_change_reprojects_component_and_matches_full_rebuild
         max_append_seq: 4,
     };
 
-    let incremental = super::MaterializedProjectionSnapshot::compact_incremental_delta(
-        &core,
+    let incremental_commit = super::apply_compact_incremental_delta(
+        &mut core,
         std::slice::from_ref(&appended),
         final_stats,
         final_at,
         &lookup,
     )
     .unwrap();
-    apply_projection_item_commit(
-        &mut incremental_rows,
-        pending_projection_item_commit(&incremental),
-    );
+    apply_projection_item_commit(&mut incremental_rows, &incremental_commit);
     let full = super::MaterializedProjectionSnapshot::build_at(
         all,
         vec![],
@@ -1611,12 +1642,20 @@ fn slack_identifier_consent_change_reprojects_component_and_matches_full_rebuild
         .collect::<std::collections::BTreeSet<_>>();
     assert!(!requested.contains(initial[1].id.as_str()));
     assert!(!requested.contains(initial[2].id.as_str()));
-    assert_eq!(requested.len(), 2);
-    assert_eq!(incremental.person_message_count, 1);
+    assert_eq!(requested.len(), 1);
+    assert_eq!(core.person_message_count, 1);
     assert_eq!(incremental_rows, full_rows);
     assert_eq!(
-        serde_json::to_value(incremental).unwrap(),
-        serde_json::to_value(full).unwrap()
+        core.manifest_value().unwrap(),
+        full.manifest_value().unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&core.compact_state).unwrap(),
+        serde_json::to_value(&full.compact_state).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&core.person_components).unwrap(),
+        serde_json::to_value(&full.person_components).unwrap()
     );
 }
 
@@ -1715,10 +1754,9 @@ fn component_reprojection_is_invariant_to_slack_batch_partition() {
             };
             let lookup =
                 component_projection_lookup(&all[..initial.len() + consumed], rows.clone());
-            let incremental = super::MaterializedProjectionSnapshot::compact_incremental_delta(
-                &core, batch, stats, final_at, &lookup,
-            )
-            .unwrap();
+            let incremental_commit =
+                super::apply_compact_incremental_delta(&mut core, batch, stats, final_at, &lookup)
+                    .unwrap();
             if consumed == deltas.len() {
                 assert!(
                     !lookup
@@ -1729,30 +1767,19 @@ fn component_reprojection_is_invariant_to_slack_batch_partition() {
                     "stable component ID must keep Gamma outside partition {partition:?}"
                 );
             }
-            apply_projection_item_commit(&mut rows, pending_projection_item_commit(&incremental));
-            core =
-                AppCore::from_materialized(*incremental, vec![], vec![], vec![], vec![]).unwrap();
+            apply_projection_item_commit(&mut rows, &incremental_commit);
         }
 
         assert_eq!(consumed, deltas.len());
         assert_eq!(rows, full_rows, "partition {partition:?}");
-        let incremental_value = serde_json::to_value(super::MaterializedProjectionSnapshot {
-            format_version: super::NON_CORPUS_MATERIALIZATION_VERSION,
-            last_append_seq: core.observation_stats.max_append_seq,
-            observation_count: core.observation_stats.count,
-            canonical_observation_fingerprint: core.canonical_observation_fingerprint.clone(),
-            supplemental_fingerprint: core.supplemental_fingerprint.clone(),
-            compact_state: core.compact_state.clone(),
-            person_consents: core.person_consents.clone(),
-            person_message_count: core.person_message_count,
-            reply_slo_count: core.reply_slo_count,
-            snapshot: core.snapshot.clone(),
-            pending_item_commit: None,
-        })
-        .unwrap();
         assert_eq!(
-            incremental_value,
-            serde_json::to_value(&full).unwrap(),
+            core.manifest_value().unwrap(),
+            full.manifest_value().unwrap(),
+            "partition {partition:?}"
+        );
+        assert_eq!(
+            serde_json::to_value(&core.person_components).unwrap(),
+            serde_json::to_value(&full.person_components).unwrap(),
             "partition {partition:?}"
         );
     }
@@ -1817,7 +1844,7 @@ fn paged_materialization_matches_full_build_and_publishes_atomically() {
     .unwrap();
     let mut expected_rows = std::collections::BTreeMap::new();
     apply_projection_item_commit(&mut expected_rows, pending_projection_item_commit(&full));
-    let expected_manifest = serde_json::to_value(&full).unwrap();
+    let expected_manifest = full.manifest_value().unwrap();
 
     for page_size in [1, 128] {
         let paged = super::rebuild_materialized_snapshot_paged(
@@ -1830,7 +1857,7 @@ fn paged_materialization_matches_full_build_and_publishes_atomically() {
             built_at,
         )
         .unwrap();
-        assert_eq!(serde_json::to_value(&paged).unwrap(), expected_manifest);
+        assert_eq!(paged.manifest_value().unwrap(), expected_manifest);
         assert_eq!(
             persistence
                 .projection_records(&ProjectionRef::new("proj:person-page"))
@@ -1994,7 +2021,7 @@ fn supplemental_delta_matches_full_build_and_updates_one_reply_row() {
         .projection_records(&ProjectionRef::new("proj:person-page"))
         .unwrap()
         .unwrap();
-    assert_eq!(persisted_manifest, serde_json::to_value(&full).unwrap());
+    assert_eq!(persisted_manifest, full.manifest_value().unwrap());
     let mut expected_rows = std::collections::BTreeMap::new();
     apply_projection_item_commit(&mut expected_rows, pending_projection_item_commit(&full));
     assert_eq!(expected_rows[&sent_item.item_key], sent_item);
@@ -2084,7 +2111,7 @@ fn wave2_slack_incremental_materialization_matches_normalized_full_rebuild() {
         &mut incremental_message_rows,
         pending_projection_item_commit(&initial_materialized),
     );
-    let core = AppCore::from_materialized(
+    let mut core = AppCore::from_materialized(
         initial_materialized,
         vec![],
         vec![],
@@ -2100,18 +2127,15 @@ fn wave2_slack_incremental_materialization_matches_normalized_full_rebuild() {
     lookup_observations.extend(appended.iter().cloned());
     let lookup =
         component_projection_lookup(&lookup_observations, incremental_message_rows.clone());
-    let incremental = super::MaterializedProjectionSnapshot::compact_incremental_delta(
-        &core,
+    let incremental_commit = super::apply_compact_incremental_delta(
+        &mut core,
         &appended,
         final_stats,
         final_at,
         &lookup,
     )
     .unwrap();
-    apply_projection_item_commit(
-        &mut incremental_message_rows,
-        pending_projection_item_commit(&incremental),
-    );
+    apply_projection_item_commit(&mut incremental_message_rows, &incremental_commit);
 
     let mut all = initial;
     all.extend(appended);
@@ -2125,14 +2149,13 @@ fn wave2_slack_incremental_materialization_matches_normalized_full_rebuild() {
     )
     .unwrap();
 
-    assert_eq!(incremental.snapshot.identity.resolved_persons.len(), 3);
-    assert_eq!(incremental.snapshot.person_page.profiles.len(), 3);
-    assert!(incremental.snapshot.person_page.messages.is_empty());
-    assert_eq!(incremental.person_message_count, 4);
-    assert_eq!(incremental.reply_slo_count, 4);
-    assert!(incremental.snapshot.reply_slo.rows.is_empty());
-    assert!(incremental.snapshot.reply_slo.overdue.is_empty());
-    assert_eq!(incremental.compact_state.identity.nodes().len(), 3);
+    assert_eq!(core.person_components.len(), 3);
+    assert!(core.snapshot.person_page.messages.is_empty());
+    assert_eq!(core.person_message_count, 4);
+    assert_eq!(core.reply_slo_count, 4);
+    assert!(core.snapshot.reply_slo.rows.is_empty());
+    assert!(core.snapshot.reply_slo.overdue.is_empty());
+    assert_eq!(core.compact_state.identity.nodes().len(), 3);
     let mut full_message_rows = std::collections::BTreeMap::new();
     apply_projection_item_commit(
         &mut full_message_rows,
@@ -2140,8 +2163,12 @@ fn wave2_slack_incremental_materialization_matches_normalized_full_rebuild() {
     );
     assert_eq!(incremental_message_rows, full_message_rows);
     assert_eq!(
-        serde_json::to_value(incremental).unwrap(),
-        serde_json::to_value(full).unwrap()
+        core.manifest_value().unwrap(),
+        full.manifest_value().unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&core.person_components).unwrap(),
+        serde_json::to_value(&full.person_components).unwrap()
     );
 }
 
@@ -2247,7 +2274,7 @@ fn duplicate_bulk_records_do_not_change_incremental_fingerprint() {
     assert_eq!(before["observation_count"], after["observation_count"]);
     assert_eq!(before["reply_slo_count"], 1);
     assert_eq!(after["reply_slo_count"], 1);
-    assert_eq!(before_item_count, 2);
+    assert_eq!(before_item_count, 4);
     assert_eq!(after_item_count, before_item_count);
     assert_eq!(
         service
@@ -2260,7 +2287,7 @@ fn duplicate_bulk_records_do_not_change_incremental_fingerprint() {
 }
 
 #[test]
-fn person_message_item_sql_failure_does_not_install_manifest_in_core() {
+fn person_message_item_sql_failure_marks_in_memory_projection_stale() {
     let root = std::env::temp_dir().join(format!("lethe-self-host-test-{}", uuid::Uuid::now_v7()));
     let db = root.join("lethe.sqlite3");
     let blobs = root.join("blobs");
@@ -2292,9 +2319,16 @@ fn person_message_item_sql_failure_does_not_install_manifest_in_core() {
         "unexpected error: {error:?}"
     );
     let core = service.core_lock().unwrap();
-    assert_eq!(core.observation_stats.count, 0);
-    assert_eq!(core.person_message_count, 0);
-    assert_eq!(core.reply_slo_count, 0);
+    assert_eq!(core.observation_stats.count, 1);
+    assert_eq!(core.person_message_count, 1);
+    assert_eq!(core.reply_slo_count, 1);
+    assert_eq!(
+        core.catalog
+            .get(&ProjectionRef::new("proj:person-page"))
+            .unwrap()
+            .status,
+        lethe_core::domain::ProjectionStatus::Stale
+    );
     assert!(core.snapshot.person_page.profiles.is_empty());
     assert!(core.snapshot.person_page.messages.is_empty());
     assert!(core.snapshot.reply_slo.rows.is_empty());
@@ -2372,25 +2406,25 @@ fn five_thousand_wave2_slack_records_use_compact_identity_without_full_load() {
     let core = service.core_lock().unwrap();
     assert_eq!(core.observation_stats.count, 5_000);
     assert_eq!(core.compact_state.identity.nodes().len(), 100);
-    assert_eq!(core.snapshot.identity.resolved_persons.len(), 100);
-    assert_eq!(core.snapshot.person_page.profiles.len(), 100);
+    assert_eq!(core.person_components.len(), 100);
+    assert!(core.snapshot.identity.resolved_persons.is_empty());
+    assert!(core.snapshot.person_page.profiles.is_empty());
     assert!(core.snapshot.person_page.messages.is_empty());
     assert_eq!(core.person_message_count, 5_000);
     assert_eq!(core.reply_slo_count, 5_000);
     assert!(core.snapshot.reply_slo.rows.is_empty());
     assert!(core.snapshot.reply_slo.overdue.is_empty());
-    let person_id = core.snapshot.person_page.profiles[0]
-        .person_id
-        .as_str()
-        .to_owned();
-    let expected_owner_messages = core
-        .snapshot
-        .person_page
-        .activities
-        .iter()
-        .find(|activity| activity.person_id.as_str() == person_id)
+    let component = core.person_components.values().next().unwrap();
+    let person_id = component.person.person_id.as_str().to_owned();
+    let expected_owner_messages = component.activity.as_ref().unwrap().total_messages;
+    let fact_owners = core
+        .compact_state
+        .identity
+        .component_members_for_person(&person_id)
         .unwrap()
-        .total_messages;
+        .iter()
+        .map(|node_id| super::identity_node_owner(*node_id))
+        .collect::<Vec<_>>();
     drop(core);
     {
         let persistence = service.persistence_lock().unwrap();
@@ -2398,7 +2432,7 @@ fn five_thousand_wave2_slack_records_use_compact_identity_without_full_load() {
             persistence
                 .projection_item_count(&ProjectionRef::new("proj:person-page"))
                 .unwrap(),
-            10_000
+            15_100
         );
         assert_eq!(
             persistence
@@ -2409,15 +2443,18 @@ fn five_thousand_wave2_slack_records_use_compact_identity_without_full_load() {
                 .unwrap(),
             5_000
         );
-        assert_eq!(
-            persistence
-                .projection_item_count_by_owner(
-                    &ProjectionRef::new("proj:person-page"),
-                    &person_id,
-                )
-                .unwrap(),
-            u64::try_from(expected_owner_messages).unwrap()
-        );
+        let owner_message_count = fact_owners
+            .iter()
+            .map(|owner| {
+                persistence
+                    .projection_items_by_owner(&ProjectionRef::new("proj:person-page"), owner)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|item| item.item_key.starts_with("pm:"))
+                    .count()
+            })
+            .sum::<usize>();
+        assert_eq!(owner_message_count, expected_owner_messages);
     }
     let messages = service
         .person_messages_response(&person_id, None, None)
@@ -2591,7 +2628,13 @@ fn app_core_restores_persisted_slide_analysis_supplemental() {
 
     let core = AppCore::new(vec![observation], vec![], vec![supplemental]).unwrap();
     assert_eq!(
-        core.snapshot.person_page.profiles[0]
+        core.person_components
+            .values()
+            .next()
+            .unwrap()
+            .profile
+            .as_ref()
+            .unwrap()
             .self_intro_text
             .as_deref(),
         Some("私は田中太郎です")
