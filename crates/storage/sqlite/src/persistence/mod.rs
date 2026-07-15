@@ -20,11 +20,14 @@ use lethe_runtime::runtime::partition::{
     split_commit_event_json, split_prepare_event_json,
 };
 use lethe_storage_api::{
-    AppendOutcome as PortAppendOutcome, BlobStore as BlobStorePort, LeafPosition, ObservationStats,
-    ObservationStore as ObservationStorePort, ProjectionItem, ProjectionItemCommit,
-    ProjectionLeafWatermark, ProjectionMaterializer as ProjectionMaterializerPort,
+    AppendOutcome as PortAppendOutcome, BlobStore as BlobStorePort, DiscoveredSlackThread,
+    LeafPosition, ObservationStats, ObservationStore as ObservationStorePort, ProjectionItem,
+    ProjectionItemCommit, ProjectionLeafWatermark,
+    ProjectionMaterializer as ProjectionMaterializerPort,
     ProjectionWatermarkStore as ProjectionWatermarkStorePort, RehomeMode as PortRehomeMode,
-    RuntimeStateStore as RuntimeStateStorePort, StorageError, StorageResult, StoredObservation,
+    RuntimeStateStore as RuntimeStateStorePort, SlackThreadCatalogEntry,
+    SlackThreadCatalogStore as SlackThreadCatalogStorePort, SlackThreadKey, StorageError,
+    StorageResult, StoredObservation,
     SupplementalProjectionCommitter as SupplementalProjectionCommitterPort,
     SupplementalStore as SupplementalStorePort, SyncMetricRecord,
 };
@@ -48,7 +51,7 @@ pub struct SqlitePersistence {
     routing_key_order: RoutingKeyOrder,
 }
 
-const CURRENT_SCHEMA_VERSION: i64 = 5;
+const CURRENT_SCHEMA_VERSION: i64 = 6;
 const CANONICAL_JSON_META_KEY: &str = "canonical_json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,83 +185,44 @@ impl SqlitePersistence {
     ) -> Result<Vec<DurableAppendOutcome>, PersistenceError> {
         let tree = self.load_partition_tree()?;
         let transaction = self.conn.unchecked_transaction()?;
-        let mut outcomes = Vec::with_capacity(observations.len());
-
-        for observation in observations {
-            let routing_key =
-                routing_key_from_observation_for_order(self.routing_key_order, observation)
-                    .map_err(|err| PersistenceError::SchemaInvariant(err.to_string()))?;
-            let leaf_id = tree.route(&routing_key);
-            let identity_key = &observation.idempotency_key;
-            let canonical_json = observation
-                .meta
-                .get(CANONICAL_JSON_META_KEY)
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    PersistenceError::SchemaInvariant(
-                        "observation.meta.canonical_json is required for durable ingest".to_owned(),
-                    )
-                })?;
-            let canonical_json_sha256 = canonical_json_sha256(canonical_json);
-            let json = serde_json::to_string(observation)?;
-            let inserted = transaction.execute(
-                "INSERT INTO observations (
-                    id,
-                    leaf_id,
-                    routing_key,
-                    identity_key,
-                    canonical_json_sha256,
-                    recorded_at,
-                    observation_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    observation.id.as_str(),
-                    leaf_id,
-                    routing_key.encoded(),
-                    identity_key.as_str(),
-                    canonical_json_sha256,
-                    observation.recorded_at.to_rfc3339(),
-                    json,
-                ],
-            );
-
-            let outcome = match inserted {
-                Ok(_) => DurableAppendOutcome::Appended(observation.id.clone()),
-                Err(insert_err) => {
-                    let existing = transaction
-                        .query_row(
-                            "SELECT id, canonical_json_sha256, observation_json FROM observations
-                             WHERE leaf_id = ?1 AND identity_key = ?2",
-                            params![leaf_id, identity_key.as_str()],
-                            |row| {
-                                Ok((
-                                    ObservationId::new(row.get::<_, String>(0)?),
-                                    row.get::<_, String>(1)?,
-                                    row.get::<_, String>(2)?,
-                                ))
-                            },
-                        )
-                        .optional()?;
-
-                    if let Some((existing_id, existing_hash, existing_json)) = existing {
-                        let same = existing_hash == canonical_json_sha256
-                            && canonical_json_from_observation_json(&existing_json)?
-                                == canonical_json;
-                        if same {
-                            DurableAppendOutcome::Duplicate(existing_id)
-                        } else {
-                            DurableAppendOutcome::CanonicalCollision(existing_id)
-                        }
-                    } else {
-                        return Err(PersistenceError::Sqlite(insert_err));
-                    }
-                }
-            };
-            outcomes.push(outcome);
-        }
+        let outcomes = append_observations_in_transaction(
+            &transaction,
+            &tree,
+            self.routing_key_order,
+            observations,
+        )?;
 
         transaction.commit()?;
         Ok(outcomes)
+    }
+
+    pub fn append_slack_observation(
+        &self,
+        observation: &Observation,
+        thread: &SlackThreadKey,
+    ) -> Result<DurableAppendOutcome, PersistenceError> {
+        validate_slack_thread_key(thread)?;
+        let tree = self.load_partition_tree()?;
+        let transaction = self.conn.unchecked_transaction()?;
+        let mut outcomes = append_observations_in_transaction(
+            &transaction,
+            &tree,
+            self.routing_key_order,
+            std::slice::from_ref(observation),
+        )?;
+        let outcome = outcomes.remove(0);
+        if let DurableAppendOutcome::Appended(observation_id)
+        | DurableAppendOutcome::Duplicate(observation_id) = &outcome
+        {
+            let append_seq = transaction.query_row(
+                "SELECT append_seq FROM observations WHERE id = ?1",
+                [observation_id.as_str()],
+                |row| row.get::<_, u64>(0),
+            )?;
+            upsert_slack_thread(&transaction, thread, append_seq)?;
+        }
+        transaction.commit()?;
+        Ok(outcome)
     }
 
     pub fn rehome_observation(
@@ -326,6 +290,246 @@ impl SqlitePersistence {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    pub fn slack_thread_discovery_high_water(&self) -> Result<u64, PersistenceError> {
+        self.conn
+            .query_row(
+                "SELECT discovery_high_water
+                 FROM slack_thread_catalog_state
+                 WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::from)
+    }
+
+    pub fn commit_slack_thread_discovery(
+        &self,
+        high_water: u64,
+        threads: &[DiscoveredSlackThread],
+    ) -> Result<(), PersistenceError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let current = transaction.query_row(
+            "SELECT discovery_high_water
+             FROM slack_thread_catalog_state
+             WHERE singleton = 1",
+            [],
+            |row| row.get::<_, u64>(0),
+        )?;
+        if high_water < current {
+            return Err(PersistenceError::SchemaInvariant(format!(
+                "Slack thread discovery high-water cannot regress from {current} to {high_water}"
+            )));
+        }
+        let max_append_seq = transaction.query_row(
+            "SELECT COALESCE(MAX(append_seq), 0) FROM observations",
+            [],
+            |row| row.get::<_, u64>(0),
+        )?;
+        if high_water > max_append_seq {
+            return Err(PersistenceError::SchemaInvariant(format!(
+                "Slack thread discovery high-water {high_water} exceeds observation tail {max_append_seq}"
+            )));
+        }
+        for thread in threads {
+            validate_slack_thread_key(&thread.key)?;
+            if thread.observation_append_seq <= current
+                || thread.observation_append_seq > high_water
+            {
+                return Err(PersistenceError::SchemaInvariant(format!(
+                    "Slack thread discovery sequence {} is outside ({current}, {high_water}]",
+                    thread.observation_append_seq
+                )));
+            }
+            upsert_slack_thread(&transaction, &thread.key, thread.observation_append_seq)?;
+        }
+        transaction.execute(
+            "UPDATE slack_thread_catalog_state
+             SET discovery_high_water = ?1
+             WHERE singleton = 1",
+            [high_water],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn advance_slack_thread_poll_generation(&self) -> Result<u64, PersistenceError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let current = transaction.query_row(
+            "SELECT poll_generation
+             FROM slack_thread_catalog_state
+             WHERE singleton = 1",
+            [],
+            |row| row.get::<_, u64>(0),
+        )?;
+        let next = current.checked_add(1).ok_or_else(|| {
+            PersistenceError::SchemaInvariant(
+                "Slack thread poll generation overflowed u64".to_owned(),
+            )
+        })?;
+        transaction.execute(
+            "UPDATE slack_thread_catalog_state
+             SET poll_generation = ?1
+             WHERE singleton = 1",
+            [next],
+        )?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    pub fn slack_threads_to_poll(
+        &self,
+        source_instance: &str,
+        channel_id: &str,
+        generation: u64,
+        limit: usize,
+    ) -> Result<Vec<SlackThreadCatalogEntry>, PersistenceError> {
+        validate_non_blank("source_instance", source_instance)?;
+        validate_non_blank("channel_id", channel_id)?;
+        if limit == 0 {
+            return Err(PersistenceError::SchemaInvariant(
+                "Slack thread poll limit must be greater than zero".to_owned(),
+            ));
+        }
+        let current = self.conn.query_row(
+            "SELECT poll_generation
+             FROM slack_thread_catalog_state
+             WHERE singleton = 1",
+            [],
+            |row| row.get::<_, u64>(0),
+        )?;
+        if generation != current {
+            return Err(PersistenceError::SchemaInvariant(format!(
+                "Slack thread queue requested generation {generation}, current generation is {current}"
+            )));
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT thread_ts, reply_cursor, active, next_poll_generation,
+                    discovered_append_seq
+             FROM (
+                SELECT thread_ts, reply_cursor, active, next_poll_generation,
+                       discovered_append_seq
+                FROM slack_thread_catalog
+                WHERE source_instance = ?1
+                  AND channel_id = ?2
+                  AND active = 1
+                UNION ALL
+                SELECT thread_ts, reply_cursor, active, next_poll_generation,
+                       discovered_append_seq
+                FROM slack_thread_catalog
+                WHERE source_instance = ?1
+                  AND channel_id = ?2
+                  AND active = 0
+                  AND next_poll_generation <= ?3
+             )
+             ORDER BY active DESC, next_poll_generation, thread_ts
+             LIMIT ?4",
+        )?;
+        let rows = statement.query_map(
+            params![source_instance, channel_id, generation, limit],
+            |row| {
+                Ok(SlackThreadCatalogEntry {
+                    key: SlackThreadKey {
+                        source_instance: source_instance.to_owned(),
+                        channel_id: channel_id.to_owned(),
+                        thread_ts: row.get(0)?,
+                    },
+                    reply_cursor: row.get(1)?,
+                    active: row.get::<_, i64>(2)? != 0,
+                    next_poll_generation: row.get(3)?,
+                    discovered_append_seq: row.get(4)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(PersistenceError::from)
+    }
+
+    pub fn complete_slack_thread_poll(
+        &self,
+        key: &SlackThreadKey,
+        generation: u64,
+        reply_cursor: &str,
+        active: bool,
+        next_poll_generation: u64,
+    ) -> Result<(), PersistenceError> {
+        validate_slack_thread_key(key)?;
+        validate_non_blank("reply_cursor", reply_cursor)?;
+        if next_poll_generation <= generation {
+            return Err(PersistenceError::SchemaInvariant(format!(
+                "Slack thread next poll generation {next_poll_generation} must be after completed generation {generation}"
+            )));
+        }
+        let transaction = self.conn.unchecked_transaction()?;
+        let current = transaction.query_row(
+            "SELECT poll_generation
+             FROM slack_thread_catalog_state
+             WHERE singleton = 1",
+            [],
+            |row| row.get::<_, u64>(0),
+        )?;
+        if generation != current {
+            return Err(PersistenceError::SchemaInvariant(format!(
+                "Slack thread poll completed generation {generation}, current generation is {current}"
+            )));
+        }
+        let changed = transaction.execute(
+            "UPDATE slack_thread_catalog
+             SET reply_cursor = ?1,
+                 active = ?2,
+                 next_poll_generation = ?3
+             WHERE source_instance = ?4
+               AND channel_id = ?5
+               AND thread_ts = ?6",
+            params![
+                reply_cursor,
+                i64::from(active),
+                next_poll_generation,
+                key.source_instance,
+                key.channel_id,
+                key.thread_ts,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(PersistenceError::SchemaInvariant(format!(
+                "Slack thread catalog entry not found for {}:{}:{}",
+                key.source_instance, key.channel_id, key.thread_ts
+            )));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn slack_thread_catalog(
+        &self,
+        source_instance: &str,
+        channel_id: &str,
+    ) -> Result<Vec<SlackThreadCatalogEntry>, PersistenceError> {
+        validate_non_blank("source_instance", source_instance)?;
+        validate_non_blank("channel_id", channel_id)?;
+        let mut statement = self.conn.prepare(
+            "SELECT thread_ts, reply_cursor, active, next_poll_generation,
+                    discovered_append_seq
+             FROM slack_thread_catalog
+             WHERE source_instance = ?1 AND channel_id = ?2
+             ORDER BY thread_ts",
+        )?;
+        let rows = statement.query_map(params![source_instance, channel_id], |row| {
+            Ok(SlackThreadCatalogEntry {
+                key: SlackThreadKey {
+                    source_instance: source_instance.to_owned(),
+                    channel_id: channel_id.to_owned(),
+                    thread_ts: row.get(0)?,
+                },
+                reply_cursor: row.get(1)?,
+                active: row.get::<_, i64>(2)? != 0,
+                next_poll_generation: row.get(3)?,
+                discovered_append_seq: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(PersistenceError::from)
     }
 
     pub fn persist_blob(&self, data: &[u8]) -> Result<BlobRef, PersistenceError> {
@@ -1495,6 +1699,150 @@ impl SqlitePersistence {
     }
 }
 
+fn append_observations_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    tree: &PartitionTree,
+    routing_key_order: RoutingKeyOrder,
+    observations: &[Observation],
+) -> Result<Vec<DurableAppendOutcome>, PersistenceError> {
+    let mut outcomes = Vec::with_capacity(observations.len());
+    for observation in observations {
+        let routing_key = routing_key_from_observation_for_order(routing_key_order, observation)
+            .map_err(|err| PersistenceError::SchemaInvariant(err.to_string()))?;
+        let leaf_id = tree.route(&routing_key);
+        let identity_key = &observation.idempotency_key;
+        let canonical_json = observation
+            .meta
+            .get(CANONICAL_JSON_META_KEY)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                PersistenceError::SchemaInvariant(
+                    "observation.meta.canonical_json is required for durable ingest".to_owned(),
+                )
+            })?;
+        let canonical_json_sha256 = canonical_json_sha256(canonical_json);
+        let json = serde_json::to_string(observation)?;
+        let inserted = transaction.execute(
+            "INSERT INTO observations (
+                id,
+                leaf_id,
+                routing_key,
+                identity_key,
+                canonical_json_sha256,
+                recorded_at,
+                observation_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                observation.id.as_str(),
+                leaf_id,
+                routing_key.encoded(),
+                identity_key.as_str(),
+                canonical_json_sha256,
+                observation.recorded_at.to_rfc3339(),
+                json,
+            ],
+        );
+
+        let outcome = match inserted {
+            Ok(_) => DurableAppendOutcome::Appended(observation.id.clone()),
+            Err(insert_err) => {
+                let existing = transaction
+                    .query_row(
+                        "SELECT id, canonical_json_sha256, observation_json FROM observations
+                         WHERE leaf_id = ?1 AND identity_key = ?2",
+                        params![leaf_id, identity_key.as_str()],
+                        |row| {
+                            Ok((
+                                ObservationId::new(row.get::<_, String>(0)?),
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+
+                if let Some((existing_id, existing_hash, existing_json)) = existing {
+                    let same = existing_hash == canonical_json_sha256
+                        && canonical_json_from_observation_json(&existing_json)? == canonical_json;
+                    if same {
+                        DurableAppendOutcome::Duplicate(existing_id)
+                    } else {
+                        DurableAppendOutcome::CanonicalCollision(existing_id)
+                    }
+                } else {
+                    return Err(PersistenceError::Sqlite(insert_err));
+                }
+            }
+        };
+        outcomes.push(outcome);
+    }
+    Ok(outcomes)
+}
+
+fn validate_non_blank(field: &str, value: &str) -> Result<(), PersistenceError> {
+    if value.trim().is_empty() {
+        return Err(PersistenceError::SchemaInvariant(format!(
+            "Slack thread {field} must not be blank"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_slack_thread_key(key: &SlackThreadKey) -> Result<(), PersistenceError> {
+    validate_non_blank("source_instance", &key.source_instance)?;
+    validate_non_blank("channel_id", &key.channel_id)?;
+    validate_non_blank("thread_ts", &key.thread_ts)
+}
+
+fn upsert_slack_thread(
+    transaction: &rusqlite::Transaction<'_>,
+    key: &SlackThreadKey,
+    observation_append_seq: u64,
+) -> Result<(), PersistenceError> {
+    validate_slack_thread_key(key)?;
+    if observation_append_seq == 0 {
+        return Err(PersistenceError::SchemaInvariant(
+            "Slack thread discovery append sequence must be positive".to_owned(),
+        ));
+    }
+    let generation = transaction.query_row(
+        "SELECT poll_generation
+         FROM slack_thread_catalog_state
+         WHERE singleton = 1",
+        [],
+        |row| row.get::<_, u64>(0),
+    )?;
+    transaction.execute(
+        "INSERT INTO slack_thread_catalog (
+            source_instance,
+            channel_id,
+            thread_ts,
+            reply_cursor,
+            active,
+            next_poll_generation,
+            discovered_append_seq
+         ) VALUES (?1, ?2, ?3, ?3, 1, ?4, ?5)
+         ON CONFLICT(source_instance, channel_id, thread_ts) DO UPDATE SET
+            active = 1,
+            next_poll_generation = MIN(
+                slack_thread_catalog.next_poll_generation,
+                excluded.next_poll_generation
+            ),
+            discovered_append_seq = MIN(
+                slack_thread_catalog.discovered_append_seq,
+                excluded.discovered_append_seq
+            )",
+        params![
+            key.source_instance,
+            key.channel_id,
+            key.thread_ts,
+            generation,
+            observation_append_seq,
+        ],
+    )?;
+    Ok(())
+}
+
 fn validate_projection_key(
     projection: &lethe_core::domain::ProjectionRef,
 ) -> Result<(), PersistenceError> {
@@ -1927,6 +2275,80 @@ impl RuntimeStateStorePort for SqlitePersistence {
 
     fn deep_check(&self) -> StorageResult<()> {
         SqlitePersistence::deep_check(self).map_err(storage_error)
+    }
+}
+
+impl SlackThreadCatalogStorePort for SqlitePersistence {
+    fn append_slack_observation(
+        &self,
+        observation: &Observation,
+        thread: &SlackThreadKey,
+    ) -> StorageResult<PortAppendOutcome> {
+        SqlitePersistence::append_slack_observation(self, observation, thread)
+            .map(port_outcome)
+            .map_err(storage_error)
+    }
+
+    fn slack_thread_discovery_high_water(&self) -> StorageResult<u64> {
+        SqlitePersistence::slack_thread_discovery_high_water(self).map_err(storage_error)
+    }
+
+    fn commit_slack_thread_discovery(
+        &self,
+        high_water: u64,
+        threads: &[DiscoveredSlackThread],
+    ) -> StorageResult<()> {
+        SqlitePersistence::commit_slack_thread_discovery(self, high_water, threads)
+            .map_err(storage_error)
+    }
+
+    fn advance_slack_thread_poll_generation(&self) -> StorageResult<u64> {
+        SqlitePersistence::advance_slack_thread_poll_generation(self).map_err(storage_error)
+    }
+
+    fn slack_threads_to_poll(
+        &self,
+        source_instance: &str,
+        channel_id: &str,
+        generation: u64,
+        limit: usize,
+    ) -> StorageResult<Vec<SlackThreadCatalogEntry>> {
+        SqlitePersistence::slack_threads_to_poll(
+            self,
+            source_instance,
+            channel_id,
+            generation,
+            limit,
+        )
+        .map_err(storage_error)
+    }
+
+    fn complete_slack_thread_poll(
+        &self,
+        key: &SlackThreadKey,
+        generation: u64,
+        reply_cursor: &str,
+        active: bool,
+        next_poll_generation: u64,
+    ) -> StorageResult<()> {
+        SqlitePersistence::complete_slack_thread_poll(
+            self,
+            key,
+            generation,
+            reply_cursor,
+            active,
+            next_poll_generation,
+        )
+        .map_err(storage_error)
+    }
+
+    fn slack_thread_catalog(
+        &self,
+        source_instance: &str,
+        channel_id: &str,
+    ) -> StorageResult<Vec<SlackThreadCatalogEntry>> {
+        SqlitePersistence::slack_thread_catalog(self, source_instance, channel_id)
+            .map_err(storage_error)
     }
 }
 

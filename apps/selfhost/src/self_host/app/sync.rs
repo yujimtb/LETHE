@@ -13,6 +13,14 @@ impl AppService {
         let mut post_commit_error = None;
 
         let slack_policy = self.slack_adapter_config();
+        let slack_poll_generation = if self.slack_sources.is_empty() {
+            None
+        } else {
+            Some(
+                self.persistence_lock()?
+                    .advance_slack_thread_poll_generation()?,
+            )
+        };
         for source in &self.slack_sources {
             let slack_adapter = SlackAdapter::new(source.client.clone(), slack_policy.clone());
             for channel_id in &source.config.channel_ids {
@@ -23,7 +31,6 @@ impl AppService {
                 let oldest = non_empty_state(self.persistence_lock()?.get_state(&cursor_key)?);
                 let mut page_cursor: Option<String> = None;
                 let mut latest_ts = oldest.clone();
-                let mut thread_roots = self.known_thread_roots(channel_id)?;
 
                 loop {
                     let circuit = format!("slack:{}:{channel_id}", source.config.id);
@@ -54,9 +61,6 @@ impl AppService {
                             break;
                         }
                         fetched += 1;
-                        if let Some(thread_root) = thread_root_ts(&message) {
-                            thread_roots.insert(thread_root.to_string());
-                        }
                         match self.ingest_slack_message(
                             &slack_adapter,
                             &source.client,
@@ -79,22 +83,6 @@ impl AppService {
                         break;
                     }
                     page_cursor = page.next_cursor;
-                }
-
-                for thread_ts in thread_roots {
-                    if fetched >= self.config.resource_limits.max_sync_items {
-                        break;
-                    }
-                    match self.sync_thread_replies(&slack_adapter, source, channel_id, &thread_ts) {
-                        Ok((ingested, dupes)) => {
-                            slack_ingested += ingested;
-                            duplicates += dupes;
-                        }
-                        Err(error) => dead_letters.push(DeadLetter {
-                            source: source.config.id.clone(),
-                            reason: error.to_string(),
-                        }),
-                    }
                 }
 
                 match self.resilient_executor.execute(
@@ -124,6 +112,48 @@ impl AppService {
 
                 if let Some(latest_ts) = latest_ts.as_deref() {
                     self.persistence_lock()?.set_state(&cursor_key, latest_ts)?;
+                }
+            }
+
+            self.refresh_slack_thread_catalog()?;
+            let generation = slack_poll_generation
+                .expect("Slack poll generation exists when a Slack source is configured");
+            for channel_id in &source.config.channel_ids {
+                let remaining = self
+                    .config
+                    .resource_limits
+                    .max_sync_items
+                    .saturating_sub(fetched);
+                if remaining == 0 {
+                    break;
+                }
+                let threads = self.persistence_lock()?.slack_threads_to_poll(
+                    &source.config.id,
+                    channel_id,
+                    generation,
+                    remaining,
+                )?;
+                for thread in threads {
+                    if fetched >= self.config.resource_limits.max_sync_items {
+                        break;
+                    }
+                    match self.sync_thread_replies(
+                        &slack_adapter,
+                        &source.replies_client,
+                        &source.replies_client,
+                        &thread,
+                        generation,
+                    ) {
+                        Ok((ingested, dupes, thread_fetched)) => {
+                            slack_ingested += ingested;
+                            duplicates += dupes;
+                            fetched += thread_fetched;
+                        }
+                        Err(error) => dead_letters.push(DeadLetter {
+                            source: source.config.id.clone(),
+                            reason: error.to_string(),
+                        }),
+                    }
                 }
             }
 

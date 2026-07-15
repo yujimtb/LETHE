@@ -66,8 +66,9 @@ use lethe_projection_person::person_page::types::{
     PersonMessage, PersonPageOutput, PersonProfile, PersonSlide, TimelineEvent,
 };
 use lethe_storage_api::{
-    AppendOutcome as DurableAppendOutcome, ObservationStats, ProjectionItem, ProjectionItemCommit,
-    StorageError, StoragePorts,
+    AppendOutcome as DurableAppendOutcome, DiscoveredSlackThread, ObservationStats, ProjectionItem,
+    ProjectionItemCommit, SlackThreadCatalogEntry, SlackThreadKey, StorageError, StoragePorts,
+    StoredObservation,
 };
 use lethe_storage_sqlite::persistence::{PersistenceError, SqlitePersistence};
 

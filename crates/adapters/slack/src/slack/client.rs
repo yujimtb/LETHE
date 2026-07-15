@@ -151,6 +151,8 @@ pub struct FixtureSlackClient {
     pub channels: std::collections::HashMap<String, SlackChannelSnapshot>,
     pub files: std::collections::HashMap<String, Vec<u8>>,
     page_index: std::cell::Cell<usize>,
+    history_calls: std::cell::Cell<usize>,
+    reply_calls: std::cell::Cell<usize>,
 }
 
 impl FixtureSlackClient {
@@ -172,6 +174,14 @@ impl FixtureSlackClient {
         self.files.insert(file_id.to_string(), data);
         self
     }
+
+    pub fn history_call_count(&self) -> usize {
+        self.history_calls.get()
+    }
+
+    pub fn reply_call_count(&self) -> usize {
+        self.reply_calls.get()
+    }
 }
 
 impl SlackClient for FixtureSlackClient {
@@ -182,6 +192,7 @@ impl SlackClient for FixtureSlackClient {
         _cursor: Option<&str>,
         _limit: u32,
     ) -> Result<SlackHistoryPage, AdapterError> {
+        self.history_calls.set(self.history_calls.get() + 1);
         let idx = self.page_index.get();
         if idx < self.history_pages.len() {
             self.page_index.set(idx + 1);
@@ -201,6 +212,7 @@ impl SlackClient for FixtureSlackClient {
         thread_ts: &str,
         oldest: Option<&str>,
     ) -> Result<Vec<SlackMessage>, AdapterError> {
+        self.reply_calls.set(self.reply_calls.get() + 1);
         let mut replies = self.replies.get(thread_ts).cloned().unwrap_or_default();
         if let Some(oldest) = oldest {
             let oldest = slack_ts_value(oldest)?;

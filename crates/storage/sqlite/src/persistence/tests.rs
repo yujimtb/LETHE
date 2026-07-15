@@ -397,6 +397,101 @@ fn migration_ledger_records_current_schema_version() {
     let _ = fs::remove_dir_all(tmp);
 }
 
+#[test]
+fn slack_thread_append_catalog_and_due_queue_are_durable() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let key = SlackThreadKey {
+        source_instance: "slack-primary".into(),
+        channel_id: "C01ABC".into(),
+        thread_ts: "1700000000.000001".into(),
+    };
+    {
+        let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+        let observation = sample_observation();
+        assert!(matches!(
+            store.append_slack_observation(&observation, &key).unwrap(),
+            DurableAppendOutcome::Appended(_)
+        ));
+        assert_eq!(store.slack_thread_discovery_high_water().unwrap(), 0);
+        let catalog = store
+            .slack_thread_catalog("slack-primary", "C01ABC")
+            .unwrap();
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].key, key);
+        assert_eq!(catalog[0].reply_cursor, "1700000000.000001");
+        assert!(catalog[0].active);
+        assert_eq!(catalog[0].discovered_append_seq, 1);
+    }
+
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    let generation = store.advance_slack_thread_poll_generation().unwrap();
+    let due = store
+        .slack_threads_to_poll("slack-primary", "C01ABC", generation, 10)
+        .unwrap();
+    assert_eq!(due.len(), 1);
+    store
+        .complete_slack_thread_poll(&key, generation, "1700000000.000002", false, generation + 8)
+        .unwrap();
+    let next_generation = store.advance_slack_thread_poll_generation().unwrap();
+    assert!(
+        store
+            .slack_threads_to_poll("slack-primary", "C01ABC", next_generation, 10)
+            .unwrap()
+            .is_empty()
+    );
+    let mut due_generation = next_generation;
+    while due_generation < generation + 8 {
+        due_generation = store.advance_slack_thread_poll_generation().unwrap();
+    }
+    assert_eq!(
+        store
+            .slack_threads_to_poll("slack-primary", "C01ABC", due_generation, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn slack_thread_discovery_rolls_back_catalog_when_high_water_batch_is_invalid() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    store
+        .append_observation_idempotent(&sample_observation())
+        .unwrap();
+    let key = SlackThreadKey {
+        source_instance: "slack-primary".into(),
+        channel_id: "C01ABC".into(),
+        thread_ts: "1700000000.000001".into(),
+    };
+
+    let error = store
+        .commit_slack_thread_discovery(
+            1,
+            &[DiscoveredSlackThread {
+                key,
+                observation_append_seq: 2,
+            }],
+        )
+        .unwrap_err();
+    assert!(matches!(error, PersistenceError::SchemaInvariant(_)));
+    assert_eq!(store.slack_thread_discovery_high_water().unwrap(), 0);
+    assert!(
+        store
+            .slack_thread_catalog("slack-primary", "C01ABC")
+            .unwrap()
+            .is_empty()
+    );
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
 fn projection_item(item_key: &str, owner_key: &str, sort_key: &str) -> ProjectionItem {
     ProjectionItem {
         item_key: item_key.to_owned(),

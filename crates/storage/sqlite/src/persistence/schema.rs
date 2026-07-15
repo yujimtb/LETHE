@@ -24,6 +24,32 @@ impl SqlitePersistence {
                 value TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS slack_thread_catalog_state (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                discovery_high_water INTEGER NOT NULL CHECK (discovery_high_water >= 0),
+                poll_generation INTEGER NOT NULL CHECK (poll_generation >= 0)
+            );
+
+            CREATE TABLE IF NOT EXISTS slack_thread_catalog (
+                source_instance TEXT NOT NULL CHECK (length(trim(source_instance)) > 0),
+                channel_id TEXT NOT NULL CHECK (length(trim(channel_id)) > 0),
+                thread_ts TEXT NOT NULL CHECK (length(trim(thread_ts)) > 0),
+                reply_cursor TEXT NOT NULL CHECK (length(trim(reply_cursor)) > 0),
+                active INTEGER NOT NULL CHECK (active IN (0, 1)),
+                next_poll_generation INTEGER NOT NULL CHECK (next_poll_generation >= 0),
+                discovered_append_seq INTEGER NOT NULL CHECK (discovered_append_seq > 0),
+                PRIMARY KEY (source_instance, channel_id, thread_ts)
+            );
+
+            CREATE INDEX IF NOT EXISTS slack_thread_catalog_poll_queue
+                ON slack_thread_catalog (
+                    source_instance,
+                    channel_id,
+                    active,
+                    next_poll_generation,
+                    thread_ts
+                );
+
             CREATE TABLE IF NOT EXISTS blobs (
                 blob_ref TEXT PRIMARY KEY,
                 file_path TEXT NOT NULL
@@ -174,10 +200,16 @@ impl SqlitePersistence {
             ",
         )?;
         self.conn.execute(
+            "INSERT OR IGNORE INTO slack_thread_catalog_state (
+                singleton, discovery_high_water, poll_generation
+             ) VALUES (1, 0, 0)",
+            [],
+        )?;
+        self.conn.execute(
             "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
             params![
                 CURRENT_SCHEMA_VERSION,
-                "canonical_json_sha256",
+                "slack_thread_catalog",
                 chrono::Utc::now().to_rfc3339(),
             ],
         )?;

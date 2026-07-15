@@ -359,6 +359,37 @@ impl AppService {
         Ok(result)
     }
 
+    pub(super) fn append_prepared_slack_observation(
+        &self,
+        observation: Observation,
+        thread: &SlackThreadKey,
+    ) -> Result<IngestResult, SelfHostError> {
+        let recorded_at = observation.recorded_at;
+        let durable_outcome = self
+            .persistence_lock()?
+            .append_slack_observation(&observation, thread)?;
+        let result = match durable_outcome {
+            DurableAppendOutcome::Appended(id) => {
+                self.emit_audit(
+                    "actor:self-host",
+                    AuditEventKind::WriteExecution,
+                    serde_json::json!({"observation_id": id.as_str()}),
+                );
+                IngestResult::Ingested { id, recorded_at }
+            }
+            DurableAppendOutcome::Duplicate(existing_id) => IngestResult::Duplicate { existing_id },
+            DurableAppendOutcome::CanonicalCollision(existing_id) => IngestResult::Quarantined {
+                ticket: lethe_core::domain::QuarantineTicket {
+                    id: uuid::Uuid::now_v7().to_string(),
+                    reason: format!(
+                        "sha256-collision: existing observation {existing_id} has different canonical_json"
+                    ),
+                },
+            },
+        };
+        Ok(result)
+    }
+
     pub(super) fn store_blob(&self, data: &[u8]) -> Result<BlobRef, SelfHostError> {
         let mut core = self.core_lock()?;
         let blob_ref = self
@@ -382,10 +413,10 @@ impl AppService {
         Ok(self.persistence_lock()?.get_blob(blob_ref)?)
     }
 
-    pub(super) fn ingest_slack_message(
+    pub(super) fn ingest_slack_message<A: SlackClient, F: SlackClient>(
         &self,
-        slack_adapter: &SlackAdapter<HttpSlackClient>,
-        file_client: &HttpSlackClient,
+        slack_adapter: &SlackAdapter<A>,
+        file_client: &F,
         source_instance_id: &str,
         channel_id: &str,
         mut message: lethe_adapter_slack::slack::client::SlackMessage,
@@ -427,49 +458,85 @@ impl AppService {
         if is_latest {
             *latest_ts = Some(message.ts.clone());
         }
-        self.ingest_draft(namespace_draft(
-            slack_adapter.map_message(&message)?,
-            source_instance_id,
-        ))
+        let thread = thread_root_ts(&message).map(|thread_ts| SlackThreadKey {
+            source_instance: source_instance_id.to_owned(),
+            channel_id: channel_id.to_owned(),
+            thread_ts: thread_ts.to_owned(),
+        });
+        let draft = namespace_draft(slack_adapter.map_message(&message)?, source_instance_id);
+        let Some(thread) = thread else {
+            return self.ingest_draft(draft);
+        };
+        let payload_bytes = serde_json::to_vec(&draft.payload)?.len();
+        if payload_bytes > self.config.resource_limits.max_payload_bytes {
+            return Err(SelfHostError::Ingestion(format!(
+                "payload size {payload_bytes} exceeds configured maximum {}",
+                self.config.resource_limits.max_payload_bytes
+            )));
+        }
+        let observation = {
+            let core = self.core_lock()?;
+            match prepare_draft(&core, draft) {
+                Ok(observation) => observation,
+                Err(IngestResult::Rejected { message, .. }) => {
+                    return Err(SelfHostError::Ingestion(message));
+                }
+                Err(IngestResult::Quarantined { ticket }) => {
+                    return Err(SelfHostError::Ingestion(ticket.reason));
+                }
+                Err(result) => return Ok(result),
+            }
+        };
+        self.append_prepared_slack_observation(observation, &thread)
     }
 
-    pub(super) fn sync_thread_replies(
+    pub(super) fn sync_thread_replies<A: SlackClient, F: SlackClient, R: SlackClient>(
         &self,
-        slack_adapter: &SlackAdapter<HttpSlackClient>,
-        source: &SlackSourceRuntime,
-        channel_id: &str,
-        thread_ts: &str,
-    ) -> Result<(usize, usize), SelfHostError> {
-        let cursor_key = format!(
-            "{}:{}",
-            source.config.id,
-            thread_cursor_key(channel_id, thread_ts)
-        );
-        let reply_oldest = non_empty_state(self.persistence_lock()?.get_state(&cursor_key)?)
-            .unwrap_or_else(|| thread_ts.to_string());
+        slack_adapter: &SlackAdapter<A>,
+        file_client: &F,
+        replies_client: &R,
+        thread: &SlackThreadCatalogEntry,
+        generation: u64,
+    ) -> Result<(usize, usize, usize), SelfHostError> {
+        let key = &thread.key;
         let policy = self.slack_adapter_config();
         let replies = self.resilient_executor.execute(
-            &format!("slack:{}:{channel_id}:replies", source.config.id),
+            &format!("slack:{}:{}:replies", key.source_instance, key.channel_id),
             &policy.retry,
             &policy.rate_limit,
             || {
-                source.replies_client.conversations_replies(
-                    channel_id,
-                    thread_ts,
-                    Some(reply_oldest.as_str()),
+                replies_client.conversations_replies(
+                    &key.channel_id,
+                    &key.thread_ts,
+                    Some(thread.reply_cursor.as_str()),
                 )
             },
         )?;
-        let mut latest_reply_ts = Some(reply_oldest);
+        let cursor_value = slack_ts_value(&thread.reply_cursor)?;
+        let mut latest_reply_ts = Some(thread.reply_cursor.clone());
         let mut ingested = 0usize;
         let mut duplicates = 0usize;
+        let mut fetched = 0usize;
 
-        for reply in replies.into_iter().filter(|reply| reply.ts != thread_ts) {
+        for reply in replies
+            .into_iter()
+            .filter(|reply| reply.ts != key.thread_ts)
+        {
+            if slack_ts_value(&reply.ts)? <= cursor_value {
+                continue;
+            }
+            if reply.thread_ts.as_deref() != Some(key.thread_ts.as_str()) {
+                return Err(SelfHostError::Ingestion(format!(
+                    "Slack thread {} reply {} has mismatched thread_ts",
+                    key.thread_ts, reply.ts
+                )));
+            }
+            fetched += 1;
             match self.ingest_slack_message(
                 slack_adapter,
-                &source.replies_client,
-                &source.config.id,
-                channel_id,
+                file_client,
+                &key.source_instance,
+                &key.channel_id,
                 reply,
                 &mut latest_reply_ts,
             )? {
@@ -479,39 +546,44 @@ impl AppService {
             }
         }
 
-        if let Some(latest_reply_ts) = latest_reply_ts.as_deref() {
-            self.persistence_lock()?
-                .set_state(&cursor_key, latest_reply_ts)?;
-        }
+        let latest_reply_ts = latest_reply_ts.expect("thread reply cursor is always initialized");
+        let delay = if fetched > 0 {
+            1
+        } else {
+            IDLE_THREAD_RECHECK_INTERVAL
+        };
+        let next_poll_generation = generation.checked_add(delay).ok_or_else(|| {
+            SelfHostError::Ingestion("Slack thread next poll generation overflowed u64".to_owned())
+        })?;
+        self.persistence_lock()?.complete_slack_thread_poll(
+            key,
+            generation,
+            &latest_reply_ts,
+            fetched > 0,
+            next_poll_generation,
+        )?;
 
-        Ok((ingested, duplicates))
+        Ok((ingested, duplicates, fetched))
     }
 
-    pub(super) fn known_thread_roots(
-        &self,
-        channel_id: &str,
-    ) -> Result<BTreeSet<String>, SelfHostError> {
-        let mut roots = BTreeSet::new();
-        let mut cursor = 0u64;
+    pub(super) fn refresh_slack_thread_catalog(&self) -> Result<(), SelfHostError> {
+        let mut cursor = self
+            .persistence_lock()?
+            .slack_thread_discovery_high_water()?;
         loop {
             let page = self.persistence_lock()?.observation_page(cursor, 512)?;
             if page.is_empty() {
-                break;
+                return Ok(());
             }
-            let observations = page
-                .iter()
-                .map(|stored| stored.observation.clone())
-                .collect::<Vec<_>>();
-            roots.extend(known_thread_roots_from_observations(
-                &observations,
-                channel_id,
-            ));
-            cursor = page
+            let high_water = page
                 .last()
-                .map(|stored| stored.append_seq)
-                .unwrap_or(cursor);
+                .expect("non-empty observation discovery page must have a tail")
+                .append_seq;
+            let threads = discovered_slack_threads(&page)?;
+            self.persistence_lock()?
+                .commit_slack_thread_discovery(high_water, &threads)?;
+            cursor = high_water;
         }
-        Ok(roots)
     }
 
     pub(super) fn extract_student_profile_from_png(
