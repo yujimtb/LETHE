@@ -28,7 +28,7 @@ use lethe_api::api::read_mode::{ReadModeError, ReadModeResolver};
 use lethe_core::domain::{
     ActorRef, AuthorityModel, BlobRef, CaptureModel, EntityRef, IngestResult, Observation,
     ObserverRef, ProjectionHealth, ProjectionRef, ProjectionStatus, ReadMode, SchemaRef, SemVer,
-    SourceSystemRef,
+    SourceSystemRef, SupplementalId, SupplementalRecord,
 };
 use lethe_derivation_gemini::{GeminiSlideAnalyzer, SlideAnalysisProjector};
 use lethe_engine::identity::projector::IdentityProjector;
@@ -54,10 +54,10 @@ use lethe_profile_model::{
 use lethe_projection_answer_log::{AnswerLogProjector, AnswerLogRecord};
 use lethe_projection_claim_queue::{ClaimQueueProjection, ClaimQueueProjector};
 use lethe_projection_cognition::{
-    CardQueueProjection, CardQueueProjector, CognitionStateProjector, FreshnessProjection,
-    FreshnessProjector, FreshnessStatus, FreshnessThreshold, PlanStateProjection, ReplyLatency,
-    ReplySloProjection, ReplySloProjector, ReplySloStatus, ResumeSnapshotProjection,
-    SourceFreshness,
+    CardQueueProjection, CardQueueProjector, CardQueueReducer, CognitionStateProjector,
+    FreshnessProjection, FreshnessProjector, FreshnessStatus, FreshnessThreshold,
+    PlanStateProjection, ReplyLatency, ReplySloJoinIndex, ReplySloProjection, ReplySloProjector,
+    ReplySloStatus, ResumeSnapshotProjection, SourceFreshness,
 };
 use lethe_projection_corpus::CorpusProjector;
 use lethe_projection_person::person_page::projector::PersonPageProjector;
@@ -202,11 +202,12 @@ pub struct ProjectionSnapshot {
     pub lineage: LineageManifest,
 }
 
-const NON_CORPUS_MATERIALIZATION_VERSION: u32 = 4;
+const NON_CORPUS_MATERIALIZATION_VERSION: u32 = 5;
 const REPLY_SLO_ITEM_OWNER: &str = "__reply_slo__";
 const NON_CORPUS_REBUILD_STAGING_PROJECTION_ID: &str = "proj:person-page:rebuild-staging";
 const CANONICAL_OBSERVATION_FINGERPRINT_DOMAIN: &[u8] =
     b"lethe:canonical-observation-fingerprint:v1\0";
+const SUPPLEMENTAL_FINGERPRINT_DOMAIN: &[u8] = b"lethe:supplemental-fingerprint:v2\0";
 const IMPORT_PROCESS_BATCH_SIZE: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,6 +261,136 @@ struct SupplementalMaterializedDelta {
     item_commit: ProjectionItemCommit,
 }
 
+#[derive(Debug)]
+struct AppSupplementalRollback {
+    id: SupplementalId,
+    store: lethe_engine::supplemental::store::UpsertRollback,
+    previous_record: Option<SupplementalRecord>,
+    current_record: SupplementalRecord,
+    previous_resident_fingerprint: String,
+    previous_count: usize,
+    previous_claim_queue_dirty: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SupplementalProjectionCache {
+    records: Vec<SupplementalRecord>,
+    cognition_records: Vec<SupplementalRecord>,
+    frontend_records: Vec<SupplementalRecord>,
+    card_queue: CardQueueReducer,
+    reply_slo: ReplySloJoinIndex,
+}
+
+impl SupplementalProjectionCache {
+    fn from_records(records: &[SupplementalRecord]) -> Self {
+        let mut ordered = records.to_vec();
+        ordered.sort_by(supplemental_record_order);
+        Self {
+            cognition_records: ordered
+                .iter()
+                .filter(|record| is_cognition_activity_kind(&record.kind))
+                .cloned()
+                .collect(),
+            frontend_records: ordered
+                .iter()
+                .filter(|record| record.kind == "slide-analysis")
+                .cloned()
+                .collect(),
+            card_queue: CardQueueReducer::from_records(&ordered),
+            reply_slo: ReplySloJoinIndex::from_records(&ordered),
+            records: ordered,
+        }
+    }
+
+    fn replace(&mut self, previous: Option<&SupplementalRecord>, current: &SupplementalRecord) {
+        if let Some(previous) = previous {
+            remove_supplemental_record(&mut self.records, &previous.id);
+            remove_supplemental_record(&mut self.cognition_records, &previous.id);
+            remove_supplemental_record(&mut self.frontend_records, &previous.id);
+            self.card_queue.remove_record(&previous.id);
+            self.reply_slo.remove_record(&previous.id);
+        }
+        insert_supplemental_record(&mut self.records, current.clone());
+        if is_cognition_activity_kind(&current.kind) {
+            insert_supplemental_record(&mut self.cognition_records, current.clone());
+        }
+        if current.kind == "slide-analysis" {
+            insert_supplemental_record(&mut self.frontend_records, current.clone());
+        }
+        self.card_queue.upsert_record(current.clone());
+        self.reply_slo.upsert_record(current.clone());
+    }
+
+    fn rollback(&mut self, current: &SupplementalRecord, previous: Option<&SupplementalRecord>) {
+        remove_supplemental_record(&mut self.records, &current.id);
+        remove_supplemental_record(&mut self.cognition_records, &current.id);
+        remove_supplemental_record(&mut self.frontend_records, &current.id);
+        self.card_queue.remove_record(&current.id);
+        self.reply_slo.remove_record(&current.id);
+        if let Some(previous) = previous {
+            insert_supplemental_record(&mut self.records, previous.clone());
+            if is_cognition_activity_kind(&previous.kind) {
+                insert_supplemental_record(&mut self.cognition_records, previous.clone());
+            }
+            if previous.kind == "slide-analysis" {
+                insert_supplemental_record(&mut self.frontend_records, previous.clone());
+            }
+            self.card_queue.upsert_record(previous.clone());
+            self.reply_slo.upsert_record(previous.clone());
+        }
+    }
+
+    fn claim_queue(&self) -> ClaimQueueProjection {
+        ClaimQueueProjector.project_ordered_records(&self.records)
+    }
+
+    fn cognition(
+        &self,
+        claim_queue: &ClaimQueueProjection,
+        built_at: DateTime<Utc>,
+    ) -> (ResumeSnapshotProjection, PlanStateProjection) {
+        CognitionStateProjector::new(built_at)
+            .project_with_claim_queue(&self.cognition_records, claim_queue)
+    }
+
+    fn count(&self) -> usize {
+        self.records.len()
+    }
+}
+
+fn supplemental_record_order(
+    left: &SupplementalRecord,
+    right: &SupplementalRecord,
+) -> std::cmp::Ordering {
+    left.created_at
+        .cmp(&right.created_at)
+        .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+}
+
+fn insert_supplemental_record(records: &mut Vec<SupplementalRecord>, record: SupplementalRecord) {
+    let position = records
+        .binary_search_by(|existing| supplemental_record_order(existing, &record))
+        .unwrap_or_else(|position| position);
+    records.insert(position, record);
+}
+
+fn remove_supplemental_record(records: &mut Vec<SupplementalRecord>, id: &SupplementalId) {
+    if let Some(position) = records.iter().position(|record| &record.id == id) {
+        records.remove(position);
+    }
+}
+
+fn is_cognition_activity_kind(kind: &str) -> bool {
+    matches!(kind, "session-summary@1" | "parking@1")
+}
+
+fn affects_claim_queue(kind: &str) -> bool {
+    matches!(
+        kind,
+        "claim@1" | "claim-transition@1" | "verification-result@1" | "decision@1"
+    )
+}
+
 type FrontendProfileSelections = BTreeMap<String, (usize, DateTime<Utc>, FrontendProfile)>;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -296,6 +427,7 @@ impl MaterializedProjectionSnapshot {
 
     fn validate(&self) -> Result<(), SelfHostError> {
         decode_canonical_observation_fingerprint(&self.canonical_observation_fingerprint)?;
+        decode_supplemental_fingerprint(&self.supplemental_fingerprint)?;
         if !self.snapshot.person_page.messages.is_empty() {
             return Err(SelfHostError::Ingestion(
                 "proj:person-page manifest must not contain resident person messages".to_owned(),
@@ -393,6 +525,10 @@ pub struct AppCore {
     observation_stats: ObservationStats,
     canonical_observation_fingerprint: String,
     supplemental_fingerprint: String,
+    resident_supplemental_fingerprint: String,
+    supplemental_count: usize,
+    supplemental_projection_cache: SupplementalProjectionCache,
+    claim_queue_dirty: bool,
     compact_state: CompactProjectionState,
     person_consents: BTreeMap<String, ConsentStatus>,
     person_message_count: u64,
@@ -405,12 +541,54 @@ pub struct AppCore {
 
 impl AppCore {
     fn from_materialized(
-        materialized: MaterializedProjectionSnapshot,
+        mut materialized: MaterializedProjectionSnapshot,
         persisted_blobs: Vec<Vec<u8>>,
         persisted_supplementals: Vec<lethe_core::domain::SupplementalRecord>,
         freshness_thresholds: Vec<FreshnessThreshold>,
         channels: Vec<lethe_registry::registry::ChannelRecord>,
     ) -> Result<Self, SelfHostError> {
+        materialized.validate()?;
+        let supplemental_projection_cache =
+            SupplementalProjectionCache::from_records(&persisted_supplementals);
+        let cached_claim_queue = supplemental_projection_cache.claim_queue();
+        let (cached_resume_snapshot, cached_plan_state) = supplemental_projection_cache
+            .cognition(&cached_claim_queue, materialized.snapshot.built_at);
+        let cached_card_queue = supplemental_projection_cache
+            .card_queue
+            .projection(materialized.snapshot.built_at);
+        for (name, persisted, cached) in [
+            (
+                "claim queue",
+                serde_json::to_value(&materialized.snapshot.claim_queue)?,
+                serde_json::to_value(&cached_claim_queue)?,
+            ),
+            (
+                "resume snapshot",
+                serde_json::to_value(&materialized.snapshot.resume_snapshot)?,
+                serde_json::to_value(&cached_resume_snapshot)?,
+            ),
+            (
+                "plan state",
+                serde_json::to_value(&materialized.snapshot.plan_state)?,
+                serde_json::to_value(&cached_plan_state)?,
+            ),
+            (
+                "card queue",
+                serde_json::to_value(&materialized.snapshot.card_queue)?,
+                serde_json::to_value(&cached_card_queue)?,
+            ),
+        ] {
+            if persisted != cached {
+                return Err(SelfHostError::Ingestion(format!(
+                    "proj:person-page persisted {name} diverged from supplemental reducer replay"
+                )));
+            }
+        }
+        materialized.snapshot.claim_queue = cached_claim_queue;
+        materialized.snapshot.resume_snapshot = cached_resume_snapshot;
+        materialized.snapshot.plan_state = cached_plan_state;
+        materialized.snapshot.card_queue = cached_card_queue;
+
         let mut blobs = BlobStore::new();
         for blob in persisted_blobs {
             blobs.put(&blob);
@@ -443,7 +621,8 @@ impl AppCore {
             })?;
         }
 
-        materialized.validate()?;
+        let resident_supplemental_fingerprint = materialized.supplemental_fingerprint.clone();
+        let supplemental_count = supplemental_projection_cache.count();
         let mut core = Self {
             registry,
             catalog: seed_projection_catalog(),
@@ -453,6 +632,10 @@ impl AppCore {
             observation_stats: materialized.observation_stats(),
             canonical_observation_fingerprint: materialized.canonical_observation_fingerprint,
             supplemental_fingerprint: materialized.supplemental_fingerprint,
+            resident_supplemental_fingerprint,
+            supplemental_count,
+            supplemental_projection_cache,
+            claim_queue_dirty: false,
             compact_state: materialized.compact_state,
             person_consents: materialized.person_consents,
             person_message_count: materialized.person_message_count,
@@ -470,6 +653,9 @@ impl AppCore {
         self.observation_stats = materialized.observation_stats();
         self.canonical_observation_fingerprint = materialized.canonical_observation_fingerprint;
         self.supplemental_fingerprint = materialized.supplemental_fingerprint;
+        self.resident_supplemental_fingerprint = self.supplemental_fingerprint.clone();
+        self.supplemental_count = self.supplemental_projection_cache.count();
+        self.claim_queue_dirty = false;
         self.compact_state = materialized.compact_state;
         self.person_consents = materialized.person_consents;
         self.person_message_count = materialized.person_message_count;
@@ -576,23 +762,74 @@ impl AppCore {
         record: lethe_core::domain::SupplementalRecord,
         observation_exists: ObservationExists,
         supplemental_exists: SupplementalExists,
-    ) -> Result<lethe_engine::supplemental::store::UpsertRollback, lethe_core::domain::DomainError>
+    ) -> Result<AppSupplementalRollback, lethe_core::domain::DomainError>
     where
         ObservationExists: Fn(&lethe_core::domain::ObservationId) -> bool,
         SupplementalExists: Fn(&lethe_core::domain::SupplementalId) -> bool,
     {
-        self.supplemental.upsert_with_rollback_checked(
+        let previous_record = self.supplemental.get(&record.id).cloned();
+        let previous_resident_fingerprint = self.resident_supplemental_fingerprint.clone();
+        let previous_count = self.supplemental_count;
+        let previous_claim_queue_dirty = self.claim_queue_dirty;
+        let next_count = if previous_record.is_none() {
+            previous_count.checked_add(1).ok_or_else(|| {
+                lethe_core::domain::DomainError::Validation(
+                    "supplemental count overflow during upsert".to_owned(),
+                )
+            })?
+        } else {
+            previous_count
+        };
+        let store = self.supplemental.upsert_with_rollback_checked(
             record,
             observation_exists,
             supplemental_exists,
-        )
+        )?;
+        let current_record = self
+            .supplemental
+            .get(&store.id)
+            .cloned()
+            .expect("successful supplemental upsert must install the record");
+        let next_fingerprint = match supplemental_fingerprint_after_delta(
+            &previous_resident_fingerprint,
+            previous_record.as_ref(),
+            &current_record,
+        ) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                self.supplemental.rollback_upsert(store);
+                return Err(lethe_core::domain::DomainError::Validation(format!(
+                    "supplemental fingerprint update failed: {error}"
+                )));
+            }
+        };
+        self.supplemental_projection_cache
+            .replace(previous_record.as_ref(), &current_record);
+        self.resident_supplemental_fingerprint = next_fingerprint;
+        self.supplemental_count = next_count;
+        self.claim_queue_dirty = previous_claim_queue_dirty
+            || affects_claim_queue(&current_record.kind)
+            || previous_record
+                .as_ref()
+                .is_some_and(|record| affects_claim_queue(&record.kind));
+        Ok(AppSupplementalRollback {
+            id: current_record.id.clone(),
+            store,
+            previous_record,
+            current_record,
+            previous_resident_fingerprint,
+            previous_count,
+            previous_claim_queue_dirty,
+        })
     }
 
-    fn rollback_supplemental(
-        &mut self,
-        rollback: lethe_engine::supplemental::store::UpsertRollback,
-    ) {
-        self.supplemental.rollback_upsert(rollback);
+    fn rollback_supplemental(&mut self, rollback: AppSupplementalRollback) {
+        self.supplemental_projection_cache
+            .rollback(&rollback.current_record, rollback.previous_record.as_ref());
+        self.resident_supplemental_fingerprint = rollback.previous_resident_fingerprint;
+        self.supplemental_count = rollback.previous_count;
+        self.claim_queue_dirty = rollback.previous_claim_queue_dirty;
+        self.supplemental.rollback_upsert(rollback.store);
     }
 }
 
@@ -702,8 +939,8 @@ impl ProjectionSnapshot {
         let freshness = FreshnessProjector::new(freshness_thresholds, built_at)
             .project_observations(lake.list());
         let cognition_projector = CognitionStateProjector::new(built_at);
-        let resume_snapshot = cognition_projector.resume_snapshot(&all_supplemental_records);
-        let plan_state = cognition_projector.plan_state(&all_supplemental_records);
+        let (resume_snapshot, plan_state) =
+            cognition_projector.project_with_claim_queue(&all_supplemental_records, &claim_queue);
         let card_queue =
             CardQueueProjector::new(built_at).project_records(&all_supplemental_records);
         let reply_slo = ReplySloProjector::new(built_at)
@@ -1129,19 +1366,12 @@ impl MaterializedProjectionSnapshot {
             )));
         }
 
-        let supplemental_records = core
-            .supplemental
-            .list()
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let current_supplemental_fingerprint = supplemental_fingerprint(&supplemental_records)?;
-        if current_supplemental_fingerprint != core.supplemental_fingerprint {
+        if core.supplemental_projection_cache.count() != core.supplemental_count {
             return Err(SelfHostError::Ingestion(
-                "resident supplemental state does not match materialized supplemental fingerprint"
-                    .to_owned(),
+                "resident supplemental reducer count diverged from supplemental store".to_owned(),
             ));
         }
+        let current_supplemental_fingerprint = core.resident_supplemental_fingerprint.clone();
 
         let canonical_observation_fingerprint = append_canonical_observation_fingerprint(
             &core.canonical_observation_fingerprint,
@@ -1196,13 +1426,20 @@ impl MaterializedProjectionSnapshot {
             built_at,
         )?;
 
-        let cognition_projector = CognitionStateProjector::new(built_at);
-        snapshot.resume_snapshot = cognition_projector.resume_snapshot(&supplemental_records);
-        snapshot.plan_state = cognition_projector.plan_state(&supplemental_records);
-        snapshot.card_queue =
-            CardQueueProjector::new(built_at).project_records(&supplemental_records);
-        let reply_slo_delta = ReplySloProjector::new(built_at)
-            .project_records(appended_observations, &supplemental_records);
+        if core.claim_queue_dirty {
+            snapshot.claim_queue = core.supplemental_projection_cache.claim_queue();
+        }
+        (snapshot.resume_snapshot, snapshot.plan_state) = core
+            .supplemental_projection_cache
+            .cognition(&snapshot.claim_queue, built_at);
+        snapshot.card_queue = core
+            .supplemental_projection_cache
+            .card_queue
+            .projection(built_at);
+        let reply_slo_delta = core
+            .supplemental_projection_cache
+            .reply_slo
+            .project_observations(appended_observations, built_at);
         let reply_slo_upserts = reply_slo_delta
             .rows
             .iter()
@@ -1229,7 +1466,7 @@ impl MaterializedProjectionSnapshot {
             &canonical_observation_fingerprint,
             stats,
             &current_supplemental_fingerprint,
-            supplemental_records.len(),
+            core.supplemental_count,
             person_page_output_count(&snapshot.person_page, person_message_count)?,
             built_at,
         );
@@ -2360,20 +2597,64 @@ fn person_page_build_id(
 fn supplemental_fingerprint(
     records: &[lethe_core::domain::SupplementalRecord],
 ) -> Result<String, SelfHostError> {
-    let mut encoded = records
-        .iter()
-        .map(|record| Ok((record.id.as_str().to_owned(), serde_json::to_vec(record)?)))
-        .collect::<Result<Vec<_>, SelfHostError>>()?;
-    encoded.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut hasher = Sha256::new();
-    hasher.update(b"lethe:non-corpus-supplementals:v1\n");
-    for (id, value) in encoded {
-        hasher.update(id.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(value);
-        hasher.update(b"\n");
+    let mut accumulator = [0_u8; 32];
+    for record in records {
+        add_modulo_256(&mut accumulator, &supplemental_record_digest(record)?);
     }
-    Ok(hex::encode(hasher.finalize()))
+    Ok(hex::encode(accumulator))
+}
+
+fn supplemental_fingerprint_after_delta(
+    current: &str,
+    previous: Option<&SupplementalRecord>,
+    next: &SupplementalRecord,
+) -> Result<String, SelfHostError> {
+    let mut accumulator = decode_supplemental_fingerprint(current)?;
+    if let Some(previous) = previous {
+        subtract_modulo_256(&mut accumulator, &supplemental_record_digest(previous)?);
+    }
+    add_modulo_256(&mut accumulator, &supplemental_record_digest(next)?);
+    Ok(hex::encode(accumulator))
+}
+
+fn supplemental_record_digest(record: &SupplementalRecord) -> Result<[u8; 32], SelfHostError> {
+    let encoded = serde_json::to_vec(record)?;
+    let encoded_len = u64::try_from(encoded.len()).map_err(|_| {
+        SelfHostError::Ingestion("serialized supplemental length does not fit u64".to_owned())
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(SUPPLEMENTAL_FINGERPRINT_DOMAIN);
+    hasher.update(encoded_len.to_be_bytes());
+    hasher.update(encoded);
+    Ok(hasher.finalize().into())
+}
+
+fn decode_supplemental_fingerprint(value: &str) -> Result<[u8; 32], SelfHostError> {
+    let bytes = hex::decode(value).map_err(|error| {
+        SelfHostError::Ingestion(format!(
+            "invalid supplemental fingerprint encoding: {error}"
+        ))
+    })?;
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        SelfHostError::Ingestion(format!(
+            "supplemental fingerprint has {} bytes, expected 32",
+            bytes.len()
+        ))
+    })
+}
+
+fn subtract_modulo_256(accumulator: &mut [u8; 32], value: &[u8; 32]) {
+    let mut borrow = 0_i16;
+    for index in (0..accumulator.len()).rev() {
+        let difference = i16::from(accumulator[index]) - i16::from(value[index]) - borrow;
+        if difference < 0 {
+            accumulator[index] = (difference + 256) as u8;
+            borrow = 1;
+        } else {
+            accumulator[index] = difference as u8;
+            borrow = 0;
+        }
+    }
 }
 
 fn for_each_observation_page(
@@ -2740,7 +3021,10 @@ fn rebuild_materialized_snapshot_paged(
 
     let canonical_observation_fingerprint = hex::encode(canonical_fingerprint);
     let supplemental_fingerprint = supplemental_fingerprint(supplementals)?;
+    let claim_queue = ClaimQueueProjector.project_records(supplementals);
     let cognition_projector = CognitionStateProjector::new(built_at);
+    let (resume_snapshot, plan_state) =
+        cognition_projector.project_with_claim_queue(supplementals, &claim_queue);
     let lineage = build_person_page_lineage(
         &canonical_observation_fingerprint,
         stats,
@@ -2763,10 +3047,10 @@ fn rebuild_materialized_snapshot_paged(
             identity,
             person_page,
             answer_log,
-            claim_queue: ClaimQueueProjector.project_records(supplementals),
+            claim_queue,
             freshness,
-            resume_snapshot: cognition_projector.resume_snapshot(supplementals),
-            plan_state: cognition_projector.plan_state(supplementals),
+            resume_snapshot,
+            plan_state,
             card_queue: CardQueueProjector::new(built_at).project_records(supplementals),
             reply_slo: ReplySloProjection::default(),
             break_glass: BreakGlassProjection::from_channels(channels),
@@ -2844,19 +3128,18 @@ fn materialized_snapshot_after_supplemental_delta(
             "supplemental delta received resident row-store projection data".to_owned(),
         ));
     }
-    let supplementals = core
-        .supplemental
-        .list()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    if !supplementals.iter().any(|record| record.id == changed.id) {
+    if core.supplemental.get(&changed.id).is_none() {
         return Err(SelfHostError::Ingestion(format!(
             "supplemental {} is absent from resident state during delta materialization",
             changed.id
         )));
     }
-    let next_supplemental_fingerprint = supplemental_fingerprint(&supplementals)?;
+    if core.supplemental_projection_cache.count() != core.supplemental_count {
+        return Err(SelfHostError::Ingestion(
+            "resident supplemental reducer count diverged from supplemental store".to_owned(),
+        ));
+    }
+    let next_supplemental_fingerprint = core.resident_supplemental_fingerprint.clone();
     if next_supplemental_fingerprint == core.supplemental_fingerprint {
         return Err(SelfHostError::Ingestion(format!(
             "supplemental {} did not advance the materialized fingerprint",
@@ -2871,26 +3154,34 @@ fn materialized_snapshot_after_supplemental_delta(
         &[],
         built_at,
     )?;
-    snapshot.claim_queue = ClaimQueueProjector.project_records(&supplementals);
-    let cognition_projector = CognitionStateProjector::new(built_at);
-    snapshot.resume_snapshot = cognition_projector.resume_snapshot(&supplementals);
-    snapshot.plan_state = cognition_projector.plan_state(&supplementals);
-    snapshot.card_queue = CardQueueProjector::new(built_at).project_records(&supplementals);
-    let frontend_profiles = frontend_profiles_from_supplementals(
-        persistence,
-        &snapshot.identity,
-        &core.person_consents,
-        &supplementals,
-        core.observation_stats.max_append_seq,
-    )?;
-    install_frontend_profiles(&mut snapshot.person_page, frontend_profiles)?;
+    if affects_claim_queue(&changed.kind) {
+        snapshot.claim_queue = core.supplemental_projection_cache.claim_queue();
+    }
+    (snapshot.resume_snapshot, snapshot.plan_state) = core
+        .supplemental_projection_cache
+        .cognition(&snapshot.claim_queue, built_at);
+    snapshot.card_queue = core
+        .supplemental_projection_cache
+        .card_queue
+        .projection(built_at);
+    if changed.kind == "slide-analysis" {
+        let frontend_profiles = frontend_profiles_from_supplementals(
+            persistence,
+            &snapshot.identity,
+            &core.person_consents,
+            &core.supplemental_projection_cache.frontend_records,
+            core.observation_stats.max_append_seq,
+        )?;
+        install_frontend_profiles(&mut snapshot.person_page, frontend_profiles)?;
+    }
 
     let mut updates = Vec::new();
     if changed.kind == "send-record@1"
         && let Some(draft_id) = changed.derived_from.supplementals.first()
-        && let Some(draft) = supplementals
-            .iter()
-            .find(|record| record.id == *draft_id && record.kind == "reply-draft@1")
+        && let Some(draft) = core
+            .supplemental_projection_cache
+            .card_queue
+            .draft(draft_id)
         && let Some(observation_id) = draft.derived_from.observations.first()
     {
         let stored = persistence
@@ -2906,8 +3197,10 @@ fn materialized_snapshot_after_supplemental_delta(
                 core.observation_stats.max_append_seq
             )));
         }
-        let projected = ReplySloProjector::new(built_at)
-            .project_records(std::slice::from_ref(&stored.observation), &supplementals);
+        let projected = core
+            .supplemental_projection_cache
+            .reply_slo
+            .project_observations(std::slice::from_ref(&stored.observation), built_at);
         if let Some(row) = projected.rows.into_iter().next() {
             let desired = reply_slo_projection_item(&row)?;
             let existing = persistence
@@ -2930,7 +3223,7 @@ fn materialized_snapshot_after_supplemental_delta(
         &core.canonical_observation_fingerprint,
         core.observation_stats,
         &next_supplemental_fingerprint,
-        supplementals.len(),
+        core.supplemental_count,
         person_page_output_count(&snapshot.person_page, core.person_message_count)?,
         built_at,
     );
