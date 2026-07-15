@@ -1436,10 +1436,10 @@ impl MaterializedProjectionSnapshot {
             .supplemental_projection_cache
             .card_queue
             .projection(built_at);
-        let reply_slo_delta = core
-            .supplemental_projection_cache
-            .reply_slo
-            .project_observations(appended_observations, built_at);
+        let reply_slo_delta = ReplySloProjector::new(built_at).project_observations(
+            appended_observations,
+            &core.supplemental_projection_cache.reply_slo,
+        );
         let reply_slo_upserts = reply_slo_delta
             .rows
             .iter()
@@ -2908,6 +2908,7 @@ fn rebuild_materialized_snapshot_paged(
 
     let mut person_message_count = 0_u64;
     let mut reply_slo_count = 0_u64;
+    let reply_slo_join_index = ReplySloJoinIndex::from_records(supplementals);
     for_each_observation_page(persistence, stats, page_size, |observations| {
         let mut inserts = Vec::new();
         if observations
@@ -2942,8 +2943,8 @@ fn rebuild_materialized_snapshot_paged(
             merge_non_slack_person_page(&mut person_page, page, &person_consents)?;
         }
 
-        let reply_slo =
-            ReplySloProjector::new(built_at).project_records(observations, supplementals);
+        let reply_slo = ReplySloProjector::new(built_at)
+            .project_observations(observations, &reply_slo_join_index);
         let page_reply_slo_count = u64::try_from(reply_slo.rows.len()).map_err(|_| {
             SelfHostError::Ingestion("paged reply SLO row count does not fit u64".to_owned())
         })?;
@@ -3188,19 +3189,20 @@ fn materialized_snapshot_after_supplemental_delta(
             .observation_by_id(observation_id)?
             .ok_or_else(|| {
                 SelfHostError::Ingestion(format!(
-                    "reply draft {draft_id} references missing observation {observation_id}"
+                    "ReplySLO supplemental {} references missing observation {observation_id}",
+                    changed.id
                 ))
             })?;
         if stored.append_seq > core.observation_stats.max_append_seq {
             return Err(SelfHostError::Ingestion(format!(
-                "reply draft {draft_id} crossed canonical high-water {}",
-                core.observation_stats.max_append_seq
+                "ReplySLO supplemental {} crossed canonical high-water {}",
+                changed.id, core.observation_stats.max_append_seq
             )));
         }
-        let projected = core
-            .supplemental_projection_cache
-            .reply_slo
-            .project_observations(std::slice::from_ref(&stored.observation), built_at);
+        let projected = ReplySloProjector::new(built_at).project_observations(
+            std::slice::from_ref(&stored.observation),
+            &core.supplemental_projection_cache.reply_slo,
+        );
         if let Some(row) = projected.rows.into_iter().next() {
             let desired = reply_slo_projection_item(&row)?;
             let existing = persistence

@@ -111,6 +111,10 @@ manager の状態は `Opening | CatchingUp | Rebuilding | Ready | Failed` であ
 
 page が過大、空なのに high-water 未到達、`append_seq` が非単調、最終件数 / high-water が不一致なら fail-fast し、既存 target materialization を保持する。Person Message と ReplySLO の全行は `ProjectionSnapshot` に常駐させず、SQLite row store から必要な行だけ読む。
 
+ReplySLO の二巡目では、全 supplemental S 件から `draft_id -> observation_id` と `observation_id -> earliest_sent_at` の hash join index をループ開始前に一度だけ構築し、全 Observation page で共有する。従来は N 件の Observation を page size P で処理するたびに supplemental 全件を走査していたため O((N/P)·S + N) だったが、現在の rebuild は期待計算量 O(S + N)、追加メモリ O(S) である。earliest sent は同一 observation に複数の send record がある場合も index 更新時に最小値を維持する。
+
+通常の canonical append は resident join index を参照して追加 Observation ΔN 件だけを ReplySLO row に変換し、既存行を再投影しないため期待計算量 O(ΔN) である。reply draft / send record の append は同じ index を O(1) で更新し、send record が影響する1 Observation row だけを upsert する。supplemental または projection の永続 commit が失敗した場合は専用 rollback token で index と supplemental store を元に戻し、全件再構築への silent fallback は行わない。
+
 supplemental write は supplemental append、strict projection item delta、manifest を一つの SQLite transaction で commit する。insert-existing、update-missing、delete-missing、同一 key の競合操作は拒否する。commit 成功後にだけ in-memory compact state を交換するため、途中失敗で DB と公開 state が分離しない。
 
 supplemental 由来の非 corpus projection は resident の kind-routed reducer を使う。通常 write は新旧レコード 1 件を順序付き cache、CardQueue draft/event state、ReplySLO join index へ適用し、ClaimQueue は claim/transition/verification/decision kind が変わった場合だけ再投影する。ClaimQueue の結果は resume snapshot と plan state へ同一インスタンスを共有する。CardQueue は draft ごとの event replay と `expires_at -> draft_id` index を持ち、期限切れ候補を全 card scan で探索しない。通常の Observation materialization も supplemental 全件の list/sort/fingerprint を行わず、これらの cache と index を再利用する。

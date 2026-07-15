@@ -115,7 +115,6 @@ impl AppService {
                 "supplemental missing after store write".to_owned(),
             ));
         };
-
         let projection_result = (|| {
             let store = self.persistence_lock()?;
             let delta = materialized_snapshot_after_supplemental_delta(

@@ -710,7 +710,69 @@ impl ReplySloProjector {
         observations: &[Observation],
         records: &[SupplementalRecord],
     ) -> ReplySloProjection {
-        ReplySloJoinIndex::from_records(records).project_observations(observations, self.now)
+        let join_index = ReplySloJoinIndex::from_records(records);
+        self.project_observations(observations, &join_index)
+    }
+
+    pub fn project_observations(
+        &self,
+        observations: &[Observation],
+        join_index: &ReplySloJoinIndex,
+    ) -> ReplySloProjection {
+        let mut rows = observations
+            .iter()
+            .filter_map(|observation| {
+                let channel_id = communication_meta(observation, "communication_channel_id")?;
+                let sender_id = communication_meta(observation, "communication_sender_id")?;
+                let thread_ref = communication_meta(observation, "communication_thread_ref")?;
+                let due_at = observation
+                    .meta
+                    .pointer("/communication/reply_due_at")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(parse_datetime)?;
+                let sent_at = join_index
+                    .sent_by_observation
+                    .get(observation.id.as_str())
+                    .copied();
+                let latency_seconds =
+                    sent_at.map(|sent_at| (sent_at - observation.published).num_seconds());
+                let status = match sent_at {
+                    Some(sent_at) if sent_at <= due_at => ReplySloStatus::SentOnTime,
+                    Some(_) => ReplySloStatus::SentLate,
+                    None if self.now > due_at => ReplySloStatus::Overdue,
+                    None => ReplySloStatus::Pending,
+                };
+                Some(ReplyLatency {
+                    incoming_observation_id: observation.id.clone(),
+                    channel_id: channel_id.to_owned(),
+                    sender_id: sender_id.to_owned(),
+                    thread_ref: thread_ref.to_owned(),
+                    published: observation.published,
+                    due_at,
+                    sent_at,
+                    latency_seconds,
+                    status,
+                })
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| {
+            left.due_at.cmp(&right.due_at).then_with(|| {
+                left.incoming_observation_id
+                    .as_str()
+                    .cmp(right.incoming_observation_id.as_str())
+            })
+        });
+        let overdue = rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.status,
+                    ReplySloStatus::Overdue | ReplySloStatus::SentLate
+                )
+            })
+            .cloned()
+            .collect();
+        ReplySloProjection { rows, overdue }
     }
 }
 
@@ -788,66 +850,6 @@ impl ReplySloJoinIndex {
         if self.records.remove(id.as_str()).is_some() {
             self.rebuild();
         }
-    }
-
-    pub fn project_observations(
-        &self,
-        observations: &[Observation],
-        now: DateTime<Utc>,
-    ) -> ReplySloProjection {
-        let sent_by_observation = &self.sent_by_observation;
-
-        let mut rows = observations
-            .iter()
-            .filter_map(|observation| {
-                let channel_id = communication_meta(observation, "communication_channel_id")?;
-                let sender_id = communication_meta(observation, "communication_sender_id")?;
-                let thread_ref = communication_meta(observation, "communication_thread_ref")?;
-                let due_at = observation
-                    .meta
-                    .pointer("/communication/reply_due_at")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(parse_datetime)?;
-                let sent_at = sent_by_observation.get(observation.id.as_str()).copied();
-                let latency_seconds =
-                    sent_at.map(|sent_at| (sent_at - observation.published).num_seconds());
-                let status = match sent_at {
-                    Some(sent_at) if sent_at <= due_at => ReplySloStatus::SentOnTime,
-                    Some(_) => ReplySloStatus::SentLate,
-                    None if now > due_at => ReplySloStatus::Overdue,
-                    None => ReplySloStatus::Pending,
-                };
-                Some(ReplyLatency {
-                    incoming_observation_id: observation.id.clone(),
-                    channel_id: channel_id.to_owned(),
-                    sender_id: sender_id.to_owned(),
-                    thread_ref: thread_ref.to_owned(),
-                    published: observation.published,
-                    due_at,
-                    sent_at,
-                    latency_seconds,
-                    status,
-                })
-            })
-            .collect::<Vec<_>>();
-        rows.sort_by(|left, right| {
-            left.due_at.cmp(&right.due_at).then_with(|| {
-                left.incoming_observation_id
-                    .as_str()
-                    .cmp(right.incoming_observation_id.as_str())
-            })
-        });
-        let overdue = rows
-            .iter()
-            .filter(|row| {
-                matches!(
-                    row.status,
-                    ReplySloStatus::Overdue | ReplySloStatus::SentLate
-                )
-            })
-            .cloned()
-            .collect();
-        ReplySloProjection { rows, overdue }
     }
 
     fn rebuild(&mut self) {
@@ -1507,7 +1509,8 @@ mod tests {
             index.upsert_record(record);
             assert_eq!(
                 serde_json::to_value(
-                    index.project_observations(std::slice::from_ref(&incoming), now)
+                    ReplySloProjector::new(now)
+                        .project_observations(std::slice::from_ref(&incoming), &index)
                 )
                 .unwrap(),
                 serde_json::to_value(
@@ -1609,5 +1612,111 @@ mod tests {
         assert_eq!(projection.rows[0].latency_seconds, Some(20));
         assert_eq!(projection.rows[0].status, ReplySloStatus::SentOnTime);
         assert!(projection.overdue.is_empty());
+    }
+
+    #[test]
+    fn reply_slo_indexed_and_incremental_projection_match_full_rebuild() {
+        let observations = vec![
+            communication_observation(
+                "obs:on-time",
+                "chan:gmail:inbox",
+                at(0),
+                at(0) + chrono::Duration::minutes(30),
+            ),
+            communication_observation(
+                "obs:late",
+                "chan:gmail:inbox",
+                at(1),
+                at(1) + chrono::Duration::minutes(30),
+            ),
+            communication_observation(
+                "obs:unsent",
+                "chan:gmail:inbox",
+                at(2),
+                at(2) + chrono::Duration::minutes(30),
+            ),
+        ];
+        let records = vec![
+            supplemental(
+                "sup:draft-on-time",
+                "reply-draft@1",
+                serde_json::json!({"drafted_at": at(3)}),
+                obs_anchor("obs:on-time"),
+                at(3),
+            ),
+            supplemental(
+                "sup:draft-late",
+                "reply-draft@1",
+                serde_json::json!({"drafted_at": at(4)}),
+                obs_anchor("obs:late"),
+                at(4),
+            ),
+            supplemental(
+                "sup:draft-unsent",
+                "reply-draft@1",
+                serde_json::json!({"drafted_at": at(5)}),
+                obs_anchor("obs:unsent"),
+                at(5),
+            ),
+            supplemental(
+                "sup:send-on-time-later",
+                "send-record@1",
+                serde_json::json!({"sent_at": at(0) + chrono::Duration::minutes(25)}),
+                sup_anchor("sup:draft-on-time"),
+                at(20),
+            ),
+            supplemental(
+                "sup:send-late",
+                "send-record@1",
+                serde_json::json!({"sent_at": at(1) + chrono::Duration::minutes(40)}),
+                sup_anchor("sup:draft-late"),
+                at(21),
+            ),
+            supplemental(
+                "sup:send-on-time-earliest",
+                "send-record@1",
+                serde_json::json!({"sent_at": at(0) + chrono::Duration::minutes(20)}),
+                sup_anchor("sup:draft-on-time"),
+                at(22),
+            ),
+        ];
+        let projector = ReplySloProjector::new(at(0) + chrono::Duration::hours(1));
+        let full = projector.project_records(&observations, &records);
+
+        let join_index = ReplySloJoinIndex::from_records(&records);
+        let indexed = projector.project_observations(&observations, &join_index);
+        assert_eq!(
+            serde_json::to_value(&indexed).unwrap(),
+            serde_json::to_value(&full).unwrap()
+        );
+
+        let mut incremental_index = ReplySloJoinIndex::default();
+        for record in &records {
+            incremental_index.upsert_record(record.clone());
+        }
+        let incremental = projector.project_observations(&observations, &incremental_index);
+        assert_eq!(
+            serde_json::to_value(&incremental).unwrap(),
+            serde_json::to_value(&full).unwrap()
+        );
+        assert_eq!(incremental.rows[0].status, ReplySloStatus::SentOnTime);
+        assert_eq!(incremental.rows[1].status, ReplySloStatus::SentLate);
+        assert_eq!(incremental.rows[2].status, ReplySloStatus::Overdue);
+        assert_eq!(incremental.overdue.len(), 2);
+
+        let earlier_send = supplemental(
+            "sup:send-temporary",
+            "send-record@1",
+            serde_json::json!({"sent_at": at(10)}),
+            sup_anchor("sup:draft-on-time"),
+            at(23),
+        );
+        incremental_index.upsert_record(earlier_send.clone());
+        incremental_index.remove_record(&earlier_send.id);
+        let after_remove = projector.project_observations(&observations, &incremental_index);
+        assert_eq!(
+            serde_json::to_value(&after_remove).unwrap(),
+            serde_json::to_value(&indexed).unwrap()
+        );
     }
 }
