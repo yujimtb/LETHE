@@ -1116,7 +1116,8 @@ fn materialized_snapshot_selection_is_versioned_strict_and_stats_bound() {
     );
 
     let mut version_mismatch = value.clone();
-    version_mismatch["format_version"] = serde_json::json!(4);
+    version_mismatch["format_version"] =
+        serde_json::json!(super::NON_CORPUS_MATERIALIZATION_VERSION + 1);
     assert!(
         super::current_materialized_snapshot(version_mismatch, stats, &fingerprint, 0, 0)
             .unwrap()
@@ -1509,6 +1510,37 @@ fn apply_projection_item_commit(
     }
 }
 
+#[derive(Default)]
+struct TestComponentProjectionLookup {
+    observations: std::collections::BTreeMap<String, lethe_storage_api::StoredObservation>,
+    rows: std::collections::BTreeMap<String, lethe_storage_api::ProjectionItem>,
+    requested_observations: std::cell::RefCell<Vec<String>>,
+}
+
+impl super::ComponentProjectionLookup for TestComponentProjectionLookup {
+    fn stored_observation(
+        &self,
+        observation_id: &lethe_core::domain::ObservationId,
+    ) -> Result<Option<lethe_storage_api::StoredObservation>, SelfHostError> {
+        self.requested_observations
+            .borrow_mut()
+            .push(observation_id.as_str().to_owned());
+        Ok(self.observations.get(observation_id.as_str()).cloned())
+    }
+
+    fn person_message_items(
+        &self,
+        owner_key: &str,
+    ) -> Result<Vec<lethe_storage_api::ProjectionItem>, SelfHostError> {
+        Ok(self
+            .rows
+            .values()
+            .filter(|item| item.owner_key == owner_key)
+            .cloned()
+            .collect())
+    }
+}
+
 fn pending_projection_item_commit(
     materialized: &super::MaterializedProjectionSnapshot,
 ) -> &lethe_storage_api::ProjectionItemCommit {
@@ -1586,11 +1618,9 @@ fn freshness_only_incremental_materialization_matches_full_rebuild() {
         &appended,
         final_stats,
         final_at,
+        &TestComponentProjectionLookup::default(),
     )
     .unwrap();
-    let super::MaterializedDeltaResult::Applied(incremental) = incremental else {
-        panic!("freshness-only delta unexpectedly required full rebuild");
-    };
 
     let mut all = vec![initial];
     all.extend(appended.iter().cloned());
@@ -1709,6 +1739,427 @@ fn wave2_slack_observation(
                 "reply_due_at": reply_due_at.to_rfc3339(),
             },
         }),
+    }
+}
+
+fn component_google_observation(
+    email: &str,
+    key: &str,
+    published: chrono::DateTime<Utc>,
+) -> Observation {
+    Observation {
+        id: Observation::new_id(),
+        schema: SchemaRef::new("schema:workspace-object-snapshot"),
+        schema_version: SemVer::new("1.0.0"),
+        observer: ObserverRef::new("obs:gslides-crawler"),
+        source_system: Some(SourceSystemRef::new("sys:google-slides")),
+        actor: None,
+        authority_model: AuthorityModel::SourceAuthoritative,
+        capture_model: CaptureModel::Snapshot,
+        subject: EntityRef::new(format!("document:gslide:{key}")),
+        target: None,
+        payload: serde_json::json!({
+            "title": format!("profile {key}"),
+            "relations": {
+                "owner": email,
+                "editors": [email],
+            },
+        }),
+        attachments: vec![],
+        published,
+        recorded_at: published + chrono::Duration::seconds(1),
+        consent: None,
+        idempotency_key: IdempotencyKey::new(format!("gslides:{key}:r1")),
+        meta: serde_json::json!({}),
+    }
+}
+
+fn component_consent_observation(
+    identifier: &str,
+    status: &str,
+    key: &str,
+    published: chrono::DateTime<Utc>,
+) -> Observation {
+    Observation {
+        id: Observation::new_id(),
+        schema: SchemaRef::new("schema:consent-decision"),
+        schema_version: SemVer::new("1.0.0"),
+        observer: ObserverRef::new("obs:consent-test"),
+        source_system: Some(SourceSystemRef::new("sys:consent")),
+        actor: None,
+        authority_model: AuthorityModel::LakeAuthoritative,
+        capture_model: CaptureModel::Event,
+        subject: EntityRef::new(format!("consent:{key}")),
+        target: None,
+        payload: serde_json::json!({
+            "identifier": identifier,
+            "status": status,
+        }),
+        attachments: vec![],
+        published,
+        recorded_at: published + chrono::Duration::seconds(1),
+        consent: None,
+        idempotency_key: IdempotencyKey::new(format!("consent:{key}")),
+        meta: serde_json::json!({}),
+    }
+}
+
+fn component_projection_lookup(
+    observations: &[Observation],
+    rows: std::collections::BTreeMap<String, lethe_storage_api::ProjectionItem>,
+) -> TestComponentProjectionLookup {
+    TestComponentProjectionLookup {
+        observations: observations
+            .iter()
+            .enumerate()
+            .map(|(index, observation)| {
+                (
+                    observation.id.as_str().to_owned(),
+                    lethe_storage_api::StoredObservation {
+                        leaf_id: "leaf:test".to_owned(),
+                        append_seq: u64::try_from(index + 1).unwrap(),
+                        observation: observation.clone(),
+                    },
+                )
+            })
+            .collect(),
+        rows,
+        requested_observations: std::cell::RefCell::new(Vec::new()),
+    }
+}
+
+#[test]
+fn slack_late_bridge_reprojects_only_affected_components_and_matches_full_rebuild() {
+    let initial_at = chrono::DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    let final_at = initial_at + chrono::Duration::hours(1);
+    let initial = vec![
+        wave2_slack_observation(
+            "U-A",
+            "Unrelated A",
+            Some("a@example.test"),
+            "1.000001",
+            initial_at,
+        ),
+        wave2_slack_observation(
+            "U-B",
+            "Unrelated B",
+            Some("b@example.test"),
+            "2.000001",
+            initial_at + chrono::Duration::minutes(1),
+        ),
+        wave2_slack_observation(
+            "U-C",
+            "Bridge",
+            Some("c@example.test"),
+            "3.000001",
+            initial_at + chrono::Duration::minutes(2),
+        ),
+        component_google_observation(
+            "d@example.test",
+            "component-d",
+            initial_at + chrono::Duration::minutes(3),
+        ),
+    ];
+    let appended = wave2_slack_observation(
+        "U-C",
+        "Bridge",
+        Some("d@example.test"),
+        "4.000001",
+        final_at,
+    );
+    let initial_stats = lethe_storage_api::ObservationStats {
+        count: 4,
+        max_append_seq: 4,
+    };
+    let initial_materialized = super::MaterializedProjectionSnapshot::build_at(
+        initial.clone(),
+        vec![],
+        vec![],
+        vec![],
+        initial_stats,
+        initial_at,
+    )
+    .unwrap();
+    let mut incremental_rows = std::collections::BTreeMap::new();
+    apply_projection_item_commit(
+        &mut incremental_rows,
+        pending_projection_item_commit(&initial_materialized),
+    );
+    let core =
+        AppCore::from_materialized(initial_materialized, vec![], vec![], vec![], vec![]).unwrap();
+    let mut all = initial.clone();
+    all.push(appended.clone());
+    let lookup = component_projection_lookup(&all, incremental_rows.clone());
+    let final_stats = lethe_storage_api::ObservationStats {
+        count: 5,
+        max_append_seq: 5,
+    };
+
+    let incremental = super::MaterializedProjectionSnapshot::compact_incremental_delta(
+        &core,
+        std::slice::from_ref(&appended),
+        final_stats,
+        final_at,
+        &lookup,
+    )
+    .unwrap();
+    apply_projection_item_commit(
+        &mut incremental_rows,
+        pending_projection_item_commit(&incremental),
+    );
+    let full = super::MaterializedProjectionSnapshot::build_at(
+        all,
+        vec![],
+        vec![],
+        vec![],
+        final_stats,
+        final_at,
+    )
+    .unwrap();
+    let mut full_rows = std::collections::BTreeMap::new();
+    apply_projection_item_commit(&mut full_rows, pending_projection_item_commit(&full));
+
+    let requested = lookup
+        .requested_observations
+        .borrow()
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(!requested.contains(initial[0].id.as_str()));
+    assert!(!requested.contains(initial[1].id.as_str()));
+    assert_eq!(requested.len(), 3);
+    assert_eq!(incremental_rows, full_rows);
+    assert_eq!(
+        serde_json::to_value(incremental).unwrap(),
+        serde_json::to_value(full).unwrap()
+    );
+}
+
+#[test]
+fn slack_identifier_consent_change_reprojects_component_and_matches_full_rebuild() {
+    let initial_at = chrono::DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    let final_at = initial_at + chrono::Duration::hours(1);
+    let initial = vec![
+        wave2_slack_observation("U-A", "Affected", None, "1.000001", initial_at),
+        wave2_slack_observation(
+            "U-B",
+            "Unrelated",
+            Some("unrelated@example.test"),
+            "2.000001",
+            initial_at + chrono::Duration::minutes(1),
+        ),
+        component_consent_observation(
+            "opted-out@example.test",
+            "opted_out",
+            "identifier-opt-out",
+            initial_at + chrono::Duration::minutes(2),
+        ),
+    ];
+    let appended = wave2_slack_observation(
+        "U-A",
+        "Affected",
+        Some("opted-out@example.test"),
+        "3.000001",
+        final_at,
+    );
+    let initial_stats = lethe_storage_api::ObservationStats {
+        count: 3,
+        max_append_seq: 3,
+    };
+    let initial_materialized = super::MaterializedProjectionSnapshot::build_at(
+        initial.clone(),
+        vec![],
+        vec![],
+        vec![],
+        initial_stats,
+        initial_at,
+    )
+    .unwrap();
+    let mut incremental_rows = std::collections::BTreeMap::new();
+    apply_projection_item_commit(
+        &mut incremental_rows,
+        pending_projection_item_commit(&initial_materialized),
+    );
+    let core =
+        AppCore::from_materialized(initial_materialized, vec![], vec![], vec![], vec![]).unwrap();
+    let mut all = initial.clone();
+    all.push(appended.clone());
+    let lookup = component_projection_lookup(&all, incremental_rows.clone());
+    let final_stats = lethe_storage_api::ObservationStats {
+        count: 4,
+        max_append_seq: 4,
+    };
+
+    let incremental = super::MaterializedProjectionSnapshot::compact_incremental_delta(
+        &core,
+        std::slice::from_ref(&appended),
+        final_stats,
+        final_at,
+        &lookup,
+    )
+    .unwrap();
+    apply_projection_item_commit(
+        &mut incremental_rows,
+        pending_projection_item_commit(&incremental),
+    );
+    let full = super::MaterializedProjectionSnapshot::build_at(
+        all,
+        vec![],
+        vec![],
+        vec![],
+        final_stats,
+        final_at,
+    )
+    .unwrap();
+    let mut full_rows = std::collections::BTreeMap::new();
+    apply_projection_item_commit(&mut full_rows, pending_projection_item_commit(&full));
+
+    let requested = lookup
+        .requested_observations
+        .borrow()
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(!requested.contains(initial[1].id.as_str()));
+    assert!(!requested.contains(initial[2].id.as_str()));
+    assert_eq!(requested.len(), 2);
+    assert_eq!(incremental.person_message_count, 1);
+    assert_eq!(incremental_rows, full_rows);
+    assert_eq!(
+        serde_json::to_value(incremental).unwrap(),
+        serde_json::to_value(full).unwrap()
+    );
+}
+
+#[test]
+fn component_reprojection_is_invariant_to_slack_batch_partition() {
+    let initial_at = chrono::DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    let final_at = initial_at + chrono::Duration::hours(2);
+    let initial = vec![
+        component_google_observation("alpha@example.test", "alpha", initial_at),
+        component_google_observation(
+            "beta@example.test",
+            "beta",
+            initial_at + chrono::Duration::minutes(1),
+        ),
+        wave2_slack_observation(
+            "U-GAMMA",
+            "Gamma",
+            Some("gamma@example.test"),
+            "1.000001",
+            initial_at + chrono::Duration::minutes(2),
+        ),
+    ];
+    let deltas = [
+        wave2_slack_observation(
+            "U-ALPHA",
+            "Alpha",
+            Some("alpha@example.test"),
+            "2.000001",
+            initial_at + chrono::Duration::minutes(3),
+        ),
+        wave2_slack_observation(
+            "U-BETA",
+            "Beta",
+            Some("beta@example.test"),
+            "3.000001",
+            initial_at + chrono::Duration::minutes(4),
+        ),
+        wave2_slack_observation(
+            "U-ALPHA",
+            "Alpha",
+            Some("beta@example.test"),
+            "4.000001",
+            initial_at + chrono::Duration::minutes(5),
+        ),
+    ];
+    let mut all = initial.clone();
+    all.extend(deltas.iter().cloned());
+    let final_stats = lethe_storage_api::ObservationStats {
+        count: u64::try_from(all.len()).unwrap(),
+        max_append_seq: u64::try_from(all.len()).unwrap(),
+    };
+    let full = super::MaterializedProjectionSnapshot::build_at(
+        all.clone(),
+        vec![],
+        vec![],
+        vec![],
+        final_stats,
+        final_at,
+    )
+    .unwrap();
+    let mut full_rows = std::collections::BTreeMap::new();
+    apply_projection_item_commit(&mut full_rows, pending_projection_item_commit(&full));
+
+    for partition in [vec![1, 1, 1], vec![2, 1], vec![1, 2], vec![3]] {
+        let initial_stats = lethe_storage_api::ObservationStats {
+            count: u64::try_from(initial.len()).unwrap(),
+            max_append_seq: u64::try_from(initial.len()).unwrap(),
+        };
+        let initial_materialized = super::MaterializedProjectionSnapshot::build_at(
+            initial.clone(),
+            vec![],
+            vec![],
+            vec![],
+            initial_stats,
+            initial_at,
+        )
+        .unwrap();
+        let mut rows = std::collections::BTreeMap::new();
+        apply_projection_item_commit(
+            &mut rows,
+            pending_projection_item_commit(&initial_materialized),
+        );
+        let mut core =
+            AppCore::from_materialized(initial_materialized, vec![], vec![], vec![], vec![])
+                .unwrap();
+        let mut consumed = 0;
+
+        for &batch_size in &partition {
+            let batch = &deltas[consumed..consumed + batch_size];
+            consumed += batch_size;
+            let stats = lethe_storage_api::ObservationStats {
+                count: u64::try_from(initial.len() + consumed).unwrap(),
+                max_append_seq: u64::try_from(initial.len() + consumed).unwrap(),
+            };
+            let lookup =
+                component_projection_lookup(&all[..initial.len() + consumed], rows.clone());
+            let incremental = super::MaterializedProjectionSnapshot::compact_incremental_delta(
+                &core, batch, stats, final_at, &lookup,
+            )
+            .unwrap();
+            apply_projection_item_commit(&mut rows, pending_projection_item_commit(&incremental));
+            core =
+                AppCore::from_materialized(*incremental, vec![], vec![], vec![], vec![]).unwrap();
+        }
+
+        assert_eq!(consumed, deltas.len());
+        assert_eq!(rows, full_rows, "partition {partition:?}");
+        let incremental_value = serde_json::to_value(super::MaterializedProjectionSnapshot {
+            format_version: super::NON_CORPUS_MATERIALIZATION_VERSION,
+            last_append_seq: core.observation_stats.max_append_seq,
+            observation_count: core.observation_stats.count,
+            canonical_observation_fingerprint: core.canonical_observation_fingerprint.clone(),
+            supplemental_fingerprint: core.supplemental_fingerprint.clone(),
+            compact_state: core.compact_state.clone(),
+            person_consents: core.person_consents.clone(),
+            person_message_count: core.person_message_count,
+            reply_slo_count: core.reply_slo_count,
+            snapshot: core.snapshot.clone(),
+            pending_item_commit: None,
+        })
+        .unwrap();
+        assert_eq!(
+            incremental_value,
+            serde_json::to_value(&full).unwrap(),
+            "partition {partition:?}"
+        );
     }
 }
 
@@ -2190,11 +2641,9 @@ fn wave2_slack_incremental_materialization_matches_normalized_full_rebuild() {
         &appended,
         final_stats,
         final_at,
+        &TestComponentProjectionLookup::default(),
     )
     .unwrap();
-    let super::MaterializedDeltaResult::Applied(incremental) = incremental else {
-        panic!("Wave2-compatible Slack delta unexpectedly required full rebuild");
-    };
     let incremental_reply_keys = match pending_projection_item_commit(&incremental) {
         lethe_storage_api::ProjectionItemCommit::Delta {
             inserts,

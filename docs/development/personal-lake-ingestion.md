@@ -621,12 +621,19 @@ persistent corpus index consumes only the new canonical tail and upserts each
 `record_id` once. Normal imports continue to materialize non-corpus projections
 after each request. Multi-request backfills must use the explicit bulk import
 session described below so that the non-corpus full rebuild runs once at the
-final high-water instead of once per request. A non-corpus rebuild performs two
-bounded page passes, writes message and reply-SLO rows to a SQLite staging
-projection, and atomically publishes the verified manifest and rows. These
-paths never load all observations or the full corpus into memory. Do not
-reintroduce per-observation materialization, per-observation audit writes, or a
-full corpus-index rebuild on normal import.
+final high-water instead of once per request. A reference non-corpus rebuild
+fixes one canonical high-water, performs two bounded page passes, writes message
+and reply-SLO rows to a SQLite staging projection, and atomically publishes the
+verified manifest and rows. Normal Slack deltas use compact identity Observation
+references. Stable topology appends remain direct inserts; topology,
+identifier-owner, and consent changes re-project only the affected old/new
+component and commit strict owner-scoped message inserts/updates/deletes with
+the manifest. Missing references or owner inconsistency fail explicitly. See
+[Identity / person-page component-local re-projection](identity-person-page-local-reprojection.md).
+These paths never load all observations or the full corpus into memory. Do not
+reintroduce per-observation materialization, per-observation audit writes, a
+normal Slack topology fallback to full non-corpus rebuild, or a full corpus-index
+rebuild on normal import.
 
 ### Bulk import session
 

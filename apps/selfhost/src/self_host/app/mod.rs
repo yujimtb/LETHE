@@ -27,8 +27,8 @@ use lethe_api::api::pagination::{PaginatedResponse, PaginationParams, paginate};
 use lethe_api::api::read_mode::{ReadModeError, ReadModeResolver};
 use lethe_core::domain::{
     ActorRef, AuthorityModel, BlobRef, CaptureModel, EntityRef, IngestResult, Observation,
-    ObserverRef, ProjectionHealth, ProjectionRef, ProjectionStatus, ReadMode, SchemaRef, SemVer,
-    SourceSystemRef, SupplementalId, SupplementalRecord,
+    ObservationId, ObserverRef, ProjectionHealth, ProjectionRef, ProjectionStatus, ReadMode,
+    SchemaRef, SemVer, SourceSystemRef, SupplementalId, SupplementalRecord,
 };
 use lethe_derivation_gemini::{GeminiSlideAnalyzer, SlideAnalysisProjector};
 use lethe_engine::identity::projector::IdentityProjector;
@@ -220,11 +220,6 @@ enum NonCorpusDeltaKind {
     FullRebuild,
 }
 
-enum MaterializedDeltaResult {
-    Applied(Box<MaterializedProjectionSnapshot>),
-    FullRebuildRequired(String),
-}
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CompactProjectionState {
@@ -238,6 +233,7 @@ struct CompactProjectionState {
 struct CompactIdentityCandidate {
     first_ordinal: u64,
     slack_user_id: Option<String>,
+    observation_ids: Vec<String>,
     candidate: PersonCandidate,
 }
 
@@ -256,7 +252,41 @@ struct CompactConsentDecision {
 struct PendingProjectionItemCommit {
     base_person_message_count: u64,
     base_reply_slo_count: u64,
+    replaced_person_owners: BTreeSet<String>,
     commit: ProjectionItemCommit,
+}
+
+struct CompactIdentityResolution {
+    identity: IdentityResolutionOutput,
+    members_by_person: BTreeMap<String, BTreeSet<u64>>,
+}
+
+trait ComponentProjectionLookup {
+    fn stored_observation(
+        &self,
+        observation_id: &ObservationId,
+    ) -> Result<Option<StoredObservation>, SelfHostError>;
+
+    fn person_message_items(&self, owner_key: &str) -> Result<Vec<ProjectionItem>, SelfHostError>;
+}
+
+struct StorageComponentProjectionLookup<'a> {
+    storage: &'a dyn StoragePorts,
+}
+
+impl ComponentProjectionLookup for StorageComponentProjectionLookup<'_> {
+    fn stored_observation(
+        &self,
+        observation_id: &ObservationId,
+    ) -> Result<Option<StoredObservation>, SelfHostError> {
+        Ok(self.storage.observation_by_id(observation_id)?)
+    }
+
+    fn person_message_items(&self, owner_key: &str) -> Result<Vec<ProjectionItem>, SelfHostError> {
+        Ok(self
+            .storage
+            .projection_items_by_owner(&ProjectionRef::new("proj:person-page"), owner_key)?)
+    }
 }
 
 struct SupplementalMaterializedDelta {
@@ -1006,23 +1036,30 @@ impl CompactProjectionState {
             for candidate in
                 IdentityProjector::extract_candidates(std::slice::from_ref(observation))
             {
-                state.add_identity_candidate(candidate, &mut slack_candidate_index)?;
+                state.add_identity_candidate(
+                    candidate,
+                    observation.id.as_str(),
+                    &mut slack_candidate_index,
+                )?;
             }
         }
         state.validate()?;
         Ok(state)
     }
 
-    fn with_observation_delta(&self, observations: &[Observation]) -> Result<Self, SelfHostError> {
+    fn with_observation_delta(
+        &self,
+        observations: &[Observation],
+    ) -> Result<(Self, BTreeSet<u64>), SelfHostError> {
         let mut state = self.clone();
-        state.apply_observation_page(observations)?;
-        Ok(state)
+        let touched_members = state.apply_observation_page(observations)?;
+        Ok((state, touched_members))
     }
 
     fn apply_observation_page(
         &mut self,
         observations: &[Observation],
-    ) -> Result<(), SelfHostError> {
+    ) -> Result<BTreeSet<u64>, SelfHostError> {
         let mut slack_candidate_index = self
             .identity_candidates
             .iter()
@@ -1034,6 +1071,7 @@ impl CompactProjectionState {
                     .map(|user_id| (user_id.clone(), index))
             })
             .collect::<BTreeMap<_, _>>();
+        let mut touched_members = BTreeSet::new();
         for observation in observations {
             self.capture_consent_decision(observation);
             let candidates =
@@ -1045,17 +1083,23 @@ impl CompactProjectionState {
                 )));
             }
             for candidate in candidates {
-                self.add_identity_candidate(candidate, &mut slack_candidate_index)?;
+                touched_members.insert(self.add_identity_candidate(
+                    candidate,
+                    observation.id.as_str(),
+                    &mut slack_candidate_index,
+                )?);
             }
         }
-        self.validate()
+        self.validate()?;
+        Ok(touched_members)
     }
 
     fn add_identity_candidate(
         &mut self,
         mut candidate: PersonCandidate,
+        observation_id: &str,
         slack_candidate_index: &mut BTreeMap<String, usize>,
-    ) -> Result<(), SelfHostError> {
+    ) -> Result<u64, SelfHostError> {
         let ordinal = self.next_identity_ordinal;
         self.next_identity_ordinal =
             self.next_identity_ordinal.checked_add(1).ok_or_else(|| {
@@ -1080,12 +1124,24 @@ impl CompactProjectionState {
                         ))
                     })?;
                 merge_source_internal_candidate(&mut existing.candidate, candidate);
-                return Ok(());
+                if existing
+                    .observation_ids
+                    .iter()
+                    .any(|existing_id| existing_id == observation_id)
+                {
+                    return Err(SelfHostError::Ingestion(format!(
+                        "identity candidate {} repeats observation {observation_id}",
+                        existing.first_ordinal
+                    )));
+                }
+                existing.observation_ids.push(observation_id.to_owned());
+                return Ok(existing.first_ordinal);
             }
             let candidate_index = self.identity_candidates.len();
             self.identity_candidates.push(CompactIdentityCandidate {
                 first_ordinal: ordinal,
                 slack_user_id: Some(slack_user_id.clone()),
+                observation_ids: vec![observation_id.to_owned()],
                 candidate,
             });
             slack_candidate_index.insert(slack_user_id, candidate_index);
@@ -1093,10 +1149,11 @@ impl CompactProjectionState {
             self.identity_candidates.push(CompactIdentityCandidate {
                 first_ordinal: ordinal,
                 slack_user_id: None,
+                observation_ids: vec![observation_id.to_owned()],
                 candidate,
             });
         }
-        Ok(())
+        Ok(ordinal)
     }
 
     fn capture_consent_decision(&mut self, observation: &Observation) {
@@ -1124,14 +1181,35 @@ impl CompactProjectionState {
     }
 
     fn resolve_identity(&self) -> IdentityResolutionOutput {
+        self.resolve_identity_with_components().identity
+    }
+
+    fn resolve_identity_with_components(&self) -> CompactIdentityResolution {
         let mut entries = self.identity_candidates.iter().collect::<Vec<_>>();
         entries.sort_by_key(|entry| entry.first_ordinal);
         let candidates = entries
-            .into_iter()
+            .iter()
             .map(|entry| entry.candidate.clone())
             .collect::<Vec<_>>();
         let matches = IdentityProjector::cross_source_match(&candidates);
-        IdentityProjector::new("1.0.0").resolve(&candidates, &matches)
+        let (identity, grouped_members) =
+            IdentityProjector::new("1.0.0").resolve_with_component_members(&candidates, &matches);
+        let members_by_person = identity
+            .resolved_persons
+            .iter()
+            .zip(grouped_members)
+            .map(|(person, members)| {
+                let members = members
+                    .into_iter()
+                    .map(|member_index| entries[member_index].first_ordinal)
+                    .collect();
+                (person.person_id.as_str().to_owned(), members)
+            })
+            .collect();
+        CompactIdentityResolution {
+            identity,
+            members_by_person,
+        }
     }
 
     fn person_consents(
@@ -1191,6 +1269,27 @@ impl CompactProjectionState {
                 ));
             }
             previous_ordinal = Some(entry.first_ordinal);
+            if entry.observation_ids.is_empty() {
+                return Err(SelfHostError::Ingestion(format!(
+                    "identity candidate {} has no source observation",
+                    entry.first_ordinal
+                )));
+            }
+            let mut observation_ids = BTreeSet::new();
+            for observation_id in &entry.observation_ids {
+                if observation_id.trim().is_empty() {
+                    return Err(SelfHostError::Ingestion(format!(
+                        "identity candidate {} has a blank source observation",
+                        entry.first_ordinal
+                    )));
+                }
+                if !observation_ids.insert(observation_id) {
+                    return Err(SelfHostError::Ingestion(format!(
+                        "identity candidate {} repeats source observation {observation_id}",
+                        entry.first_ordinal
+                    )));
+                }
+            }
             match (&entry.slack_user_id, entry.candidate.source.as_str()) {
                 (Some(user_id), "slack") => {
                     if slack_user_id_for_candidate(&entry.candidate).as_deref()
@@ -1326,6 +1425,7 @@ impl MaterializedProjectionSnapshot {
             pending_item_commit: Some(PendingProjectionItemCommit {
                 base_person_message_count: 0,
                 base_reply_slo_count: 0,
+                replaced_person_owners: BTreeSet::new(),
                 commit: projection_item_commit,
             }),
         };
@@ -1338,7 +1438,8 @@ impl MaterializedProjectionSnapshot {
         appended_observations: &[Observation],
         stats: ObservationStats,
         built_at: DateTime<Utc>,
-    ) -> Result<MaterializedDeltaResult, SelfHostError> {
+        lookup: &dyn ComponentProjectionLookup,
+    ) -> Result<Box<MaterializedProjectionSnapshot>, SelfHostError> {
         if appended_observations.is_empty() {
             return Err(SelfHostError::Ingestion(
                 "compact materialization delta must contain an appended observation".to_owned(),
@@ -1381,13 +1482,18 @@ impl MaterializedProjectionSnapshot {
             &core.canonical_observation_fingerprint,
             appended_observations,
         )?;
-        let compact_state = core
+        let (compact_state, touched_members) = core
             .compact_state
             .with_observation_delta(appended_observations)?;
-        let identity = compact_state.resolve_identity();
+        let current_resolution = core.compact_state.resolve_identity_with_components();
+        let next_resolution = compact_state.resolve_identity_with_components();
+        let identity = next_resolution.identity.clone();
         let person_consents = compact_state.person_consents(&identity);
         let mut snapshot = core.snapshot.clone();
-        let mut message_upserts = Vec::new();
+        let mut message_inserts = Vec::new();
+        let mut message_updates = Vec::new();
+        let mut message_deletes = Vec::new();
+        let mut replaced_person_owners = BTreeSet::new();
         if appended_observations
             .iter()
             .any(|observation| observation.schema.as_str() == "schema:slack-message")
@@ -1401,26 +1507,40 @@ impl MaterializedProjectionSnapshot {
                 appended_observations,
             )? {
                 Some(person_page) => person_page,
-                None => {
-                    return Ok(MaterializedDeltaResult::FullRebuildRequired(
-                        "Slack identity topology, identifier ownership, or consent changed"
-                            .to_owned(),
-                    ));
-                }
+                None => reproject_affected_person_components(
+                    &compact_state,
+                    &current_resolution,
+                    &next_resolution,
+                    &snapshot.person_page,
+                    &core.person_consents,
+                    &person_consents,
+                    &touched_members,
+                    &core.supplemental_projection_cache.records,
+                    stats.max_append_seq,
+                    lookup,
+                )?,
             };
             snapshot.identity = identity;
             snapshot.person_page = person_page_delta.person_page;
-            message_upserts = person_page_delta.message_upserts;
+            message_inserts = person_page_delta.message_inserts;
+            message_updates = person_page_delta.message_updates;
+            message_deletes = person_page_delta.message_deletes;
+            replaced_person_owners = person_page_delta.replaced_person_owners;
         }
-        let appended_person_message_count = u64::try_from(message_upserts.len()).map_err(|_| {
+        let inserted_person_message_count = u64::try_from(message_inserts.len()).map_err(|_| {
             SelfHostError::Ingestion("incremental person message count does not fit u64".to_owned())
+        })?;
+        let deleted_person_message_count = u64::try_from(message_deletes.len()).map_err(|_| {
+            SelfHostError::Ingestion("deleted person message count does not fit u64".to_owned())
         })?;
         let person_message_count = core
             .person_message_count
-            .checked_add(appended_person_message_count)
+            .checked_add(inserted_person_message_count)
+            .and_then(|count| count.checked_sub(deleted_person_message_count))
             .ok_or_else(|| {
                 SelfHostError::Ingestion(
-                    "person message count overflow during incremental materialization".to_owned(),
+                    "person message count overflow or underflow during incremental materialization"
+                        .to_owned(),
                 )
             })?;
         snapshot.freshness = freshness_projection_after_delta(
@@ -1489,18 +1609,19 @@ impl MaterializedProjectionSnapshot {
             pending_item_commit: Some(PendingProjectionItemCommit {
                 base_person_message_count: core.person_message_count,
                 base_reply_slo_count: core.reply_slo_count,
+                replaced_person_owners,
                 commit: ProjectionItemCommit::Delta {
-                    inserts: message_upserts
+                    inserts: message_inserts
                         .into_iter()
                         .chain(reply_slo_upserts)
                         .collect(),
-                    updates: Vec::new(),
-                    deletes: Vec::new(),
+                    updates: message_updates,
+                    deletes: message_deletes,
                 },
             }),
         };
         materialized.validate()?;
-        Ok(MaterializedDeltaResult::Applied(Box::new(materialized)))
+        Ok(Box::new(materialized))
     }
 }
 
@@ -1568,7 +1689,10 @@ fn contributes_to_reply_slo(observation: &Observation) -> bool {
 
 struct IncrementalPersonPageResult {
     person_page: PersonPageOutput,
-    message_upserts: Vec<ProjectionItem>,
+    message_inserts: Vec<ProjectionItem>,
+    message_updates: Vec<ProjectionItem>,
+    message_deletes: Vec<String>,
+    replaced_person_owners: BTreeSet<String>,
 }
 
 fn merge_non_slack_person_page(
@@ -1836,8 +1960,368 @@ fn increment_person_page_for_slack(
             messages: Vec::new(),
             activities,
         },
-        message_upserts,
+        message_inserts: message_upserts,
+        message_updates: Vec::new(),
+        message_deletes: Vec::new(),
+        replaced_person_owners: BTreeSet::new(),
     }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reproject_affected_person_components(
+    next_state: &CompactProjectionState,
+    current_resolution: &CompactIdentityResolution,
+    next_resolution: &CompactIdentityResolution,
+    current_page: &PersonPageOutput,
+    current_consents: &BTreeMap<String, ConsentStatus>,
+    next_consents: &BTreeMap<String, ConsentStatus>,
+    touched_members: &BTreeSet<u64>,
+    supplemental_records: &[lethe_core::domain::SupplementalRecord],
+    canonical_high_water: u64,
+    lookup: &dyn ComponentProjectionLookup,
+) -> Result<IncrementalPersonPageResult, SelfHostError> {
+    if !current_page.messages.is_empty() {
+        return Err(SelfHostError::Ingestion(
+            "component re-projection received resident historical messages".to_owned(),
+        ));
+    }
+
+    let affected_members = affected_identity_members(
+        current_resolution,
+        next_resolution,
+        current_consents,
+        next_consents,
+        touched_members,
+    );
+    if affected_members.is_empty() {
+        return Err(SelfHostError::Ingestion(
+            "identity delta did not identify an affected component".to_owned(),
+        ));
+    }
+
+    let affected_current_people =
+        component_people_intersecting(&current_resolution.members_by_person, &affected_members);
+    let affected_next_people =
+        component_people_intersecting(&next_resolution.members_by_person, &affected_members);
+
+    let mut source_observation_ids = BTreeSet::new();
+    for entry in &next_state.identity_candidates {
+        if affected_members.contains(&entry.first_ordinal) {
+            source_observation_ids.extend(entry.observation_ids.iter().cloned());
+        }
+    }
+    if source_observation_ids.is_empty() {
+        return Err(SelfHostError::Ingestion(
+            "affected identity components have no source observations".to_owned(),
+        ));
+    }
+
+    let mut observations_by_append_seq = BTreeMap::new();
+    for observation_id in &source_observation_ids {
+        let observation_ref = ObservationId::new(observation_id);
+        let stored = lookup
+            .stored_observation(&observation_ref)?
+            .ok_or_else(|| {
+                SelfHostError::Ingestion(format!(
+                    "affected component references missing observation {observation_id}"
+                ))
+            })?;
+        if stored.observation.id != observation_ref {
+            return Err(SelfHostError::Ingestion(format!(
+                "affected component lookup returned {} for {observation_id}",
+                stored.observation.id
+            )));
+        }
+        if stored.append_seq == 0 || stored.append_seq > canonical_high_water {
+            return Err(SelfHostError::Ingestion(format!(
+                "affected observation {observation_id} has append sequence {} outside high-water {canonical_high_water}",
+                stored.append_seq
+            )));
+        }
+        if let Some(previous) =
+            observations_by_append_seq.insert(stored.append_seq, stored.observation)
+        {
+            return Err(SelfHostError::Ingestion(format!(
+                "affected observations {} and {observation_id} share append sequence {}",
+                previous.id, stored.append_seq
+            )));
+        }
+    }
+    let observations = observations_by_append_seq.into_values().collect::<Vec<_>>();
+
+    let affected_identity = IdentityResolutionOutput {
+        resolved_persons: next_resolution
+            .identity
+            .resolved_persons
+            .iter()
+            .filter(|person| affected_next_people.contains(person.person_id.as_str()))
+            .cloned()
+            .collect(),
+        candidates: Vec::new(),
+        person_identifiers: next_resolution
+            .identity
+            .person_identifiers
+            .iter()
+            .filter(|row| affected_next_people.contains(row.person_id.as_str()))
+            .cloned()
+            .collect(),
+    };
+    let affected_supplementals = supplemental_records
+        .iter()
+        .filter(|record| {
+            record
+                .derived_from
+                .observations
+                .iter()
+                .any(|observation_id| source_observation_ids.contains(observation_id.as_str()))
+        })
+        .collect::<Vec<_>>();
+    let mut reprojected =
+        PersonPageProjector::project(&affected_identity, &observations, &affected_supplementals);
+    reprojected.profiles.retain(|profile| {
+        next_consents.get(profile.person_id.as_str()) != Some(&ConsentStatus::OptedOut)
+    });
+    reprojected.slides.retain(|slide| {
+        next_consents.get(slide.person_id.as_str()) != Some(&ConsentStatus::OptedOut)
+    });
+    reprojected.messages.retain(|message| {
+        next_consents.get(message.person_id.as_str()) != Some(&ConsentStatus::OptedOut)
+    });
+    reprojected.activities.retain(|activity| {
+        next_consents.get(activity.person_id.as_str()) != Some(&ConsentStatus::OptedOut)
+    });
+
+    let mut existing_items = BTreeMap::new();
+    for owner in &affected_current_people {
+        for item in lookup.person_message_items(owner)? {
+            let message = person_message_from_projection_item(&item)?;
+            if item.owner_key != *owner || message.person_id.as_str() != owner {
+                return Err(SelfHostError::Ingestion(format!(
+                    "projection item {} was returned for the wrong owner {owner}",
+                    item.item_key
+                )));
+            }
+            if existing_items.insert(item.item_key.clone(), item).is_some() {
+                return Err(SelfHostError::Ingestion(format!(
+                    "affected component contains duplicate person message item {}",
+                    message.id
+                )));
+            }
+        }
+    }
+
+    let reprojected_messages = std::mem::take(&mut reprojected.messages);
+    let mut desired_items = BTreeMap::new();
+    for message in &reprojected_messages {
+        let item = person_message_projection_item(message)?;
+        if desired_items.insert(item.item_key.clone(), item).is_some() {
+            return Err(SelfHostError::Ingestion(format!(
+                "component re-projection produced duplicate message {}",
+                message.id
+            )));
+        }
+    }
+
+    let mut message_inserts = Vec::new();
+    let mut message_updates = Vec::new();
+    for (item_key, item) in desired_items {
+        if existing_items.remove(&item_key).is_some() {
+            // Replaced owners publish their complete desired row set. Keeping
+            // equal rows in `updates` lets validation prove ordinal coverage
+            // without loading unrelated owners.
+            message_updates.push(item);
+        } else {
+            message_inserts.push(item);
+        }
+    }
+    let message_deletes = existing_items.into_keys().collect::<Vec<_>>();
+
+    let mut person_page = current_page.clone();
+    person_page
+        .profiles
+        .retain(|profile| !affected_current_people.contains(profile.person_id.as_str()));
+    person_page
+        .slides
+        .retain(|slide| !affected_current_people.contains(slide.person_id.as_str()));
+    person_page
+        .activities
+        .retain(|activity| !affected_current_people.contains(activity.person_id.as_str()));
+    person_page.profiles.extend(reprojected.profiles);
+    person_page.slides.extend(reprojected.slides);
+    person_page.activities.extend(reprojected.activities);
+
+    sort_person_page_for_identity(&mut person_page, &next_resolution.identity)?;
+
+    let next_person_ids = next_resolution
+        .identity
+        .resolved_persons
+        .iter()
+        .map(|person| person.person_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for owner in person_page
+        .profiles
+        .iter()
+        .map(|profile| profile.person_id.as_str())
+        .chain(
+            person_page
+                .slides
+                .iter()
+                .map(|slide| slide.person_id.as_str()),
+        )
+        .chain(
+            person_page
+                .activities
+                .iter()
+                .map(|activity| activity.person_id.as_str()),
+        )
+    {
+        if !next_person_ids.contains(owner) {
+            return Err(SelfHostError::Ingestion(format!(
+                "component re-projection retained row for removed person {owner}"
+            )));
+        }
+    }
+
+    let replaced_person_owners = affected_current_people
+        .union(&affected_next_people)
+        .cloned()
+        .collect();
+    Ok(IncrementalPersonPageResult {
+        person_page,
+        message_inserts,
+        message_updates,
+        message_deletes,
+        replaced_person_owners,
+    })
+}
+
+fn affected_identity_members(
+    current: &CompactIdentityResolution,
+    next: &CompactIdentityResolution,
+    current_consents: &BTreeMap<String, ConsentStatus>,
+    next_consents: &BTreeMap<String, ConsentStatus>,
+    touched_members: &BTreeSet<u64>,
+) -> BTreeSet<u64> {
+    let mut affected = touched_members.clone();
+
+    let current_by_signature = component_people_by_signature(&current.members_by_person);
+    let next_by_signature = component_people_by_signature(&next.members_by_person);
+    for (signature, current_person) in &current_by_signature {
+        if let Some(next_person) = next_by_signature.get(signature)
+            && (current_person != next_person
+                || current_consents.get(current_person) != next_consents.get(next_person))
+        {
+            affected.extend(signature.iter().copied());
+        }
+    }
+
+    let current_owners = identity_identifier_owners(&current.identity);
+    let next_owners = identity_identifier_owners(&next.identity);
+    for identifier in current_owners.keys().chain(next_owners.keys()) {
+        let current_owner = current_owners.get(identifier);
+        let next_owner = next_owners.get(identifier);
+        if current_owner != next_owner {
+            if let Some(owner) = current_owner
+                && let Some(members) = current.members_by_person.get(owner)
+            {
+                affected.extend(members.iter().copied());
+            }
+            if let Some(owner) = next_owner
+                && let Some(members) = next.members_by_person.get(owner)
+            {
+                affected.extend(members.iter().copied());
+            }
+        }
+    }
+
+    loop {
+        let before = affected.len();
+        for members in current
+            .members_by_person
+            .values()
+            .chain(next.members_by_person.values())
+        {
+            if members.iter().any(|member| affected.contains(member)) {
+                affected.extend(members.iter().copied());
+            }
+        }
+        if affected.len() == before {
+            break;
+        }
+    }
+    affected
+}
+
+fn component_people_by_signature(
+    members_by_person: &BTreeMap<String, BTreeSet<u64>>,
+) -> BTreeMap<Vec<u64>, String> {
+    members_by_person
+        .iter()
+        .map(|(person_id, members)| {
+            (
+                members.iter().copied().collect::<Vec<_>>(),
+                person_id.clone(),
+            )
+        })
+        .collect()
+}
+
+fn component_people_intersecting(
+    members_by_person: &BTreeMap<String, BTreeSet<u64>>,
+    affected_members: &BTreeSet<u64>,
+) -> BTreeSet<String> {
+    members_by_person
+        .iter()
+        .filter(|(_, members)| {
+            members
+                .iter()
+                .any(|member| affected_members.contains(member))
+        })
+        .map(|(person_id, _)| person_id.clone())
+        .collect()
+}
+
+fn sort_person_page_for_identity(
+    person_page: &mut PersonPageOutput,
+    identity: &IdentityResolutionOutput,
+) -> Result<(), SelfHostError> {
+    let identity_order = identity
+        .resolved_persons
+        .iter()
+        .enumerate()
+        .map(|(index, person)| (person.person_id.as_str().to_owned(), index))
+        .collect::<BTreeMap<_, _>>();
+    let rank = |person_id: &str| {
+        identity_order.get(person_id).copied().ok_or_else(|| {
+            SelfHostError::Ingestion(format!(
+                "person-page row references unknown person {person_id}"
+            ))
+        })
+    };
+    person_page
+        .profiles
+        .sort_by_key(|profile| rank(profile.person_id.as_str()).unwrap_or(usize::MAX));
+    person_page
+        .activities
+        .sort_by_key(|activity| rank(activity.person_id.as_str()).unwrap_or(usize::MAX));
+
+    let mut slide_sort_keys = BTreeMap::new();
+    for slide in &person_page.slides {
+        let key = (
+            rank(slide.person_id.as_str())?,
+            person_slide_ordinal(slide)?,
+        );
+        if slide_sort_keys.insert(slide.id.clone(), key).is_some() {
+            return Err(SelfHostError::Ingestion(format!(
+                "person-page contains duplicate slide id {}",
+                slide.id
+            )));
+        }
+    }
+    person_page
+        .slides
+        .sort_by_key(|slide| slide_sort_keys[&slide.id]);
+    Ok(())
 }
 
 fn identity_identifier_owners(identity: &IdentityResolutionOutput) -> BTreeMap<String, String> {
@@ -2109,68 +2593,113 @@ fn validate_pending_projection_item_commit(
             ))
         })
         .collect::<Result<BTreeMap<_, _>, SelfHostError>>()?;
-    let (items, replace) = match &pending.commit {
+    let (inserts, updates, deletes, replace) = match &pending.commit {
         ProjectionItemCommit::Replace { items } => {
-            if pending.base_person_message_count != 0 || pending.base_reply_slo_count != 0 {
+            if pending.base_person_message_count != 0
+                || pending.base_reply_slo_count != 0
+                || !pending.replaced_person_owners.is_empty()
+            {
                 return Err(SelfHostError::Ingestion(
-                    "projection item replace commit must have zero base counts".to_owned(),
+                    "projection item replace commit must have zero base counts and owners"
+                        .to_owned(),
                 ));
             }
-            (items.as_slice(), true)
+            (items.as_slice(), &[][..], &[][..], true)
         }
         ProjectionItemCommit::Delta {
             inserts,
             updates,
             deletes,
-        } => {
-            if !deletes.is_empty() {
-                return Err(SelfHostError::Ingestion(
-                    "incremental projection item commit must not delete rows".to_owned(),
-                ));
-            }
-            if !updates.is_empty() {
-                return Err(SelfHostError::Ingestion(
-                    "observation projection item delta must not update existing rows".to_owned(),
-                ));
-            }
-            (inserts.as_slice(), false)
-        }
+        } => (
+            inserts.as_slice(),
+            updates.as_slice(),
+            deletes.as_slice(),
+            false,
+        ),
     };
 
-    let mut person_items = Vec::new();
-    let mut reply_slo_items = Vec::new();
-    for item in items {
+    let mut inserted_person_items = Vec::new();
+    let mut inserted_reply_slo_items = Vec::new();
+    for item in inserts {
         if item.owner_key == REPLY_SLO_ITEM_OWNER {
             reply_slo_from_projection_item(item)?;
-            reply_slo_items.push(item);
+            inserted_reply_slo_items.push(item);
         } else {
             person_message_from_projection_item(item)?;
-            person_items.push(item);
+            inserted_person_items.push(item);
         }
     }
-    let person_item_count = u64::try_from(person_items.len()).map_err(|_| {
+    let mut updated_person_items = Vec::new();
+    for item in updates {
+        if item.owner_key == REPLY_SLO_ITEM_OWNER {
+            reply_slo_from_projection_item(item)?;
+        } else {
+            person_message_from_projection_item(item)?;
+            if !pending.replaced_person_owners.contains(&item.owner_key) {
+                return Err(SelfHostError::Ingestion(format!(
+                    "person message update {} does not belong to a replaced owner",
+                    item.item_key
+                )));
+            }
+            updated_person_items.push(item);
+        }
+    }
+
+    let mut deleted_person_item_count = 0_u64;
+    for item_key in deletes {
+        if item_key.starts_with("reply-slo:") {
+            return Err(SelfHostError::Ingestion(
+                "observation projection delta must not delete reply SLO rows".to_owned(),
+            ));
+        }
+        let belongs_to_replaced_owner = pending.replaced_person_owners.iter().any(|owner| {
+            item_key
+                .strip_prefix("pm:")
+                .is_some_and(|suffix| suffix.starts_with(&format!("{owner}:")))
+        });
+        if !belongs_to_replaced_owner {
+            return Err(SelfHostError::Ingestion(format!(
+                "person message delete {item_key} does not belong to a replaced owner"
+            )));
+        }
+        deleted_person_item_count = deleted_person_item_count.checked_add(1).ok_or_else(|| {
+            SelfHostError::Ingestion("pending person message delete count overflow".to_owned())
+        })?;
+    }
+
+    let inserted_person_item_count = u64::try_from(inserted_person_items.len()).map_err(|_| {
         SelfHostError::Ingestion("pending person message item count does not fit u64".to_owned())
     })?;
-    let reply_slo_item_count = u64::try_from(reply_slo_items.len()).map_err(|_| {
-        SelfHostError::Ingestion("pending reply SLO item count does not fit u64".to_owned())
-    })?;
-    let expected_person_message_count = pending
-        .base_person_message_count
-        .checked_add(person_item_count)
-        .ok_or_else(|| {
-            SelfHostError::Ingestion("pending person message commit count overflow".to_owned())
+    let inserted_reply_slo_item_count =
+        u64::try_from(inserted_reply_slo_items.len()).map_err(|_| {
+            SelfHostError::Ingestion("pending reply SLO item count does not fit u64".to_owned())
         })?;
+    let expected_person_message_count = if replace {
+        inserted_person_item_count
+    } else {
+        pending
+            .base_person_message_count
+            .checked_add(inserted_person_item_count)
+            .and_then(|count| count.checked_sub(deleted_person_item_count))
+            .ok_or_else(|| {
+                SelfHostError::Ingestion("pending person message commit count overflow".to_owned())
+            })?
+    };
     if expected_person_message_count != final_person_message_count {
         return Err(SelfHostError::Ingestion(format!(
             "pending person message commit yields {expected_person_message_count} rows, expected {final_person_message_count}"
         )));
     }
-    let expected_reply_slo_count = pending
-        .base_reply_slo_count
-        .checked_add(reply_slo_item_count)
-        .ok_or_else(|| {
-            SelfHostError::Ingestion("pending reply SLO commit count overflow".to_owned())
-        })?;
+    let expected_reply_slo_count = if replace {
+        inserted_reply_slo_item_count
+    } else {
+        pending
+            .base_reply_slo_count
+            .checked_add(inserted_reply_slo_item_count)
+            .ok_or_else(|| {
+                SelfHostError::Ingestion("pending reply SLO commit count overflow".to_owned())
+            })?
+    };
     if expected_reply_slo_count != final_reply_slo_count {
         return Err(SelfHostError::Ingestion(format!(
             "pending reply SLO commit yields {expected_reply_slo_count} rows, expected {final_reply_slo_count}"
@@ -2178,7 +2707,10 @@ fn validate_pending_projection_item_commit(
     }
 
     let mut ordinals_by_owner = BTreeMap::<String, BTreeSet<u64>>::new();
-    for item in &person_items {
+    for item in inserted_person_items
+        .iter()
+        .chain(updated_person_items.iter())
+    {
         let message = person_message_from_projection_item(item)?;
         let ordinal = person_message_ordinal(&message)?;
         if !activity_counts.contains_key(&item.owner_key) {
@@ -2206,7 +2738,8 @@ fn validate_pending_projection_item_commit(
                 "pending person message count does not fit u64 for {owner}"
             ))
         })?;
-        let first_expected = if replace {
+        let replaces_complete_owner = replace || pending.replaced_person_owners.contains(&owner);
+        let first_expected = if replaces_complete_owner {
             1
         } else {
             final_owner_count
@@ -2227,13 +2760,27 @@ fn validate_pending_projection_item_commit(
     }
     if replace {
         for (owner, count) in activity_counts {
-            let committed = person_items
+            let committed = inserted_person_items
                 .iter()
                 .filter(|item| item.owner_key == owner)
                 .count();
             if u64::try_from(committed).ok() != Some(count) {
                 return Err(SelfHostError::Ingestion(format!(
                     "person message replace count does not match activity for {owner}"
+                )));
+            }
+        }
+    } else {
+        for owner in &pending.replaced_person_owners {
+            let expected = activity_counts.get(owner).copied().unwrap_or(0);
+            let committed = inserted_person_items
+                .iter()
+                .chain(updated_person_items.iter())
+                .filter(|item| item.owner_key == *owner)
+                .count();
+            if u64::try_from(committed).ok() != Some(expected) {
+                return Err(SelfHostError::Ingestion(format!(
+                    "component re-projection committed {committed} desired messages for {owner}, expected {expected}"
                 )));
             }
         }
@@ -2934,7 +3481,15 @@ fn rebuild_materialized_snapshot_paged(
                 )
             })?;
             person_page = delta.person_page;
-            inserts.extend(delta.message_upserts);
+            if !delta.message_updates.is_empty()
+                || !delta.message_deletes.is_empty()
+                || !delta.replaced_person_owners.is_empty()
+            {
+                return Err(SelfHostError::Ingestion(
+                    "fixed-identity paged projection produced a replacement delta".to_owned(),
+                ));
+            }
+            inserts.extend(delta.message_inserts);
         }
 
         let non_slack = observations
