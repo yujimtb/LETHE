@@ -618,12 +618,54 @@ Import performance note: `AppService::ingest_observation_drafts` prepares the
 batch once, appends observations through the storage bulk API inside one SQLite
 transaction, and emits one summary audit event. For each non-empty batch, the
 persistent corpus index consumes only the new canonical tail and upserts each
-`record_id` once. Non-corpus materialization fixes one canonical high-water,
-performs two bounded page passes, writes message and reply-SLO rows to a SQLite
-staging projection, and atomically publishes the verified manifest and rows.
-This path never loads all observations or the full corpus into memory. Do not
+`record_id` once. Normal imports continue to materialize non-corpus projections
+after each request. Multi-request backfills must use the explicit bulk import
+session described below so that the non-corpus full rebuild runs once at the
+final high-water instead of once per request. A non-corpus rebuild performs two
+bounded page passes, writes message and reply-SLO rows to a SQLite staging
+projection, and atomically publishes the verified manifest and rows. These
+paths never load all observations or the full corpus into memory. Do not
 reintroduce per-observation materialization, per-observation audit writes, or a
 full corpus-index rebuild on normal import.
+
+### Bulk import session
+
+Use one explicit session around every multi-request archive load:
+
+1. `POST /api/import/bulk-sessions/begin` with a `write:observations` bearer
+   token. The response contains the generated `session_id`, state `deferred`,
+   and the base canonical high-water.
+2. Send each existing `POST /api/import/observation-drafts` request with the
+   additional `bulk_session_id` field. `source_instance_id` and `drafts` keep
+   their existing contract. A missing or mismatched session id fails with HTTP
+   409 while a session is active.
+3. `POST /api/import/bulk-sessions/{session_id}/end`. Finalization catches the
+   corpus index up idempotently, fixes the last canonical append sequence, and
+   runs the non-corpus snapshot rebuild once. Repeating a successful end call
+   returns the completed session without another rebuild.
+
+While the session is `deferred` or `catching_up`, every non-corpus projection
+is marked stale and its HTTP read returns `503 projection_stale`. Corpus grep,
+record, and thread reads remain available from the incrementally caught-up
+persistent index. `/health` and `/health/deep` report a
+`bulk_import_session` dependency with the session id, canonical high-water, and
+lag; overall health is `degraded` until finalization succeeds. Supplemental
+writes and source sync fail with a bulk-session conflict instead of publishing
+a mixed projection generation.
+
+Session state is stored durably in SQLite. If the process exits before end, the
+next bootstrap detects the active state, rebuilds non-corpus projections to the
+actual canonical high-water, and records the session as ready. Corrupt session
+state fails startup explicitly; it is never ignored or replaced by a silent
+fallback.
+
+For `B` requests ending at cumulative sizes `N_i`, the old topology-changing
+path could pay `sum(T_full(N_i))`, which is quadratic for fixed request sizes.
+The session path pays incremental append and corpus-index work per request plus
+one `T_full(N)` at end. With the current bounded-page projector and ordinary
+identity bucket sizes, this removes the request-level O(N^2) term and makes the
+bulk load O(N) in the total observation volume (subject to the projector's
+documented single-rebuild internal costs).
 
 Supplemental writes compute a strict non-corpus projection-item delta. SQLite
 commits the supplemental append, item inserts/updates/deletes, and projection

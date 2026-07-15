@@ -1,4 +1,4 @@
-use crate::self_host::app::ImportReport;
+use crate::self_host::app::{BulkImportSessionReport, ImportReport};
 use lethe_adapter_api::traits::ObservationDraft;
 
 #[derive(Debug, Clone)]
@@ -46,14 +46,59 @@ impl ImportApiConfig {
 }
 
 impl ImportApiClient {
+    pub fn begin_bulk_import_session(&self) -> Result<BulkImportSessionReport, ImportClientError> {
+        let response = self
+            .http
+            .post(format!("{}/api/import/bulk-sessions/begin", self.base_url))
+            .bearer_auth(&self.api_token)
+            .send()?;
+        decode_response(response)
+    }
+
     pub fn ingest_observation_drafts(
         &self,
         drafts: Vec<ObservationDraft>,
         source_instance_id: &str,
     ) -> Result<ImportReport, ImportClientError> {
+        self.send_observation_drafts(drafts, source_instance_id, None)
+    }
+
+    pub fn ingest_observation_drafts_in_session(
+        &self,
+        drafts: Vec<ObservationDraft>,
+        source_instance_id: &str,
+        bulk_session_id: &str,
+    ) -> Result<ImportReport, ImportClientError> {
+        require_non_blank("bulk_session_id", bulk_session_id)?;
+        self.send_observation_drafts(drafts, source_instance_id, Some(bulk_session_id))
+    }
+
+    pub fn end_bulk_import_session(
+        &self,
+        bulk_session_id: &str,
+    ) -> Result<BulkImportSessionReport, ImportClientError> {
+        require_non_blank("bulk_session_id", bulk_session_id)?;
+        let response = self
+            .http
+            .post(format!(
+                "{}/api/import/bulk-sessions/{bulk_session_id}/end",
+                self.base_url
+            ))
+            .bearer_auth(&self.api_token)
+            .send()?;
+        decode_response(response)
+    }
+
+    fn send_observation_drafts(
+        &self,
+        drafts: Vec<ObservationDraft>,
+        source_instance_id: &str,
+        bulk_session_id: Option<&str>,
+    ) -> Result<ImportReport, ImportClientError> {
         require_non_blank("source_instance_id", source_instance_id)?;
         let request = ImportObservationDraftsRequest {
             source_instance_id: source_instance_id.to_owned(),
+            bulk_session_id: bulk_session_id.map(str::to_owned),
             drafts,
         };
         let response = self
@@ -62,21 +107,29 @@ impl ImportApiClient {
             .bearer_auth(&self.api_token)
             .json(&request)
             .send()?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(ImportClientError::Api {
-                status,
-                body: response.text()?,
-            });
-        }
-        Ok(response.json()?)
+        decode_response(response)
     }
 }
 
 #[derive(Debug, serde::Serialize)]
 struct ImportObservationDraftsRequest {
     source_instance_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bulk_session_id: Option<String>,
     drafts: Vec<ObservationDraft>,
+}
+
+fn decode_response<T: serde::de::DeserializeOwned>(
+    response: reqwest::blocking::Response,
+) -> Result<T, ImportClientError> {
+    let status = response.status();
+    if !status.is_success() {
+        return Err(ImportClientError::Api {
+            status,
+            body: response.text()?,
+        });
+    }
+    Ok(response.json()?)
 }
 
 fn require_non_blank(name: &'static str, value: &str) -> Result<(), ImportClientError> {

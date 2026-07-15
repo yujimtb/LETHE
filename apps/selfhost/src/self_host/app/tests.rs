@@ -257,6 +257,7 @@ fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppSe
             .unwrap(),
         )),
         persistence,
+        bulk_import_operation: Arc::new(Mutex::new(())),
         search_index,
         config: Arc::new(config.clone()),
         slack_sources: vec![SlackSourceRuntime {
@@ -2303,6 +2304,292 @@ fn wave2_slack_draft(index: usize) -> ObservationDraft {
             "communication_thread_ref": format!("slack:thread:{key}"),
         }),
     }
+}
+
+fn normalized_non_corpus_manifest(mut value: serde_json::Value) -> serde_json::Value {
+    value
+        .pointer_mut("/snapshot")
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap()
+        .remove("built_at");
+    value
+        .pointer_mut("/snapshot/lineage")
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap()
+        .remove("built_at");
+    for collection in ["sources", "missing"] {
+        for source in value
+            .pointer_mut(&format!("/snapshot/freshness/{collection}"))
+            .and_then(serde_json::Value::as_array_mut)
+            .unwrap()
+        {
+            source.as_object_mut().unwrap().remove("age_seconds");
+        }
+    }
+    value
+}
+
+#[test]
+fn bulk_import_session_defers_non_corpus_keeps_corpus_ready_and_rebuilds_once() {
+    let bulk_root =
+        std::env::temp_dir().join(format!("lethe-bulk-session-test-{}", uuid::Uuid::now_v7()));
+    let bulk_db = bulk_root.join("lethe.sqlite3");
+    let bulk_blobs = bulk_root.join("blobs");
+    let bulk_persistence = SqlitePersistence::open(&bulk_db, &bulk_blobs, &[7; 32]).unwrap();
+    let mut bulk_config = test_config(bulk_db, bulk_blobs);
+    bulk_config.corpus.mode = lethe_projection_corpus::CorpusMode::PersonalAllText;
+    let bulk_service = test_service(bulk_config, bulk_persistence);
+    wait_for_search_index_ready(&bulk_service);
+
+    let session = bulk_service.begin_bulk_import_session().unwrap();
+    assert_eq!(session.state, super::BulkImportSessionPhase::Deferred);
+    let health = bulk_service.health().unwrap();
+    let bulk_dependency = health
+        .dependencies
+        .iter()
+        .find(|dependency| dependency.name == "bulk_import_session")
+        .unwrap();
+    assert_eq!(health.status, "degraded");
+    assert_eq!(bulk_dependency.status, "deferred");
+    assert!(
+        bulk_dependency
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains(&session.session_id)
+    );
+
+    let missing_session_error = bulk_service
+        .ingest_observation_drafts(vec![wave2_slack_draft(99)], "slack-test")
+        .unwrap_err();
+    assert!(matches!(
+        missing_session_error,
+        SelfHostError::BulkImportSessionConflict {
+            code: "bulk_import_session_id_required",
+            ..
+        }
+    ));
+    assert_eq!(
+        bulk_service
+            .persistence_lock()
+            .unwrap()
+            .observation_stats()
+            .unwrap()
+            .count,
+        0
+    );
+
+    for indices in [[0usize, 1usize], [2usize, 3usize]] {
+        let report = bulk_service
+            .ingest_observation_drafts_with_session(
+                indices.into_iter().map(wave2_slack_draft).collect(),
+                "slack-test",
+                Some(&session.session_id),
+            )
+            .unwrap();
+        assert_eq!(report.ingested, 2);
+        assert_eq!(
+            bulk_service
+                .non_corpus_rebuild_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    assert_eq!(bulk_service.core_lock().unwrap().observation_stats.count, 0);
+    assert!(matches!(
+        bulk_service.persons_response(
+            None,
+            None,
+            &lethe_api::api::pagination::PaginationParams::default(),
+        ),
+        Err(SelfHostError::ProjectionStale(_))
+    ));
+    let grep = bulk_service
+        .corpus_grep_response(&lethe_api::api::grep::GrepRequest {
+            pattern: "Wave2 bulk message 3".to_owned(),
+            limit: Some(10),
+            ..lethe_api::api::grep::GrepRequest::default()
+        })
+        .unwrap();
+    assert_eq!(grep.data.matches.len(), 1);
+
+    let completed = bulk_service
+        .end_bulk_import_session(&session.session_id)
+        .unwrap();
+    assert_eq!(completed.state, super::BulkImportSessionPhase::Ready);
+    assert_eq!(completed.target_append_seq, 4);
+    assert_eq!(completed.target_observation_count, 4);
+    assert_eq!(
+        bulk_service
+            .non_corpus_rebuild_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        bulk_service
+            .persons_response(
+                None,
+                None,
+                &lethe_api::api::pagination::PaginationParams::default(),
+            )
+            .unwrap()
+            .data["total"],
+        4
+    );
+
+    let retried = bulk_service
+        .end_bulk_import_session(&session.session_id)
+        .unwrap();
+    assert_eq!(retried.target_append_seq, completed.target_append_seq);
+    assert_eq!(
+        bulk_service
+            .non_corpus_rebuild_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "successful end retry must not rebuild again"
+    );
+
+    let observations = bulk_service
+        .persistence_lock()
+        .unwrap()
+        .observation_page(0, 100)
+        .unwrap()
+        .into_iter()
+        .map(|stored| stored.observation)
+        .collect::<Vec<_>>();
+
+    let reference_root = std::env::temp_dir().join(format!(
+        "lethe-bulk-reference-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let reference_db = reference_root.join("lethe.sqlite3");
+    let reference_blobs = reference_root.join("blobs");
+    let reference_persistence =
+        SqlitePersistence::open(&reference_db, &reference_blobs, &[7; 32]).unwrap();
+    let mut reference_config = test_config(reference_db, reference_blobs);
+    reference_config.corpus.mode = lethe_projection_corpus::CorpusMode::PersonalAllText;
+    let reference_service = test_service(reference_config, reference_persistence);
+    for observation in &observations {
+        reference_service
+            .persistence_lock()
+            .unwrap()
+            .append_observation(observation)
+            .unwrap();
+        let mut core = reference_service.core_lock().unwrap();
+        reference_service
+            .materialize_after_observation_append(&mut core, std::slice::from_ref(observation))
+            .unwrap();
+    }
+
+    let bulk_manifest = normalized_non_corpus_manifest(
+        bulk_service
+            .persistence_lock()
+            .unwrap()
+            .projection_records(&ProjectionRef::new("proj:person-page"))
+            .unwrap()
+            .unwrap(),
+    );
+    let reference_manifest = normalized_non_corpus_manifest(
+        reference_service
+            .persistence_lock()
+            .unwrap()
+            .projection_records(&ProjectionRef::new("proj:person-page"))
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(bulk_manifest, reference_manifest);
+
+    let mut owners = bulk_service
+        .core_lock()
+        .unwrap()
+        .snapshot
+        .person_page
+        .profiles
+        .iter()
+        .map(|profile| profile.person_id.as_str().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    owners.insert(super::REPLY_SLO_ITEM_OWNER.to_owned());
+    for owner in owners {
+        let bulk_items = bulk_service
+            .persistence_lock()
+            .unwrap()
+            .projection_items_by_owner(&ProjectionRef::new("proj:person-page"), &owner)
+            .unwrap();
+        let reference_items = reference_service
+            .persistence_lock()
+            .unwrap()
+            .projection_items_by_owner(&ProjectionRef::new("proj:person-page"), &owner)
+            .unwrap();
+        assert_eq!(bulk_items, reference_items, "owner {owner} differs");
+    }
+
+    drop(reference_service);
+    drop(bulk_service);
+    let _ = std::fs::remove_dir_all(reference_root);
+    let _ = std::fs::remove_dir_all(bulk_root);
+}
+
+#[test]
+fn bootstrap_recovers_abandoned_bulk_import_session() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-bulk-session-recovery-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let mut config = test_config(db, blobs);
+    config.corpus.mode = lethe_projection_corpus::CorpusMode::PersonalAllText;
+    let service = test_service(config.clone(), persistence);
+    wait_for_search_index_ready(&service);
+
+    let session = service.begin_bulk_import_session().unwrap();
+    service
+        .ingest_observation_drafts_with_session(
+            vec![wave2_slack_draft(7)],
+            "slack-test",
+            Some(&session.session_id),
+        )
+        .unwrap();
+    assert!(matches!(
+        service.persons_response(
+            None,
+            None,
+            &lethe_api::api::pagination::PaginationParams::default(),
+        ),
+        Err(SelfHostError::ProjectionStale(_))
+    ));
+    drop(service);
+
+    let restarted = AppService::bootstrap(config).unwrap();
+    let recovered = restarted
+        .end_bulk_import_session(&session.session_id)
+        .unwrap();
+    assert_eq!(recovered.state, super::BulkImportSessionPhase::Ready);
+    assert_eq!(recovered.target_append_seq, 1);
+    assert_eq!(
+        restarted
+            .persons_response(
+                None,
+                None,
+                &lethe_api::api::pagination::PaginationParams::default(),
+            )
+            .unwrap()
+            .data["total"],
+        1
+    );
+    assert_eq!(
+        restarted
+            .persistence_lock()
+            .unwrap()
+            .projection_item_count(&ProjectionRef::new("proj:person-page"))
+            .unwrap(),
+        2
+    );
+
+    drop(restarted);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

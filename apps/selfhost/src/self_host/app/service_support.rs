@@ -9,7 +9,10 @@ impl AppService {
         let core = self.core_lock()?;
         Ok(
             HealthResponse::from_catalog(&core.catalog, env!("CARGO_PKG_VERSION")).with_runtime(
-                vec![self.search_index.health_dependency()],
+                vec![
+                    self.bulk_import_health_dependency()?,
+                    self.search_index.health_dependency(),
+                ],
                 LastSyncHealth {
                     completed_at: core.last_sync_at,
                     error: core.last_sync_error.clone(),
@@ -37,6 +40,7 @@ impl AppService {
             HealthResponse::from_catalog(&core.catalog, env!("CARGO_PKG_VERSION")).with_runtime(
                 vec![
                     storage_dependency,
+                    self.bulk_import_health_dependency()?,
                     self.search_index.deep_health_dependency(),
                 ],
                 LastSyncHealth {
@@ -404,6 +408,7 @@ impl AppService {
         blob_ref: &BlobRef,
     ) -> Result<Option<Vec<u8>>, SelfHostError> {
         let core = self.core_lock()?;
+        self.ensure_projection_fresh(&core.catalog, "proj:person-page")?;
         let filtered_projection =
             self.apply_filter(serde_json::to_value(&core.snapshot.person_page)?);
         if !json_contains_string(&filtered_projection, blob_ref.as_str()) {
