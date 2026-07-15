@@ -32,8 +32,9 @@ use lethe_core::domain::{
 };
 use lethe_derivation_gemini::{GeminiSlideAnalyzer, SlideAnalysisProjector};
 use lethe_engine::identity::projector::IdentityProjector;
+use lethe_engine::identity::state::{IdentityNodeId, IdentityState};
 use lethe_engine::identity::types::{
-    IdentifierType, IdentityResolutionOutput, PersonCandidate, SourceIdentifier,
+    IdentifierKey, IdentifierType, IdentityResolutionOutput, PersonCandidate,
 };
 #[cfg(test)]
 use lethe_engine::lake::LakeStore;
@@ -219,18 +220,9 @@ enum NonCorpusDeltaKind {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CompactProjectionState {
-    next_identity_ordinal: u64,
-    identity_candidates: Vec<CompactIdentityCandidate>,
+    identity: IdentityState,
+    observation_ids_by_node: Vec<Vec<String>>,
     consent_decisions: Vec<CompactConsentDecision>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CompactIdentityCandidate {
-    first_ordinal: u64,
-    slack_user_id: Option<String>,
-    observation_ids: Vec<String>,
-    candidate: PersonCandidate,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -786,21 +778,16 @@ struct BuiltProjectionSnapshot {
 impl CompactProjectionState {
     fn build(observations: &[Observation]) -> Result<Self, SelfHostError> {
         let mut state = Self {
-            next_identity_ordinal: 0,
-            identity_candidates: Vec::new(),
+            identity: IdentityState::default(),
+            observation_ids_by_node: Vec::new(),
             consent_decisions: Vec::new(),
         };
-        let mut slack_candidate_index = BTreeMap::new();
         for observation in observations {
             state.capture_consent_decision(observation);
             for candidate in
                 IdentityProjector::extract_candidates(std::slice::from_ref(observation))
             {
-                state.add_identity_candidate(
-                    candidate,
-                    observation.id.as_str(),
-                    &mut slack_candidate_index,
-                )?;
+                state.add_identity_candidate(candidate, observation.id.as_str())?;
             }
         }
         state.validate()?;
@@ -820,17 +807,6 @@ impl CompactProjectionState {
         &mut self,
         observations: &[Observation],
     ) -> Result<BTreeSet<u64>, SelfHostError> {
-        let mut slack_candidate_index = self
-            .identity_candidates
-            .iter()
-            .enumerate()
-            .filter_map(|(index, candidate)| {
-                candidate
-                    .slack_user_id
-                    .as_ref()
-                    .map(|user_id| (user_id.clone(), index))
-            })
-            .collect::<BTreeMap<_, _>>();
         let mut touched_members = BTreeSet::new();
         for observation in observations {
             self.capture_consent_decision(observation);
@@ -843,11 +819,8 @@ impl CompactProjectionState {
                 )));
             }
             for candidate in candidates {
-                touched_members.insert(self.add_identity_candidate(
-                    candidate,
-                    observation.id.as_str(),
-                    &mut slack_candidate_index,
-                )?);
+                touched_members
+                    .insert(self.add_identity_candidate(candidate, observation.id.as_str())?);
             }
         }
         self.validate()?;
@@ -856,64 +829,60 @@ impl CompactProjectionState {
 
     fn add_identity_candidate(
         &mut self,
-        mut candidate: PersonCandidate,
+        candidate: PersonCandidate,
         observation_id: &str,
-        slack_candidate_index: &mut BTreeMap<String, usize>,
-    ) -> Result<u64, SelfHostError> {
-        let ordinal = self.next_identity_ordinal;
-        self.next_identity_ordinal =
-            self.next_identity_ordinal.checked_add(1).ok_or_else(|| {
-                SelfHostError::Ingestion("identity candidate ordinal overflow".to_owned())
-            })?;
-        sort_identity_identifiers(&mut candidate.identifiers);
-
-        let slack_user_id = slack_user_id_for_candidate(&candidate);
+    ) -> Result<IdentityNodeId, SelfHostError> {
+        let mut existing_node = None;
         if candidate.source == "slack" {
-            let slack_user_id = slack_user_id.ok_or_else(|| {
-                SelfHostError::Ingestion(
-                    "Slack identity candidate is missing its source user_id".to_owned(),
-                )
-            })?;
-            if let Some(existing_index) = slack_candidate_index.get(&slack_user_id).copied() {
-                let existing = self
-                    .identity_candidates
-                    .get_mut(existing_index)
-                    .ok_or_else(|| {
-                        SelfHostError::Ingestion(format!(
-                            "compact Slack candidate index is invalid for user {slack_user_id}"
-                        ))
-                    })?;
-                merge_source_internal_candidate(&mut existing.candidate, candidate);
-                if existing
-                    .observation_ids
-                    .iter()
-                    .any(|existing_id| existing_id == observation_id)
-                {
-                    return Err(SelfHostError::Ingestion(format!(
-                        "identity candidate {} repeats observation {observation_id}",
-                        existing.first_ordinal
-                    )));
-                }
-                existing.observation_ids.push(observation_id.to_owned());
-                return Ok(existing.first_ordinal);
-            }
-            let candidate_index = self.identity_candidates.len();
-            self.identity_candidates.push(CompactIdentityCandidate {
-                first_ordinal: ordinal,
-                slack_user_id: Some(slack_user_id.clone()),
-                observation_ids: vec![observation_id.to_owned()],
-                candidate,
-            });
-            slack_candidate_index.insert(slack_user_id, candidate_index);
-        } else {
-            self.identity_candidates.push(CompactIdentityCandidate {
-                first_ordinal: ordinal,
-                slack_user_id: None,
-                observation_ids: vec![observation_id.to_owned()],
-                candidate,
-            });
+            let user_identifier = candidate
+                .identifiers
+                .iter()
+                .find(|identifier| identifier.identifier_type == IdentifierType::UserId)
+                .ok_or_else(|| {
+                    SelfHostError::Ingestion(
+                        "Slack identity candidate is missing its source user_id".to_owned(),
+                    )
+                })?;
+            let key =
+                IdentifierKey::from_identifier(user_identifier).map_err(identity_state_error)?;
+            existing_node = self.identity.node_for_key(&key);
         }
-        Ok(ordinal)
+        let applied = match existing_node {
+            Some(node_id) => self
+                .identity
+                .apply_update(node_id, candidate)
+                .map_err(identity_state_error)?,
+            None => self
+                .identity
+                .apply_new(candidate)
+                .map_err(identity_state_error)?,
+        };
+        let node_index = usize::try_from(applied.node_id).map_err(|_| {
+            SelfHostError::Ingestion(format!(
+                "identity node {} does not fit usize",
+                applied.node_id
+            ))
+        })?;
+        if node_index == self.observation_ids_by_node.len() {
+            self.observation_ids_by_node.push(Vec::new());
+        }
+        let observation_ids = self
+            .observation_ids_by_node
+            .get_mut(node_index)
+            .ok_or_else(|| {
+                SelfHostError::Ingestion(format!(
+                    "identity node {} has no observation index",
+                    applied.node_id
+                ))
+            })?;
+        if observation_ids.iter().any(|id| id == observation_id) {
+            return Err(SelfHostError::Ingestion(format!(
+                "identity node {} repeats observation {observation_id}",
+                applied.node_id
+            )));
+        }
+        observation_ids.push(observation_id.to_owned());
+        Ok(applied.node_id)
     }
 
     fn capture_consent_decision(&mut self, observation: &Observation) {
@@ -945,27 +914,8 @@ impl CompactProjectionState {
     }
 
     fn resolve_identity_with_components(&self) -> CompactIdentityResolution {
-        let mut entries = self.identity_candidates.iter().collect::<Vec<_>>();
-        entries.sort_by_key(|entry| entry.first_ordinal);
-        let candidates = entries
-            .iter()
-            .map(|entry| entry.candidate.clone())
-            .collect::<Vec<_>>();
-        let matches = IdentityProjector::cross_source_match(&candidates);
-        let (identity, grouped_members) =
-            IdentityProjector::new("1.0.0").resolve_with_component_members(&candidates, &matches);
-        let members_by_person = identity
-            .resolved_persons
-            .iter()
-            .zip(grouped_members)
-            .map(|(person, members)| {
-                let members = members
-                    .into_iter()
-                    .map(|member_index| entries[member_index].first_ordinal)
-                    .collect();
-                (person.person_id.as_str().to_owned(), members)
-            })
-            .collect();
+        let identity = self.identity.resolution("1.0.0");
+        let members_by_person = self.identity.members_by_person();
         CompactIdentityResolution {
             identity,
             members_by_person,
@@ -1014,67 +964,38 @@ impl CompactProjectionState {
     }
 
     fn validate(&self) -> Result<(), SelfHostError> {
-        let mut previous_ordinal = None;
-        let mut slack_user_ids = BTreeSet::new();
-        for entry in &self.identity_candidates {
-            if entry.first_ordinal >= self.next_identity_ordinal {
+        self.identity.validate().map_err(identity_state_error)?;
+        if self.identity.nodes().len() != self.observation_ids_by_node.len() {
+            return Err(SelfHostError::Ingestion(
+                "identity nodes and observation indexes have different lengths".to_owned(),
+            ));
+        }
+        for (node_id, observation_ids) in self.observation_ids_by_node.iter().enumerate() {
+            if observation_ids.is_empty() {
                 return Err(SelfHostError::Ingestion(format!(
-                    "identity candidate ordinal {} is outside next ordinal {}",
-                    entry.first_ordinal, self.next_identity_ordinal
-                )));
-            }
-            if previous_ordinal.is_some_and(|previous| previous >= entry.first_ordinal) {
-                return Err(SelfHostError::Ingestion(
-                    "compact identity candidates are not in first-observation order".to_owned(),
-                ));
-            }
-            previous_ordinal = Some(entry.first_ordinal);
-            if entry.observation_ids.is_empty() {
-                return Err(SelfHostError::Ingestion(format!(
-                    "identity candidate {} has no source observation",
-                    entry.first_ordinal
+                    "identity node {node_id} has no source observation"
                 )));
             }
             let mut observation_ids = BTreeSet::new();
-            for observation_id in &entry.observation_ids {
+            for observation_id in &self.observation_ids_by_node[node_id] {
                 if observation_id.trim().is_empty() {
                     return Err(SelfHostError::Ingestion(format!(
-                        "identity candidate {} has a blank source observation",
-                        entry.first_ordinal
+                        "identity node {node_id} has a blank source observation"
                     )));
                 }
                 if !observation_ids.insert(observation_id) {
                     return Err(SelfHostError::Ingestion(format!(
-                        "identity candidate {} repeats source observation {observation_id}",
-                        entry.first_ordinal
+                        "identity node {node_id} repeats source observation {observation_id}"
                     )));
-                }
-            }
-            match (&entry.slack_user_id, entry.candidate.source.as_str()) {
-                (Some(user_id), "slack") => {
-                    if slack_user_id_for_candidate(&entry.candidate).as_deref()
-                        != Some(user_id.as_str())
-                    {
-                        return Err(SelfHostError::Ingestion(format!(
-                            "compact Slack identity candidate does not match user {user_id}"
-                        )));
-                    }
-                    if !slack_user_ids.insert(user_id.clone()) {
-                        return Err(SelfHostError::Ingestion(format!(
-                            "compact identity state contains duplicate Slack user {user_id}"
-                        )));
-                    }
-                }
-                (None, source) if source != "slack" => {}
-                _ => {
-                    return Err(SelfHostError::Ingestion(
-                        "compact identity candidate source/key invariant failed".to_owned(),
-                    ));
                 }
             }
         }
         Ok(())
     }
+}
+
+fn identity_state_error(error: String) -> SelfHostError {
+    SelfHostError::Ingestion(format!("identity state invariant failed: {error}"))
 }
 
 fn compact_consent_status(value: &str) -> Option<ConsentStatus> {
@@ -1083,53 +1004,6 @@ fn compact_consent_status(value: &str) -> Option<ConsentStatus> {
         "restricted_capture" => Some(ConsentStatus::RestrictedCapture),
         "opted_out" => Some(ConsentStatus::OptedOut),
         _ => None,
-    }
-}
-
-fn slack_user_id_for_candidate(candidate: &PersonCandidate) -> Option<String> {
-    candidate
-        .identifiers
-        .iter()
-        .find(|identifier| {
-            identifier.source == "slack" && identifier.identifier_type == IdentifierType::UserId
-        })
-        .map(|identifier| identifier.value.clone())
-}
-
-fn merge_source_internal_candidate(target: &mut PersonCandidate, incoming: PersonCandidate) {
-    target.observed_at = target.observed_at.max(incoming.observed_at);
-    if target.display_name.is_none() {
-        target.display_name = incoming.display_name;
-    }
-    for identifier in incoming.identifiers {
-        if !target.identifiers.contains(&identifier) {
-            target.identifiers.push(identifier);
-        }
-    }
-    sort_identity_identifiers(&mut target.identifiers);
-}
-
-fn sort_identity_identifiers(identifiers: &mut Vec<SourceIdentifier>) {
-    identifiers.sort_by(|left, right| {
-        left.source
-            .cmp(&right.source)
-            .then(
-                identity_identifier_rank(left.identifier_type)
-                    .cmp(&identity_identifier_rank(right.identifier_type)),
-            )
-            .then(left.value.cmp(&right.value))
-    });
-    identifiers.dedup();
-}
-
-fn identity_identifier_rank(identifier_type: IdentifierType) -> u8 {
-    match identifier_type {
-        IdentifierType::Email => 0,
-        IdentifierType::SlackId => 1,
-        IdentifierType::ExternalId => 2,
-        IdentifierType::ArbitraryKey => 3,
-        IdentifierType::UserId => 4,
-        IdentifierType::DisplayName => 5,
     }
 }
 
@@ -1948,9 +1822,16 @@ fn reproject_affected_person_components(
         component_people_intersecting(&next_resolution.members_by_person, &affected_members);
 
     let mut source_observation_ids = BTreeSet::new();
-    for entry in &next_state.identity_candidates {
-        if affected_members.contains(&entry.first_ordinal) {
-            source_observation_ids.extend(entry.observation_ids.iter().cloned());
+    for member in &affected_members {
+        let node_index = usize::try_from(*member).map_err(|_| {
+            SelfHostError::Ingestion(format!("identity node {member} does not fit usize"))
+        })?;
+        if let Some(observation_ids) = next_state.observation_ids_by_node.get(node_index) {
+            source_observation_ids.extend(observation_ids.iter().cloned());
+        } else {
+            return Err(SelfHostError::Ingestion(format!(
+                "affected identity node {member} has no observation index"
+            )));
         }
     }
     if source_observation_ids.is_empty() {

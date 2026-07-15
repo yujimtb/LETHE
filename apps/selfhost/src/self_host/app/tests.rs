@@ -2132,7 +2132,7 @@ fn wave2_slack_incremental_materialization_matches_normalized_full_rebuild() {
     assert_eq!(incremental.reply_slo_count, 4);
     assert!(incremental.snapshot.reply_slo.rows.is_empty());
     assert!(incremental.snapshot.reply_slo.overdue.is_empty());
-    assert_eq!(incremental.compact_state.identity_candidates.len(), 3);
+    assert_eq!(incremental.compact_state.identity.nodes().len(), 3);
     let mut full_message_rows = std::collections::BTreeMap::new();
     apply_projection_item_commit(
         &mut full_message_rows,
@@ -2371,7 +2371,7 @@ fn five_thousand_wave2_slack_records_use_compact_identity_without_full_load() {
     assert_eq!(report.quarantined, 0);
     let core = service.core_lock().unwrap();
     assert_eq!(core.observation_stats.count, 5_000);
-    assert_eq!(core.compact_state.identity_candidates.len(), 100);
+    assert_eq!(core.compact_state.identity.nodes().len(), 100);
     assert_eq!(core.snapshot.identity.resolved_persons.len(), 100);
     assert_eq!(core.snapshot.person_page.profiles.len(), 100);
     assert!(core.snapshot.person_page.messages.is_empty());
