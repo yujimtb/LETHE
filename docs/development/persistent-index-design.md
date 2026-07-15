@@ -97,6 +97,8 @@ manager の状態は `Opening | CatchingUp | Rebuilding | Ready | Failed` であ
 3. `CURRENT` 不在、schema 不一致、metadata / segment 破損なら `Rebuilding` とし、単一のバックグラウンド task が固定 page で新世代を構築する。
 4. 構築と公開に成功すれば `Ready`、失敗すれば診断 detail を保持した `Failed` にする。
 
+commit metadata に数値 `index_format_version` がない旧 Corpus index も現行世代として開かず、metadata 不一致として同じ単一 full rebuild 経路へ送る。canonical Observation 以外の旧 index や全件 scan へ fallback しない。
+
 同じ ready generation について複数要求が破損を報告しても、generation ID と epoch の compare-and-set で rebuild は一つだけ開始する。切替済み旧 generation から遅れて届いたエラーは新 generation を壊れた状態へ戻さない。
 
 `Opening`、`CatchingUp`、`Rebuilding` 中の HTTP 検索は `503 search_index_rebuilding`、`Failed` 中は `503 search_index_failed` を返す。MCP は対応する明示的 internal error を返す。空配列、SQLite 全走査、旧 index の silent fallback はない。health / readiness は状態と detail を公開する。
@@ -104,6 +106,8 @@ manager の状態は `Opening | CatchingUp | Rebuilding | Ready | Failed` であ
 ## 検索以外の materialization とメモリ上限
 
 全 Observation 常駐の原因は Corpus 以外の再投影にもあったため、selfhost の full materialization も固定 high-water の二段 page 処理へ変更した。
+
+`proj:person-page` manifest は起動時に version gate を先に通す。数値 `format_version` がない、非数値、または `7` 未満なら legacy と判定し、旧 manifest の内容を読取用 state として受理せず canonical Observation と supplemental から同期 full rebuild する。rebuild は v7 manifest と keyed items を staging から atomic publish し、次回起動は v7 manifest を厳格検証して増分経路へ進む。`7` より大きい認識可能な版と JSON object でない manifest は、旧 binary が未知の将来 state を上書きしないよう fail-fast する。
 
 - 一巡目: identity / consent、canonical fingerprint、freshness、answer log など再投影に必要な compact state を作る。
 - 二巡目: 最終 identity を使って person / ReplySLO を作り、projection item を page 単位で staging owner へ書く。
