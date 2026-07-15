@@ -2980,6 +2980,91 @@ fn bulk_import_session_defers_non_corpus_keeps_corpus_ready_and_rebuilds_once() 
 }
 
 #[test]
+fn active_bulk_session_rejects_supplemental_write_and_source_sync_without_advancing_state() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-bulk-session-guard-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let mut config = test_config(db, blobs);
+    config.corpus.mode = lethe_projection_corpus::CorpusMode::PersonalAllText;
+    let service = test_service(config, persistence);
+    wait_for_search_index_ready(&service);
+
+    let session = service.begin_bulk_import_session().unwrap();
+    let supplemental_id = SupplementalId::new("sup:00000000-0000-7000-8000-000000000301");
+    let (before_stats, before_catalog_high_water) = {
+        let persistence = service.persistence_lock().unwrap();
+        (
+            persistence.observation_stats().unwrap(),
+            persistence.slack_thread_discovery_high_water().unwrap(),
+        )
+    };
+
+    let supplemental_error = service
+        .write_supplemental(super::SupplementalWriteRequest {
+            id: supplemental_id.clone(),
+            kind: "reply-draft@1".to_owned(),
+            derived_from: InputAnchorSet::default(),
+            payload: serde_json::json!({
+                "channel": "slack",
+                "recipient": "U01",
+                "body": "deferred session must reject this"
+            }),
+            created_by: ActorRef::new("actor:test"),
+            mutability: Mutability::AppendOnly,
+            model_version: None,
+            consent_metadata: None,
+            lineage: None,
+        })
+        .unwrap_err();
+    assert!(matches!(
+        supplemental_error,
+        SelfHostError::BulkImportSessionConflict {
+            code: "bulk_import_session_active",
+            ..
+        }
+    ));
+
+    let sync_error = service.sync_all().unwrap_err();
+    assert!(matches!(
+        sync_error,
+        SelfHostError::BulkImportSessionConflict {
+            code: "bulk_import_session_active",
+            ..
+        }
+    ));
+
+    let persistence = service.persistence_lock().unwrap();
+    let after_stats = persistence.observation_stats().unwrap();
+    assert_eq!(after_stats.count, before_stats.count);
+    assert_eq!(after_stats.max_append_seq, before_stats.max_append_seq);
+    assert_eq!(
+        persistence.slack_thread_discovery_high_water().unwrap(),
+        before_catalog_high_water
+    );
+    assert!(
+        persistence
+            .supplemental_by_id(&supplemental_id)
+            .unwrap()
+            .is_none()
+    );
+    drop(persistence);
+    assert_eq!(
+        service
+            .end_bulk_import_session(&session.session_id)
+            .unwrap()
+            .state,
+        super::BulkImportSessionPhase::Ready
+    );
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn bootstrap_recovers_abandoned_bulk_import_session() {
     let root = std::env::temp_dir().join(format!(
         "lethe-bulk-session-recovery-test-{}",
