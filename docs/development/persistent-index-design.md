@@ -58,7 +58,7 @@ metadata、schema、count のいずれかが一致しなければ、その世代
 
 literal term は 1文字なら unigram、2文字なら bigram、3文字以上なら trigram を必須候補として抽出する。各term内でdocument frequencyが最小の必須n-gramを一つずつ決定的に選び、複合語ではtermごとの選択結果をANDする。同じterm内の全n-gram postings重複走査は避け、各termのexact matchが必ず含む一つだけを使うためfalse negativeはない。安全なliteral n-gramを抽出できないregexは `AllQuery` を候補源にする。Tantivyの候補一致を最終結果には使わず、保存原文に対する既存 `PreparedGrepQuery` のregex / NFKC / filter / range / snippet処理で必ずexact判定するため、増え得るfalse positiveは結果へ漏れない。
 
-SQLite の重複判定用列は canonical JSON 本文そのものではなく SHA-256 digest を保持する。digest一致時は保存済み Observation JSON の `meta.canonical_json` と入力を完全比較し、digest衝突を Duplicate と誤認しない。canonical JSON は API / 再構築の正本として Observation JSON metadata に残る。schema version 5 はこの形式を要求し、旧列形式への互換レイヤや silent fallback は持たない。
+SQLite の重複判定用列は canonical JSON 本文そのものではなく SHA-256 digest を保持する。digest一致時は保存済み Observation JSON の `meta.canonical_json` と入力を完全比較し、digest衝突を Duplicate と誤認しない。canonical JSON は API / 再構築の正本として Observation JSON metadata に残る。schema version 7 はこの形式を要求し、既存DBに旧 `canonical_json` 列だけがある場合は起動時に `canonical_json_sha256` を追加してバッチ backfill し、現行shapeへ表を再構築する。旧列を runtime の代替読み取り経路として使う互換レイヤや silent fallback は持たない。
 
 `from` / `to` は `timestamp_nanos` の inclusive `RangeQuery`、source types と channel / container は `TermSetQuery` として本文候補 query と交差する。これらは stored document の読込と regex 判定より前に Tantivy の候補段階で効き、post-filter のために全件を走査・materialize しない。
 

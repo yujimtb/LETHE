@@ -39,6 +39,66 @@ fn sample_observation() -> Observation {
     }
 }
 
+fn sample_observation_with_identity(identity_key: &str, body: &str) -> Observation {
+    let canonical_json = serde_json::json!({
+        "source": "test",
+        "object_id": identity_key,
+        "body": body
+    })
+    .to_string();
+    let mut observation = sample_observation();
+    observation.id = Observation::new_id();
+    observation.idempotency_key = IdempotencyKey::new(identity_key);
+    observation.meta = serde_json::json!({
+        CANONICAL_JSON_META_KEY: canonical_json,
+        "source_container": "test",
+    });
+    observation
+}
+
+fn replace_with_legacy_canonical_json_observations_table(
+    store: &SqlitePersistence,
+    observation: &Observation,
+) {
+    let canonical_json = observation
+        .meta
+        .get(CANONICAL_JSON_META_KEY)
+        .and_then(serde_json::Value::as_str)
+        .unwrap();
+    store
+        .conn
+        .execute_batch(
+            "
+            DROP INDEX IF EXISTS observations_leaf_append;
+            DROP TABLE observations;
+            CREATE TABLE observations (
+                append_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL UNIQUE,
+                identity_key TEXT NOT NULL UNIQUE,
+                canonical_json TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                observation_json TEXT NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO observations (
+                id, identity_key, canonical_json, recorded_at, observation_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                observation.id.as_str(),
+                observation.idempotency_key.as_str(),
+                canonical_json,
+                observation.recorded_at.to_rfc3339(),
+                serde_json::to_string(observation).unwrap(),
+            ],
+        )
+        .unwrap();
+}
+
 #[test]
 fn persist_and_reload_observation() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
@@ -393,6 +453,66 @@ fn migration_ledger_records_current_schema_version() {
         )
         .unwrap();
     assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn open_migrates_legacy_canonical_json_column_and_keeps_bulk_dedupe_idempotent() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let legacy_observation = sample_observation();
+    {
+        let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+        replace_with_legacy_canonical_json_observations_table(&store, &legacy_observation);
+    }
+
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    let columns = {
+        let mut statement = store
+            .conn
+            .prepare("PRAGMA table_info(observations)")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap();
+        rows.collect::<Result<Vec<_>, _>>().unwrap()
+    };
+    assert!(columns.contains(&"leaf_id".to_owned()));
+    assert!(columns.contains(&"routing_key".to_owned()));
+    assert!(columns.contains(&"canonical_json_sha256".to_owned()));
+    assert!(!columns.contains(&"canonical_json".to_owned()));
+    let stored_hash: String = store
+        .conn
+        .query_row(
+            "SELECT canonical_json_sha256 FROM observations WHERE id = ?1",
+            [legacy_observation.id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let canonical_json = legacy_observation
+        .meta
+        .get(CANONICAL_JSON_META_KEY)
+        .and_then(serde_json::Value::as_str)
+        .unwrap();
+    assert_eq!(stored_hash, canonical_json_sha256(canonical_json));
+
+    let mut duplicate = legacy_observation.clone();
+    duplicate.id = Observation::new_id();
+    let fresh = sample_observation_with_identity("legacy-migration-fresh", "fresh");
+    let outcomes = store
+        .append_observations_idempotent(&[duplicate, fresh.clone()])
+        .unwrap();
+
+    assert_eq!(
+        outcomes,
+        vec![
+            DurableAppendOutcome::Duplicate(legacy_observation.id.clone()),
+            DurableAppendOutcome::Appended(fresh.id.clone()),
+        ]
+    );
+    assert_eq!(store.load_observations().unwrap().len(), 2);
 
     let _ = fs::remove_dir_all(tmp);
 }
