@@ -1,5 +1,9 @@
 use super::*;
 
+use std::collections::HashSet;
+
+const OBSERVATION_SCHEMA_BACKFILL_BATCH_SIZE: i64 = 512;
+
 impl SqlitePersistence {
     pub(super) fn init_schema(&self) -> Result<(), PersistenceError> {
         self.conn.execute_batch(
@@ -15,9 +19,6 @@ impl SqlitePersistence {
                 observation_json TEXT NOT NULL,
                 UNIQUE (leaf_id, identity_key)
             );
-
-            CREATE INDEX IF NOT EXISTS observations_leaf_append
-                ON observations(leaf_id, append_seq);
 
             CREATE TABLE IF NOT EXISTS sync_state (
                 key TEXT PRIMARY KEY,
@@ -199,6 +200,14 @@ impl SqlitePersistence {
             END;
             ",
         )?;
+        self.ensure_partition_initialize()?;
+        self.migrate_existing_schema()?;
+        self.conn.execute_batch(
+            "
+            CREATE INDEX IF NOT EXISTS observations_leaf_append
+                ON observations(leaf_id, append_seq);
+            ",
+        )?;
         self.conn.execute(
             "INSERT OR IGNORE INTO slack_thread_catalog_state (
                 singleton, discovery_high_water, poll_generation
@@ -209,12 +218,249 @@ impl SqlitePersistence {
             "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
             params![
                 CURRENT_SCHEMA_VERSION,
-                "slack_thread_catalog",
+                "canonical_json_sha256_backfill",
                 chrono::Utc::now().to_rfc3339(),
             ],
         )?;
-        self.ensure_partition_initialize()?;
         Ok(())
+    }
+
+    fn migrate_existing_schema(&self) -> Result<(), PersistenceError> {
+        let current_version_recorded = self.schema_migration_recorded(CURRENT_SCHEMA_VERSION)?;
+        let mut columns = self.observation_columns()?;
+
+        let mut route_backfill_required = false;
+        if !columns.contains("leaf_id") {
+            self.conn
+                .execute("ALTER TABLE observations ADD COLUMN leaf_id TEXT", [])?;
+            columns.insert("leaf_id".to_owned());
+            route_backfill_required = true;
+        }
+        if !columns.contains("routing_key") {
+            self.conn
+                .execute("ALTER TABLE observations ADD COLUMN routing_key TEXT", [])?;
+            columns.insert("routing_key".to_owned());
+            route_backfill_required = true;
+        }
+        if route_backfill_required {
+            self.backfill_observation_routing_columns()?;
+        }
+
+        let mut canonical_digest_backfill_required = !current_version_recorded;
+        if !columns.contains("canonical_json_sha256") {
+            if !columns.contains(CANONICAL_JSON_META_KEY) {
+                return Err(PersistenceError::SchemaInvariant(
+                    "observations table lacks canonical_json_sha256 and legacy canonical_json; cannot migrate duplicate-detection schema"
+                        .to_owned(),
+                ));
+            }
+            self.conn.execute(
+                "ALTER TABLE observations ADD COLUMN canonical_json_sha256 TEXT",
+                [],
+            )?;
+            columns.insert("canonical_json_sha256".to_owned());
+            canonical_digest_backfill_required = true;
+        }
+        if canonical_digest_backfill_required && columns.contains(CANONICAL_JSON_META_KEY) {
+            self.backfill_canonical_json_sha256_from_legacy_column()?;
+        }
+        if columns.contains(CANONICAL_JSON_META_KEY) {
+            self.rebuild_observations_with_current_columns()?;
+            columns = self.observation_columns()?;
+        }
+
+        self.require_observation_columns(&columns)
+    }
+
+    fn schema_migration_recorded(&self, version: i64) -> Result<bool, PersistenceError> {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM schema_migrations WHERE version = ?1",
+                [version],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|row| row.is_some())
+            .map_err(PersistenceError::from)
+    }
+
+    fn observation_columns(&self) -> Result<HashSet<String>, PersistenceError> {
+        let mut statement = self.conn.prepare("PRAGMA table_info(observations)")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+        let mut columns = HashSet::new();
+        for row in rows {
+            columns.insert(row?);
+        }
+        Ok(columns)
+    }
+
+    fn require_observation_columns(
+        &self,
+        columns: &HashSet<String>,
+    ) -> Result<(), PersistenceError> {
+        let missing = [
+            "append_seq",
+            "id",
+            "leaf_id",
+            "routing_key",
+            "identity_key",
+            "canonical_json_sha256",
+            "recorded_at",
+            "observation_json",
+        ]
+        .into_iter()
+        .filter(|column| !columns.contains(*column))
+        .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(PersistenceError::SchemaInvariant(format!(
+            "observations table is missing current schema columns: {}",
+            missing.join(", ")
+        )))
+    }
+
+    fn backfill_observation_routing_columns(&self) -> Result<(), PersistenceError> {
+        let root_leaf_id = self.root_leaf_id()?;
+        loop {
+            let transaction = self.conn.unchecked_transaction()?;
+            let rows = {
+                let mut statement = transaction.prepare(
+                    "SELECT append_seq, observation_json
+                     FROM observations
+                     WHERE leaf_id IS NULL OR routing_key IS NULL
+                     ORDER BY append_seq
+                     LIMIT ?1",
+                )?;
+                let mapped = statement
+                    .query_map([OBSERVATION_SCHEMA_BACKFILL_BATCH_SIZE], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })?;
+                mapped.collect::<Result<Vec<_>, _>>()?
+            };
+            if rows.is_empty() {
+                transaction.commit()?;
+                break;
+            }
+
+            for (append_seq, observation_json) in rows {
+                let observation: Observation = serde_json::from_str(&observation_json)?;
+                let routing_key =
+                    routing_key_from_observation_for_order(self.routing_key_order, &observation)
+                        .map_err(|err| PersistenceError::SchemaInvariant(err.to_string()))?;
+                transaction.execute(
+                    "UPDATE observations
+                     SET leaf_id = ?1, routing_key = ?2
+                     WHERE append_seq = ?3",
+                    params![root_leaf_id.as_str(), routing_key.encoded(), append_seq],
+                )?;
+            }
+            transaction.commit()?;
+        }
+        Ok(())
+    }
+
+    fn backfill_canonical_json_sha256_from_legacy_column(&self) -> Result<(), PersistenceError> {
+        loop {
+            let transaction = self.conn.unchecked_transaction()?;
+            let rows = {
+                let mut statement = transaction.prepare(
+                    "SELECT append_seq, canonical_json, observation_json
+                     FROM observations
+                     WHERE canonical_json_sha256 IS NULL
+                     ORDER BY append_seq
+                     LIMIT ?1",
+                )?;
+                let mapped =
+                    statement.query_map([OBSERVATION_SCHEMA_BACKFILL_BATCH_SIZE], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?;
+                mapped.collect::<Result<Vec<_>, _>>()?
+            };
+            if rows.is_empty() {
+                transaction.commit()?;
+                break;
+            }
+
+            for (append_seq, canonical_json, observation_json) in rows {
+                let metadata_canonical_json =
+                    canonical_json_from_observation_json(&observation_json)?;
+                if metadata_canonical_json != canonical_json {
+                    return Err(PersistenceError::SchemaInvariant(format!(
+                        "legacy observations.canonical_json differs from observation.meta.canonical_json at append_seq {append_seq}"
+                    )));
+                }
+                transaction.execute(
+                    "UPDATE observations
+                     SET canonical_json_sha256 = ?1
+                     WHERE append_seq = ?2 AND canonical_json_sha256 IS NULL",
+                    params![canonical_json_sha256(&canonical_json), append_seq],
+                )?;
+            }
+            transaction.commit()?;
+        }
+        Ok(())
+    }
+
+    fn rebuild_observations_with_current_columns(&self) -> Result<(), PersistenceError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute_batch(
+            "
+            DROP TABLE IF EXISTS observations_rebuild;
+            CREATE TABLE observations_rebuild (
+                append_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL UNIQUE,
+                leaf_id TEXT NOT NULL CHECK (leaf_id LIKE 'lake:%'),
+                routing_key TEXT NOT NULL,
+                identity_key TEXT NOT NULL,
+                canonical_json_sha256 TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                observation_json TEXT NOT NULL,
+                UNIQUE (leaf_id, identity_key)
+            );
+            INSERT INTO observations_rebuild (
+                append_seq,
+                id,
+                leaf_id,
+                routing_key,
+                identity_key,
+                canonical_json_sha256,
+                recorded_at,
+                observation_json
+            )
+            SELECT
+                append_seq,
+                id,
+                leaf_id,
+                routing_key,
+                identity_key,
+                canonical_json_sha256,
+                recorded_at,
+                observation_json
+            FROM observations
+            ORDER BY append_seq;
+            DROP TABLE observations;
+            ALTER TABLE observations_rebuild RENAME TO observations;
+            ",
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn root_leaf_id(&self) -> Result<String, PersistenceError> {
+        self.conn
+            .query_row(
+                "SELECT leaf_id
+                 FROM partition_log
+                 WHERE event_type = ?1",
+                [PARTITION_EVENT_INITIALIZE],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::from)
     }
 
     pub(super) fn ensure_partition_initialize(&self) -> Result<(), PersistenceError> {
