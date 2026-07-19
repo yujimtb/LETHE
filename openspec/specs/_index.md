@@ -33,6 +33,7 @@
 | M16 | Platform Generalization | [platform-generalization.md](platform-generalization.md) | ドメイン分離 / plugin / storage port | — |
 | M17 | Platform Robustness | [platform-robustness.md](platform-robustness.md) | authn / 冪等 / 失敗隔離 / 運用品質 | — |
 | M18 | Operational Event Ledger | [operational-event-ledger.md](operational-event-ledger.md) | Nanihold event / DataSpace / backend cutover | ✓ |
+| M19 | Personal History Ingestion | [history-ingestion.md](history-ingestion.md) | Native conversation import / receipt / bounded Nanihold read | ✓ |
 
 ---
 
@@ -69,6 +70,8 @@ M01 Domain Kernel ────────────────────�
   ├──► M17 Platform Robustness (cross-cutting; depends on M03/M08/M14/M15)
   │
   └──► M18 Operational Event Ledger (depends on M01/M03/M08/M14)
+          │
+          └──► M19 Personal History Ingestion (depends on M18)
 ```
 
 ### 依存関係の読み方

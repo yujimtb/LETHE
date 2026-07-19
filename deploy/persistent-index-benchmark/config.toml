@@ -65,11 +65,11 @@ reject_unregistered_kinds = true
 
 [[api_tokens]]
 token_env = "LETHE_BENCH_READ_TOKEN"
-scopes = ["read:corpus", "read:operational"]
+scopes = ["read:corpus", "read:operational", "read:history"]
 
 [[api_tokens]]
 token_env = "LETHE_BENCH_WRITE_TOKEN"
-scopes = ["write:observations", "write:operational"]
+scopes = ["write:observations", "write:operational", "write:history"]
 
 [[api_tokens]]
 token_env = "LETHE_BENCH_HEALTH_TOKEN"

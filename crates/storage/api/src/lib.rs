@@ -13,6 +13,10 @@ pub enum StorageError {
     Backend(String),
     #[error("storage invariant violation: {0}")]
     Invariant(String),
+    #[error("operational idempotency collision for {0}")]
+    OperationalIdempotencyCollision(String),
+    #[error("operational event_id collision for {0}")]
+    OperationalEventIdCollision(String),
 }
 
 pub type StorageResult<T> = Result<T, StorageError>;

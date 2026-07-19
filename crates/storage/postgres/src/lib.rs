@@ -349,9 +349,9 @@ fn append_one(
         let stored_sha256: String = row.get(2);
         let stored_event_id: String = row.get(3);
         if stored_sha256 != event_sha256 || stored_event_id != request.event.event_id.as_str() {
-            return Err(StorageError::Invariant(format!(
-                "operational idempotency collision for {idempotency_key}"
-            )));
+            return Err(StorageError::OperationalIdempotencyCollision(
+                idempotency_key.to_owned(),
+            ));
         }
         return Ok(OperationalAppendOutcome::Duplicate {
             cursor,
@@ -368,10 +368,9 @@ fn append_one(
         let cursor = from_i64("cursor", row.get(0))?;
         let stored_sha256: String = row.get(1);
         if stored_sha256 != event_sha256 {
-            return Err(StorageError::Invariant(format!(
-                "operational event_id collision for {}",
-                request.event.event_id
-            )));
+            return Err(StorageError::OperationalEventIdCollision(
+                request.event.event_id.as_str().to_owned(),
+            ));
         }
         return Ok(OperationalAppendOutcome::Duplicate {
             cursor,

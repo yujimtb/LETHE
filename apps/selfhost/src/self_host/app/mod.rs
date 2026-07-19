@@ -44,6 +44,10 @@ use lethe_engine::lake::{BlobStore, IngestRequest, ObservationPreparer};
 use lethe_engine::projection::catalog::ProjectionCatalog;
 use lethe_engine::projection::lineage::{LineageManifest, SourceSnapshot};
 use lethe_engine::supplemental::SupplementalStore;
+use lethe_history::{
+    HistoryError, HistoryImportCommand, HistoryImportResult, HistoryInventoryReport,
+    HistoryInventoryRequest, HistoryQueryRequest, HistoryQueryResponse,
+};
 use lethe_policy::governance::audit::{AuditLog, InMemoryAuditLog};
 use lethe_policy::governance::engine::PolicyEngine;
 use lethe_policy::governance::filter::FilteringGate;
@@ -91,6 +95,8 @@ pub enum SelfHostError {
     SearchIndex(#[from] lethe_search_index::IndexError),
     #[error(transparent)]
     Adapter(#[from] AdapterError),
+    #[error(transparent)]
+    History(#[from] HistoryError),
     #[error("read mode error: {0}")]
     ReadMode(String),
     #[error("not found: {0}")]
@@ -4968,6 +4974,47 @@ impl AppService {
             .map_err(|_| SelfHostError::LockPoisoned)?
             .get_blob(blob_ref)
             .map_err(Into::into)
+    }
+
+    pub fn inventory_history(
+        &self,
+        request: &HistoryInventoryRequest,
+    ) -> Result<HistoryInventoryReport, SelfHostError> {
+        let report = lethe_history::inventory_history(request)?;
+        Ok(report)
+    }
+
+    pub fn import_history(
+        &self,
+        command: &HistoryImportCommand,
+    ) -> Result<HistoryImportResult, SelfHostError> {
+        let ledger = self
+            .operational_ledger
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?;
+        let result = lethe_history::import_history(
+            ledger.as_ref(),
+            command,
+            self.config.resource_limits.max_blob_bytes,
+        )?;
+        Ok(result)
+    }
+
+    pub fn query_history(
+        &self,
+        request: &HistoryQueryRequest,
+    ) -> Result<HistoryQueryResponse, SelfHostError> {
+        if request.max_result_bytes > self.config.resource_limits.max_payload_bytes {
+            return Err(SelfHostError::Ingestion(format!(
+                "history max_result_bytes must be between 1 and {}",
+                self.config.resource_limits.max_payload_bytes
+            )));
+        }
+        let ledger = self
+            .operational_ledger
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?;
+        Ok(lethe_history::query_history(ledger.as_ref(), request)?)
     }
 
     pub fn spawn_polling_task(&self) {

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -8,7 +9,9 @@ use lethe_adapter_api::traits::ObservationDraft;
 use lethe_core::domain::SemVer;
 use serde_json::Value;
 
-use crate::backbone::{BackboneItem, BackboneRecord, CodingAgentSourceConfig};
+use crate::backbone::{
+    BackboneHistoryRecord, BackboneItem, BackboneRecord, CodingAgentSourceConfig,
+};
 
 pub const CLAUDE_CODE_OBSERVER_ID: &str = "obs:claude-code-importer";
 pub const CLAUDE_CODE_SOURCE_SYSTEM: &str = "sys:claude-code";
@@ -23,6 +26,7 @@ const CLAUDE_CODE_CONFIG: CodingAgentSourceConfig = CodingAgentSourceConfig {
 #[derive(Debug, Clone, Default)]
 pub struct ClaudeCodeImportBatch {
     pub drafts: Vec<ObservationDraft>,
+    pub history_records: Vec<BackboneHistoryRecord>,
     pub audit: ClaudeCodeImportAudit,
 }
 
@@ -63,15 +67,33 @@ impl ClaudeCodeImporter {
                 archive_root.display()
             )));
         }
+        self.import_native_root(&source_root)
+    }
 
-        let files = jsonl_files(&source_root)?;
+    pub fn import_native_root(
+        &self,
+        source_root: &Path,
+    ) -> Result<ClaudeCodeImportBatch, AdapterError> {
+        if !source_root.is_dir() {
+            return Err(malformed(format!(
+                "Claude Code native root must be a directory: {}",
+                source_root.display()
+            )));
+        }
+        let files = jsonl_files(source_root)?;
+        if files.is_empty() {
+            return Err(malformed(format!(
+                "Claude Code native root contains no jsonl files: {}",
+                source_root.display()
+            )));
+        }
         let mut batch = ClaudeCodeImportBatch::default();
         for file in files {
             let jsonl = fs::read_to_string(&file).map_err(|error| {
                 AdapterError::Other(format!("failed to read {}: {error}", file.display()))
             })?;
             let label = file
-                .strip_prefix(archive_root)
+                .strip_prefix(source_root)
                 .unwrap_or(file.as_path())
                 .to_string_lossy()
                 .replace('\\', "/");
@@ -89,8 +111,93 @@ impl ClaudeCodeImporter {
             batch.audit.excluded_known_lines += imported.audit.excluded_known_lines;
             batch.audit.excluded_tool_result_lines += imported.audit.excluded_tool_result_lines;
             batch.drafts.extend(imported.drafts);
+            batch.history_records.extend(imported.history_records);
         }
         Ok(batch)
+    }
+
+    pub fn visit_native_root<F>(
+        &self,
+        source_root: &Path,
+        max_record_bytes: usize,
+        mut visitor: F,
+    ) -> Result<ClaudeCodeImportAudit, AdapterError>
+    where
+        F: FnMut(BackboneHistoryRecord) -> Result<(), AdapterError>,
+    {
+        if max_record_bytes == 0 {
+            return Err(malformed("max_record_bytes must be positive".to_owned()));
+        }
+        if !source_root.is_dir() {
+            return Err(malformed(format!(
+                "Claude Code native root must be a directory: {}",
+                source_root.display()
+            )));
+        }
+        let files = jsonl_files(source_root)?;
+        if files.is_empty() {
+            return Err(malformed(format!(
+                "Claude Code native root contains no jsonl files: {}",
+                source_root.display()
+            )));
+        }
+        let mut audit = ClaudeCodeImportAudit::default();
+        for file in files {
+            let label = file
+                .strip_prefix(source_root)
+                .unwrap_or(file.as_path())
+                .to_string_lossy()
+                .replace('\\', "/");
+            let reader = BufReader::new(fs::File::open(&file).map_err(|error| {
+                AdapterError::Other(format!("failed to read {}: {error}", file.display()))
+            })?);
+            audit.files_read += 1;
+            for (index, line) in reader.split(b'\n').enumerate() {
+                let line_number = index + 1;
+                let mut raw = line.map_err(|error| {
+                    AdapterError::Other(format!("failed to read {}: {error}", file.display()))
+                })?;
+                if raw.last() == Some(&b'\r') {
+                    raw.pop();
+                }
+                if raw.is_empty() {
+                    continue;
+                }
+                if raw.len() > max_record_bytes {
+                    return Err(malformed(format!(
+                        "Claude Code record exceeds max_record_bytes at {label}:{line_number}: {} > {max_record_bytes}",
+                        raw.len()
+                    )));
+                }
+                audit.lines_read += 1;
+                let value = match serde_json::from_slice::<Value>(&raw) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        audit.malformed_lines.push(ClaudeCodeAuditLine {
+                            path: label.clone(),
+                            line: line_number,
+                            reason: format!("MalformedTranscriptLine: {error}"),
+                        });
+                        continue;
+                    }
+                };
+                match map_row(value, line_number, &label, &mut audit) {
+                    Ok(Some(record)) => visitor(BackboneHistoryRecord {
+                        record,
+                        source_path: label.clone(),
+                        line_number,
+                        raw,
+                    })?,
+                    Ok(None) => {}
+                    Err(reason) => audit.malformed_lines.push(ClaudeCodeAuditLine {
+                        path: label.clone(),
+                        line: line_number,
+                        reason,
+                    }),
+                }
+            }
+        }
+        Ok(audit)
     }
 
     pub fn import_jsonl_str(
@@ -123,6 +230,12 @@ impl ClaudeCodeImporter {
                     batch.drafts.push(
                         record.to_observation_draft(&CLAUDE_CODE_CONFIG, &self.adapter_version),
                     );
+                    batch.history_records.push(BackboneHistoryRecord {
+                        record,
+                        source_path: source_path.to_owned(),
+                        line_number,
+                        raw: line.as_bytes().to_vec(),
+                    });
                 }
                 Ok(None) => {}
                 Err(reason) => batch.audit.malformed_lines.push(ClaudeCodeAuditLine {

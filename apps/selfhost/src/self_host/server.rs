@@ -17,6 +17,10 @@ use lethe_api::api::health::HealthResponse;
 use lethe_api::api::pagination::PaginationParams;
 use lethe_core::domain::BlobRef;
 use lethe_core::domain::OperationalEventId;
+use lethe_history::{
+    HistoryError, HistoryImportCommand, HistoryImportResult, HistoryInventoryReport,
+    HistoryInventoryRequest, HistoryQueryRequest, HistoryQueryResponse,
+};
 use lethe_projection_claim_queue::ClaimState;
 use lethe_projection_cognition::CardState;
 use lethe_storage_api::{
@@ -75,6 +79,17 @@ pub fn build_router(service: AppService) -> Router {
             "/api/operational-blobs/{blob_hash}",
             get(get_operational_blob),
         )
+        .route(
+            "/api/history/imports/inventory",
+            post(inventory_history)
+                .layer(DefaultBodyLimit::max(service.operational_blob_body_limit())),
+        )
+        .route(
+            "/api/history/imports",
+            post(import_history)
+                .layer(DefaultBodyLimit::max(service.operational_blob_body_limit())),
+        )
+        .route("/api/history/query", post(history_query))
         .route(
             "/api/projections/{projection_id}/blobs/{blob_hash}",
             get(projection_blob),
@@ -275,6 +290,42 @@ async fn get_operational_blob(
         bytes,
     )
         .into_response())
+}
+
+async fn inventory_history(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Json(request): Json<HistoryInventoryRequest>,
+) -> Result<Json<HistoryInventoryReport>, ApiError> {
+    service.authorize_headers(&headers, "write:history")?;
+    let report = tokio::task::spawn_blocking(move || service.inventory_history(&request))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))??;
+    Ok(Json(report))
+}
+
+async fn import_history(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Json(command): Json<HistoryImportCommand>,
+) -> Result<Json<HistoryImportResult>, ApiError> {
+    service.authorize_headers(&headers, "write:history")?;
+    let result = tokio::task::spawn_blocking(move || service.import_history(&command))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))??;
+    Ok(Json(result))
+}
+
+async fn history_query(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Json(request): Json<HistoryQueryRequest>,
+) -> Result<Json<HistoryQueryResponse>, ApiError> {
+    service.authorize_headers(&headers, "read:history")?;
+    let response = tokio::task::spawn_blocking(move || service.query_history(&request))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))??;
+    Ok(Json(response))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -762,10 +813,67 @@ impl From<SelfHostError> for ApiError {
                 Self::unprocessable_entity(code, detail)
             }
             SelfHostError::SupplementalConflict { code, detail } => Self::conflict(code, detail),
+            SelfHostError::Storage(
+                lethe_storage_api::StorageError::OperationalIdempotencyCollision(idempotency_key),
+            ) => Self::conflict(
+                "operational_idempotency_collision",
+                serde_json::json!({"idempotency_key": idempotency_key}),
+            ),
+            SelfHostError::Storage(
+                lethe_storage_api::StorageError::OperationalEventIdCollision(event_id),
+            ) => Self::conflict(
+                "operational_event_id_collision",
+                serde_json::json!({"event_id": event_id}),
+            ),
             SelfHostError::Storage(lethe_storage_api::StorageError::Invariant(detail)) => {
                 Self::unprocessable_entity(
                     "operational_event_invalid",
                     serde_json::json!({"detail": detail}),
+                )
+            }
+            SelfHostError::History(HistoryError::NotFound(_)) => Self::not_found(),
+            SelfHostError::History(HistoryError::UnresolvedOwnership(detail)) => Self::conflict(
+                "history_ownership_unresolved",
+                serde_json::json!({"detail": detail}),
+            ),
+            SelfHostError::History(HistoryError::ManifestMismatch { expected, actual }) => {
+                Self::conflict(
+                    "history_manifest_mismatch",
+                    serde_json::json!({"expected": expected, "actual": actual}),
+                )
+            }
+            SelfHostError::History(HistoryError::SourceIdentityCollision(identity)) => {
+                Self::conflict(
+                    "history_source_identity_collision",
+                    serde_json::json!({"identity": identity}),
+                )
+            }
+            SelfHostError::History(HistoryError::Invariant(detail)) => {
+                Self::unprocessable_entity("history_invalid", serde_json::json!({"detail": detail}))
+            }
+            SelfHostError::History(HistoryError::InvalidCursor(detail)) => {
+                Self::unprocessable_entity(
+                    "HistoryCursorInvalid",
+                    serde_json::json!({"detail": detail}),
+                )
+            }
+            SelfHostError::History(HistoryError::CursorStale {
+                cursor_source,
+                current_source,
+            }) => Self::unprocessable_entity(
+                "HistoryCursorStale",
+                serde_json::json!({
+                    "cursor_source": cursor_source,
+                    "current_source": current_source,
+                }),
+            ),
+            SelfHostError::History(HistoryError::ResultTooLarge { required, maximum }) => {
+                Self::unprocessable_entity(
+                    "HistoryResultTooLarge",
+                    serde_json::json!({
+                        "required": required,
+                        "maximum": maximum,
+                    }),
                 )
             }
             SelfHostError::Ingestion(detail) => Self {

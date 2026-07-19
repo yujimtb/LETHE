@@ -428,9 +428,8 @@ pub(super) fn analysis_record_is_rich(record: &lethe_core::domain::SupplementalR
 
 pub(super) fn audit_kind_for_scope(scope: &str) -> AuditEventKind {
     match scope {
-        "admin:sync" | "write:observations" | "write:supplemental" | "write:operational" => {
-            AuditEventKind::WriteExecution
-        }
+        "admin:sync" | "write:observations" | "write:supplemental" | "write:operational"
+        | "write:history" => AuditEventKind::WriteExecution,
         "read:persons" | "read:timeline" => AuditEventKind::ReadRestricted,
         _ => AuditEventKind::ReadRestricted,
     }

@@ -1,0 +1,97 @@
+{
+  "schema": "schema:history-activation-handoff",
+  "schema_version": "1.0.0",
+  "inventory_id": "inventory:fixture",
+  "data_space_id": "space:personal",
+  "manifest_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "record_count": 7,
+  "raw_bytes": 70,
+  "cross_source_overlap_identities": 0,
+  "sources": [
+    {
+      "source_id": "claude_code:claude-code-personal",
+      "source_kind": "claude_code",
+      "ownership": "personal",
+      "owner_id": "owner:personal",
+      "record_count": 1,
+      "raw_bytes": 10,
+      "digest_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "cutover_cursor": "cursor:claude-code"
+    },
+    {
+      "source_id": "claude_ai:claude-ai-personal",
+      "source_kind": "claude_ai",
+      "ownership": "personal",
+      "owner_id": "owner:personal",
+      "record_count": 1,
+      "raw_bytes": 10,
+      "digest_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "cutover_cursor": "cursor:claude-ai"
+    },
+    {
+      "source_id": "codex:codex-personal",
+      "source_kind": "codex",
+      "ownership": "personal",
+      "owner_id": "owner:personal",
+      "record_count": 1,
+      "raw_bytes": 10,
+      "digest_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "cutover_cursor": "cursor:codex"
+    },
+    {
+      "source_id": "intercom:intercom-personal",
+      "source_kind": "intercom",
+      "ownership": "personal",
+      "owner_id": "owner:personal",
+      "record_count": 1,
+      "raw_bytes": 10,
+      "digest_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+      "cutover_cursor": "cursor:intercom"
+    },
+    {
+      "source_id": "lethe:lethe-personal",
+      "source_kind": "lethe",
+      "ownership": "personal",
+      "owner_id": "owner:personal",
+      "record_count": 1,
+      "raw_bytes": 10,
+      "digest_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+      "cutover_cursor": "cursor:lethe"
+    },
+    {
+      "source_id": "nanihold_legacy:nanihold-personal",
+      "source_kind": "nanihold_legacy",
+      "ownership": "personal",
+      "owner_id": "owner:personal",
+      "record_count": 1,
+      "raw_bytes": 10,
+      "digest_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+      "cutover_cursor": "cursor:nanihold"
+    },
+    {
+      "source_id": "system_snapshot:snapshot-personal",
+      "source_kind": "system_snapshot",
+      "ownership": "personal",
+      "owner_id": "owner:personal",
+      "record_count": 1,
+      "raw_bytes": 10,
+      "digest_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+      "cutover_cursor": "cursor:snapshot"
+    }
+  ],
+  "session_count": 1,
+  "sessions": [
+    {
+      "session_ref": "history-session:sha256:fixture",
+      "source_kind": "nanihold_legacy",
+      "source_id": "nanihold_legacy:nanihold-personal",
+      "source_session_id": "session:fixture",
+      "first_message_at": "2026-07-20T00:00:00Z",
+      "last_message_at": "2026-07-20T00:06:00Z",
+      "message_count": 7
+    }
+  ],
+  "session_index_ref": "history-projection:session-index:sha256:8888888888888888888888888888888888888888888888888888888888888888",
+  "open_commitments_ref": "history-projection:open-commitments:sha256:9999999999999999999999999999999999999999999999999999999999999999",
+  "current_state_ref": "history-projection:current-state:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

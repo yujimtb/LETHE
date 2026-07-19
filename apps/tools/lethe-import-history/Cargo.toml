@@ -1,0 +1,20 @@
+[package]
+name = "lethe-import-history"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chrono.workspace = true
+hex.workspace = true
+lethe-adapter-api = { path = "../../../crates/adapters/api" }
+lethe-adapter-coding-agent = { path = "../../../crates/adapters/coding-agent" }
+lethe-core = { path = "../../../crates/core" }
+lethe-history = { path = "../../../crates/history" }
+lethe-runtime = { path = "../../../crates/runtime" }
+lethe-storage-api = { path = "../../../crates/storage/api" }
+lethe-storage-postgres = { path = "../../../crates/storage/postgres" }
+lethe-storage-sqlite = { path = "../../../crates/storage/sqlite" }
+serde_json.workspace = true
+sha2.workspace = true
+rusqlite.workspace = true
+serde.workspace = true

@@ -132,11 +132,11 @@ reject_unregistered_kinds = true
 # API tokens are read from environment variables and mapped to explicit scopes.
 [[api_tokens]]
 token_env = "LETHE_API_READ_TOKEN"
-scopes = ["read:persons", "read:timeline", "read:corpus", "read:operational"]
+scopes = ["read:persons", "read:timeline", "read:corpus", "read:operational", "read:history"]
 
 [[api_tokens]]
 token_env = "LETHE_API_WRITE_TOKEN"
-scopes = ["write:supplemental", "write:operational"]
+scopes = ["write:supplemental", "write:operational", "write:history"]
 
 [[api_tokens]]
 token_env = "LETHE_API_SYNC_TOKEN"

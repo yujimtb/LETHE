@@ -61,6 +61,14 @@ An event's declared `stream_version` must equal
 idempotency key or event ID with different content is an invariant violation.
 Update and delete triggers reject mutation of operational events.
 
+送信側がappend結果を受け取れず成否不明になった場合は、決定論的`event_id`を使って
+`GET /api/operational-events/{event_id}`を行います。存在すれば返された
+`StoredOperationalEvent`を送信したevent envelopeと完全比較して成功を確定し、
+存在しなければ同一bytesのrequestだけを再送します。SQLite/PostgreSQLの重複判定hashは
+Observationを含むevent JSON全体を対象とするため、`observation.id`、
+`observation.recorded_at`を含め再生成してはいけません。再起動後も同じlookupで
+reconciliationし、推測で成功扱いしません。
+
 ## HTTP surface
 
 The selfhost exposes the same contract:
@@ -96,10 +104,16 @@ sequence:
 The implementation has no live dual-write path and no reader for an old
 backend after cutover.
 
+Personal conversation import and the bounded Nanihold read contract are
+specified separately in [Personal History Ingestion](history-ingestion.md).
+
 ## Conformance
 
 The SQLite and PostgreSQL adapters run the shared storage contract for
 idempotency, conflicts, cursor/stream reads, event lookup, and blob storage.
+HTTP conformance also appends an event, resolves an unknown-result through
+exact event-ID lookup, compares the complete envelope, and verifies that a
+byte-equivalent retry returns `duplicate`.
 SQLite additionally tests file pinning and export/replay. PostgreSQL
 conformance runs against a disposable real PostgreSQL instance and verifies
 the required schema/role boundary.

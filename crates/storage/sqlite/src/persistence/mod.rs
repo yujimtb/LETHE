@@ -1821,9 +1821,9 @@ impl OperationalEventStore for SqliteOperationalEventStore {
                 if stored_sha256 != event_sha256
                     || stored_event_id != request.event.event_id.as_str()
                 {
-                    return Err(StorageError::Invariant(format!(
-                        "operational idempotency collision for {idempotency_key}"
-                    )));
+                    return Err(StorageError::OperationalIdempotencyCollision(
+                        idempotency_key.to_owned(),
+                    ));
                 }
                 outcomes.push(OperationalAppendOutcome::Duplicate {
                     cursor,
@@ -1843,10 +1843,9 @@ impl OperationalEventStore for SqliteOperationalEventStore {
                 .map_err(Self::storage_error)?;
             if let Some((cursor, stored_sha256)) = existing_event {
                 if stored_sha256 != event_sha256 {
-                    return Err(StorageError::Invariant(format!(
-                        "operational event_id collision for {}",
-                        request.event.event_id
-                    )));
+                    return Err(StorageError::OperationalEventIdCollision(
+                        request.event.event_id.as_str().to_owned(),
+                    ));
                 }
                 outcomes.push(OperationalAppendOutcome::Duplicate {
                     cursor,
@@ -2238,7 +2237,10 @@ fn validate_item_key(item_key: &str) -> Result<(), PersistenceError> {
 
 fn projection_item_validation_error(error: StorageError) -> PersistenceError {
     match error {
-        StorageError::Invariant(message) | StorageError::Backend(message) => {
+        StorageError::Invariant(message)
+        | StorageError::Backend(message)
+        | StorageError::OperationalIdempotencyCollision(message)
+        | StorageError::OperationalEventIdCollision(message) => {
             PersistenceError::SchemaInvariant(message)
         }
     }

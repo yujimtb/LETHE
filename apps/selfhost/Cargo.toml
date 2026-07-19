@@ -15,6 +15,7 @@ lethe-api = { path = "../../crates/api" }
 lethe-core = { path = "../../crates/core" }
 lethe-derivation-gemini = { path = "../../crates/derivations/gemini" }
 lethe-engine = { path = "../../crates/engine" }
+lethe-history = { path = "../../crates/history" }
 lethe-policy = { path = "../../crates/policy" }
 lethe-profile-model = { path = "../../crates/profile-model" }
 lethe-projection-answer-log = { path = "../../crates/projections/answer-log" }

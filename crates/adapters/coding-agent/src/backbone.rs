@@ -46,6 +46,14 @@ pub struct BackboneRecord {
     pub item: BackboneItem,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackboneHistoryRecord {
+    pub record: BackboneRecord,
+    pub source_path: String,
+    pub line_number: usize,
+    pub raw: Vec<u8>,
+}
+
 impl BackboneRecord {
     pub fn to_observation_draft(
         &self,

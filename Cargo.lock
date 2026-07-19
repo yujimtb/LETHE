@@ -1495,6 +1495,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "lethe-history"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chrono",
+ "hex",
+ "lethe-adapter-coding-agent",
+ "lethe-core",
+ "lethe-storage-api",
+ "lethe-storage-postgres",
+ "lethe-storage-sqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "lethe-import-chatgpt"
 version = "0.1.0"
 dependencies = [
@@ -1540,6 +1559,26 @@ dependencies = [
  "lethe-adapter-github",
  "lethe-core",
  "lethe-selfhost",
+]
+
+[[package]]
+name = "lethe-import-history"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "lethe-adapter-api",
+ "lethe-adapter-coding-agent",
+ "lethe-core",
+ "lethe-history",
+ "lethe-runtime",
+ "lethe-storage-api",
+ "lethe-storage-postgres",
+ "lethe-storage-sqlite",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -1700,6 +1739,7 @@ dependencies = [
  "lethe-core",
  "lethe-derivation-gemini",
  "lethe-engine",
+ "lethe-history",
  "lethe-policy",
  "lethe-profile-model",
  "lethe-projection-answer-log",

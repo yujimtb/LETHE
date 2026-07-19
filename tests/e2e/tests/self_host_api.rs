@@ -164,6 +164,8 @@ fn test_config_with_corpus(db: PathBuf, blobs: PathBuf, corpus_mode: CorpusMode)
                 "read:answer-log".into(),
                 "read:operational".into(),
                 "write:operational".into(),
+                "read:history".into(),
+                "write:history".into(),
             ],
         }],
         resource_limits: ResourceLimits {
@@ -363,6 +365,51 @@ fn operational_event_and_blob_http_contract_is_cursor_based_and_scoped() {
     );
     assert_eq!(json["next_cursor"], serde_json::json!(1));
 
+    let reconciled = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/operational-events/event:http:1")
+                        .header("authorization", "Bearer test-api-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(reconciled.status(), StatusCode::OK);
+    let body = runtime
+        .block_on(async { axum::body::to_bytes(reconciled.into_body(), usize::MAX).await })
+        .unwrap();
+    let reconciled_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        reconciled_json["event"],
+        append_body["requests"][0]["event"]
+    );
+
+    let retry = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/operational-events")
+                        .header("authorization", "Bearer test-api-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(append_body.to_string()))
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(retry.status(), StatusCode::OK);
+    let body = runtime
+        .block_on(async { axum::body::to_bytes(retry.into_body(), usize::MAX).await })
+        .unwrap();
+    let retry_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(retry_json["outcomes"][0]["outcome"], "duplicate");
+
     let blob = runtime
         .block_on(async {
             app.clone()
@@ -414,6 +461,197 @@ fn operational_event_and_blob_http_contract_is_cursor_based_and_scoped() {
         })
         .unwrap();
     assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn history_import_and_single_query_http_contract_are_data_space_scoped() {
+    let (root, db, blobs) = temp_paths();
+    let service = bootstrap_ready(test_config(db, blobs));
+    let app = build_router(service);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let inventory = serde_json::json!({
+        "inventory_id": "inventory:http-history",
+        "data_space_id": "space:e2e",
+        "captured_at": "2026-07-20T12:00:00Z",
+        "required_sources": [{
+            "source_kind": "codex",
+            "source_instance_id": "codex-personal"
+        }],
+        "sources": [{
+            "source_kind": "codex",
+            "source_instance_id": "codex-personal",
+            "cutover_cursor": "native-tree:sha256:test",
+            "ownership": {"status": "personal", "owner_id": "owner"},
+            "records": [{
+                "source_session_id": "session-http",
+                "source_message_id": "message-http",
+                "parent_message_id": null,
+                "published_at": "2026-07-20T11:00:00Z",
+                "ordinal": 1,
+                "author": "owner",
+                "surface": "codex",
+                "channel": "local",
+                "text": "履歴検索の確認",
+                "record_kind": {"kind": "message"},
+                "raw": [114, 97, 119],
+                "metadata": {}
+            }]
+        }]
+    });
+    let dry_run = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/history/imports/inventory")
+                        .header("authorization", "Bearer test-api-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(inventory.to_string()))
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(dry_run.status(), StatusCode::OK);
+    let dry_body = runtime
+        .block_on(async { axum::body::to_bytes(dry_run.into_body(), usize::MAX).await })
+        .unwrap();
+    let dry_json: serde_json::Value = serde_json::from_slice(&dry_body).unwrap();
+    assert_eq!(dry_json["ready_for_import"], true);
+    let manifest_digest = dry_json["manifest"]["manifest_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let import = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/history/imports")
+                        .header("authorization", "Bearer test-api-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "inventory": inventory,
+                                "expected_manifest_digest": manifest_digest
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(import.status(), StatusCode::OK);
+
+    let query = |operation: &str, argument: serde_json::Value| {
+        runtime
+            .block_on(async {
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/history/query")
+                            .header("authorization", "Bearer test-api-token")
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                serde_json::json!({
+                                    "data_space_id": "space:e2e",
+                                    "operation": operation,
+                                    "argument": argument,
+                                    "page_cursor": null,
+                                    "max_result_bytes": 1048576
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+            })
+            .unwrap()
+    };
+
+    let sessions = query("list_sessions", serde_json::json!({}));
+    assert_eq!(sessions.status(), StatusCode::OK);
+    let sessions_body = runtime
+        .block_on(async { axum::body::to_bytes(sessions.into_body(), usize::MAX).await })
+        .unwrap();
+    let sessions_json: serde_json::Value = serde_json::from_slice(&sessions_body).unwrap();
+    assert_eq!(sessions_json["source_cursor"], "operational:2");
+    let session_id = sessions_json["result_json"][0]["session_ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let timeline = query(
+        "read_timeline",
+        serde_json::json!({"session_id": session_id}),
+    );
+    assert_eq!(timeline.status(), StatusCode::OK);
+    let timeline_body = runtime
+        .block_on(async { axum::body::to_bytes(timeline.into_body(), usize::MAX).await })
+        .unwrap();
+    let timeline_json: serde_json::Value = serde_json::from_slice(&timeline_body).unwrap();
+    let message_id = timeline_json["result_json"][0]["event_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        timeline_json["result_json"][0]["raw_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+
+    let raw = query(
+        "read_raw",
+        serde_json::json!({"message_id": message_id.clone()}),
+    );
+    assert_eq!(raw.status(), StatusCode::OK);
+    let raw_body = runtime
+        .block_on(async { axum::body::to_bytes(raw.into_body(), usize::MAX).await })
+        .unwrap();
+    let raw_json: serde_json::Value = serde_json::from_slice(&raw_body).unwrap();
+    assert_eq!(raw_json["result_json"]["encoding"], "base64");
+    assert_eq!(raw_json["result_json"]["content_base64"], "cmF3");
+
+    let search = query("search", serde_json::json!({"query": "履歴検索"}));
+    assert_eq!(search.status(), StatusCode::OK);
+    let reference = query(
+        "resolve_reference",
+        serde_json::json!({"reference_id": message_id}),
+    );
+    assert_eq!(reference.status(), StatusCode::OK);
+
+    let wrong_space = runtime
+        .block_on(async {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/history/query")
+                    .header("authorization", "Bearer test-api-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "data_space_id": "space:company",
+                            "operation": "list_sessions",
+                            "argument": {},
+                            "page_cursor": null,
+                            "max_result_bytes": 1024
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+        })
+        .unwrap();
+    assert_eq!(wrong_space.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let _ = std::fs::remove_dir_all(root);
 }
 

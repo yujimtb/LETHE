@@ -610,7 +610,12 @@ impl FileConfig {
                 "api_tokens must contain at least one entry".to_owned(),
             ));
         }
-        for required_scope in ["read:operational", "write:operational"] {
+        for required_scope in [
+            "read:operational",
+            "write:operational",
+            "read:history",
+            "write:history",
+        ] {
             let present = self.api_tokens.iter().any(|token| {
                 token
                     .scopes
@@ -1099,7 +1104,7 @@ mod tests {
             reject_unregistered_kinds = true
             [[api_tokens]]
             token_env = "TOKEN"
-            scopes = ["read", "read:operational", "write:operational"]
+            scopes = ["read", "read:operational", "write:operational", "read:history", "write:history"]
             [sources]
             [[sources.slack]]
             id = "same"
@@ -1170,7 +1175,7 @@ mod tests {
             reject_unregistered_kinds = true
             [[api_tokens]]
             token_env = "TOKEN"
-            scopes = ["admin:health", "read:corpus", "read:operational", "write:operational"]
+            scopes = ["admin:health", "read:corpus", "read:operational", "write:operational", "read:history", "write:history"]
             [sources]
             slack = []
             google_slides = []
@@ -1229,7 +1234,7 @@ mod tests {
             reject_unregistered_kinds = true
             [[api_tokens]]
             token_env = "TOKEN"
-            scopes = ["read:corpus", "read:operational", "write:operational"]
+            scopes = ["read:corpus", "read:operational", "write:operational", "read:history", "write:history"]
             [sources]
             slack = []
             google_slides = []
@@ -1289,7 +1294,7 @@ mod tests {
             reject_unregistered_kinds = true
             [[api_tokens]]
             token_env = "TOKEN"
-            scopes = ["read", "read:operational", "write:operational"]
+            scopes = ["read", "read:operational", "write:operational", "read:history", "write:history"]
             [sources]
             slack = []
             [[sources.google_slides]]

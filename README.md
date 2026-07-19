@@ -15,6 +15,7 @@ crates/
   policy/                      Governance policy
   registry/                    Schema / observer registry
   engine/                      Lake / projection / propagation / identity
+  history/                     Personal履歴inventory / receipt / read projection
   api/                         API contract
   runtime/                     partition / resolver / runtime control
   storage/                     storage port と SQLite/PostgreSQL 実装
@@ -36,6 +37,7 @@ workspace root は virtual manifest です。Rust 実装を持つルート `src/
 - append-only Observation Lake と SQLite 永続化
 - DataSpaceごとに隔離したNanihold Operational Event Ledger
   (optimistic version、idempotency、cursor、signed export/replay)
+- Claude Code/Codex native履歴のmanifest検証取込とbounded HistoryReader
 - Gemini による slide-analysis derivation
 - identity resolution と Person Page Projection
 - scope 付き Bearer token、consent、Filtering-before-Exposure
@@ -54,6 +56,7 @@ source-native write adapter は実装していません。
 - [Documentation index](docs/README.md)
 - [System overview](docs/architecture/system-overview.md)
 - [Operational Event Ledger](docs/architecture/operational-event-ledger.md)
+- [Personal history ingestion](docs/architecture/history-ingestion.md)
 - [Domain algebra](docs/architecture/domain-algebra.md)
 - [Runtime reference](docs/architecture/runtime-reference.md)
 - [Repository layout](docs/development/repository-layout.md)
@@ -138,6 +141,9 @@ cargo run -p lethe-selfhost
 - `GET /api/projections/proj:corpus/records/{record_id}` (`read:corpus`)
 - `GET /api/projections/proj:corpus/threads/{record_id}` (`read:corpus`)
 - `POST /supplementals` (`write:supplemental`)
+- `POST /api/history/imports/inventory` (`write:history`)
+- `POST /api/history/imports` (`write:history`)
+- `POST /api/history/query` (`read:history`)
 
 `/health` 以外は `Authorization: Bearer <token>` が必要です。Person Projection ID
 は `proj:person-page` です。旧 `/api/persons/*` ルートや raw CAS 配信ルートは

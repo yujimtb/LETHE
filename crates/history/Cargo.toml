@@ -1,0 +1,21 @@
+[package]
+name = "lethe-history"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chrono.workspace = true
+base64.workspace = true
+hex.workspace = true
+lethe-adapter-coding-agent = { path = "../adapters/coding-agent" }
+lethe-core = { path = "../core" }
+lethe-storage-api = { path = "../storage/api" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+lethe-storage-postgres = { path = "../storage/postgres" }
+lethe-storage-sqlite = { path = "../storage/sqlite" }
+uuid.workspace = true

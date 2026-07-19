@@ -23,6 +23,10 @@ Nanihold向けのDataSpace分離Event Ledger契約は
 [`architecture/operational-event-ledger.md`](architecture/operational-event-ledger.md)
 にあります。
 
+Nanihold/Fable向けのPersonal履歴取込と単一HistoryReader契約は
+[`architecture/history-ingestion.md`](architecture/history-ingestion.md)
+にあります。
+
 個人 lake の Claude/ChatGPT/GitHub ingestion 手順は
 [`development/personal-lake-ingestion.md`](development/personal-lake-ingestion.md) にあります。
 

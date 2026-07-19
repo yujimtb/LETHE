@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -8,7 +9,9 @@ use lethe_adapter_api::traits::ObservationDraft;
 use lethe_core::domain::SemVer;
 use serde_json::Value;
 
-use crate::backbone::{BackboneItem, BackboneRecord, CodingAgentSourceConfig};
+use crate::backbone::{
+    BackboneHistoryRecord, BackboneItem, BackboneRecord, CodingAgentSourceConfig,
+};
 
 pub const CODEX_OBSERVER_ID: &str = "obs:codex-importer";
 pub const CODEX_SOURCE_SYSTEM: &str = "sys:codex";
@@ -23,6 +26,7 @@ const CODEX_CONFIG: CodingAgentSourceConfig = CodingAgentSourceConfig {
 #[derive(Debug, Clone, Default)]
 pub struct CodingAgentImportBatch {
     pub drafts: Vec<ObservationDraft>,
+    pub history_records: Vec<BackboneHistoryRecord>,
     pub audit: ImportAudit,
 }
 
@@ -60,12 +64,17 @@ impl CodexImporter {
     }
 
     pub fn import_archive_path(&self, path: &Path) -> Result<CodingAgentImportBatch, AdapterError> {
-        let sessions_root = resolve_sessions_root(path)?;
-        let files = jsonl_files(&sessions_root)?;
+        let session_roots = resolve_session_roots(path)?;
+        let mut files = Vec::new();
+        for root in &session_roots {
+            files.extend(jsonl_files(root)?);
+        }
+        files.sort();
+        files.dedup();
         if files.is_empty() {
             return Err(malformed(format!(
-                "codex sessions root contains no jsonl files: {}",
-                sessions_root.display()
+                "Codex native root contains no jsonl files: {}",
+                path.display()
             )));
         }
 
@@ -75,7 +84,7 @@ impl CodexImporter {
                 AdapterError::Other(format!("failed to read {}: {error}", file.display()))
             })?;
             let label = file
-                .strip_prefix(&sessions_root)
+                .strip_prefix(path)
                 .unwrap_or(file.as_path())
                 .to_string_lossy()
                 .replace('\\', "/");
@@ -92,8 +101,94 @@ impl CodexImporter {
                 .extend(imported.audit.skipped_unknown_lines);
             batch.audit.excluded_known_lines += imported.audit.excluded_known_lines;
             batch.drafts.extend(imported.drafts);
+            batch.history_records.extend(imported.history_records);
         }
         Ok(batch)
+    }
+
+    pub fn visit_native_path<F>(
+        &self,
+        path: &Path,
+        max_record_bytes: usize,
+        mut visitor: F,
+    ) -> Result<ImportAudit, AdapterError>
+    where
+        F: FnMut(BackboneHistoryRecord) -> Result<(), AdapterError>,
+    {
+        if max_record_bytes == 0 {
+            return Err(malformed("max_record_bytes must be positive".to_owned()));
+        }
+        let session_roots = resolve_session_roots(path)?;
+        let mut files = Vec::new();
+        for root in &session_roots {
+            files.extend(jsonl_files(root)?);
+        }
+        files.sort();
+        files.dedup();
+        if files.is_empty() {
+            return Err(malformed(format!(
+                "Codex native root contains no jsonl files: {}",
+                path.display()
+            )));
+        }
+        let mut audit = ImportAudit::default();
+        for file in files {
+            let label = file
+                .strip_prefix(path)
+                .unwrap_or(file.as_path())
+                .to_string_lossy()
+                .replace('\\', "/");
+            let meta = find_session_meta(&file, &label, max_record_bytes)?;
+            let reader = BufReader::new(fs::File::open(&file).map_err(|error| {
+                AdapterError::Other(format!("failed to read {}: {error}", file.display()))
+            })?);
+            audit.files_read += 1;
+            audit.transcripts_read += 1;
+            for (index, line) in reader.split(b'\n').enumerate() {
+                let line_number = index + 1;
+                let mut raw = line.map_err(|error| {
+                    AdapterError::Other(format!("failed to read {}: {error}", file.display()))
+                })?;
+                if raw.last() == Some(&b'\r') {
+                    raw.pop();
+                }
+                if raw.is_empty() {
+                    continue;
+                }
+                if raw.len() > max_record_bytes {
+                    return Err(malformed(format!(
+                        "Codex record exceeds max_record_bytes at {label}:{line_number}: {} > {max_record_bytes}",
+                        raw.len()
+                    )));
+                }
+                let row = match serde_json::from_slice::<Value>(&raw) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        audit.malformed_lines.push(AuditLine {
+                            path: label.clone(),
+                            line: line_number,
+                            reason: format!("MalformedTranscriptLine: {error}"),
+                        });
+                        continue;
+                    }
+                };
+                match map_row(row, line_number, &label, &meta, &mut audit) {
+                    Ok(Some(record)) => visitor(BackboneHistoryRecord {
+                        record,
+                        source_path: label.clone(),
+                        line_number,
+                        raw,
+                    })?,
+                    Ok(None) => {}
+                    Err(reason) => audit.malformed_lines.push(AuditLine {
+                        path: label.clone(),
+                        line: line_number,
+                        reason,
+                    }),
+                }
+            }
+        }
+        Ok(audit)
     }
 
     pub fn import_jsonl_str(
@@ -109,7 +204,7 @@ impl CodexImporter {
                 continue;
             }
             match serde_json::from_str::<Value>(line) {
-                Ok(value) => rows.push((line_number, value)),
+                Ok(value) => rows.push((line_number, value, line.as_bytes().to_vec())),
                 Err(error) => audit.malformed_lines.push(AuditLine {
                     path: source_path.to_owned(),
                     line: line_number,
@@ -120,7 +215,7 @@ impl CodexImporter {
 
         let meta = rows
             .iter()
-            .find_map(|(_, row)| {
+            .find_map(|(_, row, _)| {
                 (string_at(row, "/type") == Some("session_meta")).then(|| parse_session_meta(row))
             })
             .transpose()?
@@ -131,10 +226,17 @@ impl CodexImporter {
             })?;
 
         let mut drafts = Vec::new();
-        for (line_number, row) in rows {
+        let mut history_records = Vec::new();
+        for (line_number, row, raw) in rows {
             match map_row(row, line_number, source_path, &meta, &mut audit) {
                 Ok(Some(record)) => {
                     drafts.push(record.to_observation_draft(&CODEX_CONFIG, &self.adapter_version));
+                    history_records.push(BackboneHistoryRecord {
+                        record,
+                        source_path: source_path.to_owned(),
+                        line_number,
+                        raw,
+                    });
                 }
                 Ok(None) => {}
                 Err(reason) => audit.malformed_lines.push(AuditLine {
@@ -146,11 +248,52 @@ impl CodexImporter {
         }
 
         audit.transcripts_read = 1;
-        Ok(CodingAgentImportBatch { drafts, audit })
+        Ok(CodingAgentImportBatch {
+            drafts,
+            history_records,
+            audit,
+        })
     }
 }
 
-fn resolve_sessions_root(path: &Path) -> Result<PathBuf, AdapterError> {
+fn find_session_meta(
+    path: &Path,
+    source_path: &str,
+    max_record_bytes: usize,
+) -> Result<CodexSessionMeta, AdapterError> {
+    let reader = BufReader::new(fs::File::open(path).map_err(|error| {
+        AdapterError::Other(format!("failed to read {}: {error}", path.display()))
+    })?);
+    for (index, line) in reader.split(b'\n').enumerate() {
+        let mut raw = line.map_err(|error| {
+            AdapterError::Other(format!("failed to read {}: {error}", path.display()))
+        })?;
+        if raw.last() == Some(&b'\r') {
+            raw.pop();
+        }
+        if raw.is_empty() {
+            continue;
+        }
+        if raw.len() > max_record_bytes {
+            return Err(malformed(format!(
+                "Codex record exceeds max_record_bytes at {source_path}:{}: {} > {max_record_bytes}",
+                index + 1,
+                raw.len()
+            )));
+        }
+        let Ok(row) = serde_json::from_slice::<Value>(&raw) else {
+            continue;
+        };
+        if string_at(&row, "/type") == Some("session_meta") {
+            return parse_session_meta(&row);
+        }
+    }
+    Err(malformed(format!(
+        "codex transcript has no session_meta: {source_path}"
+    )))
+}
+
+fn resolve_session_roots(path: &Path) -> Result<Vec<PathBuf>, AdapterError> {
     if !path.is_dir() {
         return Err(malformed(format!(
             "--archive must point to a directory: {}",
@@ -159,21 +302,31 @@ fn resolve_sessions_root(path: &Path) -> Result<PathBuf, AdapterError> {
     }
     let archive_codex_sessions = path.join("codex").join("sessions");
     if archive_codex_sessions.is_dir() {
-        return Ok(archive_codex_sessions);
+        let mut roots = vec![archive_codex_sessions];
+        let archived = path.join("codex").join("archived_sessions");
+        if archived.is_dir() {
+            roots.push(archived);
+        }
+        return Ok(roots);
     }
     let direct_sessions = path.join("sessions");
     if direct_sessions.is_dir() {
-        return Ok(direct_sessions);
+        let mut roots = vec![direct_sessions];
+        let archived = path.join("archived_sessions");
+        if archived.is_dir() {
+            roots.push(archived);
+        }
+        return Ok(roots);
     }
     if path
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name == "sessions")
     {
-        return Ok(path.to_path_buf());
+        return Ok(vec![path.to_path_buf()]);
     }
     Err(malformed(format!(
-        "codex archive must be an archive root containing codex/sessions, a codex root containing sessions, or a sessions directory: {}",
+        "Codex path must be an archive root containing codex/sessions, a native root containing sessions (and optional archived_sessions), or a sessions directory: {}",
         path.display()
     )))
 }
