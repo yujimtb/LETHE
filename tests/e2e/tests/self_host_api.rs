@@ -13,8 +13,8 @@ use lethe_runtime::runtime::partition::RoutingKeyOrder;
 use lethe_selfhost::self_host::app::AppService;
 use lethe_selfhost::self_host::config::{
     ApiTokenConfig, CorpusProjectionConfig, FreshnessConfig, GoogleConfig, JsonWebKey,
-    JsonWebKeySet, McpOAuthConfig, OpsConfig, ResourceLimits, SecretString, SelfHostConfig,
-    SlackConfig, SlideAiConfig, SupplementalConfig,
+    JsonWebKeySet, McpOAuthConfig, OperationalLedgerConfig, OpsConfig, ResourceLimits,
+    SecretString, SelfHostConfig, SlackConfig, SlideAiConfig, SupplementalConfig,
 };
 use lethe_selfhost::self_host::server::build_router;
 use lethe_storage_sqlite::persistence::SqlitePersistence;
@@ -147,6 +147,12 @@ fn test_config_with_corpus(db: PathBuf, blobs: PathBuf, corpus_mode: CorpusMode)
         database_path: db.clone(),
         blob_dir: blobs,
         secret_encryption_key: [7; 32],
+        operational_ledger: OperationalLedgerConfig::Sqlite {
+            data_space_id: lethe_core::domain::DataSpaceId::new("space:e2e"),
+            database_path: db.with_extension("operational.sqlite3"),
+            blob_dir: db.with_extension("operational-blobs"),
+            secret_encryption_key: [8; 32],
+        },
         poll_interval: std::time::Duration::from_secs(300),
         routing_key_order: RoutingKeyOrder::MonthYearSourceContainerPublished,
         api_tokens: vec![ApiTokenConfig {
@@ -156,6 +162,8 @@ fn test_config_with_corpus(db: PathBuf, blobs: PathBuf, corpus_mode: CorpusMode)
                 "read:timeline".into(),
                 "read:corpus".into(),
                 "read:answer-log".into(),
+                "read:operational".into(),
+                "write:operational".into(),
             ],
         }],
         resource_limits: ResourceLimits {
@@ -291,6 +299,122 @@ fn bootstrap_ready(config: SelfHostConfig) -> AppService {
     let service = AppService::bootstrap(config).unwrap();
     wait_for_search_index_ready(&service);
     service
+}
+
+#[test]
+fn operational_event_and_blob_http_contract_is_cursor_based_and_scoped() {
+    let (root, db, blobs) = temp_paths();
+    let service = bootstrap_ready(test_config(db, blobs));
+    let app = build_router(service);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let event = lethe_storage_api::conformance::sample_operational_event(
+        &lethe_core::domain::DataSpaceId::new("space:e2e"),
+        "event:http:1",
+        "work:http",
+        1,
+        "operational:http:1",
+    );
+    let append_body = serde_json::json!({
+        "requests": [{
+            "event": event,
+            "expected_stream_version": 0
+        }]
+    });
+
+    let append = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/operational-events")
+                        .header("authorization", "Bearer test-api-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(append_body.to_string()))
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(append.status(), StatusCode::OK);
+
+    let page = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/operational-events?after_cursor=0&limit=10")
+                        .header("authorization", "Bearer test-api-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let body = runtime
+        .block_on(async { axum::body::to_bytes(page.into_body(), usize::MAX).await })
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["events"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        json["events"][0]["event"]["data_space_id"],
+        serde_json::json!("space:e2e")
+    );
+    assert_eq!(json["next_cursor"], serde_json::json!(1));
+
+    let blob = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/operational-blobs")
+                        .header("authorization", "Bearer test-api-token")
+                        .body(Body::from("raw owner message"))
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(blob.status(), StatusCode::OK);
+    let body = runtime
+        .block_on(async { axum::body::to_bytes(blob.into_body(), usize::MAX).await })
+        .unwrap();
+    let blob_ref: String = serde_json::from_slice(&body).unwrap();
+    let blob_hash = blob_ref.strip_prefix("blob:sha256:").unwrap();
+    let fetched = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/operational-blobs/{blob_hash}"))
+                        .header("authorization", "Bearer test-api-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(fetched.status(), StatusCode::OK);
+    let fetched_body = runtime
+        .block_on(async { axum::body::to_bytes(fetched.into_body(), usize::MAX).await })
+        .unwrap();
+    assert_eq!(&fetched_body[..], b"raw owner message");
+
+    let unauthenticated = runtime
+        .block_on(async {
+            app.oneshot(
+                Request::builder()
+                    .uri("/api/operational-events/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        })
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

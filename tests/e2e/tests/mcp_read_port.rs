@@ -18,8 +18,8 @@ use lethe_runtime::runtime::partition::RoutingKeyOrder;
 use lethe_selfhost::self_host::app::AppService;
 use lethe_selfhost::self_host::config::{
     ApiTokenConfig, CorpusProjectionConfig, FreshnessConfig, GoogleConfig, JsonWebKey,
-    JsonWebKeySet, McpOAuthConfig, OpsConfig, ResourceLimits, SecretString, SelfHostConfig,
-    SupplementalConfig,
+    JsonWebKeySet, McpOAuthConfig, OperationalLedgerConfig, OpsConfig, ResourceLimits,
+    SecretString, SelfHostConfig, SupplementalConfig,
 };
 use lethe_selfhost::self_host::mcp::build_mcp_router;
 use lethe_selfhost::self_host::server::build_router;
@@ -200,6 +200,12 @@ fn test_config(db: PathBuf, blobs: PathBuf, oauth: McpOAuthConfig) -> SelfHostCo
         database_path: db.clone(),
         blob_dir: blobs,
         secret_encryption_key: [7; 32],
+        operational_ledger: OperationalLedgerConfig::Sqlite {
+            data_space_id: lethe_core::domain::DataSpaceId::new("space:mcp-e2e"),
+            database_path: db.with_extension("operational.sqlite3"),
+            blob_dir: db.with_extension("operational-blobs"),
+            secret_encryption_key: [8; 32],
+        },
         poll_interval: std::time::Duration::from_secs(300),
         routing_key_order: RoutingKeyOrder::MonthYearSourceContainerPublished,
         api_tokens: vec![ApiTokenConfig {

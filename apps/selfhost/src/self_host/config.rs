@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use lethe_core::domain::DataSpaceId;
 use lethe_projection_corpus::{CorpusConfig, CorpusMode};
 use lethe_registry::registry::{ChannelKind, ChannelRecord};
 use lethe_runtime::runtime::partition::RoutingKeyOrder;
@@ -20,6 +21,7 @@ pub struct SelfHostConfig {
     pub database_path: PathBuf,
     pub blob_dir: PathBuf,
     pub secret_encryption_key: [u8; 32],
+    pub operational_ledger: OperationalLedgerConfig,
     pub poll_interval: Duration,
     pub routing_key_order: RoutingKeyOrder,
     pub api_tokens: Vec<ApiTokenConfig>,
@@ -33,6 +35,22 @@ pub struct SelfHostConfig {
     pub slide_analysis_limit: Option<usize>,
     pub slide_ai: Option<SlideAiConfig>,
     pub supplemental: SupplementalConfig,
+}
+
+#[derive(Debug, Clone)]
+pub enum OperationalLedgerConfig {
+    Sqlite {
+        data_space_id: DataSpaceId,
+        database_path: PathBuf,
+        blob_dir: PathBuf,
+        secret_encryption_key: [u8; 32],
+    },
+    Postgres {
+        data_space_id: DataSpaceId,
+        dsn: SecretString,
+        schema: String,
+        role: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +205,7 @@ struct FileConfig {
     server: ServerFileConfig,
     mcp: McpFileConfig,
     storage: StorageFileConfig,
+    operational_ledger: OperationalLedgerFileConfig,
     routing: RoutingFileConfig,
     runtime: RuntimeFileConfig,
     limits: LimitsFileConfig,
@@ -224,6 +243,23 @@ struct StorageFileConfig {
     database_path: PathBuf,
     blob_dir: PathBuf,
     encryption_key_env: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
+enum OperationalLedgerFileConfig {
+    Sqlite {
+        data_space_id: String,
+        database_path: PathBuf,
+        blob_dir: PathBuf,
+        encryption_key_env: String,
+    },
+    Postgres {
+        data_space_id: String,
+        dsn_env: String,
+        schema: String,
+        role: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -439,6 +475,30 @@ impl SelfHostConfig {
             ),
             None => (None, None),
         };
+        let operational_ledger = match raw.operational_ledger {
+            OperationalLedgerFileConfig::Sqlite {
+                data_space_id,
+                database_path,
+                blob_dir,
+                encryption_key_env,
+            } => OperationalLedgerConfig::Sqlite {
+                data_space_id: DataSpaceId::new(data_space_id),
+                database_path,
+                blob_dir,
+                secret_encryption_key: parse_encryption_key(&required_env(&encryption_key_env)?)?,
+            },
+            OperationalLedgerFileConfig::Postgres {
+                data_space_id,
+                dsn_env,
+                schema,
+                role,
+            } => OperationalLedgerConfig::Postgres {
+                data_space_id: DataSpaceId::new(data_space_id),
+                dsn: SecretString::new(required_env(&dsn_env)?)?,
+                schema,
+                role,
+            },
+        };
 
         Ok(Self {
             bind_addr: raw.server.bind_addr,
@@ -456,6 +516,7 @@ impl SelfHostConfig {
             secret_encryption_key: parse_encryption_key(&required_env(
                 &raw.storage.encryption_key_env,
             )?)?,
+            operational_ledger,
             poll_interval: Duration::from_secs(raw.runtime.poll_seconds),
             routing_key_order: raw.routing.key_order,
             api_tokens,
@@ -528,6 +589,7 @@ impl FileConfig {
             self.limits.max_leaf_observations,
         )?;
         require_positive("limits.retention_days", self.limits.retention_days as usize)?;
+        self.operational_ledger.validate()?;
         self.corpus.validate()?;
         if matches!(self.corpus.mode, CorpusMode::PersonalAllText) {
             let has_corpus_reader = self.api_tokens.iter().any(|token| {
@@ -547,6 +609,19 @@ impl FileConfig {
             return Err(ConfigError::Invalid(
                 "api_tokens must contain at least one entry".to_owned(),
             ));
+        }
+        for required_scope in ["read:operational", "write:operational"] {
+            let present = self.api_tokens.iter().any(|token| {
+                token
+                    .scopes
+                    .iter()
+                    .any(|scope| scope == "*" || scope == required_scope)
+            });
+            if !present {
+                return Err(ConfigError::Invalid(format!(
+                    "operational ledger requires an api token with {required_scope} scope"
+                )));
+            }
         }
         if self.freshness.threshold_seconds.is_empty() {
             return Err(ConfigError::Invalid(
@@ -628,6 +703,52 @@ impl FileConfig {
             }
         }
         Ok(())
+    }
+}
+
+impl OperationalLedgerFileConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        match self {
+            Self::Sqlite {
+                data_space_id,
+                database_path,
+                blob_dir,
+                encryption_key_env,
+            } => {
+                require_non_empty("operational_ledger.data_space_id", data_space_id)?;
+                require_non_empty(
+                    "operational_ledger.database_path",
+                    &database_path.to_string_lossy(),
+                )?;
+                require_non_empty("operational_ledger.blob_dir", &blob_dir.to_string_lossy())?;
+                require_non_empty("operational_ledger.encryption_key_env", encryption_key_env)
+            }
+            Self::Postgres {
+                data_space_id,
+                dsn_env,
+                schema,
+                role,
+            } => {
+                require_non_empty("operational_ledger.data_space_id", data_space_id)?;
+                require_non_empty("operational_ledger.dsn_env", dsn_env)?;
+                require_postgres_identifier("operational_ledger.schema", schema)?;
+                require_postgres_identifier("operational_ledger.role", role)
+            }
+        }
+    }
+}
+
+fn require_postgres_identifier(field: &str, value: &str) -> Result<(), ConfigError> {
+    require_non_empty(field, value)?;
+    let valid = value.chars().enumerate().all(|(index, ch)| {
+        ch == '_' || ch.is_ascii_lowercase() || (index > 0 && ch.is_ascii_digit())
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err(ConfigError::Invalid(format!(
+            "{field} must be a lowercase PostgreSQL identifier"
+        )))
     }
 }
 
@@ -948,6 +1069,12 @@ mod tests {
             database_path = "data/lethe.sqlite3"
             blob_dir = "data/blobs"
             encryption_key_env = "ENCRYPTION_KEY"
+            [operational_ledger]
+            backend = "sqlite"
+            data_space_id = "space:test"
+            database_path = "data/operational.sqlite3"
+            blob_dir = "data/operational-blobs"
+            encryption_key_env = "OPERATIONAL_ENCRYPTION_KEY"
             [routing]
             key_order = "month_year_source_container_published"
             [runtime]
@@ -972,7 +1099,7 @@ mod tests {
             reject_unregistered_kinds = true
             [[api_tokens]]
             token_env = "TOKEN"
-            scopes = ["read"]
+            scopes = ["read", "read:operational", "write:operational"]
             [sources]
             [[sources.slack]]
             id = "same"
@@ -1013,6 +1140,12 @@ mod tests {
             database_path = "data/lethe.sqlite3"
             blob_dir = "data/blobs"
             encryption_key_env = "ENCRYPTION_KEY"
+            [operational_ledger]
+            backend = "sqlite"
+            data_space_id = "space:test"
+            database_path = "data/operational.sqlite3"
+            blob_dir = "data/operational-blobs"
+            encryption_key_env = "OPERATIONAL_ENCRYPTION_KEY"
             [routing]
             key_order = "year_month_source_container_published"
             [runtime]
@@ -1037,7 +1170,7 @@ mod tests {
             reject_unregistered_kinds = true
             [[api_tokens]]
             token_env = "TOKEN"
-            scopes = ["admin:health", "read:corpus"]
+            scopes = ["admin:health", "read:corpus", "read:operational", "write:operational"]
             [sources]
             slack = []
             google_slides = []
@@ -1066,6 +1199,12 @@ mod tests {
             database_path = "data/lethe.sqlite3"
             blob_dir = "data/blobs"
             encryption_key_env = "ENCRYPTION_KEY"
+            [operational_ledger]
+            backend = "sqlite"
+            data_space_id = "space:test"
+            database_path = "data/operational.sqlite3"
+            blob_dir = "data/operational-blobs"
+            encryption_key_env = "OPERATIONAL_ENCRYPTION_KEY"
             [routing]
             key_order = "year_month_source_container_published"
             [runtime]
@@ -1090,7 +1229,7 @@ mod tests {
             reject_unregistered_kinds = true
             [[api_tokens]]
             token_env = "TOKEN"
-            scopes = ["read:corpus"]
+            scopes = ["read:corpus", "read:operational", "write:operational"]
             [sources]
             slack = []
             google_slides = []
@@ -1120,6 +1259,12 @@ mod tests {
             database_path = "data/lethe.sqlite3"
             blob_dir = "data/blobs"
             encryption_key_env = "ENCRYPTION_KEY"
+            [operational_ledger]
+            backend = "sqlite"
+            data_space_id = "space:test"
+            database_path = "data/operational.sqlite3"
+            blob_dir = "data/operational-blobs"
+            encryption_key_env = "OPERATIONAL_ENCRYPTION_KEY"
             [routing]
             key_order = "month_year_source_container_published"
             [runtime]
@@ -1144,7 +1289,7 @@ mod tests {
             reject_unregistered_kinds = true
             [[api_tokens]]
             token_env = "TOKEN"
-            scopes = ["read"]
+            scopes = ["read", "read:operational", "write:operational"]
             [sources]
             slack = []
             [[sources.google_slides]]

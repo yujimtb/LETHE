@@ -20,6 +20,43 @@ impl SqlitePersistence {
                 UNIQUE (leaf_id, identity_key)
             );
 
+            CREATE TABLE IF NOT EXISTS operational_data_space (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                data_space_id TEXT NOT NULL CHECK (length(trim(data_space_id)) > 0)
+            );
+
+            CREATE TABLE IF NOT EXISTS operational_events (
+                cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                data_space_id TEXT NOT NULL CHECK (length(trim(data_space_id)) > 0),
+                stream_id TEXT NOT NULL CHECK (length(trim(stream_id)) > 0),
+                stream_version INTEGER NOT NULL CHECK (stream_version > 0),
+                idempotency_key TEXT NOT NULL CHECK (length(trim(idempotency_key)) > 0),
+                event_type TEXT NOT NULL CHECK (length(trim(event_type)) > 0),
+                occurred_at TEXT NOT NULL,
+                observation_id TEXT NOT NULL UNIQUE,
+                event_sha256 TEXT NOT NULL CHECK (length(event_sha256) = 64),
+                event_json TEXT NOT NULL,
+                UNIQUE (data_space_id, stream_id, stream_version),
+                UNIQUE (data_space_id, idempotency_key),
+                FOREIGN KEY (observation_id) REFERENCES observations(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS operational_events_stream
+                ON operational_events(data_space_id, stream_id, stream_version);
+
+            CREATE TRIGGER IF NOT EXISTS operational_events_no_update
+            BEFORE UPDATE ON operational_events
+            BEGIN
+                SELECT RAISE(ABORT, 'operational_events is append-only');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS operational_events_no_delete
+            BEFORE DELETE ON operational_events
+            BEGIN
+                SELECT RAISE(ABORT, 'operational_events is append-only');
+            END;
+
             CREATE TABLE IF NOT EXISTS sync_state (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL

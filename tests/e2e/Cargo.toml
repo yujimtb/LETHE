@@ -24,6 +24,7 @@ lethe-projection-person = { path = "../../crates/projections/person" }
 lethe-registry = { path = "../../crates/registry" }
 lethe-runtime = { path = "../../crates/runtime" }
 lethe-selfhost = { path = "../../apps/selfhost" }
+lethe-storage-api = { path = "../../crates/storage/api" }
 lethe-storage-sqlite = { path = "../../crates/storage/sqlite" }
 ring.workspace = true
 serde_json.workspace = true

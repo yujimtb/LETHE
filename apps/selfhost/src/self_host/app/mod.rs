@@ -6,7 +6,9 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
 use crate::attribute_inventory::{AttributeInventoryDocument, build_inventory_documents};
-use crate::self_host::config::{GoogleConfig, SelfHostConfig, SlackConfig};
+use crate::self_host::config::{
+    GoogleConfig, OperationalLedgerConfig, SelfHostConfig, SlackConfig,
+};
 use crate::self_host::google::HttpGoogleSlidesClient;
 use crate::self_host::registry::{seed_projection_catalog, seed_registry};
 use crate::self_host::slack::HttpSlackClient;
@@ -67,11 +69,15 @@ use lethe_projection_person::person_page::types::{
     PersonMessage, PersonPageOutput, PersonProfile, PersonSlide, TimelineEvent,
 };
 use lethe_storage_api::{
-    AppendOutcome as DurableAppendOutcome, DiscoveredSlackThread, ObservationStats, ProjectionItem,
-    ProjectionItemCommit, SlackThreadCatalogEntry, SlackThreadKey, StorageError, StoragePorts,
-    StoredObservation,
+    AppendOutcome as DurableAppendOutcome, DiscoveredSlackThread, ObservationStats,
+    OperationalAppendOutcome, OperationalAppendRequest, OperationalEventStats,
+    OperationalStoragePorts, ProjectionItem, ProjectionItemCommit, SlackThreadCatalogEntry,
+    SlackThreadKey, StorageError, StoragePorts, StoredObservation, StoredOperationalEvent,
 };
-use lethe_storage_sqlite::persistence::{PersistenceError, SqlitePersistence};
+use lethe_storage_postgres::PostgresOperationalEventStore;
+use lethe_storage_sqlite::persistence::{
+    PersistenceError, SqliteOperationalEventStore, SqlitePersistence,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SelfHostError {
@@ -113,6 +119,8 @@ pub enum SelfHostError {
     LockPoisoned,
     #[error("ingestion rejected: {0}")]
     Ingestion(String),
+    #[error("operational ledger startup failed: {0}")]
+    OperationalLedger(String),
     #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -1060,6 +1068,7 @@ fn prepare_draft(core: &AppCore, draft: ObservationDraft) -> Result<Observation,
 pub struct AppService {
     core: Arc<Mutex<AppCore>>,
     persistence: Arc<Mutex<Box<dyn StoragePorts>>>,
+    operational_ledger: Arc<Mutex<Box<dyn OperationalStoragePorts>>>,
     bulk_import_operation: Arc<Mutex<()>>,
     search_index: search_index::SearchIndexManager,
     config: Arc<SelfHostConfig>,
@@ -4734,6 +4743,37 @@ struct GoogleSourceRuntime {
 
 impl AppService {
     pub fn bootstrap(config: SelfHostConfig) -> Result<Self, SelfHostError> {
+        let operational_ledger: Box<dyn OperationalStoragePorts> = match &config.operational_ledger
+        {
+            OperationalLedgerConfig::Sqlite {
+                data_space_id,
+                database_path,
+                blob_dir,
+                secret_encryption_key,
+            } => Box::new(
+                SqliteOperationalEventStore::open(
+                    data_space_id.clone(),
+                    database_path,
+                    blob_dir,
+                    secret_encryption_key,
+                )
+                .map_err(|error| SelfHostError::OperationalLedger(error.to_string()))?,
+            ),
+            OperationalLedgerConfig::Postgres {
+                data_space_id,
+                dsn,
+                schema,
+                role,
+            } => Box::new(
+                PostgresOperationalEventStore::connect_no_tls(
+                    data_space_id.clone(),
+                    dsn.expose(),
+                    schema,
+                    role,
+                )
+                .map_err(|error| SelfHostError::OperationalLedger(error.to_string()))?,
+            ),
+        };
         let persistence = SqlitePersistence::open_with_routing_key_order(
             &config.database_path,
             &config.blob_dir,
@@ -4825,6 +4865,7 @@ impl AppService {
         Ok(Self {
             core: Arc::new(Mutex::new(core)),
             persistence,
+            operational_ledger: Arc::new(Mutex::new(operational_ledger)),
             bulk_import_operation: Arc::new(Mutex::new(())),
             search_index,
             config: Arc::new(config),
@@ -4839,6 +4880,94 @@ impl AppService {
             #[cfg(test)]
             non_corpus_rebuild_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
+    }
+
+    pub fn append_operational_events(
+        &self,
+        requests: &[OperationalAppendRequest],
+    ) -> Result<Vec<OperationalAppendOutcome>, SelfHostError> {
+        self.operational_ledger
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?
+            .append_operational_events(requests)
+            .map_err(Into::into)
+    }
+
+    pub fn operational_event_stats(&self) -> Result<OperationalEventStats, SelfHostError> {
+        self.operational_ledger
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?
+            .operational_event_stats()
+            .map_err(Into::into)
+    }
+
+    pub fn operational_event_page(
+        &self,
+        after_cursor: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredOperationalEvent>, SelfHostError> {
+        self.operational_ledger
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?
+            .operational_event_page(after_cursor, limit)
+            .map_err(Into::into)
+    }
+
+    pub fn validate_operational_page_limit(&self, limit: usize) -> Result<(), SelfHostError> {
+        if limit == 0 || limit > self.config.resource_limits.max_page_size {
+            return Err(SelfHostError::Ingestion(format!(
+                "operational event page limit must be between 1 and {}",
+                self.config.resource_limits.max_page_size
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn operational_events_for_stream(
+        &self,
+        stream_id: &str,
+        after_stream_version: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredOperationalEvent>, SelfHostError> {
+        self.operational_ledger
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?
+            .operational_events_for_stream(stream_id, after_stream_version, limit)
+            .map_err(Into::into)
+    }
+
+    pub fn operational_event_by_id(
+        &self,
+        event_id: &lethe_core::domain::OperationalEventId,
+    ) -> Result<Option<StoredOperationalEvent>, SelfHostError> {
+        self.operational_ledger
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?
+            .operational_event_by_id(event_id)
+            .map_err(Into::into)
+    }
+
+    pub fn put_operational_blob(&self, data: &[u8]) -> Result<BlobRef, SelfHostError> {
+        self.operational_ledger
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?
+            .put_blob(data, self.config.resource_limits.max_blob_bytes)
+            .map_err(Into::into)
+    }
+
+    pub fn operational_blob_body_limit(&self) -> usize {
+        self.config.resource_limits.max_blob_bytes
+    }
+
+    pub fn get_operational_blob(
+        &self,
+        blob_ref: &BlobRef,
+    ) -> Result<Option<Vec<u8>>, SelfHostError> {
+        self.operational_ledger
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?
+            .get_blob(blob_ref)
+            .map_err(Into::into)
     }
 
     pub fn spawn_polling_task(&self) {

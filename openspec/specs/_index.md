@@ -32,6 +32,7 @@
 | M15 | Runtime | [runtime.md](runtime.md) | Topology / sandbox / reference stack | ✓(min) |
 | M16 | Platform Generalization | [platform-generalization.md](platform-generalization.md) | ドメイン分離 / plugin / storage port | — |
 | M17 | Platform Robustness | [platform-robustness.md](platform-robustness.md) | authn / 冪等 / 失敗隔離 / 運用品質 | — |
+| M18 | Operational Event Ledger | [operational-event-ledger.md](operational-event-ledger.md) | Nanihold event / DataSpace / backend cutover | ✓ |
 
 ---
 
@@ -65,7 +66,9 @@ M01 Domain Kernel ────────────────────�
   │                                                                 
   ├──► M16 Platform Generalization (cross-cutting; depends on M01/M02/M09)
   │                                                                 
-  └──► M17 Platform Robustness (cross-cutting; depends on M03/M08/M14/M15)
+  ├──► M17 Platform Robustness (cross-cutting; depends on M03/M08/M14/M15)
+  │
+  └──► M18 Operational Event Ledger (depends on M01/M03/M08/M14)
 ```
 
 ### 依存関係の読み方

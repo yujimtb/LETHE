@@ -17,8 +17,8 @@ use super::{
 };
 use crate::self_host::config::{
     ApiTokenConfig, CorpusProjectionConfig, FreshnessConfig, GoogleConfig, JsonWebKey,
-    JsonWebKeySet, McpOAuthConfig, OpsConfig, ResourceLimits, SecretString, SelfHostConfig,
-    SlackConfig, SlideAiConfig, SupplementalConfig,
+    JsonWebKeySet, McpOAuthConfig, OperationalLedgerConfig, OpsConfig, ResourceLimits,
+    SecretString, SelfHostConfig, SlackConfig, SlideAiConfig, SupplementalConfig,
 };
 use crate::self_host::google::HttpGoogleSlidesClient;
 use crate::self_host::slack::HttpSlackClient;
@@ -30,8 +30,10 @@ use lethe_core::domain::{
 use lethe_derivation_gemini::GeminiSlideAnalyzer;
 use lethe_policy::governance::audit::InMemoryAuditLog;
 use lethe_runtime::runtime::partition::RoutingKeyOrder;
-use lethe_storage_api::{SlackThreadKey, StoredObservation};
-use lethe_storage_sqlite::persistence::SqlitePersistence;
+use lethe_storage_api::{
+    OperationalAppendOutcome, OperationalAppendRequest, SlackThreadKey, StoredObservation,
+};
+use lethe_storage_sqlite::persistence::{SqliteOperationalEventStore, SqlitePersistence};
 
 #[test]
 fn non_empty_state_filters_blank_values() {
@@ -149,6 +151,12 @@ fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
         database_path: db.clone(),
         blob_dir: blobs,
         secret_encryption_key: [7; 32],
+        operational_ledger: OperationalLedgerConfig::Sqlite {
+            data_space_id: lethe_core::domain::DataSpaceId::new("space:test"),
+            database_path: db.with_extension("operational.sqlite3"),
+            blob_dir: db.with_extension("operational-blobs"),
+            secret_encryption_key: [8; 32],
+        },
         poll_interval: std::time::Duration::from_secs(300),
         routing_key_order: RoutingKeyOrder::MonthYearSourceContainerPublished,
         api_tokens: vec![ApiTokenConfig {
@@ -230,6 +238,55 @@ fn test_mcp_oauth() -> McpOAuthConfig {
     }
 }
 
+#[test]
+fn operational_ledger_survives_interface_service_restart() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-self-host-operational-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let config = test_config(db, blobs);
+    let service = AppService::bootstrap(config.clone()).unwrap();
+    let event = lethe_storage_api::conformance::sample_operational_event(
+        &lethe_core::domain::DataSpaceId::new("space:test"),
+        "event:selfhost:1",
+        "work:selfhost",
+        1,
+        "operational:selfhost:1",
+    );
+
+    let outcomes = service
+        .append_operational_events(&[OperationalAppendRequest {
+            event,
+            expected_stream_version: 0,
+        }])
+        .unwrap();
+    assert!(matches!(
+        outcomes.as_slice(),
+        [OperationalAppendOutcome::Appended {
+            stream_version: 1,
+            ..
+        }]
+    ));
+    let blob_ref = service.put_operational_blob(b"raw conversation").unwrap();
+    assert_eq!(
+        service.get_operational_blob(&blob_ref).unwrap(),
+        Some(b"raw conversation".to_vec())
+    );
+    drop(service);
+
+    let restarted = AppService::bootstrap(config).unwrap();
+    assert_eq!(restarted.operational_event_stats().unwrap().count, 1);
+    assert_eq!(
+        restarted
+            .operational_events_for_stream("work:selfhost", 0, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
 fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppService {
     let persistence: Arc<Mutex<Box<dyn lethe_storage_api::StoragePorts>>> =
         Arc::new(Mutex::new(Box::new(persistence)));
@@ -245,6 +302,25 @@ fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppSe
         config.corpus.rebuild_page_size,
         Arc::clone(&persistence),
     );
+    let OperationalLedgerConfig::Sqlite {
+        data_space_id,
+        database_path,
+        blob_dir,
+        secret_encryption_key,
+    } = &config.operational_ledger
+    else {
+        panic!("test_service requires the explicit SQLite operational backend");
+    };
+    let operational_ledger: Arc<Mutex<Box<dyn lethe_storage_api::OperationalStoragePorts>>> =
+        Arc::new(Mutex::new(Box::new(
+            SqliteOperationalEventStore::open(
+                data_space_id.clone(),
+                database_path,
+                blob_dir,
+                secret_encryption_key,
+            )
+            .unwrap(),
+        )));
     AppService {
         core: Arc::new(Mutex::new(
             AppCore::new_with_config(
@@ -257,6 +333,7 @@ fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppSe
             .unwrap(),
         )),
         persistence,
+        operational_ledger,
         bulk_import_operation: Arc::new(Mutex::new(())),
         search_index,
         config: Arc::new(config.clone()),

@@ -31,6 +31,13 @@ database_path = "deploy/personal-lake/data/lethe.sqlite3"
 blob_dir = "deploy/personal-lake/data/blobs"
 encryption_key_env = "LETHE_STORAGE_ENCRYPTION_KEY"
 
+[operational_ledger]
+backend = "sqlite"
+data_space_id = "space:personal"
+database_path = "deploy/personal-lake/data/personal-operational.sqlite3"
+blob_dir = "deploy/personal-lake/data/personal-operational-blobs"
+encryption_key_env = "LETHE_OPERATIONAL_STORAGE_ENCRYPTION_KEY"
+
 [routing]
 key_order = "year_month_source_container_published"
 
@@ -66,11 +73,11 @@ reject_unregistered_kinds = true
 
 [[api_tokens]]
 token_env = "LETHE_API_READ_TOKEN"
-scopes = ["read:persons", "read:timeline", "read:corpus"]
+scopes = ["read:persons", "read:timeline", "read:corpus", "read:operational"]
 
 [[api_tokens]]
 token_env = "LETHE_API_WRITE_TOKEN"
-scopes = ["write:supplemental", "write:observations"]
+scopes = ["write:supplemental", "write:observations", "write:operational"]
 
 [[api_tokens]]
 token_env = "LETHE_API_SYNC_TOKEN"
