@@ -1,7 +1,11 @@
+use chrono::{DateTime, Utc};
 use lethe_core::domain::{
-    BlobRef, IdempotencyKey, Observation, ObservationId, ProjectionRef, SupplementalId,
-    SupplementalRecord,
+    AuthorityModel, BlobRef, CaptureModel, DataSpaceId, IdempotencyKey, Observation, ObservationId,
+    OperationalEventId, ProjectionRef, SupplementalId, SupplementalRecord,
 };
+use ring::hmac;
+use serde::{Deserialize, Serialize};
+use sha2::Digest;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -12,6 +16,397 @@ pub enum StorageError {
 }
 
 pub type StorageResult<T> = Result<T, StorageError>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationalEvent {
+    pub event_id: OperationalEventId,
+    pub data_space_id: DataSpaceId,
+    pub stream_id: String,
+    pub stream_version: u64,
+    pub event_type: String,
+    pub occurred_at: DateTime<Utc>,
+    pub actor_type: String,
+    pub actor_id: Option<String>,
+    pub correlation_id: Option<String>,
+    pub causation_id: Option<OperationalEventId>,
+    pub observation: Observation,
+}
+
+impl OperationalEvent {
+    pub fn validate(&self) -> StorageResult<()> {
+        validate_non_blank("event_id", self.event_id.as_str())?;
+        validate_non_blank("data_space_id", self.data_space_id.as_str())?;
+        validate_non_blank("stream_id", &self.stream_id)?;
+        validate_non_blank("event_type", &self.event_type)?;
+        validate_non_blank("actor_type", &self.actor_type)?;
+        if self.stream_version == 0 {
+            return Err(StorageError::Invariant(
+                "operational event stream_version must be >= 1".to_owned(),
+            ));
+        }
+        if self.observation.authority_model != AuthorityModel::LakeAuthoritative {
+            return Err(StorageError::Invariant(
+                "operational event observation must be lake_authoritative".to_owned(),
+            ));
+        }
+        if self.observation.capture_model != CaptureModel::Event {
+            return Err(StorageError::Invariant(
+                "operational event observation capture_model must be event".to_owned(),
+            ));
+        }
+        if self.observation.published != self.occurred_at {
+            return Err(StorageError::Invariant(
+                "operational event occurred_at must equal observation.published".to_owned(),
+            ));
+        }
+        let meta = self.observation.meta.as_object().ok_or_else(|| {
+            StorageError::Invariant(
+                "operational event observation.meta must be an object".to_owned(),
+            )
+        })?;
+        if meta
+            .get("data_space_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(self.data_space_id.as_str())
+        {
+            return Err(StorageError::Invariant(
+                "operational event observation.meta.data_space_id mismatch".to_owned(),
+            ));
+        }
+        if meta.get("event_id").and_then(serde_json::Value::as_str) != Some(self.event_id.as_str())
+        {
+            return Err(StorageError::Invariant(
+                "operational event observation.meta.event_id mismatch".to_owned(),
+            ));
+        }
+        validate_non_blank(
+            "operational event observation.idempotency_key",
+            self.observation.idempotency_key.as_str(),
+        )
+    }
+}
+
+fn validate_non_blank(field: &str, value: &str) -> StorageResult<()> {
+    if value.trim().is_empty() {
+        return Err(StorageError::Invariant(format!(
+            "operational event {field} must not be blank"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationalAppendRequest {
+    pub event: OperationalEvent,
+    pub expected_stream_version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum OperationalAppendOutcome {
+    Appended { cursor: u64, stream_version: u64 },
+    Duplicate { cursor: u64, stream_version: u64 },
+    VersionConflict { expected: u64, actual: u64 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredOperationalEvent {
+    pub cursor: u64,
+    pub event: OperationalEvent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationalEventStats {
+    pub count: u64,
+    pub max_cursor: u64,
+}
+
+pub trait OperationalEventStore: Send {
+    fn data_space_id(&self) -> &DataSpaceId;
+
+    fn append_operational_events(
+        &self,
+        requests: &[OperationalAppendRequest],
+    ) -> StorageResult<Vec<OperationalAppendOutcome>>;
+
+    fn append_operational_event(
+        &self,
+        request: &OperationalAppendRequest,
+    ) -> StorageResult<OperationalAppendOutcome> {
+        let mut outcomes = self.append_operational_events(std::slice::from_ref(request))?;
+        outcomes.pop().ok_or_else(|| {
+            StorageError::Invariant("operational event store returned no append outcome".to_owned())
+        })
+    }
+
+    fn operational_event_stats(&self) -> StorageResult<OperationalEventStats>;
+
+    fn operational_event_page(
+        &self,
+        after_cursor: u64,
+        limit: usize,
+    ) -> StorageResult<Vec<StoredOperationalEvent>>;
+
+    fn operational_events_for_stream(
+        &self,
+        stream_id: &str,
+        after_stream_version: u64,
+        limit: usize,
+    ) -> StorageResult<Vec<StoredOperationalEvent>>;
+
+    fn operational_event_by_id(
+        &self,
+        event_id: &OperationalEventId,
+    ) -> StorageResult<Option<StoredOperationalEvent>>;
+
+    fn operational_stream_version(&self, stream_id: &str) -> StorageResult<u64>;
+}
+
+pub trait OperationalStoragePorts: OperationalEventStore + BlobStore {}
+
+impl<T> OperationalStoragePorts for T where T: OperationalEventStore + BlobStore {}
+
+pub const OPERATIONAL_ARCHIVE_FORMAT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchiveBlobDigest {
+    pub blob_ref: BlobRef,
+    pub sha256: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanonicalOperationalArchive {
+    pub format_version: u32,
+    pub data_space_id: DataSpaceId,
+    pub exported_at: DateTime<Utc>,
+    pub events: Vec<OperationalEvent>,
+    pub blobs: Vec<ArchiveBlobDigest>,
+}
+
+impl CanonicalOperationalArchive {
+    pub fn validate(&self) -> StorageResult<()> {
+        if self.format_version != OPERATIONAL_ARCHIVE_FORMAT_VERSION {
+            return Err(StorageError::Invariant(format!(
+                "unsupported operational archive format_version: {}",
+                self.format_version
+            )));
+        }
+        validate_non_blank("archive data_space_id", self.data_space_id.as_str())?;
+        let mut stream_versions = std::collections::BTreeMap::<String, u64>::new();
+        let mut event_ids = std::collections::BTreeSet::new();
+        for event in &self.events {
+            event.validate()?;
+            if event.data_space_id != self.data_space_id {
+                return Err(StorageError::Invariant(
+                    "archive contains an event from another data space".to_owned(),
+                ));
+            }
+            if !event_ids.insert(event.event_id.as_str().to_owned()) {
+                return Err(StorageError::Invariant(format!(
+                    "archive contains duplicate event_id {}",
+                    event.event_id
+                )));
+            }
+            let expected = stream_versions.get(&event.stream_id).copied().unwrap_or(0) + 1;
+            if event.stream_version != expected {
+                return Err(StorageError::Invariant(format!(
+                    "archive stream {} expected version {}, got {}",
+                    event.stream_id, expected, event.stream_version
+                )));
+            }
+            stream_versions.insert(event.stream_id.clone(), event.stream_version);
+        }
+        let mut blob_refs = std::collections::BTreeSet::new();
+        for blob in &self.blobs {
+            validate_non_blank("archive blob_ref", blob.blob_ref.as_str())?;
+            if blob.sha256.len() != 64 || !blob.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(StorageError::Invariant(format!(
+                    "archive blob {} has invalid sha256",
+                    blob.blob_ref
+                )));
+            }
+            let expected_ref = format!("blob:sha256:{}", blob.sha256.to_ascii_lowercase());
+            if blob.blob_ref.as_str() != expected_ref {
+                return Err(StorageError::Invariant(format!(
+                    "archive blob reference {} does not match digest {}",
+                    blob.blob_ref, blob.sha256
+                )));
+            }
+            if !blob_refs.insert(blob.blob_ref.as_str().to_owned()) {
+                return Err(StorageError::Invariant(format!(
+                    "archive contains duplicate blob {}",
+                    blob.blob_ref
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SignedOperationalArchive {
+    pub manifest_json: String,
+    pub hmac_sha256: String,
+}
+
+pub fn sign_operational_archive(
+    archive: &CanonicalOperationalArchive,
+    signing_key: &[u8],
+) -> StorageResult<SignedOperationalArchive> {
+    if signing_key.is_empty() {
+        return Err(StorageError::Invariant(
+            "operational archive signing key must not be empty".to_owned(),
+        ));
+    }
+    archive.validate()?;
+    let manifest_json =
+        serde_json::to_string(archive).map_err(|error| StorageError::Backend(error.to_string()))?;
+    let key = hmac::Key::new(hmac::HMAC_SHA256, signing_key);
+    let signature = hmac::sign(&key, manifest_json.as_bytes());
+    Ok(SignedOperationalArchive {
+        manifest_json,
+        hmac_sha256: hex::encode(signature.as_ref()),
+    })
+}
+
+pub fn verify_operational_archive(
+    signed: &SignedOperationalArchive,
+    signing_key: &[u8],
+) -> StorageResult<CanonicalOperationalArchive> {
+    if signing_key.is_empty() {
+        return Err(StorageError::Invariant(
+            "operational archive signing key must not be empty".to_owned(),
+        ));
+    }
+    let signature = hex::decode(&signed.hmac_sha256)
+        .map_err(|error| StorageError::Invariant(format!("invalid archive signature: {error}")))?;
+    let key = hmac::Key::new(hmac::HMAC_SHA256, signing_key);
+    hmac::verify(&key, signed.manifest_json.as_bytes(), &signature).map_err(|_| {
+        StorageError::Invariant("operational archive signature mismatch".to_owned())
+    })?;
+    let archive: CanonicalOperationalArchive = serde_json::from_str(&signed.manifest_json)
+        .map_err(|error| StorageError::Invariant(format!("invalid archive manifest: {error}")))?;
+    archive.validate()?;
+    Ok(archive)
+}
+
+pub fn export_operational_archive<T: OperationalEventStore>(
+    store: &T,
+    exported_at: DateTime<Utc>,
+    blobs: Vec<ArchiveBlobDigest>,
+) -> StorageResult<CanonicalOperationalArchive> {
+    let mut cursor = 0;
+    let mut events = Vec::new();
+    loop {
+        let page = store.operational_event_page(cursor, 512)?;
+        if page.is_empty() {
+            break;
+        }
+        cursor = page
+            .last()
+            .map(|stored| stored.cursor)
+            .ok_or_else(|| StorageError::Invariant("empty event page".to_owned()))?;
+        events.extend(page.into_iter().map(|stored| stored.event));
+    }
+    let archive = CanonicalOperationalArchive {
+        format_version: OPERATIONAL_ARCHIVE_FORMAT_VERSION,
+        data_space_id: store.data_space_id().clone(),
+        exported_at,
+        events,
+        blobs,
+    };
+    archive.validate()?;
+    Ok(archive)
+}
+
+pub fn operational_blob_manifest<T: BlobStore>(
+    store: &T,
+    blob_refs: &[BlobRef],
+) -> StorageResult<Vec<ArchiveBlobDigest>> {
+    let mut unique = blob_refs.to_vec();
+    unique.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    unique.dedup_by(|left, right| left.as_str() == right.as_str());
+    unique
+        .into_iter()
+        .map(|blob_ref| {
+            let data = store.get_blob(&blob_ref)?.ok_or_else(|| {
+                StorageError::Invariant(format!(
+                    "operational archive references missing blob {blob_ref}"
+                ))
+            })?;
+            let sha256 = hex::encode(sha2::Sha256::digest(&data));
+            let expected_ref = format!("blob:sha256:{sha256}");
+            if blob_ref.as_str() != expected_ref {
+                return Err(StorageError::Invariant(format!(
+                    "blob content digest does not match reference {blob_ref}"
+                )));
+            }
+            let bytes = u64::try_from(data.len()).map_err(|_| {
+                StorageError::Invariant(format!("blob {blob_ref} length does not fit u64"))
+            })?;
+            Ok(ArchiveBlobDigest {
+                blob_ref,
+                sha256,
+                bytes,
+            })
+        })
+        .collect()
+}
+
+pub fn verify_operational_archive_blobs<T: BlobStore>(
+    store: &T,
+    archive: &CanonicalOperationalArchive,
+) -> StorageResult<()> {
+    archive.validate()?;
+    for expected in &archive.blobs {
+        let data = store.get_blob(&expected.blob_ref)?.ok_or_else(|| {
+            StorageError::Invariant(format!(
+                "operational archive blob {} is missing",
+                expected.blob_ref
+            ))
+        })?;
+        let bytes = u64::try_from(data.len()).map_err(|_| {
+            StorageError::Invariant(format!(
+                "blob {} length does not fit u64",
+                expected.blob_ref
+            ))
+        })?;
+        let actual_sha256 = hex::encode(sha2::Sha256::digest(&data));
+        if bytes != expected.bytes || actual_sha256 != expected.sha256 {
+            return Err(StorageError::Invariant(format!(
+                "operational archive blob {} failed digest verification",
+                expected.blob_ref
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub fn replay_operational_archive<T: OperationalEventStore>(
+    store: &T,
+    archive: &CanonicalOperationalArchive,
+) -> StorageResult<Vec<OperationalAppendOutcome>> {
+    archive.validate()?;
+    if store.data_space_id() != &archive.data_space_id {
+        return Err(StorageError::Invariant(format!(
+            "archive data space {} does not match target {}",
+            archive.data_space_id,
+            store.data_space_id()
+        )));
+    }
+    let requests = archive
+        .events
+        .iter()
+        .cloned()
+        .map(|event| OperationalAppendRequest {
+            expected_stream_version: event.stream_version - 1,
+            event,
+        })
+        .collect::<Vec<_>>();
+    store.append_operational_events(&requests)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppendOutcome {
@@ -370,6 +765,7 @@ impl<T> StoragePorts for T where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     fn item(item_key: &str) -> ProjectionItem {
         ProjectionItem {
@@ -430,6 +826,42 @@ mod tests {
             assert!(matches!(commit.validate(), Err(StorageError::Invariant(_))));
         }
     }
+
+    #[test]
+    fn operational_archive_signature_detects_tampering() {
+        let archive = CanonicalOperationalArchive {
+            format_version: OPERATIONAL_ARCHIVE_FORMAT_VERSION,
+            data_space_id: DataSpaceId::new("space:personal"),
+            exported_at: Utc.with_ymd_and_hms(2026, 7, 19, 0, 0, 0).unwrap(),
+            events: vec![],
+            blobs: vec![],
+        };
+        let signed = sign_operational_archive(&archive, b"archive-test-key").unwrap();
+        let verified = verify_operational_archive(&signed, b"archive-test-key").unwrap();
+        assert_eq!(verified.data_space_id, archive.data_space_id);
+
+        let mut tampered = signed;
+        tampered.manifest_json = tampered
+            .manifest_json
+            .replace("space:personal", "space:company");
+        assert!(verify_operational_archive(&tampered, b"archive-test-key").is_err());
+    }
+
+    #[test]
+    fn operational_archive_rejects_blob_reference_digest_mismatch() {
+        let archive = CanonicalOperationalArchive {
+            format_version: OPERATIONAL_ARCHIVE_FORMAT_VERSION,
+            data_space_id: DataSpaceId::new("space:personal"),
+            exported_at: Utc.with_ymd_and_hms(2026, 7, 19, 0, 0, 0).unwrap(),
+            events: vec![],
+            blobs: vec![ArchiveBlobDigest {
+                blob_ref: BlobRef::new(format!("blob:sha256:{}", "a".repeat(64))),
+                sha256: "b".repeat(64),
+                bytes: 1,
+            }],
+        };
+        assert!(archive.validate().is_err());
+    }
 }
 
 pub mod conformance {
@@ -462,6 +894,159 @@ pub mod conformance {
                 "source_container": "conformance",
             }),
         }
+    }
+
+    pub fn sample_operational_event(
+        data_space_id: &DataSpaceId,
+        event_id: &str,
+        stream_id: &str,
+        stream_version: u64,
+        idempotency_key: &str,
+    ) -> OperationalEvent {
+        let occurred_at = Utc::now();
+        OperationalEvent {
+            event_id: OperationalEventId::new(event_id),
+            data_space_id: data_space_id.clone(),
+            stream_id: stream_id.to_owned(),
+            stream_version,
+            event_type: "work_item_created".to_owned(),
+            occurred_at,
+            actor_type: "human".to_owned(),
+            actor_id: Some("owner".to_owned()),
+            correlation_id: Some("correlation:conformance".to_owned()),
+            causation_id: None,
+            observation: Observation {
+                id: Observation::new_id(),
+                schema: SchemaRef::new("schema:nanihold-operational-event"),
+                schema_version: SemVer::new("1.0.0"),
+                observer: ObserverRef::new("obs:nanihold-kernel"),
+                source_system: Some(SourceSystemRef::new("sys:nanihold")),
+                actor: Some(EntityRef::new("human:owner")),
+                authority_model: AuthorityModel::LakeAuthoritative,
+                capture_model: CaptureModel::Event,
+                subject: EntityRef::new("work:conformance"),
+                target: None,
+                payload: serde_json::json!({"title": "conformance"}),
+                attachments: vec![],
+                published: occurred_at,
+                recorded_at: occurred_at,
+                consent: None,
+                idempotency_key: IdempotencyKey::new(idempotency_key),
+                meta: serde_json::json!({
+                    "canonical_json": serde_json::json!({
+                        "event_id": event_id,
+                        "stream_id": stream_id,
+                        "stream_version": stream_version,
+                        "title": "conformance"
+                    }).to_string(),
+                    "source_container": "nanihold",
+                    "data_space_id": data_space_id.as_str(),
+                    "event_id": event_id
+                }),
+            },
+        }
+    }
+
+    pub fn operational_event_store_round_trip<T: OperationalEventStore>(store: &T) {
+        assert_eq!(
+            store.operational_event_stats().unwrap(),
+            OperationalEventStats {
+                count: 0,
+                max_cursor: 0
+            }
+        );
+        let first = sample_operational_event(
+            store.data_space_id(),
+            "event:conformance:1",
+            "work:conformance",
+            1,
+            "operational:conformance:1",
+        );
+        let request = OperationalAppendRequest {
+            event: first.clone(),
+            expected_stream_version: 0,
+        };
+        assert!(matches!(
+            store.append_operational_event(&request).unwrap(),
+            OperationalAppendOutcome::Appended {
+                stream_version: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            store.append_operational_event(&request).unwrap(),
+            OperationalAppendOutcome::Duplicate {
+                stream_version: 1,
+                ..
+            }
+        ));
+
+        let conflict = OperationalAppendRequest {
+            event: sample_operational_event(
+                store.data_space_id(),
+                "event:conformance:conflict",
+                "work:conformance",
+                1,
+                "operational:conformance:conflict",
+            ),
+            expected_stream_version: 0,
+        };
+        assert_eq!(
+            store.append_operational_event(&conflict).unwrap(),
+            OperationalAppendOutcome::VersionConflict {
+                expected: 0,
+                actual: 1
+            }
+        );
+
+        let second = OperationalAppendRequest {
+            event: sample_operational_event(
+                store.data_space_id(),
+                "event:conformance:2",
+                "work:conformance",
+                2,
+                "operational:conformance:2",
+            ),
+            expected_stream_version: 1,
+        };
+        assert!(matches!(
+            store.append_operational_event(&second).unwrap(),
+            OperationalAppendOutcome::Appended {
+                stream_version: 2,
+                ..
+            }
+        ));
+        assert_eq!(
+            store
+                .operational_stream_version("work:conformance")
+                .unwrap(),
+            2
+        );
+        let page = store.operational_event_page(0, 10).unwrap();
+        assert_eq!(page.len(), 2);
+        assert!(page[0].cursor < page[1].cursor);
+        let stream = store
+            .operational_events_for_stream("work:conformance", 1, 10)
+            .unwrap();
+        assert_eq!(stream.len(), 1);
+        assert_eq!(stream[0].event.stream_version, 2);
+        assert_eq!(
+            store
+                .operational_event_by_id(&OperationalEventId::new("event:conformance:2"))
+                .unwrap()
+                .unwrap()
+                .event
+                .event_id
+                .as_str(),
+            "event:conformance:2"
+        );
+        assert_eq!(
+            store.operational_event_stats().unwrap(),
+            OperationalEventStats {
+                count: 2,
+                max_cursor: page[1].cursor
+            }
+        );
     }
 
     pub fn observation_store_round_trip<T: ObservationStore>(store: &T) {

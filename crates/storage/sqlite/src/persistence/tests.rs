@@ -1880,3 +1880,85 @@ fn persisted_secrets_are_encrypted_at_rest() {
 
     let _ = fs::remove_dir_all(tmp);
 }
+
+#[test]
+fn operational_event_store_conforms_and_pins_data_space() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let database_path = tmp.join("personal.sqlite3");
+    let store = SqliteOperationalEventStore::open(
+        lethe_core::domain::DataSpaceId::new("space:personal"),
+        &database_path,
+        &tmp.join("blobs"),
+        &[7; 32],
+    )
+    .unwrap();
+    lethe_storage_api::conformance::operational_event_store_round_trip(&store);
+    lethe_storage_api::conformance::blob_store_round_trip(&store);
+
+    drop(store);
+    let mismatch = SqliteOperationalEventStore::open(
+        lethe_core::domain::DataSpaceId::new("space:company"),
+        &database_path,
+        &tmp.join("blobs"),
+        &[7; 32],
+    );
+    assert!(matches!(
+        mismatch,
+        Err(PersistenceError::SchemaInvariant(message))
+            if message.contains("space:personal")
+    ));
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn operational_archive_replays_into_an_empty_sqlite_lake() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let source = SqliteOperationalEventStore::open(
+        lethe_core::domain::DataSpaceId::new("space:personal"),
+        &tmp.join("source.sqlite3"),
+        &tmp.join("source-blobs"),
+        &[7; 32],
+    )
+    .unwrap();
+    let event = lethe_storage_api::conformance::sample_operational_event(
+        source.data_space_id(),
+        "event:archive:1",
+        "work:archive",
+        1,
+        "operational:archive:1",
+    );
+    source
+        .append_operational_event(&OperationalAppendRequest {
+            event,
+            expected_stream_version: 0,
+        })
+        .unwrap();
+    let blob_ref = source.put_blob(b"archived conversation", 1024).unwrap();
+    let blob_manifest =
+        lethe_storage_api::operational_blob_manifest(&source, std::slice::from_ref(&blob_ref))
+            .unwrap();
+    let archive =
+        lethe_storage_api::export_operational_archive(&source, Utc::now(), blob_manifest).unwrap();
+    let signed = lethe_storage_api::sign_operational_archive(&archive, b"archive-key").unwrap();
+    let verified = lethe_storage_api::verify_operational_archive(&signed, b"archive-key").unwrap();
+
+    let target = SqliteOperationalEventStore::open(
+        lethe_core::domain::DataSpaceId::new("space:personal"),
+        &tmp.join("target.sqlite3"),
+        &tmp.join("target-blobs"),
+        &[9; 32],
+    )
+    .unwrap();
+    target.put_blob(b"archived conversation", 1024).unwrap();
+    lethe_storage_api::verify_operational_archive_blobs(&target, &verified).unwrap();
+    let outcomes = lethe_storage_api::replay_operational_archive(&target, &verified).unwrap();
+    assert!(matches!(
+        outcomes.as_slice(),
+        [OperationalAppendOutcome::Appended {
+            stream_version: 1,
+            ..
+        }]
+    ));
+    assert_eq!(target.operational_event_stats().unwrap().count, 1);
+    let _ = fs::remove_dir_all(tmp);
+}

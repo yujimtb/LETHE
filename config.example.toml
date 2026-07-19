@@ -79,6 +79,15 @@ database_path = "./data/lethe.sqlite3"
 blob_dir = "./data/blobs"
 encryption_key_env = "LETHE_STORAGE_ENCRYPTION_KEY"
 
+# Operational events use one explicitly pinned DataSpace per backend. A SQLite
+# DataSpace must have its own database file and blob directory.
+[operational_ledger]
+backend = "sqlite"
+data_space_id = "space:personal"
+database_path = "./data/personal-operational.sqlite3"
+blob_dir = "./data/personal-operational-blobs"
+encryption_key_env = "LETHE_OPERATIONAL_STORAGE_ENCRYPTION_KEY"
+
 # Routing controls the partition key order for append-only lake leaves.
 [routing]
 key_order = "month_year_source_container_published"
@@ -123,11 +132,11 @@ reject_unregistered_kinds = true
 # API tokens are read from environment variables and mapped to explicit scopes.
 [[api_tokens]]
 token_env = "LETHE_API_READ_TOKEN"
-scopes = ["read:persons", "read:timeline", "read:corpus"]
+scopes = ["read:persons", "read:timeline", "read:corpus", "read:operational"]
 
 [[api_tokens]]
 token_env = "LETHE_API_WRITE_TOKEN"
-scopes = ["write:supplemental"]
+scopes = ["write:supplemental", "write:operational"]
 
 [[api_tokens]]
 token_env = "LETHE_API_SYNC_TOKEN"

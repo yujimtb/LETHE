@@ -19,6 +19,10 @@
 [`audits/openspec-verification-2026-06-22.md`](audits/openspec-verification-2026-06-22.md)
 です。
 
+Nanihold向けのDataSpace分離Event Ledger契約は
+[`architecture/operational-event-ledger.md`](architecture/operational-event-ledger.md)
+にあります。
+
 個人 lake の Claude/ChatGPT/GitHub ingestion 手順は
 [`development/personal-lake-ingestion.md`](development/personal-lake-ingestion.md) にあります。
 

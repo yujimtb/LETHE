@@ -17,7 +17,7 @@ crates/
   engine/                      Lake / projection / propagation / identity
   api/                         API contract
   runtime/                     partition / resolver / runtime control
-  storage/                     storage port と SQLite 実装
+  storage/                     storage port と SQLite/PostgreSQL 実装
   adapters/                    read-side source adapter
   derivations/                 AI derivation provider
   projections/                 domain projection
@@ -34,6 +34,8 @@ workspace root は virtual manifest です。Rust 実装を持つルート `src/
 
 - Slack / Google Slides の read-side adapter
 - append-only Observation Lake と SQLite 永続化
+- DataSpaceごとに隔離したNanihold Operational Event Ledger
+  (optimistic version、idempotency、cursor、signed export/replay)
 - Gemini による slide-analysis derivation
 - identity resolution と Person Page Projection
 - scope 付き Bearer token、consent、Filtering-before-Exposure
@@ -51,6 +53,7 @@ source-native write adapter は実装していません。
 
 - [Documentation index](docs/README.md)
 - [System overview](docs/architecture/system-overview.md)
+- [Operational Event Ledger](docs/architecture/operational-event-ledger.md)
 - [Domain algebra](docs/architecture/domain-algebra.md)
 - [Runtime reference](docs/architecture/runtime-reference.md)
 - [Repository layout](docs/development/repository-layout.md)

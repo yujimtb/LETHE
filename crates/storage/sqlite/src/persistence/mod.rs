@@ -9,7 +9,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sha2::Digest;
 
 use lethe_core::domain::{
-    BlobRef, IdempotencyKey, Observation, ObservationId, SupplementalId, SupplementalRecord,
+    BlobRef, DataSpaceId, IdempotencyKey, Observation, ObservationId, OperationalEventId,
+    SupplementalId, SupplementalRecord,
 };
 use lethe_runtime::runtime::partition::{
     PARTITION_EVENT_FAILOVER, PARTITION_EVENT_INITIALIZE, PARTITION_EVENT_RECOVER,
@@ -21,13 +22,14 @@ use lethe_runtime::runtime::partition::{
 };
 use lethe_storage_api::{
     AppendOutcome as PortAppendOutcome, BlobStore as BlobStorePort, DiscoveredSlackThread,
-    LeafPosition, ObservationStats, ObservationStore as ObservationStorePort, ProjectionItem,
-    ProjectionItemCommit, ProjectionLeafWatermark,
+    LeafPosition, ObservationStats, ObservationStore as ObservationStorePort,
+    OperationalAppendOutcome, OperationalAppendRequest, OperationalEventStats,
+    OperationalEventStore, ProjectionItem, ProjectionItemCommit, ProjectionLeafWatermark,
     ProjectionMaterializer as ProjectionMaterializerPort,
     ProjectionWatermarkStore as ProjectionWatermarkStorePort, RehomeMode as PortRehomeMode,
     RuntimeStateStore as RuntimeStateStorePort, SlackThreadCatalogEntry,
     SlackThreadCatalogStore as SlackThreadCatalogStorePort, SlackThreadKey, StorageError,
-    StorageResult, StoredObservation,
+    StorageResult, StoredObservation, StoredOperationalEvent,
     SupplementalProjectionCommitter as SupplementalProjectionCommitterPort,
     SupplementalStore as SupplementalStorePort, SyncMetricRecord,
 };
@@ -49,6 +51,11 @@ pub struct SqlitePersistence {
     blob_dir: PathBuf,
     secret_encryption_key: [u8; 32],
     routing_key_order: RoutingKeyOrder,
+}
+
+pub struct SqliteOperationalEventStore {
+    persistence: SqlitePersistence,
+    data_space_id: DataSpaceId,
 }
 
 const CURRENT_SCHEMA_VERSION: i64 = 7;
@@ -1696,6 +1703,363 @@ impl SqlitePersistence {
             [&modifier],
         )?;
         Ok(dead_letters + audits)
+    }
+}
+
+impl SqliteOperationalEventStore {
+    pub fn open(
+        data_space_id: DataSpaceId,
+        database_path: &Path,
+        blob_dir: &Path,
+        secret_encryption_key: &[u8; 32],
+    ) -> Result<Self, PersistenceError> {
+        if data_space_id.as_str().trim().is_empty() {
+            return Err(PersistenceError::SchemaInvariant(
+                "data_space_id must not be blank".to_owned(),
+            ));
+        }
+        let persistence = SqlitePersistence::open(database_path, blob_dir, secret_encryption_key)?;
+        let existing = persistence
+            .conn
+            .query_row(
+                "SELECT data_space_id FROM operational_data_space WHERE singleton = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match existing {
+            Some(existing) if existing != data_space_id.as_str() => {
+                return Err(PersistenceError::SchemaInvariant(format!(
+                    "sqlite Lake is pinned to data space {existing}, not {data_space_id}"
+                )));
+            }
+            Some(_) => {}
+            None => {
+                persistence.conn.execute(
+                    "INSERT INTO operational_data_space (singleton, data_space_id)
+                     VALUES (1, ?1)",
+                    [data_space_id.as_str()],
+                )?;
+            }
+        }
+        Ok(Self {
+            persistence,
+            data_space_id,
+        })
+    }
+
+    pub fn persistence(&self) -> &SqlitePersistence {
+        &self.persistence
+    }
+
+    fn storage_error(error: impl std::fmt::Display) -> StorageError {
+        StorageError::Backend(error.to_string())
+    }
+}
+
+impl OperationalEventStore for SqliteOperationalEventStore {
+    fn data_space_id(&self) -> &DataSpaceId {
+        &self.data_space_id
+    }
+
+    fn append_operational_events(
+        &self,
+        requests: &[OperationalAppendRequest],
+    ) -> StorageResult<Vec<OperationalAppendOutcome>> {
+        for request in requests {
+            request.event.validate()?;
+            if request.event.data_space_id != self.data_space_id {
+                return Err(StorageError::Invariant(format!(
+                    "event data space {} does not match sqlite Lake {}",
+                    request.event.data_space_id, self.data_space_id
+                )));
+            }
+            if request.event.stream_version != request.expected_stream_version + 1 {
+                return Err(StorageError::Invariant(format!(
+                    "event {} stream_version {} does not follow expected {}",
+                    request.event.event_id,
+                    request.event.stream_version,
+                    request.expected_stream_version
+                )));
+            }
+        }
+
+        let tree = self
+            .persistence
+            .load_partition_tree()
+            .map_err(Self::storage_error)?;
+        let transaction = self
+            .persistence
+            .conn
+            .unchecked_transaction()
+            .map_err(Self::storage_error)?;
+        let mut outcomes = Vec::with_capacity(requests.len());
+
+        for request in requests {
+            let event_json = serde_json::to_string(&request.event).map_err(Self::storage_error)?;
+            let event_sha256 = hex::encode(sha2::Sha256::digest(event_json.as_bytes()));
+            let idempotency_key = request.event.observation.idempotency_key.as_str();
+
+            let duplicate = transaction
+                .query_row(
+                    "SELECT cursor, stream_version, event_sha256, event_id
+                     FROM operational_events
+                     WHERE data_space_id = ?1 AND idempotency_key = ?2",
+                    params![self.data_space_id.as_str(), idempotency_key],
+                    |row| {
+                        Ok((
+                            row.get::<_, u64>(0)?,
+                            row.get::<_, u64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(Self::storage_error)?;
+            if let Some((cursor, stream_version, stored_sha256, stored_event_id)) = duplicate {
+                if stored_sha256 != event_sha256
+                    || stored_event_id != request.event.event_id.as_str()
+                {
+                    return Err(StorageError::Invariant(format!(
+                        "operational idempotency collision for {idempotency_key}"
+                    )));
+                }
+                outcomes.push(OperationalAppendOutcome::Duplicate {
+                    cursor,
+                    stream_version,
+                });
+                continue;
+            }
+
+            let existing_event = transaction
+                .query_row(
+                    "SELECT cursor, event_sha256 FROM operational_events
+                     WHERE event_id = ?1",
+                    [request.event.event_id.as_str()],
+                    |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .map_err(Self::storage_error)?;
+            if let Some((cursor, stored_sha256)) = existing_event {
+                if stored_sha256 != event_sha256 {
+                    return Err(StorageError::Invariant(format!(
+                        "operational event_id collision for {}",
+                        request.event.event_id
+                    )));
+                }
+                outcomes.push(OperationalAppendOutcome::Duplicate {
+                    cursor,
+                    stream_version: request.event.stream_version,
+                });
+                continue;
+            }
+
+            let actual = transaction
+                .query_row(
+                    "SELECT COALESCE(MAX(stream_version), 0)
+                     FROM operational_events
+                     WHERE data_space_id = ?1 AND stream_id = ?2",
+                    params![self.data_space_id.as_str(), request.event.stream_id],
+                    |row| row.get::<_, u64>(0),
+                )
+                .map_err(Self::storage_error)?;
+            if actual != request.expected_stream_version {
+                outcomes.push(OperationalAppendOutcome::VersionConflict {
+                    expected: request.expected_stream_version,
+                    actual,
+                });
+                continue;
+            }
+
+            let mut observation_outcomes = append_observations_in_transaction(
+                &transaction,
+                &tree,
+                self.persistence.routing_key_order,
+                std::slice::from_ref(&request.event.observation),
+            )
+            .map_err(Self::storage_error)?;
+            match observation_outcomes.remove(0) {
+                DurableAppendOutcome::Appended(_) => {}
+                DurableAppendOutcome::Duplicate(observation_id) => {
+                    return Err(StorageError::Invariant(format!(
+                        "observation {observation_id} exists without its operational event"
+                    )));
+                }
+                DurableAppendOutcome::CanonicalCollision(observation_id) => {
+                    return Err(StorageError::Invariant(format!(
+                        "operational observation identity collision with {observation_id}"
+                    )));
+                }
+            }
+
+            transaction
+                .execute(
+                    "INSERT INTO operational_events (
+                        event_id, data_space_id, stream_id, stream_version,
+                        idempotency_key, event_type, occurred_at, observation_id,
+                        event_sha256, event_json
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        request.event.event_id.as_str(),
+                        self.data_space_id.as_str(),
+                        request.event.stream_id,
+                        request.event.stream_version,
+                        idempotency_key,
+                        request.event.event_type,
+                        request.event.occurred_at.to_rfc3339(),
+                        request.event.observation.id.as_str(),
+                        event_sha256,
+                        event_json,
+                    ],
+                )
+                .map_err(Self::storage_error)?;
+            let cursor = transaction.last_insert_rowid() as u64;
+            outcomes.push(OperationalAppendOutcome::Appended {
+                cursor,
+                stream_version: request.event.stream_version,
+            });
+        }
+        transaction.commit().map_err(Self::storage_error)?;
+        Ok(outcomes)
+    }
+
+    fn operational_event_stats(&self) -> StorageResult<OperationalEventStats> {
+        self.persistence
+            .conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(cursor), 0)
+                 FROM operational_events WHERE data_space_id = ?1",
+                [self.data_space_id.as_str()],
+                |row| {
+                    Ok(OperationalEventStats {
+                        count: row.get(0)?,
+                        max_cursor: row.get(1)?,
+                    })
+                },
+            )
+            .map_err(Self::storage_error)
+    }
+
+    fn operational_event_page(
+        &self,
+        after_cursor: u64,
+        limit: usize,
+    ) -> StorageResult<Vec<StoredOperationalEvent>> {
+        if limit == 0 {
+            return Err(StorageError::Invariant(
+                "operational event page limit must be positive".to_owned(),
+            ));
+        }
+        let mut statement = self
+            .persistence
+            .conn
+            .prepare(
+                "SELECT cursor, event_json FROM operational_events
+                 WHERE data_space_id = ?1 AND cursor > ?2
+                 ORDER BY cursor LIMIT ?3",
+            )
+            .map_err(Self::storage_error)?;
+        let rows = statement
+            .query_map(
+                params![self.data_space_id.as_str(), after_cursor, limit as u64],
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(Self::storage_error)?;
+        rows.map(|row| {
+            let (cursor, event_json) = row.map_err(Self::storage_error)?;
+            let event = serde_json::from_str(&event_json).map_err(Self::storage_error)?;
+            Ok(StoredOperationalEvent { cursor, event })
+        })
+        .collect()
+    }
+
+    fn operational_events_for_stream(
+        &self,
+        stream_id: &str,
+        after_stream_version: u64,
+        limit: usize,
+    ) -> StorageResult<Vec<StoredOperationalEvent>> {
+        if stream_id.trim().is_empty() || limit == 0 {
+            return Err(StorageError::Invariant(
+                "stream_id and a positive limit are required".to_owned(),
+            ));
+        }
+        let mut statement = self
+            .persistence
+            .conn
+            .prepare(
+                "SELECT cursor, event_json FROM operational_events
+                 WHERE data_space_id = ?1 AND stream_id = ?2 AND stream_version > ?3
+                 ORDER BY stream_version LIMIT ?4",
+            )
+            .map_err(Self::storage_error)?;
+        let rows = statement
+            .query_map(
+                params![
+                    self.data_space_id.as_str(),
+                    stream_id,
+                    after_stream_version,
+                    limit as u64
+                ],
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(Self::storage_error)?;
+        rows.map(|row| {
+            let (cursor, event_json) = row.map_err(Self::storage_error)?;
+            let event = serde_json::from_str(&event_json).map_err(Self::storage_error)?;
+            Ok(StoredOperationalEvent { cursor, event })
+        })
+        .collect()
+    }
+
+    fn operational_event_by_id(
+        &self,
+        event_id: &OperationalEventId,
+    ) -> StorageResult<Option<StoredOperationalEvent>> {
+        let row = self
+            .persistence
+            .conn
+            .query_row(
+                "SELECT cursor, event_json FROM operational_events
+                 WHERE data_space_id = ?1 AND event_id = ?2",
+                params![self.data_space_id.as_str(), event_id.as_str()],
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(Self::storage_error)?;
+        row.map(|(cursor, event_json)| {
+            let event = serde_json::from_str(&event_json).map_err(Self::storage_error)?;
+            Ok(StoredOperationalEvent { cursor, event })
+        })
+        .transpose()
+    }
+
+    fn operational_stream_version(&self, stream_id: &str) -> StorageResult<u64> {
+        if stream_id.trim().is_empty() {
+            return Err(StorageError::Invariant(
+                "stream_id must not be blank".to_owned(),
+            ));
+        }
+        self.persistence
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(stream_version), 0) FROM operational_events
+                 WHERE data_space_id = ?1 AND stream_id = ?2",
+                params![self.data_space_id.as_str(), stream_id],
+                |row| row.get(0),
+            )
+            .map_err(Self::storage_error)
+    }
+}
+
+impl BlobStorePort for SqliteOperationalEventStore {
+    fn put_blob(&self, data: &[u8], max_bytes: usize) -> StorageResult<BlobRef> {
+        <SqlitePersistence as BlobStorePort>::put_blob(&self.persistence, data, max_bytes)
+    }
+
+    fn get_blob(&self, blob_ref: &BlobRef) -> StorageResult<Option<Vec<u8>>> {
+        <SqlitePersistence as BlobStorePort>::get_blob(&self.persistence, blob_ref)
     }
 }
 

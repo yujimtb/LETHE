@@ -27,6 +27,13 @@ database_path = "/var/lib/lethe/lethe.sqlite3"
 blob_dir = "/var/lib/lethe/blobs"
 encryption_key_env = "LETHE_BENCH_STORAGE_ENCRYPTION_KEY"
 
+[operational_ledger]
+backend = "sqlite"
+data_space_id = "space:benchmark"
+database_path = "/var/lib/lethe/benchmark-operational.sqlite3"
+blob_dir = "/var/lib/lethe/benchmark-operational-blobs"
+encryption_key_env = "LETHE_BENCH_OPERATIONAL_STORAGE_ENCRYPTION_KEY"
+
 [routing]
 key_order = "year_month_source_container_published"
 
@@ -58,11 +65,11 @@ reject_unregistered_kinds = true
 
 [[api_tokens]]
 token_env = "LETHE_BENCH_READ_TOKEN"
-scopes = ["read:corpus"]
+scopes = ["read:corpus", "read:operational"]
 
 [[api_tokens]]
 token_env = "LETHE_BENCH_WRITE_TOKEN"
-scopes = ["write:observations"]
+scopes = ["write:observations", "write:operational"]
 
 [[api_tokens]]
 token_env = "LETHE_BENCH_HEALTH_TOKEN"

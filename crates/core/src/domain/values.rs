@@ -71,6 +71,14 @@ branded_id!(ObservationId);
 branded_id!(SupplementalId);
 branded_id!(CommandId);
 branded_id!(ActorRef);
+branded_id!(
+    /// Dedicated Lake / policy boundary identifier.
+    DataSpaceId
+);
+branded_id!(
+    /// Append-only operational event identifier.
+    OperationalEventId
+);
 
 /// Semantic version string (e.g. "1.0.0").
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

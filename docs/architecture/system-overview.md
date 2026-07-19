@@ -54,7 +54,9 @@ LETHE は「Lake に全部を直接見せるシステム」ではなく、**Obse
 - `apps/selfhost`と`apps/tools/*`
 - `tests/e2e`
 
-実装はRust、Axum、SQLite、content-addressed local blob storageを使用する。
+実装はRust、Axum、SQLite、PostgreSQL、content-addressed blob storageを使用する。
+通常のsource Observation storeとは別に、NaniholdのoperationをDataSpace単位で
+固定する[Operational Event Ledger](operational-event-ledger.md)を持つ。
 workspace rootはsourceを持たず、crate間依存はDAG検査で検証する。
 
 ### 0.3 Functional Core / Imperative Shell

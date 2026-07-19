@@ -1,11 +1,11 @@
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::self_host::app::{
     AppService, BulkImportSessionReport, ImportReport, SelfHostError, SupplementalWriteRequest,
@@ -16,8 +16,13 @@ use lethe_api::api::envelope::{ErrorResponse, ResponseEnvelope};
 use lethe_api::api::health::HealthResponse;
 use lethe_api::api::pagination::PaginationParams;
 use lethe_core::domain::BlobRef;
+use lethe_core::domain::OperationalEventId;
 use lethe_projection_claim_queue::ClaimState;
 use lethe_projection_cognition::CardState;
+use lethe_storage_api::{
+    OperationalAppendOutcome, OperationalAppendRequest, OperationalEventStats,
+    StoredOperationalEvent,
+};
 
 pub fn build_router(service: AppService) -> Router {
     Router::new()
@@ -45,6 +50,31 @@ pub fn build_router(service: AppService) -> Router {
         .route("/projections/plan-state", get(plan_state))
         .route("/projections/card-queue", get(card_queue))
         .route("/supplementals", post(create_supplemental))
+        .route(
+            "/api/operational-events",
+            get(operational_event_page).post(append_operational_events),
+        )
+        .route(
+            "/api/operational-events/stats",
+            get(operational_event_stats),
+        )
+        .route(
+            "/api/operational-events/{event_id}",
+            get(operational_event_by_id),
+        )
+        .route(
+            "/api/operational-streams/{stream_id}",
+            get(operational_stream_page),
+        )
+        .route(
+            "/api/operational-blobs",
+            post(put_operational_blob)
+                .layer(DefaultBodyLimit::max(service.operational_blob_body_limit())),
+        )
+        .route(
+            "/api/operational-blobs/{blob_hash}",
+            get(get_operational_blob),
+        )
         .route(
             "/api/projections/{projection_id}/blobs/{blob_hash}",
             get(projection_blob),
@@ -90,6 +120,161 @@ pub fn build_router(service: AppService) -> Router {
             get(projection_record_timeline),
         )
         .with_state(service)
+}
+
+#[derive(Debug, Deserialize)]
+struct AppendOperationalEventsRequest {
+    requests: Vec<OperationalAppendRequest>,
+}
+
+#[derive(Debug, Serialize)]
+struct AppendOperationalEventsResponse {
+    outcomes: Vec<OperationalAppendOutcome>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OperationalCursorQuery {
+    after_cursor: u64,
+    limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct OperationalStreamQuery {
+    after_stream_version: u64,
+    limit: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct OperationalEventPageResponse {
+    events: Vec<StoredOperationalEvent>,
+    next_cursor: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct OperationalStreamPageResponse {
+    events: Vec<StoredOperationalEvent>,
+    next_stream_version: u64,
+}
+
+async fn append_operational_events(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Json(request): Json<AppendOperationalEventsRequest>,
+) -> Result<Json<AppendOperationalEventsResponse>, ApiError> {
+    service.authorize_headers(&headers, "write:operational")?;
+    if request.requests.is_empty() {
+        return Err(ApiError::unprocessable_entity(
+            "operational_append_empty",
+            serde_json::json!({"requests": "must contain at least one event"}),
+        ));
+    }
+    let outcomes =
+        tokio::task::spawn_blocking(move || service.append_operational_events(&request.requests))
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))??;
+    Ok(Json(AppendOperationalEventsResponse { outcomes }))
+}
+
+async fn operational_event_stats(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+) -> Result<Json<OperationalEventStats>, ApiError> {
+    service.authorize_headers(&headers, "read:operational")?;
+    let stats = tokio::task::spawn_blocking(move || service.operational_event_stats())
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))??;
+    Ok(Json(stats))
+}
+
+async fn operational_event_page(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Query(query): Query<OperationalCursorQuery>,
+) -> Result<Json<OperationalEventPageResponse>, ApiError> {
+    service.authorize_headers(&headers, "read:operational")?;
+    service.validate_operational_page_limit(query.limit)?;
+    let events = tokio::task::spawn_blocking(move || {
+        service.operational_event_page(query.after_cursor, query.limit)
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))??;
+    let next_cursor = events
+        .last()
+        .map_or(query.after_cursor, |stored| stored.cursor);
+    Ok(Json(OperationalEventPageResponse {
+        events,
+        next_cursor,
+    }))
+}
+
+async fn operational_stream_page(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Path(stream_id): Path<String>,
+    Query(query): Query<OperationalStreamQuery>,
+) -> Result<Json<OperationalStreamPageResponse>, ApiError> {
+    service.authorize_headers(&headers, "read:operational")?;
+    service.validate_operational_page_limit(query.limit)?;
+    let events = tokio::task::spawn_blocking(move || {
+        service.operational_events_for_stream(&stream_id, query.after_stream_version, query.limit)
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))??;
+    let next_stream_version = events.last().map_or(query.after_stream_version, |stored| {
+        stored.event.stream_version
+    });
+    Ok(Json(OperationalStreamPageResponse {
+        events,
+        next_stream_version,
+    }))
+}
+
+async fn operational_event_by_id(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Path(event_id): Path<String>,
+) -> Result<Json<StoredOperationalEvent>, ApiError> {
+    service.authorize_headers(&headers, "read:operational")?;
+    let stored = tokio::task::spawn_blocking(move || {
+        service.operational_event_by_id(&OperationalEventId::new(event_id))
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))??
+    .ok_or_else(ApiError::not_found)?;
+    Ok(Json(stored))
+}
+
+async fn put_operational_blob(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<BlobRef>, ApiError> {
+    service.authorize_headers(&headers, "write:operational")?;
+    let blob_ref = tokio::task::spawn_blocking(move || service.put_operational_blob(&body))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))??;
+    Ok(Json(blob_ref))
+}
+
+async fn get_operational_blob(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Path(blob_hash): Path<String>,
+) -> Result<Response, ApiError> {
+    service.authorize_headers(&headers, "read:operational")?;
+    let blob_ref = blob_ref_from_hash(&blob_hash).ok_or_else(ApiError::not_found)?;
+    let bytes = tokio::task::spawn_blocking(move || service.get_operational_blob(&blob_ref))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))??
+        .ok_or_else(ApiError::not_found)?;
+    Ok((
+        [(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        )],
+        bytes,
+    )
+        .into_response())
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -577,6 +762,16 @@ impl From<SelfHostError> for ApiError {
                 Self::unprocessable_entity(code, detail)
             }
             SelfHostError::SupplementalConflict { code, detail } => Self::conflict(code, detail),
+            SelfHostError::Storage(lethe_storage_api::StorageError::Invariant(detail)) => {
+                Self::unprocessable_entity(
+                    "operational_event_invalid",
+                    serde_json::json!({"detail": detail}),
+                )
+            }
+            SelfHostError::Ingestion(detail) => Self {
+                status: StatusCode::BAD_REQUEST,
+                body: ErrorResponse::bad_request(&detail),
+            },
             other => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 body: ErrorResponse::internal_server_error(&other.to_string()),

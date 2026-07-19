@@ -26,6 +26,7 @@ lethe-registry = { path = "../../crates/registry" }
 lethe-runtime = { path = "../../crates/runtime" }
 lethe-search-index = { path = "../../crates/search-index" }
 lethe-storage-api = { path = "../../crates/storage/api" }
+lethe-storage-postgres = { path = "../../crates/storage/postgres" }
 lethe-storage-sqlite = { path = "../../crates/storage/sqlite" }
 regex.workspace = true
 reqwest.workspace = true
