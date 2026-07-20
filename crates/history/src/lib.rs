@@ -996,10 +996,21 @@ pub struct CurrentStateEntry {
     pub published_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentStateIndexEntry {
+    pub state_key: String,
+    pub event_id: String,
+    pub published_at: DateTime<Utc>,
+    pub value_bytes: u64,
+    pub value_sha256: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryQueryOperation {
     ListSessions,
+    ListOpenCommitments,
+    GetCurrentState,
     ReadTimeline,
     ReadRaw,
     Search,
@@ -1010,6 +1021,8 @@ impl HistoryQueryOperation {
     fn name(self) -> &'static str {
         match self {
             Self::ListSessions => "list_sessions",
+            Self::ListOpenCommitments => "list_open_commitments",
+            Self::GetCurrentState => "get_current_state",
             Self::ReadTimeline => "read_timeline",
             Self::ReadRaw => "read_raw",
             Self::Search => "search",
@@ -1048,13 +1061,22 @@ pub struct HistoryRawResult {
 pub struct HistoryProjection {
     entries: Vec<HistoryTimelineEntry>,
     source_watermark: u64,
+    query_revision: u64,
 }
 
 impl HistoryProjection {
     pub fn rebuild<T: OperationalStoragePorts + ?Sized>(store: &T) -> HistoryResult<Self> {
-        let source_watermark = store.operational_event_stats()?.max_cursor;
-        let mut after_cursor = 0;
-        let mut entries = Vec::new();
+        let mut projection = Self::default();
+        projection.refresh_from(store)?;
+        Ok(projection)
+    }
+
+    pub fn refresh_from<T: OperationalStoragePorts + ?Sized>(
+        &mut self,
+        store: &T,
+    ) -> HistoryResult<()> {
+        let mut after_cursor = self.source_watermark;
+        let mut changed = false;
         loop {
             let page = store.operational_event_page(after_cursor, 512)?;
             if page.is_empty() {
@@ -1064,6 +1086,7 @@ impl HistoryProjection {
                 HistoryError::Invariant("history projection received an empty page".to_owned())
             })?;
             for stored in page {
+                after_cursor = stored.cursor;
                 if stored.event.event_type != HISTORY_MESSAGE_EVENT_TYPE {
                     continue;
                 }
@@ -1084,14 +1107,20 @@ impl HistoryProjection {
                     )));
                 }
                 entry.cursor = stored.cursor;
-                entries.push(entry);
+                self.entries.push(entry);
+                self.query_revision = stored.cursor;
+                changed = true;
             }
         }
-        entries.sort_by(timeline_cmp);
-        Ok(Self {
-            entries,
-            source_watermark,
-        })
+        if changed {
+            self.entries.sort_by(timeline_cmp);
+        }
+        self.source_watermark = after_cursor;
+        Ok(())
+    }
+
+    pub fn source_watermark(&self) -> u64 {
+        self.source_watermark
     }
 
     pub fn list_sessions(
@@ -1278,13 +1307,45 @@ impl HistoryProjection {
         let offset = parse_query_cursor(
             request.page_cursor.as_deref(),
             request.operation,
-            self.source_watermark,
+            self.query_revision,
         )?;
         let (result_json, next_offset) = match request.operation {
             HistoryQueryOperation::ListSessions => {
                 let _: EmptyArgument = parse_argument(&request.argument)?;
                 let sessions = self.all_sessions()?;
                 page_values(&sessions, offset, request.max_result_bytes)?
+            }
+            HistoryQueryOperation::ListOpenCommitments => {
+                let _: EmptyArgument = parse_argument(&request.argument)?;
+                let commitments = self.list_open_commitments();
+                page_values(&commitments, offset, request.max_result_bytes)?
+            }
+            HistoryQueryOperation::GetCurrentState => {
+                let argument: CurrentStateArgument = parse_argument(&request.argument)?;
+                let current_state = self.get_current_state();
+                if let Some(state_key) = argument.state_key {
+                    require_first_page(offset)?;
+                    validate_non_blank("argument.state_key", &state_key)?;
+                    let entry = current_state
+                        .into_iter()
+                        .find(|entry| entry.state_key == state_key)
+                        .ok_or_else(|| HistoryError::NotFound(state_key))?;
+                    let value = serde_json::to_value(entry)?;
+                    ensure_value_size(&value, request.max_result_bytes)?;
+                    (value, None)
+                } else {
+                    let index = current_state
+                        .into_iter()
+                        .map(|entry| CurrentStateIndexEntry {
+                            state_key: entry.state_key,
+                            event_id: entry.event_id,
+                            published_at: entry.published_at,
+                            value_bytes: entry.value.len() as u64,
+                            value_sha256: sha256_hex(entry.value.as_bytes()),
+                        })
+                        .collect::<Vec<_>>();
+                    page_values(&index, offset, request.max_result_bytes)?
+                }
             }
             HistoryQueryOperation::ReadTimeline => {
                 let argument: TimelineArgument = parse_argument(&request.argument)?;
@@ -1338,7 +1399,7 @@ impl HistoryProjection {
         Ok(HistoryQueryResponse {
             result_json,
             next_cursor: next_offset.map(|next_offset| {
-                format_query_cursor(request.operation, self.source_watermark, next_offset)
+                format_query_cursor(request.operation, self.query_revision, next_offset)
             }),
             source_cursor: format!("operational:{}", self.source_watermark),
         })
@@ -1376,6 +1437,15 @@ pub struct LetheObservationScan {
     pub included_records: u64,
 }
 
+/// The explicit destination source for a conversation recovered from an
+/// existing LETHE Lake.  Coding-agent observations are deliberately absent:
+/// their authoritative native archives are imported by their own adapters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LetheConversationPartition {
+    ClaudeAi,
+    ResidualLethe,
+}
+
 pub fn lethe_observation_cutover_cursor(max_append_seq: u64) -> String {
     format!("lethe-observation:{max_append_seq}")
 }
@@ -1384,14 +1454,16 @@ pub fn visit_lethe_conversation_observations<T, F>(
     store: &T,
     max_append_seq: u64,
     page_size: usize,
-    upstream_instances: &BTreeMap<String, String>,
+    claude_ai_source_instance: &str,
+    residual_upstream_instances: &BTreeMap<String, String>,
     mut visitor: F,
 ) -> HistoryResult<LetheObservationScan>
 where
     T: ObservationStore + ?Sized,
-    F: FnMut(HistoryRawRecord) -> HistoryResult<()>,
+    F: FnMut(LetheConversationPartition, HistoryRawRecord) -> HistoryResult<()>,
 {
     validate_limit(page_size)?;
+    validate_non_blank("claude_ai_source_instance", claude_ai_source_instance)?;
     let stats = store.observation_stats()?;
     if max_append_seq > stats.max_append_seq {
         return Err(HistoryError::Invariant(format!(
@@ -1424,8 +1496,50 @@ where
             examined_observations = examined_observations.checked_add(1).ok_or_else(|| {
                 HistoryError::Invariant("LETHE examined observation count overflow".to_owned())
             })?;
+            let source_system = stored
+                .observation
+                .source_system
+                .as_ref()
+                .map(|source| source.as_str());
+            let partition = match source_system {
+                // Both historical Claude desktop identifiers are one explicit
+                // Claude AI source.  Do not infer an instance from the Lake.
+                Some("sys:claude") | Some("sys:claude-ai") => LetheConversationPartition::ClaudeAi,
+                // Native Claude Code and Codex are imported directly.  Keeping
+                // them here would produce a cross-source native-identity overlap.
+                Some("sys:claude-code") | Some("sys:codex") => {
+                    if after_append_seq == max_append_seq {
+                        reached_cutover = true;
+                    }
+                    continue;
+                }
+                Some(_) => LetheConversationPartition::ResidualLethe,
+                None => {
+                    if after_append_seq == max_append_seq {
+                        reached_cutover = true;
+                    }
+                    continue;
+                }
+            };
+            let claude_ai_instances;
+            let upstream_instances = match partition {
+                LetheConversationPartition::ClaudeAi => {
+                    claude_ai_instances = BTreeMap::from([
+                        (
+                            "sys:claude".to_owned(),
+                            claude_ai_source_instance.to_owned(),
+                        ),
+                        (
+                            "sys:claude-ai".to_owned(),
+                            claude_ai_source_instance.to_owned(),
+                        ),
+                    ]);
+                    &claude_ai_instances
+                }
+                LetheConversationPartition::ResidualLethe => residual_upstream_instances,
+            };
             if let Some(record) = lethe_observation_history_record(&stored, upstream_instances)? {
-                visitor(record)?;
+                visitor(partition, record)?;
                 included_records = included_records.checked_add(1).ok_or_else(|| {
                     HistoryError::Invariant("LETHE included history count overflow".to_owned())
                 })?;
@@ -1682,6 +1796,13 @@ fn optional_json_string(value: &serde_json::Value, field: &str) -> Option<String
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EmptyArgument {}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentStateArgument {
+    #[serde(default)]
+    state_key: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2323,6 +2444,114 @@ pub mod conformance {
         assert_eq!(projection.list_open_commitments().len(), 1);
         assert_eq!(projection.get_current_state()[0].state_key, "claude_quota");
 
+        let commitments = projection.list_open_commitments();
+        let commitment_bytes = serde_json::to_vec(&serde_json::json!(commitments))
+            .unwrap()
+            .len();
+        let commitments_response = projection
+            .query(
+                store,
+                &HistoryQueryRequest {
+                    data_space_id: store.data_space_id().clone(),
+                    operation: HistoryQueryOperation::ListOpenCommitments,
+                    argument: serde_json::json!({}),
+                    page_cursor: None,
+                    max_result_bytes: commitment_bytes,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            commitments_response.result_json,
+            serde_json::json!(commitments)
+        );
+        assert_eq!(commitments_response.next_cursor, None);
+        assert_eq!(
+            commitments_response.source_cursor,
+            format!(
+                "operational:{}",
+                store.operational_event_stats().unwrap().max_cursor
+            )
+        );
+        assert!(matches!(
+            projection.query(
+                store,
+                &HistoryQueryRequest {
+                    data_space_id: store.data_space_id().clone(),
+                    operation: HistoryQueryOperation::ListOpenCommitments,
+                    argument: serde_json::json!({}),
+                    page_cursor: Some(format_query_cursor(
+                        HistoryQueryOperation::GetCurrentState,
+                        projection.source_watermark,
+                        0,
+                    )),
+                    max_result_bytes: commitment_bytes,
+                },
+            ),
+            Err(HistoryError::InvalidCursor(_))
+        ));
+        assert!(matches!(
+            projection.query(
+                store,
+                &HistoryQueryRequest {
+                    data_space_id: store.data_space_id().clone(),
+                    operation: HistoryQueryOperation::ListOpenCommitments,
+                    argument: serde_json::json!({}),
+                    page_cursor: None,
+                    max_result_bytes: 1,
+                },
+            ),
+            Err(HistoryError::ResultTooLarge { .. })
+        ));
+
+        let current_state = projection.get_current_state();
+        let current_state_index = current_state
+            .iter()
+            .map(|entry| CurrentStateIndexEntry {
+                state_key: entry.state_key.clone(),
+                event_id: entry.event_id.clone(),
+                published_at: entry.published_at,
+                value_bytes: entry.value.len() as u64,
+                value_sha256: sha256_hex(entry.value.as_bytes()),
+            })
+            .collect::<Vec<_>>();
+        let state_bytes = serde_json::to_vec(&serde_json::json!(current_state_index))
+            .unwrap()
+            .len();
+        let current_state_response = projection
+            .query(
+                store,
+                &HistoryQueryRequest {
+                    data_space_id: store.data_space_id().clone(),
+                    operation: HistoryQueryOperation::GetCurrentState,
+                    argument: serde_json::json!({}),
+                    page_cursor: None,
+                    max_result_bytes: state_bytes,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            current_state_response.result_json,
+            serde_json::json!(current_state_index)
+        );
+        assert_eq!(current_state_response.next_cursor, None);
+        assert_eq!(
+            current_state_response.source_cursor,
+            commitments_response.source_cursor
+        );
+        let targeted = projection
+            .query(
+                store,
+                &HistoryQueryRequest {
+                    data_space_id: store.data_space_id().clone(),
+                    operation: HistoryQueryOperation::GetCurrentState,
+                    argument: serde_json::json!({"state_key": current_state[0].state_key}),
+                    page_cursor: None,
+                    max_result_bytes: 65_536,
+                },
+            )
+            .unwrap();
+        assert_eq!(targeted.result_json, serde_json::json!(current_state[0]));
+
         let one_timeline_record_bytes = serde_json::to_vec(&serde_json::json!([timeline[0]]))
             .unwrap()
             .len();
@@ -2479,6 +2708,7 @@ pub mod conformance {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use lethe_storage_api::OperationalEventStore;
     use lethe_storage_postgres::PostgresOperationalEventStore;
     use lethe_storage_sqlite::{SqliteOperationalEventStore, SqlitePersistence};
 
@@ -2493,6 +2723,68 @@ mod tests {
         )
         .unwrap();
         conformance::history_ingestion_round_trip(&store);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn history_projection_refresh_advances_over_non_history_events_without_duplicate_entries() {
+        let tmp =
+            std::env::temp_dir().join(format!("lethe-history-refresh-{}", uuid::Uuid::now_v7()));
+        let store = SqliteOperationalEventStore::open(
+            DataSpaceId::new("space:personal"),
+            &tmp.join("personal.sqlite3"),
+            &tmp.join("blobs"),
+            &[7; 32],
+        )
+        .unwrap();
+        conformance::history_ingestion_round_trip(&store);
+        let mut projection = HistoryProjection::rebuild(&store).unwrap();
+        let initial_watermark = projection.source_watermark();
+        let continuation = format_query_cursor(
+            HistoryQueryOperation::ListSessions,
+            projection.query_revision,
+            1,
+        );
+        let initial_sessions = projection.list_sessions(None, 100).unwrap();
+
+        let receipt = HistoryImportReceipt {
+            receipt_id: "history-receipt:refresh".to_owned(),
+            inventory_id: "inventory:refresh".to_owned(),
+            data_space_id: store.data_space_id().clone(),
+            manifest_digest: "f".repeat(64),
+            captured_at: Utc.timestamp_opt(1_700_000_100, 0).single().unwrap(),
+            source_count: 1,
+            message_count: 0,
+            raw_bytes: 0,
+            cross_source_overlap_identities: 0,
+            cutover_cursors: BTreeMap::new(),
+        };
+        store
+            .append_operational_event(
+                &prepare_history_receipt_request(store.data_space_id(), &receipt).unwrap(),
+            )
+            .unwrap();
+
+        projection.refresh_from(&store).unwrap();
+        assert_eq!(projection.source_watermark(), initial_watermark + 1);
+        assert_eq!(
+            projection.list_sessions(None, 100).unwrap(),
+            initial_sessions
+        );
+        assert!(
+            projection
+                .query(
+                    &store,
+                    &HistoryQueryRequest {
+                        data_space_id: store.data_space_id().clone(),
+                        operation: HistoryQueryOperation::ListSessions,
+                        argument: serde_json::json!({}),
+                        page_cursor: Some(continuation),
+                        max_result_bytes: 65_536,
+                    },
+                )
+                .is_ok()
+        );
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -2543,6 +2835,26 @@ mod tests {
                 }),
             ),
             (
+                "sys:claude-code",
+                "schema:coding-agent-history",
+                serde_json::json!({
+                    "session_id": "claude-code-session",
+                    "object_id": "claude-code-message",
+                    "parent_message_id": null,
+                    "item": {"kind": "message", "role": "user", "text": "native archive wins"}
+                }),
+            ),
+            (
+                "sys:codex",
+                "schema:coding-agent-history",
+                serde_json::json!({
+                    "session_id": "codex-session",
+                    "object_id": "codex-message",
+                    "parent_message_id": null,
+                    "item": {"kind": "message", "role": "user", "text": "native archive wins"}
+                }),
+            ),
+            (
                 "sys:lethe-history",
                 HISTORY_SCHEMA,
                 serde_json::json!({"text": "must not loop"}),
@@ -2553,30 +2865,38 @@ mod tests {
                 .unwrap();
         }
         let cutover = store.observation_stats().unwrap().max_append_seq;
-        let upstream_instances = BTreeMap::from([
-            ("sys:claude-ai".to_owned(), "claude-ai-personal".to_owned()),
-            ("sys:chatgpt".to_owned(), "chatgpt-personal".to_owned()),
-        ]);
+        let residual_upstream_instances =
+            BTreeMap::from([("sys:chatgpt".to_owned(), "chatgpt-personal".to_owned())]);
         let mut records = Vec::new();
         let scan = visit_lethe_conversation_observations(
             &store,
             cutover,
             1,
-            &upstream_instances,
-            |record| {
-                records.push(record);
+            "claude-ai-personal",
+            &residual_upstream_instances,
+            |partition, record| {
+                records.push((partition, record));
                 Ok(())
             },
         )
         .unwrap();
-        assert_eq!(scan.examined_observations, 3);
+        assert_eq!(scan.examined_observations, 5);
         assert_eq!(scan.included_records, 2);
         assert_eq!(records.len(), 2);
-        assert_eq!(records[0].text, records[1].text);
-        assert_ne!(records[0].source_message_id, records[1].source_message_id);
+        assert_eq!(records[0].1.text, records[1].1.text);
+        assert_ne!(
+            records[0].1.source_message_id,
+            records[1].1.source_message_id
+        );
+        assert_eq!(records[0].0, LetheConversationPartition::ClaudeAi);
+        assert_eq!(records[1].0, LetheConversationPartition::ResidualLethe);
         assert_eq!(
-            records[0].metadata["upstream_source_system"],
+            records[0].1.metadata["upstream_source_system"],
             "sys:claude-ai"
+        );
+        assert_eq!(
+            records[0].1.metadata[UPSTREAM_SOURCE_INSTANCE_META],
+            "claude-ai-personal"
         );
         assert_eq!(
             lethe_observation_cutover_cursor(cutover),

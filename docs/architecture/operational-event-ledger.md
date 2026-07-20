@@ -53,7 +53,42 @@ or falls back to SQLite.
 - an append-only event and Observation write in one database transaction;
 - a monotonically increasing DataSpace cursor;
 - cursor pages, stream-version pages, event lookup, and stream version lookup;
-- content-addressed blob put/get.
+- content-addressed blob single put/get and explicit ordered batch put. Batch put
+  validates every per-blob byte limit before mutation and has no single-put
+  fallback.
+
+`put_blobs` returns one `BlobRef` for every input in the same order, including
+duplicate content. SQLite writes each content-addressed file before opening the
+single metadata transaction. It deduplicates equal digests within the batch,
+then writes only missing unique files with a bounded worker count:
+`min(available_parallelism, 8, unique_digest_count)`. All scoped writers must
+join successfully before SQLite starts the index transaction. A writer error
+or panic stops the operation without committing any batch index row; files
+already completed by another writer can remain as unindexed orphans. SQLite
+then inserts every `blobs` row and commits that index transaction atomically.
+A file-system or SQLite failure cannot expose a partially committed metadata
+batch. Files written before a failed metadata commit are not success evidence,
+are safe to reuse by digest on retry, and remain eligible for orphan GC.
+PostgreSQL prepares one insert statement and executes the complete batch in one
+database transaction, so content and blob rows commit or roll back together.
+Both backends validate all input sizes before the first mutation and repeated
+batch calls are idempotent by content digest.
+
+SQLite blob index entries store only the 64-character content digest as
+`file_name`; an environment-specific absolute or relative blob directory is
+never persisted. Opening a database that still has the old `file_path` column
+fails fast. Runtime startup does not migrate it and does not read the old
+column.
+
+Cutover is an explicit offline operation with
+`lethe-migrate-blob-index --mode=dry-run|execute|verify`. Stop every writer and
+reader first. Run dry-run and execute separately for each SQLite database that
+uses the shared BlobStore (including both the primary Lake database and the
+Operational Ledger database), retaining distinct receipts. `verify` is
+required after execute. It checks the row count, canonical index digest,
+BlobRef-to-file-name identity, missing CAS files, and the SHA-256 of every
+indexed file. Any invalid row, index mismatch, missing file, content mismatch,
+existing receipt path, or unexpected schema stops without fallback.
 
 An event's declared `stream_version` must equal
 `expected_stream_version + 1`. A stale expectation returns

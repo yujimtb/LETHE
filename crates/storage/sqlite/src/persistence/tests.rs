@@ -1911,6 +1911,90 @@ fn operational_event_store_conforms_and_pins_data_space() {
 }
 
 #[test]
+fn blob_batch_prevalidates_limits_and_retries_after_atomic_index_failure() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let blob_dir = tmp.join("blobs");
+    let store = SqliteOperationalEventStore::open(
+        lethe_core::domain::DataSpaceId::new("space:personal"),
+        &tmp.join("personal.sqlite3"),
+        &blob_dir,
+        &[7; 32],
+    )
+    .unwrap();
+
+    let too_large = store.put_blobs(&[b"first", b"exceeds-limit"], 5);
+    assert!(matches!(too_large, Err(StorageError::Invariant(_))));
+    assert_eq!(fs::read_dir(&blob_dir).unwrap().count(), 0);
+    assert_eq!(
+        store
+            .persistence()
+            .conn
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+
+    let second_digest = hex::encode(sha2::Sha256::digest(b"second"));
+    store
+        .persistence()
+        .conn
+        .execute_batch(&format!(
+            "CREATE TRIGGER reject_second_blob
+             BEFORE INSERT ON blobs
+             WHEN NEW.blob_ref = 'blob:sha256:{second_digest}'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected batch index failure');
+             END;"
+        ))
+        .unwrap();
+    assert!(store.put_blobs(&[b"first", b"second"], 1024).is_err());
+    assert_eq!(
+        store
+            .persistence()
+            .conn
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(fs::read_dir(&blob_dir).unwrap().count(), 2);
+
+    store
+        .persistence()
+        .conn
+        .execute_batch("DROP TRIGGER reject_second_blob")
+        .unwrap();
+    let blob_refs = store.put_blobs(&[b"first", b"second"], 1024).unwrap();
+    assert_eq!(
+        blob_refs,
+        vec![
+            BlobRef::new(format!(
+                "blob:sha256:{}",
+                hex::encode(sha2::Sha256::digest(b"first"))
+            )),
+            BlobRef::new(format!("blob:sha256:{second_digest}")),
+        ]
+    );
+    assert_eq!(
+        store
+            .persistence()
+            .conn
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get::<_, u64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        store.get_blob(&blob_refs[0]).unwrap(),
+        Some(b"first".to_vec())
+    );
+    assert_eq!(
+        store.get_blob(&blob_refs[1]).unwrap(),
+        Some(b"second".to_vec())
+    );
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
 fn operational_archive_replays_into_an_empty_sqlite_lake() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let source = SqliteOperationalEventStore::open(

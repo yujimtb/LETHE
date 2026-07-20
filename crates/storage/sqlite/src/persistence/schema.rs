@@ -90,7 +90,7 @@ impl SqlitePersistence {
 
             CREATE TABLE IF NOT EXISTS blobs (
                 blob_ref TEXT PRIMARY KEY,
-                file_path TEXT NOT NULL
+                file_name TEXT NOT NULL CHECK (length(file_name) = 64 AND file_name NOT GLOB '*[^0-9a-f]*')
             );
 
             CREATE TABLE IF NOT EXISTS supplementals (
@@ -237,6 +237,18 @@ impl SqlitePersistence {
             END;
             ",
         )?;
+        let has_legacy_path = self
+            .conn
+            .prepare("PRAGMA table_info(blobs)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|name| name == "file_path");
+        if has_legacy_path {
+            return Err(PersistenceError::SchemaInvariant(
+                "legacy blobs.file_path schema is unsupported; run the explicit offline blob-index migration before starting LETHE".to_owned(),
+            ));
+        }
         self.ensure_partition_initialize()?;
         self.migrate_existing_schema()?;
         self.conn.execute_batch(

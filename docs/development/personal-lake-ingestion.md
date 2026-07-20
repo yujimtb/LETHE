@@ -250,7 +250,7 @@ search_lake(query="aquisition", source_types=["github-commit"], limit=3)
 
 Each client returned `result_count=1` and
 `first_record_id=corpus:github-commit:019f2dea-4cf8-7e53-9f1c-863986634345`.
-Claude Code was tested with `--model opus`; Fable was not used.
+Claude Code was tested with `--model opus`; no Interface Pilot was used.
 
 The 2026-07-08 live reauthorization and verification query was:
 

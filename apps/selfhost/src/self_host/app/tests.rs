@@ -321,6 +321,10 @@ fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppSe
             )
             .unwrap(),
         )));
+    let history_projection = Arc::new(Mutex::new(
+        lethe_history::HistoryProjection::rebuild(operational_ledger.lock().unwrap().as_ref())
+            .unwrap(),
+    ));
     AppService {
         core: Arc::new(Mutex::new(
             AppCore::new_with_config(
@@ -334,6 +338,7 @@ fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppSe
         )),
         persistence,
         operational_ledger,
+        history_projection,
         bulk_import_operation: Arc::new(Mutex::new(())),
         search_index,
         config: Arc::new(config.clone()),

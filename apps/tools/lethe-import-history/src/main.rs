@@ -12,11 +12,11 @@ use lethe_history::{
     HISTORY_ACTIVATION_HANDOFF_SCHEMA, HISTORY_ACTIVATION_HANDOFF_VERSION,
     HistoryActivationHandoff, HistoryActivationSessionEntry, HistoryActivationSource, HistoryError,
     HistoryImportReceipt, HistoryImportResult, HistoryManifestDigestBuilder, HistoryRawRecord,
-    HistoryRecordKind, HistorySourceKind, HistorySourceManifest, OwnershipAssignment,
-    RequiredHistorySource, coding_agent_source_inventory, history_session_reference,
-    history_upstream_identity, lethe_observation_cutover_cursor, manifest_entry_for_raw_record,
-    prepare_history_message_request, prepare_history_receipt_request,
-    visit_lethe_conversation_observations,
+    HistoryRecordKind, HistorySourceKind, HistorySourceManifest, LetheConversationPartition,
+    OwnershipAssignment, RequiredHistorySource, coding_agent_source_inventory,
+    history_session_reference, history_upstream_identity, lethe_observation_cutover_cursor,
+    manifest_entry_for_raw_record, prepare_history_message_request,
+    prepare_history_receipt_request, visit_lethe_conversation_observations,
 };
 use lethe_runtime::runtime::partition::RoutingKeyOrder;
 use lethe_storage_api::{OperationalAppendOutcome, OperationalStoragePorts};
@@ -29,8 +29,8 @@ const HELP: &str = "\
 Inventory or import native Claude Code and Codex histories into a Personal LETHE DataSpace.
 
 Usage:
-  lethe-import-history --mode=dry-run --inventory-id=<id> --data-space-id=<id> --owner-id=<id> --captured-at=<rfc3339> --spool-database=<new-path> --max-source-record-bytes=<n> --max-resident-batch-records=<n> --max-handoff-session-entries=<n> [source options]
-  lethe-import-history --mode=execute --inventory-id=<id> --data-space-id=<id> --owner-id=<id> --captured-at=<rfc3339> --spool-database=<new-path> --max-source-record-bytes=<n> --max-resident-batch-records=<n> --max-handoff-session-entries=<n> --expected-manifest-digest=<sha256> --max-blob-bytes=<n> [source options] [backend options]
+  lethe-import-history --mode=dry-run --inventory-id=<id> --data-space-id=<id> --owner-id=<id> --captured-at=<rfc3339> --spool-database=<new-path> --max-source-record-bytes=<n> --max-resident-batch-records=<n> --max-handoff-session-entries=<n> [--require-activation-source-set=true] [source options]
+  lethe-import-history --mode=execute --inventory-id=<id> --data-space-id=<id> --owner-id=<id> --captured-at=<rfc3339> --spool-database=<new-path> --max-source-record-bytes=<n> --max-resident-batch-records=<n> --max-handoff-session-entries=<n> --expected-manifest-digest=<sha256> --max-blob-bytes=<n> [--require-activation-source-set=true] [source options] [backend options]
 
 Source options (at least one pair is required):
   --claude-root=<path>                 Native .claude/projects directory
@@ -40,7 +40,11 @@ Source options (at least one pair is required):
   --history-jsonl=<kind>:<instance>:<path>
                                         Repeatable generic HistoryRawRecord JSONL source
   --lethe-source-backend=sqlite          Existing Personal Lake source backend
-  --lethe-source-instance=<id>           Stable existing Lake source instance id
+  --lethe-claude-ai-source-instance=<id> Explicit Claude AI partition source instance
+  --lethe-residual-source-instance=<id>  Explicit residual LETHE partition source instance
+  --lethe-direct-coding-source-policy=exclude
+                                        Required: exclude sys:claude-code and sys:codex;
+                                        their native archives are imported directly
   --lethe-source-database=<path>         Existing Personal Lake SQLite database
   --lethe-source-blob-dir=<path>         Existing Personal Lake blob directory
   --lethe-source-key-env=<name>          Environment variable containing its 32-byte hex key
@@ -60,6 +64,7 @@ The spool path must not exist. JSONL is processed one bounded record at a time a
 holds at most --max-resident-batch-records event requests in memory.
 Dry-run prints counts, digests, cursors, and ownership only. It never prints message bodies or raw records.
 Execute requires the exact manifest digest from a preceding dry-run and fails if the source tree changed.
+--require-activation-source-set=true requires exactly one of every activation source kind.
 ";
 
 fn main() {
@@ -178,26 +183,42 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         let max_append_seq = source_store.observation_stats()?.max_append_seq;
         let cutover_cursor = lethe_observation_cutover_cursor(max_append_seq);
-        let source_manifest = source_manifest(
-            HistorySourceKind::Lethe,
-            &source.source_instance,
+        let claude_ai_manifest = source_manifest(
+            HistorySourceKind::ClaudeAi,
+            &source.claude_ai_source_instance,
             &cutover_cursor,
             &options.owner_id,
         );
-        spool.insert_source(&source_manifest)?;
+        let residual_manifest = source_manifest(
+            HistorySourceKind::Lethe,
+            &source.residual_source_instance,
+            &cutover_cursor,
+            &options.owner_id,
+        );
+        spool.insert_source(&claude_ai_manifest)?;
+        spool.insert_source(&residual_manifest)?;
+        required_sources.push(RequiredHistorySource {
+            source_kind: HistorySourceKind::ClaudeAi,
+            source_instance_id: source.claude_ai_source_instance.clone(),
+        });
         required_sources.push(RequiredHistorySource {
             source_kind: HistorySourceKind::Lethe,
-            source_instance_id: source.source_instance.clone(),
+            source_instance_id: source.residual_source_instance.clone(),
         });
         visit_lethe_conversation_observations(
             &source_store,
             max_append_seq,
             source.page_size,
+            &source.claude_ai_source_instance,
             &source.upstream_instances,
-            |history| {
+            |partition, history| {
                 scan_stats.source_records += 1;
+                let manifest = match partition {
+                    LetheConversationPartition::ClaudeAi => &claude_ai_manifest,
+                    LetheConversationPartition::ResidualLethe => &residual_manifest,
+                };
                 if spool
-                    .insert_record(&source_manifest, &history)
+                    .insert_record(manifest, &history)
                     .map_err(|error| HistoryError::Invariant(error.to_string()))?
                 {
                     scan_stats.unique_records += 1;
@@ -244,6 +265,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         scan_stats,
         options.max_handoff_session_entries,
     )?;
+    if options.require_activation_source_set {
+        validate_activation_source_set(&required_sources)?;
+    }
     println!("{}", serde_json::to_string_pretty(&plan.safe_json())?);
 
     let Mode::Execute {
@@ -770,32 +794,29 @@ fn execute_spool<T: OperationalStoragePorts + ?Sized>(
         )?;
         let mut rows =
             statement.query([source_key(source.source_kind, &source.source_instance_id)])?;
-        let mut requests = Vec::with_capacity(max_resident_batch_records);
+        let mut records = Vec::with_capacity(max_resident_batch_records);
         while let Some(row) = rows.next()? {
-            let record = row_record(row)?;
-            let entry = manifest_entry_for_raw_record(&record)?;
-            let blob_ref = store.put_blob(&record.raw, max_blob_bytes)?;
-            requests.push(prepare_history_message_request(
-                store.data_space_id(),
-                source,
-                owner_id,
-                &entry,
-                blob_ref,
-            )?);
+            records.push(row_record(row)?);
             metrics.max_resident_batch_records =
-                metrics.max_resident_batch_records.max(requests.len());
-            if requests.len() == max_resident_batch_records {
-                apply_message_batch(
+                metrics.max_resident_batch_records.max(records.len());
+            if records.len() == max_resident_batch_records {
+                apply_record_batch(
                     store,
-                    &mut requests,
+                    source,
+                    owner_id,
+                    &mut records,
+                    max_blob_bytes,
                     &mut appended_messages,
                     &mut duplicate_messages,
                 )?;
             }
         }
-        apply_message_batch(
+        apply_record_batch(
             store,
-            &mut requests,
+            source,
+            owner_id,
+            &mut records,
+            max_blob_bytes,
             &mut appended_messages,
             &mut duplicate_messages,
         )?;
@@ -846,6 +867,42 @@ fn execute_spool<T: OperationalStoragePorts + ?Sized>(
         },
         metrics,
     ))
+}
+
+fn apply_record_batch<T: OperationalStoragePorts + ?Sized>(
+    store: &T,
+    source: &HistorySourceManifest,
+    owner_id: &str,
+    records: &mut Vec<HistoryRawRecord>,
+    max_blob_bytes: usize,
+    appended: &mut u64,
+    duplicates: &mut u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let raw = records
+        .iter()
+        .map(|record| record.raw.as_slice())
+        .collect::<Vec<_>>();
+    let blob_refs = store.put_blobs(&raw, max_blob_bytes)?;
+    if blob_refs.len() != records.len() {
+        return Err("blob store returned the wrong history batch reference count".into());
+    }
+    let mut requests = Vec::with_capacity(records.len());
+    for (record, blob_ref) in records.iter().zip(blob_refs) {
+        let entry = manifest_entry_for_raw_record(record)?;
+        requests.push(prepare_history_message_request(
+            store.data_space_id(),
+            source,
+            owner_id,
+            &entry,
+            blob_ref,
+        )?);
+    }
+    apply_message_batch(store, &mut requests, appended, duplicates)?;
+    records.clear();
+    Ok(())
 }
 
 fn apply_message_batch<T: OperationalStoragePorts + ?Sized>(
@@ -927,6 +984,7 @@ struct Options {
     max_source_record_bytes: usize,
     max_resident_batch_records: usize,
     max_handoff_session_entries: usize,
+    require_activation_source_set: bool,
     claude: Option<NativeSource>,
     codex: Option<NativeSource>,
     generic_sources: Vec<GenericSource>,
@@ -945,7 +1003,8 @@ struct GenericSource {
 }
 
 struct LetheSource {
-    source_instance: String,
+    claude_ai_source_instance: String,
+    residual_source_instance: String,
     database: PathBuf,
     blob_dir: PathBuf,
     key_env: String,
@@ -1077,6 +1136,8 @@ impl Options {
             positive_usize(&mut values, "--max-resident-batch-records")?;
         let max_handoff_session_entries =
             positive_usize(&mut values, "--max-handoff-session-entries")?;
+        let require_activation_source_set =
+            optional_exact_bool(&mut values, "--require-activation-source-set")?.unwrap_or(false);
         let claude = take_source(&mut values, "--claude-root", "--claude-source-instance")?;
         let codex = take_source(&mut values, "--codex-root", "--codex-source-instance")?;
         let lethe = take_lethe_source(&mut values, lethe_upstream_instances)?;
@@ -1136,6 +1197,7 @@ impl Options {
             max_source_record_bytes,
             max_resident_batch_records,
             max_handoff_session_entries,
+            require_activation_source_set,
             claude,
             codex,
             generic_sources,
@@ -1150,7 +1212,9 @@ fn take_lethe_source(
 ) -> Result<Option<LetheSource>, Box<dyn std::error::Error>> {
     let names = [
         "--lethe-source-backend",
-        "--lethe-source-instance",
+        "--lethe-claude-ai-source-instance",
+        "--lethe-residual-source-instance",
+        "--lethe-direct-coding-source-policy",
         "--lethe-source-database",
         "--lethe-source-blob-dir",
         "--lethe-source-key-env",
@@ -1170,8 +1234,33 @@ fn take_lethe_source(
         )
         .into());
     }
+    let claude_ai_source_instance = take_required(values, "--lethe-claude-ai-source-instance")?;
+    let residual_source_instance = take_required(values, "--lethe-residual-source-instance")?;
+    if claude_ai_source_instance == residual_source_instance {
+        return Err(
+            "--lethe-claude-ai-source-instance and --lethe-residual-source-instance must differ"
+                .into(),
+        );
+    }
+    if take_required(values, "--lethe-direct-coding-source-policy")? != "exclude" {
+        return Err("--lethe-direct-coding-source-policy must be exclude".into());
+    }
+    for source_system in [
+        "sys:claude",
+        "sys:claude-ai",
+        "sys:claude-code",
+        "sys:codex",
+    ] {
+        if upstream_instances.contains_key(source_system) {
+            return Err(format!(
+                "--lethe-upstream-instance must not map {source_system}; its partition is explicit"
+            )
+            .into());
+        }
+    }
     Ok(Some(LetheSource {
-        source_instance: take_required(values, "--lethe-source-instance")?,
+        claude_ai_source_instance,
+        residual_source_instance,
         database: PathBuf::from(take_required(values, "--lethe-source-database")?),
         blob_dir: PathBuf::from(take_required(values, "--lethe-source-blob-dir")?),
         key_env: take_required(values, "--lethe-source-key-env")?,
@@ -1229,6 +1318,57 @@ fn positive_usize(
     } else {
         Ok(value)
     }
+}
+
+fn optional_exact_bool(
+    values: &mut BTreeMap<String, String>,
+    name: &str,
+) -> Result<Option<bool>, Box<dyn std::error::Error>> {
+    let Some(value) = values.remove(name) else {
+        return Ok(None);
+    };
+    match value.as_str() {
+        "true" => Ok(Some(true)),
+        "false" => Ok(Some(false)),
+        _ => Err(format!("{name} must be true or false").into()),
+    }
+}
+
+fn validate_activation_source_set(
+    sources: &[RequiredHistorySource],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let expected = [
+        HistorySourceKind::ClaudeCode,
+        HistorySourceKind::ClaudeAi,
+        HistorySourceKind::Codex,
+        HistorySourceKind::Intercom,
+        HistorySourceKind::Lethe,
+        HistorySourceKind::NaniholdLegacy,
+        HistorySourceKind::SystemSnapshot,
+    ];
+    if sources.len() != expected.len() {
+        return Err(format!(
+            "activation source set requires exactly {} sources, got {}",
+            expected.len(),
+            sources.len()
+        )
+        .into());
+    }
+    for kind in expected {
+        if sources
+            .iter()
+            .filter(|source| source.source_kind == kind)
+            .count()
+            != 1
+        {
+            return Err(format!(
+                "activation source set requires exactly one {} source",
+                source_key(kind, "<instance>")
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 fn take_source(
@@ -1476,6 +1616,31 @@ mod tests {
     }
 
     #[test]
+    fn activation_source_set_gate_requires_explicit_boolean() {
+        let mut args = vec![
+            "--mode=dry-run".to_owned(),
+            "--inventory-id=inventory:test".to_owned(),
+            "--data-space-id=space:personal".to_owned(),
+            "--owner-id=owner".to_owned(),
+            "--captured-at=2026-07-20T00:00:00Z".to_owned(),
+            "--spool-database=C:\\spool.sqlite3".to_owned(),
+            "--max-source-record-bytes=1024".to_owned(),
+            "--max-resident-batch-records=2".to_owned(),
+            "--max-handoff-session-entries=100".to_owned(),
+            "--history-jsonl=intercom:intercom-personal:C:\\intercom.jsonl".to_owned(),
+            "--require-activation-source-set=true".to_owned(),
+        ];
+        assert!(
+            Options::parse(args.clone())
+                .unwrap()
+                .require_activation_source_set
+        );
+        args.pop();
+        args.push("--require-activation-source-set=yes".to_owned());
+        assert!(Options::parse(args).is_err());
+    }
+
+    #[test]
     fn existing_lethe_source_requires_explicit_backend_location_key_and_page_size() {
         let base = vec![
             "--mode=dry-run".to_owned(),
@@ -1490,7 +1655,40 @@ mod tests {
             "--lethe-source-backend=sqlite".to_owned(),
         ];
         let error = Options::parse(base).err().unwrap().to_string();
-        assert!(error.contains("--lethe-source-instance"));
+        assert!(error.contains("--lethe-claude-ai-source-instance"));
+    }
+
+    #[test]
+    fn existing_lethe_partitions_are_explicit_and_do_not_accept_coding_mappings() {
+        let mut args = vec![
+            "--mode=dry-run".to_owned(),
+            "--inventory-id=inventory:test".to_owned(),
+            "--data-space-id=space:personal".to_owned(),
+            "--owner-id=owner".to_owned(),
+            "--captured-at=2026-07-20T00:00:00Z".to_owned(),
+            "--spool-database=C:\\spool.sqlite3".to_owned(),
+            "--max-source-record-bytes=1024".to_owned(),
+            "--max-resident-batch-records=2".to_owned(),
+            "--max-handoff-session-entries=100".to_owned(),
+            "--lethe-source-backend=sqlite".to_owned(),
+            "--lethe-claude-ai-source-instance=claude-ai-personal".to_owned(),
+            "--lethe-residual-source-instance=lethe-personal".to_owned(),
+            "--lethe-direct-coding-source-policy=exclude".to_owned(),
+            "--lethe-source-database=C:\\lethe.sqlite3".to_owned(),
+            "--lethe-source-blob-dir=C:\\blobs".to_owned(),
+            "--lethe-source-key-env=LETHE_SOURCE_KEY".to_owned(),
+            "--lethe-source-routing-key-order=year_month_source_container_published".to_owned(),
+            "--lethe-source-page-size=100".to_owned(),
+        ];
+        assert!(Options::parse(args.clone()).is_ok());
+        args.push("--lethe-upstream-instance=sys:codex=codex-personal".to_owned());
+        assert!(
+            Options::parse(args)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("must not map sys:codex")
+        );
     }
 
     #[test]
@@ -1604,6 +1802,64 @@ mod tests {
             .unwrap();
         assert_eq!(plan.cross_source_overlap_identities, 1);
         assert_eq!(plan.safe_json()["ready_for_import"], false);
+        drop(spool);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn seven_source_activation_plan_is_partitioned_and_overlap_free() {
+        let root = test_root("seven-source");
+        fs::create_dir_all(&root).unwrap();
+        let spool = HistorySpool::create(&root.join("spool.sqlite3")).unwrap();
+        let sources = [
+            (HistorySourceKind::ClaudeCode, "claude-code-personal"),
+            (HistorySourceKind::ClaudeAi, "claude-ai-personal"),
+            (HistorySourceKind::Codex, "codex-personal"),
+            (HistorySourceKind::Intercom, "intercom-personal"),
+            (HistorySourceKind::Lethe, "lethe-personal"),
+            (
+                HistorySourceKind::NaniholdLegacy,
+                "nanihold-legacy-personal",
+            ),
+            (HistorySourceKind::SystemSnapshot, "system-current"),
+        ]
+        .into_iter()
+        .map(|(kind, instance)| source_manifest(kind, instance, "cursor:1", "owner"))
+        .collect::<Vec<_>>();
+        for (ordinal, source) in sources.iter().enumerate() {
+            spool.insert_source(source).unwrap();
+            let mut record = sample_record(u32::try_from(ordinal + 1).unwrap());
+            record.source_session_id = format!("session-{ordinal}");
+            record.source_message_id = format!("message-{ordinal}");
+            record.raw = format!("raw-{ordinal}").into_bytes();
+            spool.insert_record(source, &record).unwrap();
+        }
+        let required = sources
+            .iter()
+            .map(|source| RequiredHistorySource {
+                source_kind: source.source_kind,
+                source_instance_id: source.source_instance_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        let plan = spool
+            .build_plan(
+                "inventory:seven-source",
+                &DataSpaceId::new("space:personal"),
+                Utc.with_ymd_and_hms(2026, 7, 20, 1, 0, 0).unwrap(),
+                &required,
+                ScanStats {
+                    source_records: 7,
+                    unique_records: 7,
+                    duplicate_source_records: 0,
+                },
+                100,
+            )
+            .unwrap();
+        assert_eq!(plan.sources.len(), 7);
+        assert_eq!(plan.cross_source_overlap_identities, 0);
+        assert_eq!(plan.safe_json()["ready_for_import"], true);
+        validate_activation_source_set(&required).unwrap();
+        assert!(validate_activation_source_set(&required[..6]).is_err());
         drop(spool);
         let _ = fs::remove_dir_all(root);
     }

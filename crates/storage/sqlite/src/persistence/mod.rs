@@ -1,5 +1,6 @@
 mod schema;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -540,28 +541,89 @@ impl SqlitePersistence {
     }
 
     pub fn persist_blob(&self, data: &[u8]) -> Result<BlobRef, PersistenceError> {
-        let hash = hex::encode(sha2::Sha256::digest(data));
-        let blob_ref = BlobRef::new(format!("blob:sha256:{hash}"));
-        let path = self.blob_dir.join(&hash);
-        if !path.exists() {
-            fs::write(&path, data)?;
+        let mut blob_refs = self.persist_blobs(&[data])?;
+        blob_refs.pop().ok_or_else(|| {
+            PersistenceError::SchemaInvariant(
+                "single blob persistence returned no blob reference".to_owned(),
+            )
+        })
+    }
+
+    pub fn persist_blobs(&self, data: &[&[u8]]) -> Result<Vec<BlobRef>, PersistenceError> {
+        let blobs = data
+            .iter()
+            .map(|bytes| {
+                let hash = hex::encode(sha2::Sha256::digest(bytes));
+                (
+                    BlobRef::new(format!("blob:sha256:{hash}")),
+                    self.blob_dir.join(&hash),
+                    *bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let unique_files = blobs
+            .iter()
+            .map(|(_, path, bytes)| (path.clone(), *bytes))
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            .filter(|(path, _)| !path.exists())
+            .collect::<Vec<_>>();
+        let workers = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .min(8)
+            .min(unique_files.len().max(1));
+        let chunk_size = unique_files.len().div_ceil(workers);
+        std::thread::scope(|scope| -> Result<(), PersistenceError> {
+            let handles = unique_files
+                .chunks(chunk_size.max(1))
+                .map(|chunk| {
+                    scope.spawn(move || -> Result<(), std::io::Error> {
+                        for (path, bytes) in chunk {
+                            if !path.exists() {
+                                fs::write(path, bytes)?;
+                            }
+                        }
+                        Ok(())
+                    })
+                })
+                .collect::<Vec<_>>();
+            for handle in handles {
+                handle.join().map_err(|_| {
+                    PersistenceError::SchemaInvariant("parallel blob writer panicked".to_owned())
+                })??;
+            }
+            Ok(())
+        })?;
+
+        let transaction = self.conn.unchecked_transaction()?;
+        {
+            let mut statement = transaction.prepare_cached(
+                "INSERT OR IGNORE INTO blobs (blob_ref, file_name) VALUES (?1, ?2)",
+            )?;
+            for (blob_ref, path, _) in &blobs {
+                let file_name = path
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .ok_or_else(|| {
+                        PersistenceError::SchemaInvariant("blob file name is not UTF-8".to_owned())
+                    })?;
+                statement.execute(params![blob_ref.as_str(), file_name])?;
+            }
         }
-        self.conn.execute(
-            "INSERT OR IGNORE INTO blobs (blob_ref, file_path) VALUES (?1, ?2)",
-            params![blob_ref.as_str(), path.to_string_lossy().to_string()],
-        )?;
-        Ok(blob_ref)
+        transaction.commit()?;
+        Ok(blobs.into_iter().map(|(blob_ref, _, _)| blob_ref).collect())
     }
 
     pub fn load_blobs(&self) -> Result<Vec<Vec<u8>>, PersistenceError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT file_path FROM blobs ORDER BY file_path")?;
+            .prepare("SELECT file_name FROM blobs ORDER BY file_name")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
 
         let mut blobs = Vec::new();
         for row in rows {
-            blobs.push(fs::read(row?)?);
+            blobs.push(fs::read(self.blob_dir.join(row?))?);
         }
         Ok(blobs)
     }
@@ -1127,12 +1189,12 @@ impl SqlitePersistence {
         let path = self
             .conn
             .query_row(
-                "SELECT file_path FROM blobs WHERE blob_ref = ?1",
+                "SELECT file_name FROM blobs WHERE blob_ref = ?1",
                 [blob_ref.as_str()],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
-        path.map(fs::read)
+        path.map(|file_name| fs::read(self.blob_dir.join(file_name)))
             .transpose()
             .map_err(PersistenceError::from)
     }
@@ -2057,6 +2119,10 @@ impl BlobStorePort for SqliteOperationalEventStore {
         <SqlitePersistence as BlobStorePort>::put_blob(&self.persistence, data, max_bytes)
     }
 
+    fn put_blobs(&self, data: &[&[u8]], max_bytes: usize) -> StorageResult<Vec<BlobRef>> {
+        <SqlitePersistence as BlobStorePort>::put_blobs(&self.persistence, data, max_bytes)
+    }
+
     fn get_blob(&self, blob_ref: &BlobRef) -> StorageResult<Option<Vec<u8>>> {
         <SqlitePersistence as BlobStorePort>::get_blob(&self.persistence, blob_ref)
     }
@@ -2482,6 +2548,20 @@ impl BlobStorePort for SqlitePersistence {
             )));
         }
         self.persist_blob(data).map_err(storage_error)
+    }
+
+    fn put_blobs(&self, data: &[&[u8]], max_bytes: usize) -> StorageResult<Vec<BlobRef>> {
+        if let Some((index, blob)) = data
+            .iter()
+            .enumerate()
+            .find(|(_, blob)| blob.len() > max_bytes)
+        {
+            return Err(StorageError::Invariant(format!(
+                "blob at batch index {index} has size {} exceeding configured maximum {max_bytes}",
+                blob.len()
+            )));
+        }
+        self.persist_blobs(data).map_err(storage_error)
     }
 
     fn get_blob(&self, blob_ref: &BlobRef) -> StorageResult<Option<Vec<u8>>> {

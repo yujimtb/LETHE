@@ -46,7 +46,7 @@ use lethe_engine::projection::lineage::{LineageManifest, SourceSnapshot};
 use lethe_engine::supplemental::SupplementalStore;
 use lethe_history::{
     HistoryError, HistoryImportCommand, HistoryImportResult, HistoryInventoryReport,
-    HistoryInventoryRequest, HistoryQueryRequest, HistoryQueryResponse,
+    HistoryInventoryRequest, HistoryProjection, HistoryQueryRequest, HistoryQueryResponse,
 };
 use lethe_policy::governance::audit::{AuditLog, InMemoryAuditLog};
 use lethe_policy::governance::engine::PolicyEngine;
@@ -1075,6 +1075,7 @@ pub struct AppService {
     core: Arc<Mutex<AppCore>>,
     persistence: Arc<Mutex<Box<dyn StoragePorts>>>,
     operational_ledger: Arc<Mutex<Box<dyn OperationalStoragePorts>>>,
+    history_projection: Arc<Mutex<HistoryProjection>>,
     bulk_import_operation: Arc<Mutex<()>>,
     search_index: search_index::SearchIndexManager,
     config: Arc<SelfHostConfig>,
@@ -4780,6 +4781,10 @@ impl AppService {
                 .map_err(|error| SelfHostError::OperationalLedger(error.to_string()))?,
             ),
         };
+        // The history read API is a projection API.  Build its immutable snapshot before
+        // accepting requests so a first owner query cannot hold the operational-ledger mutex
+        // while scanning every historical event.
+        let history_projection = HistoryProjection::rebuild(operational_ledger.as_ref())?;
         let persistence = SqlitePersistence::open_with_routing_key_order(
             &config.database_path,
             &config.blob_dir,
@@ -4872,6 +4877,7 @@ impl AppService {
             core: Arc::new(Mutex::new(core)),
             persistence,
             operational_ledger: Arc::new(Mutex::new(operational_ledger)),
+            history_projection: Arc::new(Mutex::new(history_projection)),
             bulk_import_operation: Arc::new(Mutex::new(())),
             search_index,
             config: Arc::new(config),
@@ -5014,7 +5020,14 @@ impl AppService {
             .operational_ledger
             .lock()
             .map_err(|_| SelfHostError::LockPoisoned)?;
-        Ok(lethe_history::query_history(ledger.as_ref(), request)?)
+        let mut projection = self
+            .history_projection
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?;
+        if projection.source_watermark() != ledger.operational_event_stats()?.max_cursor {
+            projection.refresh_from(ledger.as_ref())?;
+        }
+        Ok(projection.query(ledger.as_ref(), request)?)
     }
 
     pub fn spawn_polling_task(&self) {

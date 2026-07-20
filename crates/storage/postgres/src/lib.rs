@@ -314,6 +314,47 @@ impl BlobStore for PostgresOperationalEventStore {
         Ok(blob_ref)
     }
 
+    fn put_blobs(&self, data: &[&[u8]], max_bytes: usize) -> StorageResult<Vec<BlobRef>> {
+        if let Some((index, blob)) = data
+            .iter()
+            .enumerate()
+            .find(|(_, blob)| blob.len() > max_bytes)
+        {
+            return Err(StorageError::Invariant(format!(
+                "blob at batch index {index} has size {} exceeding maximum {max_bytes}",
+                blob.len()
+            )));
+        }
+        let blobs = data
+            .iter()
+            .map(|blob| {
+                let digest = hex::encode(Sha256::digest(blob));
+                let blob_ref = BlobRef::new(format!("blob:sha256:{digest}"));
+                let bytes = to_i64("blob bytes", blob.len() as u64)?;
+                Ok((blob_ref, bytes, *blob))
+            })
+            .collect::<StorageResult<Vec<_>>>()?;
+
+        let mut client = self.client()?;
+        let mut transaction = client.transaction().map_err(Self::backend)?;
+        {
+            let statement = transaction
+                .prepare(
+                    "INSERT INTO operational_blobs (blob_ref, bytes, content)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (blob_ref) DO NOTHING",
+                )
+                .map_err(Self::backend)?;
+            for (blob_ref, bytes, content) in &blobs {
+                transaction
+                    .execute(&statement, &[&blob_ref.as_str(), bytes, content])
+                    .map_err(Self::backend)?;
+            }
+        }
+        transaction.commit().map_err(Self::backend)?;
+        Ok(blobs.into_iter().map(|(blob_ref, _, _)| blob_ref).collect())
+    }
+
     fn get_blob(&self, blob_ref: &BlobRef) -> StorageResult<Option<Vec<u8>>> {
         let mut client = self.client()?;
         client

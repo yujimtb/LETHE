@@ -1582,6 +1582,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lethe-migrate-blob-index"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "lethe-policy"
 version = "0.1.0"
 dependencies = [

@@ -9,6 +9,7 @@ members = [
     "apps/tools/lethe-import-codex",
     "apps/tools/lethe-import-github",
     "apps/tools/lethe-import-history",
+    "apps/tools/lethe-migrate-blob-index",
     "apps/tools/review-harness",
     "crates/adapters/api",
     "crates/adapters/claude",

@@ -613,6 +613,7 @@ pub trait ObservationStore: Send {
 
 pub trait BlobStore: Send {
     fn put_blob(&self, data: &[u8], max_bytes: usize) -> StorageResult<BlobRef>;
+    fn put_blobs(&self, data: &[&[u8]], max_bytes: usize) -> StorageResult<Vec<BlobRef>>;
     fn get_blob(&self, blob_ref: &BlobRef) -> StorageResult<Option<Vec<u8>>>;
 }
 
@@ -1093,6 +1094,39 @@ pub mod conformance {
             store.get_blob(&blob).unwrap(),
             Some(b"conformance".to_vec())
         );
+
+        let batch = store
+            .put_blobs(&[b"batch-b", b"batch-a", b"batch-b"], 1024)
+            .unwrap();
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0], batch[2]);
+        assert_ne!(batch[0], batch[1]);
+        assert_eq!(
+            batch[0].as_str(),
+            format!(
+                "blob:sha256:{}",
+                hex::encode(sha2::Sha256::digest(b"batch-b"))
+            )
+        );
+        assert_eq!(
+            store.get_blob(&batch[0]).unwrap(),
+            Some(b"batch-b".to_vec())
+        );
+        assert_eq!(
+            store.get_blob(&batch[1]).unwrap(),
+            Some(b"batch-a".to_vec())
+        );
+
+        let repeated = store
+            .put_blobs(&[b"batch-b", b"batch-a", b"batch-b"], 1024)
+            .unwrap();
+        assert_eq!(repeated, batch);
+
+        assert!(matches!(
+            store.put_blobs(&[b"ok", b"too-large"], 3),
+            Err(StorageError::Invariant(_))
+        ));
+        assert_eq!(store.put_blobs(&[], 1024).unwrap(), Vec::<BlobRef>::new());
     }
 
     pub fn materializer_round_trip<T: ProjectionMaterializer>(materializer: &T) {
