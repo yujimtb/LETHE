@@ -1711,7 +1711,7 @@ mod tests {
         let mut changed = first.clone();
         changed.raw = b"changed".to_vec();
         assert!(spool.insert_record(&source, &first).unwrap());
-        assert!(spool.insert_record(&source, &first).unwrap() == false);
+        assert!(!spool.insert_record(&source, &first).unwrap());
         assert!(spool.insert_record(&source, &changed).is_err());
         first.raw.clear();
         drop(spool);

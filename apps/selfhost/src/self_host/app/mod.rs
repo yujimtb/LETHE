@@ -221,7 +221,9 @@ pub struct ProjectionSnapshot {
     pub lineage: LineageManifest,
 }
 
-const NON_CORPUS_MATERIALIZATION_VERSION: u32 = 7;
+// ReplyCard.agent_name is derived during the supplemental fold; rebuild older
+// serialized snapshots so existing cards receive the attribution.
+const NON_CORPUS_MATERIALIZATION_VERSION: u32 = 8;
 const REPLY_SLO_ITEM_OWNER: &str = "__reply_slo__";
 const IDENTITY_EVENT_ITEM_OWNER: &str = "__identity_events__";
 const PERSON_COMPONENT_ITEM_OWNER: &str = "__person_components__";

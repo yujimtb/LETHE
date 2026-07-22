@@ -775,7 +775,17 @@ Cognition substrate projection surfaces:
   decisions after supersedes resolution into project-level portfolio state.
 - `GET /projections/card-queue` folds `reply-draft@1`, `reply-approval@1`, and
   `send-record@1`. It supports `state`, `channel`, `automatic`, `limit`, and
-  `cursor` query parameters.
+  `cursor` query parameters. Each card also exposes `agent_name`: an
+  `agent:<name>` draft `created_by` is preferred, and a terminal
+  `/agent/<name>` segment in `lineage` is used only when `created_by` is not an
+  agent reference. Other ownership prefixes produce `null` when no lineage
+  fallback applies.
+
+The card queue derives `agent_name` during the supplemental fold, so it is not
+stored independently. The materialized non-corpus projection format is bumped
+when this serialized shape changes; an older snapshot is rebuilt from all
+persisted supplementals on bootstrap and existing cards receive attribution
+without a manual data migration.
 
 ## ChatGPT
 

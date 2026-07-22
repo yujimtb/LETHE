@@ -1329,7 +1329,7 @@ impl HistoryProjection {
                     let entry = current_state
                         .into_iter()
                         .find(|entry| entry.state_key == state_key)
-                        .ok_or_else(|| HistoryError::NotFound(state_key))?;
+                        .ok_or(HistoryError::NotFound(state_key))?;
                     let value = serde_json::to_value(entry)?;
                     ensure_value_size(&value, request.max_result_bytes)?;
                     (value, None)

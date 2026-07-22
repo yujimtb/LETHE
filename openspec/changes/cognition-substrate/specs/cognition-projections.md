@@ -30,6 +30,11 @@ open claim / parking / 決定台帳(supersedes チェーン解決済みの現行
 
 reply-draft@1 / reply-approval@1 / send-record@1 のチェーンを時刻順に畳み、カード状態(pending / approved / sent / skipped / expired)を計算する SHALL。不正遷移は skip し監査ログに記録する SHALL。
 
+カードは reply-draft@1 の `created_by` が `agent:<name>` 形式の場合に
+`agent_name=<name>` を含める SHALL。`created_by` に有効な agent 帰属がない
+場合は、末尾 `/agent/<name>` 形式の `lineage` をフォールバックとして使用して
+よい。いずれも該当しない場合は `agent_name=null` とする SHALL。
+
 受け入れ: 正常系遷移 test、不正遷移 skip test、replay 決定性 test。
 
 ## CARD-02: 多面承認の first-approval-wins

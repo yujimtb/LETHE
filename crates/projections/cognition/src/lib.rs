@@ -395,6 +395,7 @@ pub enum CardState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplyCard {
     pub draft_id: SupplementalId,
+    pub agent_name: Option<String>,
     pub channel: String,
     pub recipient: String,
     pub body: String,
@@ -597,6 +598,7 @@ impl CardQueueReducer {
             draft_id.to_owned(),
             ReplyCard {
                 draft_id: draft.id.clone(),
+                agent_name: derive_agent_name(draft),
                 channel: channel.to_owned(),
                 recipient: recipient.to_owned(),
                 body: body.to_owned(),
@@ -1039,6 +1041,28 @@ fn draft_expiry(draft: &SupplementalRecord) -> Option<DateTime<Utc>> {
     string_field(&draft.payload, "expires_at").and_then(parse_datetime)
 }
 
+fn derive_agent_name(draft: &SupplementalRecord) -> Option<String> {
+    agent_name_from_created_by(draft.created_by.as_str()).or_else(|| {
+        draft
+            .lineage
+            .as_ref()
+            .and_then(|lineage| agent_name_from_lineage(lineage.as_str()))
+    })
+}
+
+fn agent_name_from_created_by(created_by: &str) -> Option<String> {
+    let name = created_by.strip_prefix("agent:")?;
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+fn agent_name_from_lineage(lineage: &str) -> Option<String> {
+    let (_, name) = lineage.rsplit_once("/agent/")?;
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    Some(name.to_owned())
+}
+
 fn audit_event(record: &SupplementalRecord, code: &str, message: &str) -> ProjectionAuditEvent {
     ProjectionAuditEvent {
         record_id: record.id.clone(),
@@ -1072,7 +1096,7 @@ mod tests {
     use chrono::TimeZone;
     use lethe_core::domain::supplemental::InputAnchorSet;
     use lethe_core::domain::{
-        ActorRef, AuthorityModel, CaptureModel, EntityRef, IdempotencyKey, Mutability,
+        ActorRef, AuthorityModel, CaptureModel, EntityRef, IdempotencyKey, LineageRef, Mutability,
         ObservationId, ObserverRef, SchemaRef, SemVer, SourceSystemRef,
     };
 
@@ -1364,6 +1388,68 @@ mod tests {
             Some("slack")
         );
         assert!(!projection.cards[0].automatic_send);
+    }
+
+    #[test]
+    fn card_queue_derives_agent_name_from_created_by_and_serializes_it() {
+        let mut draft = supplemental(
+            "sup:draft-agent",
+            "reply-draft@1",
+            serde_json::json!({"channel": "slack", "recipient": "U1", "body": "hi", "drafted_at": at(1)}),
+            obs_anchor("obs:message"),
+            at(1),
+        );
+        draft.created_by = ActorRef::new("agent:Dawn");
+        draft.lineage = Some(LineageRef::new(
+            "nanihold/work-item/1/execution/2/agent/Nagi",
+        ));
+
+        let projection = CardQueueProjector::new(at(10)).project_records(&[draft]);
+
+        assert_eq!(projection.cards[0].agent_name.as_deref(), Some("Dawn"));
+        assert_eq!(
+            serde_json::to_value(&projection).unwrap()["cards"][0]["agent_name"],
+            "Dawn"
+        );
+    }
+
+    #[test]
+    fn card_queue_does_not_derive_agent_name_from_owner_created_by() {
+        let mut draft = supplemental(
+            "sup:draft-owner",
+            "reply-draft@1",
+            serde_json::json!({"channel": "slack", "recipient": "U1", "body": "hi", "drafted_at": at(1)}),
+            obs_anchor("obs:message"),
+            at(1),
+        );
+        draft.created_by = ActorRef::new("owner:yuji");
+
+        let projection = CardQueueProjector::new(at(10)).project_records(&[draft]);
+
+        assert_eq!(projection.cards[0].agent_name, None);
+        assert_eq!(
+            serde_json::to_value(&projection).unwrap()["cards"][0]["agent_name"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn card_queue_falls_back_to_agent_name_from_lineage() {
+        let mut draft = supplemental(
+            "sup:draft-lineage",
+            "reply-draft@1",
+            serde_json::json!({"channel": "slack", "recipient": "U1", "body": "hi", "drafted_at": at(1)}),
+            obs_anchor("obs:message"),
+            at(1),
+        );
+        draft.created_by = ActorRef::new("system:reply-drafter");
+        draft.lineage = Some(LineageRef::new(
+            "nanihold/work-item/3/execution/4/agent/Nagi",
+        ));
+
+        let projection = CardQueueProjector::new(at(10)).project_records(&[draft]);
+
+        assert_eq!(projection.cards[0].agent_name.as_deref(), Some("Nagi"));
     }
 
     #[test]

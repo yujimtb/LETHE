@@ -2579,6 +2579,61 @@ fn claim_queue_api_filters_pages_and_searches_decisions() {
 }
 
 #[test]
+fn card_queue_api_exposes_reply_draft_agent_attribution() {
+    let (root, db, blobs) = temp_paths();
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let observation = corpus_slack_observation("general", "incoming", "ca", false);
+    persistence.persist_observation(&observation).unwrap();
+    persistence
+        .persist_supplemental(&SupplementalRecord {
+            id: SupplementalId::new("sup:card-agent-draft"),
+            kind: "reply-draft@1".into(),
+            derived_from: InputAnchorSet {
+                observations: vec![observation.id.clone()],
+                blobs: vec![],
+                supplementals: vec![],
+            },
+            payload: serde_json::json!({
+                "channel": "slack",
+                "recipient": "U123",
+                "body": "reply",
+                "drafted_at": fixed_time(1),
+            }),
+            created_by: ActorRef::new("agent:Dawn"),
+            created_at: fixed_time(1),
+            mutability: Mutability::AppendOnly,
+            record_version: None,
+            model_version: None,
+            consent_metadata: None,
+            lineage: None,
+        })
+        .unwrap();
+
+    let app = build_router(bootstrap_ready(test_config(db, blobs)));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let response = runtime
+        .block_on(async {
+            app.oneshot(
+                Request::builder()
+                    .uri("/projections/card-queue?limit=10")
+                    .header("authorization", "Bearer test-api-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        })
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = runtime
+        .block_on(async { axum::body::to_bytes(response.into_body(), usize::MAX).await })
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["cards"][0]["agent_name"], "Dawn");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn api_rejects_unauthenticated_projection_access() {
     let (root, db, blobs) = temp_paths();
     let app = build_router(bootstrap_ready(test_config(db, blobs)));
