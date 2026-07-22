@@ -39,7 +39,7 @@ canonical Observation ledger は append-only の正本で、projection は破棄
 
 - **canonical 書き込み lane:** 短時間の writer lock。append トランザクションと outbox marker のみを保持し、blob I/O・page 走査・network 待ちの間は保持しない。
 - **派生消費者 lane:** append-seq consumer 用。書き込み lane と別ロック/別 connection。
-- **読み取り lane:** immutable snapshot を `Arc` で公開し lock なしで参照。SQLite は read connection pool、PostgreSQL は connection pool を書き込みと分離する。
+- **読み取り lane:** immutable snapshot を `Arc` で公開し lock なしで参照。SQLite の read connection pool と PostgreSQL の connection pool を**同一実装スコープでまとめて**書き込みと分離する(両バックエンドの差は小さく段階分けしない。旧 Q3 確定)。
 
 `spawn_blocking` は並行化とみなさない。B-02 の実測(監査系 2 並行で両方ハング)は、独立読み取りが同一 mutex に直列化されない設計で解消する。
 
@@ -78,8 +78,8 @@ canonical Observation ledger は append-only の正本で、projection は破棄
 1. **outbox = append-seq 直接消費(旧 Q1 確定):** 派生駆動は canonical ledger の append-seq(cursor / high-water)を直接消費し、専用 outbox テーブルは設けない。append-only 原則(canonical 台帳が唯一の順序源)からの導出で、二重書き込みと二台帳同期を避ける。consumer は自身の再開位置(消費済み cursor)のみを保持する。
 2. **派生失敗 = 台帳の専用エラーイベント + health(旧 Q4 確定):** 派生 consumer の失敗は lake authoritative に従い canonical 台帳へ専用のエラーイベントとして記録し、加えて projection health で可視化する。取り込み応答の outcome は反転しない。
 3. **audit の durable enqueue は commit 境界内・同期・fail-closed(D7):** 遅延を許すのは監査記録の書き出し・整形のみ。監査イベントの durable enqueue は commit 境界内で同期・fail-closed とし、保護操作成功=監査イベントが台帳に載っていることの保証とする。consumer 遅延の想定は数秒〜数十秒で health 可視化する。
+4. **read pool 分割は SQLite / PostgreSQL をまとめて同一実装スコープ(旧 Q3 確定):** 両バックエンドの差は小さいため適用順の段階分けをせず、read connection pool(SQLite)と connection pool(PostgreSQL)の書き込みからの分離を一つの実装スコープで行う。
 
 ## Open Questions(オーナー確定が必要)
 
 1. **Q2 同期必須 audit の操作リスト(細部):** commit 境界内で同期 enqueue を必須とする保護操作の具体リスト(全保護操作 / write 系のみ / 認可 deny を含むか)。durability を広げるほど commit 境界コストが増える。方式(commit 境界内・同期・fail-closed)は確定済みで、残るのは対象操作の粒度のみ。
-2. **Q3 lane 分割の storage 適用順(運用判断):** read connection pool を SQLite / PostgreSQL のどちらから入れるか。personal(SQLite)先行が既定案。

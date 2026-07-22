@@ -1,7 +1,7 @@
 ## 1. OEL 索引付き keyset 検索
 
-- [ ] 1.1 [Spec Designer] `operational-event-indexed-query` OIQ-01/OIQ-02 の filter query 契約(correlation/causation/event_type/stream + occurred_at レンジ × keyset cursor)を確定し、`OperationalEventStore` trait(`crates/storage/api/src/lib.rs:128-166`)への追加メソッド署名を文書化する。索引列は最小集合とし超過列は需要駆動拡張(確定 3)。受入: 各 filter が `after_cursor` + `limit` を伴い O(log N + k) を満たす契約が定まる。
-- [ ] 1.2 [Implementer] OIQ-02 に従い SQLite の correlation_id / causation_id / event_type を列・複合 index 化し(`schema.rs:28`)、canonical archive / replay 契約を変えずに索引を派生付与する。受入: 既知 correlation/causation/type の検索が索引で解決し監査 trace が有界になるテストが通る。
+- [ ] 1.1 [Spec Designer] `operational-event-indexed-query` OIQ-01/OIQ-02 の filter query 契約(correlation/causation/event_type/stream/actor_id + occurred_at レンジ × keyset cursor)を確定し、`OperationalEventStore` trait(`crates/storage/api/src/lib.rs:128-166`)への追加メソッド署名を文書化する。初期索引集合は actor_id / occurred_at を含み、これを超える列は需要駆動拡張(確定 3)。受入: 各 filter が `after_cursor` + `limit` を伴い O(log N + k) を満たす契約が定まる。
+- [ ] 1.2 [Implementer] OIQ-02 に従い SQLite の correlation_id / causation_id / event_type / actor_id を列・複合 index 化し(occurred_at レンジ含む、`schema.rs:28`)、canonical archive / replay 契約を変えずに索引を派生付与する。受入: 既知 correlation/causation/type/actor の検索が索引で解決し監査 trace が有界になるテストが通る。
 - [ ] 1.3 [Implementer] OIQ-01 に従い HTTP surface(`server.rs:58`)へ索引付き keyset filter endpoint を追加し cursor 0 全走査 + クライアント側 filter を廃止する。受入: correlation 指定検索が O(log N + k) で返り全 page 走査しないテストが通る。
 
 ## 2. keyset ページング

@@ -6,7 +6,7 @@
 
 ## 2. lock lane 分割
 
-- [ ] 2.1 [Implementer] SLP-01/SLP-03 に従い単一 mutex を canonical 書き込み / 派生消費者 / 読み取りの 3 lane へ分割し、immutable snapshot を `Arc` で公開、SQLite read connection pool・PostgreSQL connection pool を書き込みと分離する(参照: `mod.rs:1320/5447`、`postgres/lib.rs:19`、`server.rs:399`)。受入: 読み取りが書き込み critical section へ直列化されないテストが通る。
+- [ ] 2.1 [Implementer] SLP-01/SLP-03 に従い単一 mutex を canonical 書き込み / 派生消費者 / 読み取りの 3 lane へ分割し、immutable snapshot を `Arc` で公開、SQLite read connection pool と PostgreSQL connection pool を**同一実装スコープでまとめて**書き込みと分離する(適用順の段階分けをしない。旧 Q3 確定。参照: `mod.rs:1320/5447`、`postgres/lib.rs:19`、`server.rs:399`)。受入: 読み取りが書き込み critical section へ直列化されず、両バックエンドで read pool が分離されるテストが通る。
 - [ ] 2.2 [Reviewer] SLP-02 に従い独立読み取りの非ブロックを実測する。受入: 監査系読み取り 2 並行が両方応答し、長時間 import / blob I/O 進行中も独立読み取りが進むことを確認する(B-02 の 2 並行ハング再現が解消)。
 - [ ] 2.3 [Implementer] SLP-03 に従い blob I/O・page 走査・network 待ちの間 AppCore lock を保持しないよう書き込み lane を縮小する。受入: I/O 待ち中にロックを保持しないことのテストが通る。
 
