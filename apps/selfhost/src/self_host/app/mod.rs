@@ -63,8 +63,8 @@ use lethe_projection_answer_log::{AnswerLogProjector, AnswerLogRecord};
 use lethe_projection_claim_queue::{ClaimQueueProjection, ClaimQueueProjector};
 use lethe_projection_cognition::{
     CardQueueProjection, CardQueueProjector, CardQueueReducer, CognitionStateProjector,
-    FreshnessProjection, FreshnessProjector, FreshnessStatus, FreshnessThreshold,
-    PlanStateProjection, ReplyLatency, ReplySloJoinIndex, ReplySloProjection, ReplySloProjector,
+    CommunicationProjectionState, FreshnessProjection, FreshnessProjector, FreshnessStatus,
+    FreshnessThreshold, PlanStateProjection, ReplyLatency, ReplySloJoinIndex, ReplySloProjection,
     ReplySloStatus, ResumeSnapshotProjection, SourceFreshness,
 };
 use lethe_projection_corpus::CorpusProjector;
@@ -223,7 +223,7 @@ pub struct ProjectionSnapshot {
 
 // ReplyCard.agent_name is derived during the supplemental fold; rebuild older
 // serialized snapshots so existing cards receive the attribution.
-const NON_CORPUS_MATERIALIZATION_VERSION: u32 = 8;
+const NON_CORPUS_MATERIALIZATION_VERSION: u32 = 9;
 const REPLY_SLO_ITEM_OWNER: &str = "__reply_slo__";
 const IDENTITY_EVENT_ITEM_OWNER: &str = "__identity_events__";
 const PERSON_COMPONENT_ITEM_OWNER: &str = "__person_components__";
@@ -236,56 +236,132 @@ const OBSERVATION_IMPORT_SLOW_THRESHOLD_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NonCorpusDeltaKind {
+    NoOp,
     FreshnessOnly,
     SlackMessage,
-    FullRebuild,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NonCorpusDeltaReason {
-    EmptyAppend,
-    SlackUserIdMissing,
-    ReplySloRequired,
-    UnsupportedSchema,
-}
-
-impl NonCorpusDeltaReason {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::EmptyAppend => "empty_append",
-            Self::SlackUserIdMissing => "slack_user_id_missing",
-            Self::ReplySloRequired => "reply_slo_required",
-            Self::UnsupportedSchema => "unsupported_schema",
-        }
-    }
+    Communication,
+    DeclaredSchemaSkip,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct NonCorpusDeltaClassification {
     kind: NonCorpusDeltaKind,
-    reason: Option<NonCorpusDeltaReason>,
 }
 
 impl NonCorpusDeltaClassification {
     fn materialization_mode(self) -> &'static str {
         match self.kind {
-            NonCorpusDeltaKind::FreshnessOnly | NonCorpusDeltaKind::SlackMessage => "incremental",
-            NonCorpusDeltaKind::FullRebuild => "full_rebuild",
+            NonCorpusDeltaKind::NoOp => "not_applicable",
+            NonCorpusDeltaKind::FreshnessOnly
+            | NonCorpusDeltaKind::SlackMessage
+            | NonCorpusDeltaKind::Communication
+            | NonCorpusDeltaKind::DeclaredSchemaSkip => "incremental",
         }
     }
 
     fn kind_as_str(self) -> &'static str {
         match self.kind {
+            NonCorpusDeltaKind::NoOp => "no_op",
             NonCorpusDeltaKind::FreshnessOnly => "freshness_only",
             NonCorpusDeltaKind::SlackMessage => "slack_message",
-            NonCorpusDeltaKind::FullRebuild => "full_rebuild",
+            NonCorpusDeltaKind::Communication => "communication",
+            NonCorpusDeltaKind::DeclaredSchemaSkip => "declared_schema_skip",
         }
     }
+}
 
-    fn full_rebuild_reason(self) -> &'static str {
-        self.reason
-            .map_or("not_applicable", NonCorpusDeltaReason::as_str)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectionFoldBehavior {
+    FreshnessOnly,
+    Communication,
+    Incremental,
+}
+
+const PROJECTION_FOLD_DECLARATIONS: &[(&str, ProjectionFoldBehavior)] = &[
+    (
+        "schema:claude-message",
+        ProjectionFoldBehavior::Communication,
+    ),
+    (
+        "schema:chatgpt-message",
+        ProjectionFoldBehavior::Communication,
+    ),
+    ("schema:github-event", ProjectionFoldBehavior::FreshnessOnly),
+    (
+        "schema:coding-agent-message",
+        ProjectionFoldBehavior::Communication,
+    ),
+    (
+        "schema:slack-message",
+        ProjectionFoldBehavior::Communication,
+    ),
+    (
+        "schema:gmail-message",
+        ProjectionFoldBehavior::Communication,
+    ),
+    (
+        "schema:discord-message",
+        ProjectionFoldBehavior::Communication,
+    ),
+    (
+        "schema:slack-channel-snapshot",
+        ProjectionFoldBehavior::FreshnessOnly,
+    ),
+    (
+        "schema:workspace-object-snapshot",
+        ProjectionFoldBehavior::FreshnessOnly,
+    ),
+    (
+        "schema:observer-heartbeat",
+        ProjectionFoldBehavior::FreshnessOnly,
+    ),
+    (
+        "schema:bot-answer-log",
+        ProjectionFoldBehavior::FreshnessOnly,
+    ),
+    (
+        "schema:slide-analysis-result",
+        ProjectionFoldBehavior::Incremental,
+    ),
+    (
+        "schema:consent-decision",
+        ProjectionFoldBehavior::Incremental,
+    ),
+];
+
+fn projection_fold_behavior(schema: &str) -> Option<ProjectionFoldBehavior> {
+    PROJECTION_FOLD_DECLARATIONS
+        .iter()
+        .find_map(|(declared_schema, behavior)| (*declared_schema == schema).then_some(*behavior))
+}
+
+fn validate_projection_fold_declarations(
+    registry: &lethe_registry::registry::RegistryStore,
+    declarations: &[(&str, ProjectionFoldBehavior)],
+) -> Result<(), SelfHostError> {
+    let registered = registry
+        .list_schemas()
+        .into_iter()
+        .map(|schema| schema.id.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+    let declared = declarations
+        .iter()
+        .map(|(schema, _)| (*schema).to_owned())
+        .collect::<BTreeSet<_>>();
+    if registered != declared {
+        let missing = registered
+            .difference(&declared)
+            .cloned()
+            .collect::<Vec<_>>();
+        let extra = declared
+            .difference(&registered)
+            .cloned()
+            .collect::<Vec<_>>();
+        return Err(SelfHostError::Ingestion(format!(
+            "projection fold declaration drift: missing={missing:?}, extra={extra:?}"
+        )));
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -430,7 +506,7 @@ impl ObservationImportTimingLog {
                 ImportMaterializationState::Classified(classification) => (
                     classification.materialization_mode(),
                     classification.kind_as_str(),
-                    classification.full_rebuild_reason(),
+                    "not_applicable",
                 ),
             };
         let slow = self.timing.total_ms > OBSERVATION_IMPORT_SLOW_THRESHOLD_MS;
@@ -749,6 +825,7 @@ struct MaterializedProjectionSnapshot {
     person_slide_count: u64,
     person_message_count: u64,
     reply_slo_count: u64,
+    communication_projection: CommunicationProjectionState,
     snapshot: ProjectionSnapshot,
     pending_item_commit: Option<PendingProjectionItemCommit>,
 }
@@ -765,6 +842,7 @@ struct MaterializedProjectionManifestRef<'a> {
     person_slide_count: u64,
     person_message_count: u64,
     reply_slo_count: u64,
+    communication_projection: &'a CommunicationProjectionState,
     snapshot: AuxiliaryProjectionSnapshotRef<'a>,
 }
 
@@ -794,6 +872,8 @@ struct MaterializedProjectionManifest {
     person_slide_count: u64,
     person_message_count: u64,
     reply_slo_count: u64,
+    #[serde(default)]
+    communication_projection: CommunicationProjectionState,
     snapshot: AuxiliaryProjectionSnapshot,
 }
 
@@ -827,6 +907,7 @@ impl MaterializedProjectionSnapshot {
             person_slide_count: self.person_slide_count,
             person_message_count: self.person_message_count,
             reply_slo_count: self.reply_slo_count,
+            communication_projection: &self.communication_projection,
             snapshot: AuxiliaryProjectionSnapshotRef {
                 answer_log: &self.snapshot.answer_log,
                 claim_queue: &self.snapshot.claim_queue,
@@ -867,6 +948,15 @@ impl MaterializedProjectionSnapshot {
         if !self.snapshot.reply_slo.rows.is_empty() || !self.snapshot.reply_slo.overdue.is_empty() {
             return Err(SelfHostError::Ingestion(
                 "proj:person-page manifest must not contain resident reply SLO rows".to_owned(),
+            ));
+        }
+        if self.communication_projection.len()
+            != usize::try_from(self.reply_slo_count).map_err(|_| {
+                SelfHostError::Ingestion("reply SLO count does not fit usize".to_owned())
+            })?
+        {
+            return Err(SelfHostError::Ingestion(
+                "communication projection fact count does not match reply SLO count".to_owned(),
             ));
         }
         if let Some(pending) = &self.pending_item_commit {
@@ -960,6 +1050,7 @@ pub struct AppCore {
     person_slide_count: u64,
     person_message_count: u64,
     reply_slo_count: u64,
+    communication_projection: CommunicationProjectionState,
     pub snapshot: ProjectionSnapshot,
     pub last_sync_at: Option<DateTime<Utc>>,
     pub last_sync_error: Option<String>,
@@ -982,6 +1073,7 @@ impl AppCore {
             person_slide_count: self.person_slide_count,
             person_message_count: self.person_message_count,
             reply_slo_count: self.reply_slo_count,
+            communication_projection: &self.communication_projection,
             snapshot: AuxiliaryProjectionSnapshotRef {
                 answer_log: &self.snapshot.answer_log,
                 claim_queue: &self.snapshot.claim_queue,
@@ -1076,6 +1168,7 @@ impl AppCore {
                 ))
             })?;
         }
+        validate_projection_fold_declarations(&registry, PROJECTION_FOLD_DECLARATIONS)?;
 
         let resident_supplemental_fingerprint = materialized.supplemental_fingerprint.clone();
         let supplemental_count = supplemental_projection_cache.count();
@@ -1101,6 +1194,7 @@ impl AppCore {
             person_slide_count: materialized.person_slide_count,
             person_message_count: materialized.person_message_count,
             reply_slo_count: materialized.reply_slo_count,
+            communication_projection: materialized.communication_projection,
             snapshot: materialized.snapshot,
             last_sync_at: None,
             last_sync_error: None,
@@ -1126,6 +1220,7 @@ impl AppCore {
         self.person_slide_count = materialized.person_slide_count;
         self.person_message_count = materialized.person_message_count;
         self.reply_slo_count = materialized.reply_slo_count;
+        self.communication_projection = materialized.communication_projection;
         self.snapshot = materialized.snapshot;
         self.activate_non_corpus_projections();
     }
@@ -1269,8 +1364,37 @@ impl AppCore {
                 )));
             }
         };
+        let mut communication_observation_ids = BTreeSet::new();
+        for record in [previous_record.as_ref(), Some(&current_record)]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(observation_id) = self
+                .supplemental_projection_cache
+                .reply_slo
+                .observation_id_for_record(record)
+            {
+                communication_observation_ids.insert(observation_id.as_str().to_owned());
+            }
+        }
         self.supplemental_projection_cache
             .replace(previous_record.as_ref(), &current_record);
+        if let Some(observation_id) = self
+            .supplemental_projection_cache
+            .reply_slo
+            .observation_id_for_record(&current_record)
+        {
+            communication_observation_ids.insert(observation_id.as_str().to_owned());
+        }
+        for observation_id in communication_observation_ids {
+            let observation_id = ObservationId::new(observation_id);
+            self.communication_projection.refresh_sent_at(
+                &observation_id,
+                self.supplemental_projection_cache
+                    .reply_slo
+                    .sent_at_for_observation(&observation_id),
+            );
+        }
         self.resident_supplemental_fingerprint = next_fingerprint;
         self.supplemental_count = next_count;
         self.claim_queue_dirty = previous_claim_queue_dirty
@@ -1290,8 +1414,33 @@ impl AppCore {
     }
 
     fn rollback_supplemental(&mut self, rollback: AppSupplementalRollback) {
+        let mut communication_observation_ids = BTreeSet::new();
+        for record in [
+            Some(&rollback.current_record),
+            rollback.previous_record.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(observation_id) = self
+                .supplemental_projection_cache
+                .reply_slo
+                .observation_id_for_record(record)
+            {
+                communication_observation_ids.insert(observation_id.as_str().to_owned());
+            }
+        }
         self.supplemental_projection_cache
             .rollback(&rollback.current_record, rollback.previous_record.as_ref());
+        for observation_id in communication_observation_ids {
+            let observation_id = ObservationId::new(observation_id);
+            self.communication_projection.refresh_sent_at(
+                &observation_id,
+                self.supplemental_projection_cache
+                    .reply_slo
+                    .sent_at_for_observation(&observation_id),
+            );
+        }
         self.resident_supplemental_fingerprint = rollback.previous_resident_fingerprint;
         self.supplemental_count = rollback.previous_count;
         self.claim_queue_dirty = rollback.previous_claim_queue_dirty;
@@ -1331,6 +1480,8 @@ pub struct AppService {
     slide_analyzer: Option<GeminiSlideAnalyzer>,
     resilient_executor: Arc<ResilientExecutor>,
     audit_log: Arc<InMemoryAuditLog>,
+    non_corpus_rebuild_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    non_corpus_rebuild_error: Arc<Mutex<Option<String>>>,
     #[cfg(test)]
     non_corpus_rebuild_count: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -1412,8 +1563,10 @@ impl ProjectionSnapshot {
             cognition_projector.project_with_claim_queue(&all_supplemental_records, &claim_queue);
         let card_queue =
             CardQueueProjector::new(built_at).project_records(&all_supplemental_records);
-        let reply_slo = ReplySloProjector::new(built_at)
-            .project_records(lake.list(), &all_supplemental_records);
+        let reply_slo_join_index = ReplySloJoinIndex::from_records(&all_supplemental_records);
+        let communication_projection =
+            CommunicationProjectionState::from_observations(lake.list(), &reply_slo_join_index);
+        let reply_slo = communication_projection.project(built_at);
         let break_glass = BreakGlassProjection::from_channels(&channels);
         let lineage = build_person_page_lineage(
             &canonical_observation_fingerprint,
@@ -1445,6 +1598,7 @@ impl ProjectionSnapshot {
             canonical_observation_fingerprint,
             supplemental_fingerprint,
             compact_state,
+            communication_projection,
         })
     }
 }
@@ -1456,6 +1610,7 @@ struct BuiltProjectionSnapshot {
     canonical_observation_fingerprint: String,
     supplemental_fingerprint: String,
     compact_state: CompactProjectionState,
+    communication_projection: CommunicationProjectionState,
 }
 
 impl CompactProjectionState {
@@ -2108,6 +2263,7 @@ impl MaterializedProjectionSnapshot {
             person_slide_count,
             person_message_count,
             reply_slo_count,
+            communication_projection: built.communication_projection,
             snapshot: built.snapshot,
             pending_item_commit: Some(PendingProjectionItemCommit {
                 commit: projection_item_commit,
@@ -2299,7 +2455,7 @@ fn apply_compact_incremental_delta(
         })
         .map(|event| identity_replay_event_projection_item(&event))
         .collect::<Result<Vec<_>, _>>()?;
-    let reply_slo_delta = ReplySloProjector::new(built_at).project_observations(
+    let reply_slo_delta = core.communication_projection.fold_observations(
         appended_observations,
         &core.supplemental_projection_cache.reply_slo,
     );
@@ -2390,12 +2546,8 @@ fn apply_compact_incremental_delta(
             SelfHostError::Ingestion("identity event delta count does not fit u64".to_owned())
         })?)
         .ok_or_else(|| SelfHostError::Ingestion("identity event count overflow".to_owned()))?;
-    core.reply_slo_count = core
-        .reply_slo_count
-        .checked_add(u64::try_from(reply_slo_inserts.len()).map_err(|_| {
-            SelfHostError::Ingestion("reply SLO delta count does not fit u64".to_owned())
-        })?)
-        .ok_or_else(|| SelfHostError::Ingestion("reply SLO count overflow".to_owned()))?;
+    core.reply_slo_count = u64::try_from(core.communication_projection.len())
+        .map_err(|_| SelfHostError::Ingestion("reply SLO count does not fit u64".to_owned()))?;
 
     let next_visible_rows = next_components
         .values()
@@ -2715,65 +2867,47 @@ fn slack_identity_node_for_observation(
 fn classify_non_corpus_delta_with_reason(
     observations: &[Observation],
 ) -> NonCorpusDeltaClassification {
-    const FRESHNESS_ONLY_SCHEMAS: &[&str] = &[
-        "schema:claude-message",
-        "schema:chatgpt-message",
-        "schema:github-event",
-        "schema:coding-agent-message",
-        "schema:gmail-message",
-        "schema:discord-message",
-    ];
-
     if observations.is_empty() {
         return NonCorpusDeltaClassification {
-            kind: NonCorpusDeltaKind::FullRebuild,
-            reason: Some(NonCorpusDeltaReason::EmptyAppend),
+            kind: NonCorpusDeltaKind::NoOp,
         };
     }
     let mut saw_slack_message = false;
+    let mut saw_communication = false;
+    let mut saw_declared_schema = false;
     for observation in observations {
-        match observation.schema.as_str() {
-            "schema:slack-message"
-                if observation
-                    .payload
-                    .get("user_id")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|user_id| !user_id.trim().is_empty()) =>
-            {
-                saw_slack_message = true;
-            }
-            "schema:slack-message" => {
-                return NonCorpusDeltaClassification {
-                    kind: NonCorpusDeltaKind::FullRebuild,
-                    reason: Some(NonCorpusDeltaReason::SlackUserIdMissing),
-                };
-            }
-            schema
-                if FRESHNESS_ONLY_SCHEMAS.contains(&schema)
-                    && !contributes_to_reply_slo(observation) => {}
-            schema if FRESHNESS_ONLY_SCHEMAS.contains(&schema) => {
-                return NonCorpusDeltaClassification {
-                    kind: NonCorpusDeltaKind::FullRebuild,
-                    reason: Some(NonCorpusDeltaReason::ReplySloRequired),
-                };
-            }
-            _ => {
-                return NonCorpusDeltaClassification {
-                    kind: NonCorpusDeltaKind::FullRebuild,
-                    reason: Some(NonCorpusDeltaReason::UnsupportedSchema),
-                };
-            }
+        let Some(_behavior) = projection_fold_behavior(observation.schema.as_str()) else {
+            tracing::warn!(
+                schema = %observation.schema,
+                observation_id = %observation.id,
+                "observation schema has no projection fold declaration; skipping"
+            );
+            continue;
+        };
+        saw_declared_schema = true;
+        if observation.schema.as_str() == "schema:slack-message" {
+            saw_slack_message = true;
+        }
+        if contributes_to_reply_slo(observation) {
+            saw_communication = true;
         }
     }
-    if saw_slack_message {
+    if !saw_declared_schema {
+        return NonCorpusDeltaClassification {
+            kind: NonCorpusDeltaKind::DeclaredSchemaSkip,
+        };
+    }
+    if saw_communication {
+        NonCorpusDeltaClassification {
+            kind: NonCorpusDeltaKind::Communication,
+        }
+    } else if saw_slack_message {
         NonCorpusDeltaClassification {
             kind: NonCorpusDeltaKind::SlackMessage,
-            reason: None,
         }
     } else {
         NonCorpusDeltaClassification {
             kind: NonCorpusDeltaKind::FreshnessOnly,
-            reason: None,
         }
     }
 }
@@ -3490,13 +3624,6 @@ fn detach_projection_items(
             .collect::<Result<Vec<_>, _>>()?,
     );
 
-    let mut expected_reply_slo = snapshot.reply_slo.clone();
-    refresh_reply_slo_statuses(&mut expected_reply_slo, snapshot.built_at);
-    if serde_json::to_value(&expected_reply_slo)? != serde_json::to_value(&snapshot.reply_slo)? {
-        return Err(SelfHostError::Ingestion(
-            "full reply SLO projection is internally inconsistent".to_owned(),
-        ));
-    }
     let reply_rows = std::mem::take(&mut snapshot.reply_slo.rows);
     snapshot.reply_slo.overdue.clear();
     let reply_slo_count = u64::try_from(reply_rows.len()).map_err(|_| {
@@ -3803,38 +3930,6 @@ fn freshness_source_id(observation: &Observation) -> Result<String, SelfHostErro
                 observation.id
             ))
         })
-}
-
-fn refresh_reply_slo_statuses(projection: &mut ReplySloProjection, built_at: DateTime<Utc>) {
-    for row in &mut projection.rows {
-        row.latency_seconds = row
-            .sent_at
-            .map(|sent_at| (sent_at - row.published).num_seconds());
-        row.status = match row.sent_at {
-            Some(sent_at) if sent_at <= row.due_at => ReplySloStatus::SentOnTime,
-            Some(_) => ReplySloStatus::SentLate,
-            None if built_at > row.due_at => ReplySloStatus::Overdue,
-            None => ReplySloStatus::Pending,
-        };
-    }
-    projection.rows.sort_by(|left, right| {
-        left.due_at.cmp(&right.due_at).then_with(|| {
-            left.incoming_observation_id
-                .as_str()
-                .cmp(right.incoming_observation_id.as_str())
-        })
-    });
-    projection.overdue = projection
-        .rows
-        .iter()
-        .filter(|row| {
-            matches!(
-                row.status,
-                ReplySloStatus::Overdue | ReplySloStatus::SentLate
-            )
-        })
-        .cloned()
-        .collect();
 }
 
 fn person_page_output_count(
@@ -4198,9 +4293,12 @@ fn rebuild_materialized_snapshot_paged(
     let mut freshness =
         FreshnessProjector::new(freshness_thresholds.to_vec(), built_at).project_observations(&[]);
     let mut answer_log = Vec::new();
+    let reply_slo_join_index = ReplySloJoinIndex::from_records(supplementals);
+    let mut communication_projection = CommunicationProjectionState::default();
 
     for_each_observation_page(persistence, stats, page_size, |_, observations| {
         compact_state.apply_observation_page(observations)?;
+        communication_projection.fold_observations(observations, &reply_slo_join_index);
         for observation in observations {
             add_observation_to_fingerprint(&mut canonical_fingerprint, observation)?;
         }
@@ -4273,7 +4371,6 @@ fn rebuild_materialized_snapshot_paged(
 
     let mut person_message_count = 0_u64;
     let mut reply_slo_count = 0_u64;
-    let reply_slo_join_index = ReplySloJoinIndex::from_records(supplementals);
     let mut identity_event_count = 0_u64;
     for_each_observation_page(persistence, stats, page_size, |stored, observations| {
         let fact_append_sequences = stored
@@ -4338,8 +4435,7 @@ fn rebuild_materialized_snapshot_paged(
             merge_non_slack_person_page(&mut person_page, page, &person_consents)?;
         }
 
-        let reply_slo = ReplySloProjector::new(built_at)
-            .project_observations(observations, &reply_slo_join_index);
+        let reply_slo = communication_projection.project_observations(observations, built_at);
         let page_reply_slo_count = u64::try_from(reply_slo.rows.len()).map_err(|_| {
             SelfHostError::Ingestion("paged reply SLO row count does not fit u64".to_owned())
         })?;
@@ -4468,6 +4564,7 @@ fn rebuild_materialized_snapshot_paged(
         person_slide_count,
         person_message_count,
         reply_slo_count,
+        communication_projection,
         snapshot: ProjectionSnapshot {
             identity,
             person_page,
@@ -4686,10 +4783,9 @@ fn apply_supplemental_delta(
                 changed.id, core.observation_stats.max_append_seq
             )));
         }
-        let projected = ReplySloProjector::new(built_at).project_observations(
-            std::slice::from_ref(&stored.observation),
-            &core.supplemental_projection_cache.reply_slo,
-        );
+        let projected = core
+            .communication_projection
+            .project_observations(std::slice::from_ref(&stored.observation), built_at);
         if let Some(row) = projected.rows.into_iter().next() {
             let desired = reply_slo_projection_item(&row)?;
             let existing = persistence
@@ -4842,9 +4938,6 @@ fn current_materialized_snapshot(
             "proj:person-page materialization format {format_version} is newer than supported format {current_format_version}"
         )));
     }
-    if format_version < current_format_version {
-        return Ok(None);
-    }
     let manifest: MaterializedProjectionManifest = serde_json::from_value(value)?;
     if manifest.last_append_seq != stats.max_append_seq
         || manifest.observation_count != stats.count
@@ -4959,6 +5052,21 @@ fn current_materialized_snapshot(
             .filter_map(|component| component.activity.clone())
             .collect(),
     };
+    let communication_projection = if format_version < current_format_version
+        && manifest.communication_projection.is_empty()
+    {
+        let rows = persistence
+            .projection_items_by_owner(
+                &ProjectionRef::new("proj:person-page"),
+                REPLY_SLO_ITEM_OWNER,
+            )?
+            .iter()
+            .map(reply_slo_from_projection_item)
+            .collect::<Result<Vec<_>, _>>()?;
+        CommunicationProjectionState::from_reply_latencies(&rows)
+    } else {
+        manifest.communication_projection
+    };
     let auxiliary = manifest.snapshot;
     let materialized = MaterializedProjectionSnapshot {
         format_version: manifest.format_version,
@@ -4973,6 +5081,7 @@ fn current_materialized_snapshot(
         person_slide_count: manifest.person_slide_count,
         person_message_count: manifest.person_message_count,
         reply_slo_count: manifest.reply_slo_count,
+        communication_projection,
         snapshot: ProjectionSnapshot {
             identity,
             person_page,
@@ -5021,6 +5130,55 @@ struct SlackSourceRuntime {
 struct GoogleSourceRuntime {
     config: GoogleConfig,
     client: HttpGoogleSlidesClient,
+}
+
+fn bootstrap_materialized_placeholder(
+    stats: ObservationStats,
+    supplementals: &[SupplementalRecord],
+    channels: &[lethe_registry::registry::ChannelRecord],
+) -> Result<MaterializedProjectionSnapshot, SelfHostError> {
+    let cache = SupplementalProjectionCache::from_records(supplementals);
+    let claim_queue = cache.claim_queue();
+    let (resume_snapshot, plan_state) = cache.cognition(&claim_queue, Utc::now());
+    let built_at = Utc::now();
+    let canonical_fingerprint = hex::encode([0_u8; 32]);
+    let supplemental_fingerprint = supplemental_fingerprint(supplementals)?;
+    let snapshot = ProjectionSnapshot {
+        claim_queue,
+        resume_snapshot,
+        plan_state,
+        card_queue: cache.card_queue.projection(built_at),
+        break_glass: BreakGlassProjection::from_channels(channels),
+        built_at,
+        lineage: build_person_page_lineage(
+            &canonical_fingerprint,
+            stats,
+            &supplemental_fingerprint,
+            supplementals.len(),
+            0,
+            built_at,
+        ),
+        ..ProjectionSnapshot::default()
+    };
+    let materialized = MaterializedProjectionSnapshot {
+        format_version: NON_CORPUS_MATERIALIZATION_VERSION,
+        last_append_seq: stats.max_append_seq,
+        observation_count: stats.count,
+        canonical_observation_fingerprint: canonical_fingerprint,
+        supplemental_fingerprint,
+        compact_state: CompactProjectionState::build(&[])?,
+        person_consents: BTreeMap::new(),
+        person_components: BTreeMap::new(),
+        identity_event_count: 0,
+        person_slide_count: 0,
+        person_message_count: 0,
+        reply_slo_count: 0,
+        communication_projection: CommunicationProjectionState::default(),
+        snapshot,
+        pending_item_commit: None,
+    };
+    materialized.validate()?;
+    Ok(materialized)
 }
 
 impl AppService {
@@ -5075,7 +5233,9 @@ impl AppService {
             persistence.projection_item_count(&person_page_ref)?;
         let persisted_reply_slo_count =
             persistence.projection_item_count_by_owner(&person_page_ref, REPLY_SLO_ITEM_OWNER)?;
-        let materialized = match persistence.projection_records(&person_page_ref)? {
+        let persisted_manifest = persistence.projection_records(&person_page_ref)?;
+        let had_persisted_manifest = persisted_manifest.is_some();
+        let persisted_materialized = match persisted_manifest {
             Some(value) => current_materialized_snapshot(
                 &persistence,
                 value,
@@ -5086,17 +5246,13 @@ impl AppService {
             )?,
             None => None,
         };
-        let materialized = match materialized {
+        let requires_background_rebuild = match persisted_materialized.as_ref() {
+            Some(materialized) => materialized.format_version < NON_CORPUS_MATERIALIZATION_VERSION,
+            None => true,
+        };
+        let materialized = match persisted_materialized {
             Some(materialized) => materialized,
-            None => rebuild_materialized_snapshot_paged(
-                &persistence,
-                &supplementals,
-                &freshness_thresholds(&config),
-                &config.channels,
-                stats,
-                config.corpus.rebuild_page_size,
-                Utc::now(),
-            )?,
+            None => bootstrap_materialized_placeholder(stats, &supplementals, &config.channels)?,
         };
         let core = AppCore::from_materialized(
             materialized,
@@ -5105,7 +5261,6 @@ impl AppService {
             freshness_thresholds(&config),
             config.channels.clone(),
         )?;
-        recover_bulk_import_session_after_bootstrap(&persistence, stats)?;
         let persistence: Arc<Mutex<Box<dyn StoragePorts>>> =
             Arc::new(Mutex::new(Box::new(persistence)));
         let corpus_config = config.corpus.projector_config();
@@ -5148,7 +5303,7 @@ impl AppService {
             .map(|slide_ai| GeminiSlideAnalyzer::new(slide_ai.api_key.expose(), &slide_ai.model))
             .transpose()?;
 
-        Ok(Self {
+        let service = Self {
             core: Arc::new(Mutex::new(core)),
             persistence,
             operational_ledger: Arc::new(Mutex::new(operational_ledger)),
@@ -5164,9 +5319,26 @@ impl AppService {
                 std::time::Duration::from_secs(60),
             )),
             audit_log: Arc::new(InMemoryAuditLog::new()),
+            non_corpus_rebuild_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            non_corpus_rebuild_error: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             non_corpus_rebuild_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        })
+        };
+        if requires_background_rebuild {
+            let mut core = service.core_lock()?;
+            if !had_persisted_manifest {
+                core.mark_non_corpus_materializations_stale();
+            }
+            service.refresh_materialized_snapshot_with_reason(
+                &mut core,
+                if had_persisted_manifest {
+                    "migration"
+                } else {
+                    "bootstrap"
+                },
+            )?;
+        }
+        Ok(service)
     }
 
     pub fn append_operational_events(
@@ -5653,7 +5825,6 @@ mod supplemental_write;
 mod sync;
 mod sync_support;
 
-use bulk_import::recover_bulk_import_session_after_bootstrap;
 pub use bulk_import::{BulkImportSessionPhase, BulkImportSessionReport};
 use media_support::*;
 pub use projection_api::CorpusSourceTypeSummary;

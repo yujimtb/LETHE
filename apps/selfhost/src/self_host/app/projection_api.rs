@@ -119,32 +119,23 @@ impl AppService {
         Ok(slides)
     }
 
-    fn persisted_reply_slo(
+    fn communication_projection_reply_slo(
         &self,
-        expected_count: u64,
+        core: &AppCore,
     ) -> Result<ReplySloProjection, SelfHostError> {
-        let items = self.persistence_lock()?.projection_items_by_owner(
-            &ProjectionRef::new("proj:person-page"),
-            REPLY_SLO_ITEM_OWNER,
-        )?;
-        let actual_count = u64::try_from(items.len()).map_err(|_| {
+        // IM-05/D7: normal incremental propagation is <=5s; while a background
+        // migration/recovery/bootstrap rebuild runs, the last published snapshot
+        // may be <=60s old and is never replaced by a partial result.
+        let actual_count = u64::try_from(core.communication_projection.len()).map_err(|_| {
             SelfHostError::Ingestion("reply SLO row count does not fit u64".to_owned())
         })?;
-        if actual_count != expected_count {
+        if actual_count != core.reply_slo_count {
             return Err(SelfHostError::Ingestion(format!(
-                "reply SLO row count is {actual_count}, expected {expected_count}"
+                "communication projection row count is {actual_count}, expected {}",
+                core.reply_slo_count
             )));
         }
-        let rows = items
-            .iter()
-            .map(reply_slo_from_projection_item)
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut projection = ReplySloProjection {
-            rows,
-            overdue: Vec::new(),
-        };
-        refresh_reply_slo_statuses(&mut projection, Utc::now());
-        Ok(projection)
+        Ok(core.communication_projection.project(Utc::now()))
     }
 
     pub fn persons_response(
@@ -801,7 +792,7 @@ impl AppService {
         let core = self.core_lock()?;
         self.ensure_projection_fresh(&core.catalog, "proj:reply-slo")?;
         let mode = self.resolve_read_mode(&core.catalog, "proj:reply-slo", None, None)?;
-        let reply_slo = self.persisted_reply_slo(core.reply_slo_count)?;
+        let reply_slo = self.communication_projection_reply_slo(&core)?;
         let lineage = build_mixed_projection_lineage(
             "proj:reply-slo",
             &core.snapshot.lineage.build_id,

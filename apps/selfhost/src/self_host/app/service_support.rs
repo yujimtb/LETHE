@@ -210,36 +210,149 @@ impl AppService {
         &self,
         core: &mut AppCore,
     ) -> Result<(), SelfHostError> {
+        self.refresh_materialized_snapshot_with_reason(core, "recovery")
+    }
+
+    pub(super) fn refresh_materialized_snapshot_with_reason(
+        &self,
+        core: &mut AppCore,
+        reason: &'static str,
+    ) -> Result<(), SelfHostError> {
+        if !matches!(reason, "migration" | "recovery" | "bootstrap") {
+            return Err(SelfHostError::Ingestion(format!(
+                "invalid background non-corpus rebuild reason {reason}"
+            )));
+        }
+        let already_running = self
+            .non_corpus_rebuild_in_flight
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err();
+        if already_running {
+            return Ok(());
+        }
+        *self
+            .non_corpus_rebuild_error
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)? = None;
         #[cfg(test)]
         self.non_corpus_rebuild_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let result = (|| {
-            let materialized = {
+        let service = self.clone();
+        let freshness_thresholds = core.freshness_thresholds.clone();
+        let channels = core
+            .registry
+            .list_channels()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let spawn_result = std::thread::Builder::new()
+            .name("lethe-non-corpus-rebuild".to_owned())
+            .spawn(move || {
+                let result = service.run_background_materialized_rebuild(
+                    &freshness_thresholds,
+                    &channels,
+                    reason,
+                );
+                if let Err(error) = result {
+                    tracing::error!(error = %error, "background non-corpus materialization failed");
+                    if let Ok(mut rebuild_error) = service.non_corpus_rebuild_error.lock() {
+                        *rebuild_error = Some(error.to_string());
+                    }
+                    if let Ok(mut core) = service.core_lock() {
+                        core.mark_non_corpus_materializations_stale();
+                    }
+                }
+                service
+                    .non_corpus_rebuild_in_flight
+                    .store(false, std::sync::atomic::Ordering::Release);
+            });
+        if let Err(error) = spawn_result {
+            self.non_corpus_rebuild_in_flight
+                .store(false, std::sync::atomic::Ordering::Release);
+            core.mark_non_corpus_materializations_stale();
+            return Err(SelfHostError::Ingestion(format!(
+                "failed to spawn background non-corpus materialization: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn run_background_materialized_rebuild(
+        &self,
+        freshness_thresholds: &[FreshnessThreshold],
+        channels: &[lethe_registry::registry::ChannelRecord],
+        reason: &'static str,
+    ) -> Result<(), SelfHostError> {
+        tracing::info!(
+            import_timing = true,
+            non_corpus_materialize_mode = "background",
+            full_rebuild_reason = reason,
+            "background non-corpus materialization started"
+        );
+        loop {
+            let (materialized, stats) = {
                 let store = self.persistence_lock()?;
                 let supplementals = store.load_supplementals()?;
                 let stats = store.observation_stats()?;
-                rebuild_materialized_snapshot_paged(
+                let materialized = rebuild_materialized_snapshot_paged(
                     store.as_ref(),
                     &supplementals,
-                    &core.freshness_thresholds,
-                    &core
-                        .registry
-                        .list_channels()
-                        .into_iter()
-                        .cloned()
-                        .collect::<Vec<_>>(),
+                    freshness_thresholds,
+                    channels,
                     stats,
                     self.config.corpus.rebuild_page_size,
                     Utc::now(),
-                )?
+                )?;
+                (materialized, stats)
             };
+            let current_stats = self.persistence_lock()?.observation_stats()?;
+            if current_stats != stats {
+                tracing::debug!(
+                    built_count = stats.count,
+                    current_count = current_stats.count,
+                    "background non-corpus rebuild observed a newer canonical high-water; retrying"
+                );
+                continue;
+            }
+            let mut core = self.core_lock()?;
+            if core.observation_stats.max_append_seq > stats.max_append_seq
+                || core.observation_stats.count > stats.count
+            {
+                continue;
+            }
             core.install_materialized(materialized);
-            Ok(())
-        })();
-        if result.is_err() {
-            core.mark_non_corpus_materializations_stale();
+            return Ok(());
         }
-        result
+    }
+
+    pub(super) fn wait_for_non_corpus_rebuild(&self) -> Result<(), SelfHostError> {
+        for _ in 0..6000 {
+            if !self
+                .non_corpus_rebuild_in_flight
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                if let Some(error) = self
+                    .non_corpus_rebuild_error
+                    .lock()
+                    .map_err(|_| SelfHostError::LockPoisoned)?
+                    .as_ref()
+                {
+                    return Err(SelfHostError::Ingestion(format!(
+                        "background non-corpus materialization failed: {error}"
+                    )));
+                }
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Err(SelfHostError::ProjectionStale(
+            "background non-corpus materialization did not complete within 60 seconds".to_owned(),
+        ))
     }
 
     pub(super) fn materialize_after_observation_append(
@@ -248,7 +361,20 @@ impl AppService {
         appended_observations: &[Observation],
     ) -> Result<(), SelfHostError> {
         let result = (|| match classify_non_corpus_delta_with_reason(appended_observations).kind {
-            NonCorpusDeltaKind::FreshnessOnly | NonCorpusDeltaKind::SlackMessage => {
+            NonCorpusDeltaKind::NoOp | NonCorpusDeltaKind::DeclaredSchemaSkip => Ok(()),
+            NonCorpusDeltaKind::FreshnessOnly
+            | NonCorpusDeltaKind::SlackMessage
+            | NonCorpusDeltaKind::Communication => {
+                let declared_observations = appended_observations
+                    .iter()
+                    .filter(|observation| {
+                        projection_fold_behavior(observation.schema.as_str()).is_some()
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if declared_observations.is_empty() {
+                    return Ok(());
+                }
                 let persistence = self.persistence_lock()?;
                 let stats = persistence.observation_stats()?;
                 let lookup = StorageComponentProjectionLookup {
@@ -256,7 +382,7 @@ impl AppService {
                 };
                 let commit = apply_compact_incremental_delta(
                     core,
-                    appended_observations,
+                    &declared_observations,
                     stats,
                     Utc::now(),
                     &lookup,
@@ -267,10 +393,25 @@ impl AppService {
                     &manifest,
                     &commit,
                 )?;
-                core.activate_non_corpus_projections();
+                let person_page_ref = ProjectionRef::new("proj:person-page");
+                let has_published_snapshot =
+                    core.catalog.get(&person_page_ref).is_some_and(|entry| {
+                        entry.status == ProjectionStatus::Active
+                            && entry.health == ProjectionHealth::Healthy
+                    });
+                let rebuild_in_flight = self
+                    .non_corpus_rebuild_in_flight
+                    .load(std::sync::atomic::Ordering::Acquire);
+                let rebuild_failed = self
+                    .non_corpus_rebuild_error
+                    .lock()
+                    .map_err(|_| SelfHostError::LockPoisoned)?
+                    .is_some();
+                if has_published_snapshot || (!rebuild_in_flight && !rebuild_failed) {
+                    core.activate_non_corpus_projections();
+                }
                 Ok(())
             }
-            NonCorpusDeltaKind::FullRebuild => self.refresh_materialized_snapshot(core),
         })();
         if result.is_err() {
             core.mark_non_corpus_materializations_stale();
