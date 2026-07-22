@@ -110,6 +110,31 @@ Each import CLI supports `--help` / `-h`; use it before running a new source to
 confirm the required arguments and the token environment variable expected by
 `--api-token-env`.
 
+### Ingestion API contract versions
+
+The existing /api/import/observation-drafts endpoint is the frozen v1
+contract. Existing clients, including nanihold_intercom and Nanihold_OS,
+continue to use it without a client-side change; its response and
+request-level failure semantics are not silently changed.
+
+New clients should use
+POST /api/v2/import/observation-drafts. v2 returns one results item for
+each draft in input order and always uses HTTP 200 for partial success. Each
+item has client_ref (or its input index), outcome, and the relevant
+observation_id, existing_id, ticket, failure_class, error_code, and reason.
+A durable ingested or duplicate result is an ACK for the canonical ledger;
+projection and search-index catch-up health does not reverse that outcome.
+
+For v2, clients must keep source_instance_id, meta.object_id,
+meta.canonical_json, and the server-derived idempotency_key fixed across
+retries. The server derives
+source_instance_id:object_id:sha256(canonical_json) and rejects a mismatched
+key with identity_mismatch. published is event metadata and must not be used
+as a retry identity or routing uniqueness key. The request body limit is
+128 MiB, the configured payload limit defaults to 1 MiB, and the configured
+page limit defaults to 500 for the personal lake. Limit errors include both
+the actual value and the applied maximum.
+
 The 2026-07-06 production rebuild used:
 
 ```powershell
