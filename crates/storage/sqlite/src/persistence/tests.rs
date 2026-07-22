@@ -755,6 +755,114 @@ fn schema_v11_converges_from_fresh_v9_and_v10_upgrade_paths() {
     let _ = fs::remove_dir_all(v8_tmp);
 }
 
+#[test]
+fn schema_v11_upgrades_true_v10_operational_event_shape() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let database_path = tmp.join("operational.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let data_space = lethe_core::domain::DataSpaceId::new("space:v10-upgrade");
+    {
+        let seed = SqliteOperationalEventStore::open(
+            data_space.clone(),
+            &database_path,
+            &blob_dir,
+            &[7; 32],
+        )
+        .unwrap();
+        let mut event = lethe_storage_api::conformance::sample_operational_event(
+            &data_space,
+            "event:v10-upgrade",
+            "stream:v10-upgrade",
+            1,
+            "idempotency:v10-upgrade",
+        );
+        event.actor_id = Some("actor:v10".to_owned());
+        event.causation_id = Some(lethe_core::domain::OperationalEventId::new(
+            "event:caused-by-v10",
+        ));
+        event.correlation_id = Some("correlation:v10".to_owned());
+        seed.append_operational_event(&OperationalAppendRequest {
+            expected_stream_version: 0,
+            event,
+        })
+        .unwrap();
+
+        seed.persistence()
+            .conn
+            .execute_batch(
+                "
+                DROP INDEX operational_events_correlation_cursor;
+                DROP INDEX operational_events_causation_cursor;
+                DROP INDEX operational_events_actor_cursor;
+                ALTER TABLE operational_events DROP COLUMN correlation_id;
+                ALTER TABLE operational_events DROP COLUMN causation_id;
+                ALTER TABLE operational_events DROP COLUMN actor_id;
+                DELETE FROM schema_migrations WHERE version = 11;
+                ",
+            )
+            .unwrap();
+        let columns = connection_table_columns(seed.persistence());
+        assert!(!columns.contains("correlation_id"));
+        assert!(!columns.contains("causation_id"));
+        assert!(!columns.contains("actor_id"));
+    }
+
+    let upgraded =
+        SqliteOperationalEventStore::open(data_space, &database_path, &blob_dir, &[7; 32]).unwrap();
+    let columns = connection_table_columns(upgraded.persistence());
+    assert!(columns.contains("correlation_id"));
+    assert!(columns.contains("causation_id"));
+    assert!(columns.contains("actor_id"));
+    let scalar_values: (Option<String>, Option<String>, Option<String>) = upgraded
+        .persistence()
+        .conn
+        .query_row(
+            "SELECT correlation_id, causation_id, actor_id
+             FROM operational_events WHERE event_id = 'event:v10-upgrade'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        scalar_values,
+        (
+            Some("correlation:v10".to_owned()),
+            Some("event:caused-by-v10".to_owned()),
+            Some("actor:v10".to_owned()),
+        )
+    );
+    for index in [
+        "operational_events_correlation_cursor",
+        "operational_events_causation_cursor",
+        "operational_events_actor_cursor",
+    ] {
+        let exists: Option<i64> = upgraded
+            .persistence()
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [index],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(exists, Some(1), "missing migrated index {index}");
+    }
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+fn connection_table_columns(store: &SqlitePersistence) -> std::collections::BTreeSet<String> {
+    store
+        .conn
+        .prepare("PRAGMA table_info(operational_events)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
 fn migration_ledger(store: &SqlitePersistence) -> Vec<(i64, String)> {
     let mut statement = store
         .conn

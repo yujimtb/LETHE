@@ -217,6 +217,7 @@ fn test_config(db: PathBuf, blobs: PathBuf, oauth: McpOAuthConfig) -> SelfHostCo
             max_payload_bytes: 1024 * 1024,
             max_sync_items: 10_000,
             max_page_size: 100,
+            max_search_job_workers: 2,
             max_leaf_observations: 100_000,
             retention_days: 30,
         },

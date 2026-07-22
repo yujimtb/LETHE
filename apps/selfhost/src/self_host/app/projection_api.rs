@@ -820,47 +820,91 @@ impl AppService {
                 },
             );
         }
-        let worker_service = self.clone();
-        let worker_job_id = job_id.clone();
-        std::thread::spawn(move || {
-            let run = || -> Result<(), SelfHostError> {
-                {
-                    let mut jobs = worker_service
-                        .search_jobs
-                        .lock()
-                        .map_err(|_| SelfHostError::LockPoisoned)?;
-                    let job = jobs.get_mut(&worker_job_id).ok_or_else(|| {
-                        SelfHostError::NotFound(format!("search job {worker_job_id}"))
-                    })?;
-                    job.status = "running".to_owned();
-                }
-                let response = worker_service.corpus_grep_job_response(&request)?;
-                let result = serde_json::to_value(response)?;
-                let mut jobs = worker_service
-                    .search_jobs
-                    .lock()
-                    .map_err(|_| SelfHostError::LockPoisoned)?;
-                let job = jobs.get_mut(&worker_job_id).ok_or_else(|| {
-                    SelfHostError::NotFound(format!("search job {worker_job_id}"))
-                })?;
-                job.status = "completed".to_owned();
-                job.result = Some(result);
-                Ok(())
-            };
-            if let Err(error) = run()
-                && let Ok(mut jobs) = worker_service.search_jobs.lock()
-                && let Some(job) = jobs.get_mut(&worker_job_id)
-            {
-                job.status = "failed".to_owned();
-                job.error = Some(error.to_string());
-            }
-        });
+        if self
+            .search_job_queue
+            .try_submit(SearchJobWork {
+                service: self.clone(),
+                job_id: job_id.clone(),
+                request,
+            })
+            .is_err()
+        {
+            let mut jobs = self
+                .search_jobs
+                .lock()
+                .map_err(|_| SelfHostError::LockPoisoned)?;
+            jobs.remove(&job_id);
+            return Err(SelfHostError::ReadMode(format!(
+                "regex search job queue is full (capacity {})",
+                self.config.resource_limits.max_search_job_workers
+            )));
+        }
         Ok(SearchJobStatus {
             job_id,
             status: "queued".to_owned(),
             result: None,
             error: None,
         })
+    }
+
+    pub(super) fn run_search_job(&self, work: SearchJobWork) -> Result<(), SelfHostError> {
+        {
+            let mut jobs = self
+                .search_jobs
+                .lock()
+                .map_err(|_| SelfHostError::LockPoisoned)?;
+            let job = jobs
+                .get_mut(&work.job_id)
+                .ok_or_else(|| SelfHostError::NotFound(format!("search job {}", work.job_id)))?;
+            job.status = "running".to_owned();
+        }
+        #[cfg(test)]
+        if let Some(gate) = &self.search_job_test_gate {
+            gate.wait();
+        }
+        #[cfg(test)]
+        match self.search_job_test_fault {
+            Some(SearchJobTestFault::Error) => {
+                return Err(SelfHostError::ReadMode(
+                    "injected search job worker failure".to_owned(),
+                ));
+            }
+            Some(SearchJobTestFault::Panic) => {
+                panic!("injected search job worker panic");
+            }
+            None => {}
+        }
+        let response = self.corpus_grep_job_response(&work.request)?;
+        let result = serde_json::to_value(response)?;
+        let mut jobs = self
+            .search_jobs
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?;
+        let job = jobs
+            .get_mut(&work.job_id)
+            .ok_or_else(|| SelfHostError::NotFound(format!("search job {}", work.job_id)))?;
+        job.status = "completed".to_owned();
+        job.result = Some(result);
+        Ok(())
+    }
+
+    pub(super) fn mark_search_job_failed(&self, job_id: &str, error: String) {
+        match self.search_jobs.lock() {
+            Ok(mut jobs) => {
+                if let Some(job) = jobs.get_mut(job_id) {
+                    job.status = "failed".to_owned();
+                    job.error = Some(error);
+                    job.result = None;
+                }
+            }
+            Err(lock_error) => {
+                tracing::error!(
+                    job_id,
+                    error = %lock_error,
+                    "failed to record terminal search job failure"
+                );
+            }
+        }
     }
 
     pub fn search_job_status(&self, job_id: &str) -> Result<SearchJobStatus, SelfHostError> {

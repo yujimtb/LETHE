@@ -39,3 +39,13 @@
 - [x] SCC-01/SCC-02: exact 索引経路と regex search job の queued/running/terminal lifecycle を実装。
 - [x] SSR-01/SSR-02: persisted sync state のロード・health 反映・欠損エラーを実装。
 - [x] 検証: 同一 sort key 境界、EXPLAIN QUERY PLAN、exact、BlobRef、sync state、regex job のテストを追加。
+
+## フォローアップ
+
+- [ ] claim/card の `(state, channel, automatic, sort)` 複合索引を導入し、現行の有界な作業キューを前提とした保守的なページ内フィルタを厳密 O(k) の索引読みへ置き換える。これは本 change では実装しない。
+
+## REJECTレビュー是正記録
+
+- [x] SQLite v10→v11 起動順を修正し、scalar列依存の3索引をbase DDLからmigration後へ限定した。fresh経路と真のv10形状からの収束テストを追加。
+- [x] regex search job を設定可能なbounded worker poolへ置換し、queue待機・容量超過拒否・worker Err/panicのfailed遷移をテストした。
+- [x] claim/card の暫定フィルタ計算量と、PostgreSQL backfill・cursor応答形状・regex job再起動非永続の既知限界を `design.md` に記録した。

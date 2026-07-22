@@ -1,5 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{
+    Arc, Mutex,
+    mpsc::{self, Receiver, SyncSender, TrySendError},
+};
 
 use arc_swap::ArcSwap;
 use std::time::{Duration, Instant};
@@ -1803,6 +1807,7 @@ pub struct AppService {
     bulk_import_operation: Arc<Mutex<()>>,
     search_index: search_index::SearchIndexManager,
     search_jobs: Arc<Mutex<BTreeMap<String, SearchJobRecord>>>,
+    search_job_queue: Arc<SearchJobQueue>,
     config: Arc<SelfHostConfig>,
     slack_sources: Vec<SlackSourceRuntime>,
     google_sources: Vec<GoogleSourceRuntime>,
@@ -1815,6 +1820,10 @@ pub struct AppService {
     non_corpus_rebuild_error: Arc<Mutex<Option<String>>>,
     #[cfg(test)]
     non_corpus_rebuild_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    search_job_test_gate: Option<Arc<std::sync::Barrier>>,
+    #[cfg(test)]
+    search_job_test_fault: Option<SearchJobTestFault>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1832,6 +1841,92 @@ struct SearchJobRecord {
     status: String,
     result: Option<serde_json::Value>,
     error: Option<String>,
+}
+
+struct SearchJobWork {
+    service: AppService,
+    job_id: String,
+    request: GrepRequest,
+}
+
+struct SearchJobQueue {
+    sender: SyncSender<SearchJobWork>,
+}
+
+impl SearchJobQueue {
+    fn try_submit(&self, work: SearchJobWork) -> Result<(), ()> {
+        match self.sender.try_send(work) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => Err(()),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+enum SearchJobTestFault {
+    Error,
+    Panic,
+}
+
+fn start_search_job_workers(worker_count: usize) -> Result<Arc<SearchJobQueue>, SelfHostError> {
+    if worker_count == 0 {
+        return Err(SelfHostError::ReadMode(
+            "limits.max_search_job_workers must be positive".to_owned(),
+        ));
+    }
+    let (sender, receiver) = mpsc::sync_channel(worker_count);
+    let queue = Arc::new(SearchJobQueue { sender });
+    let receiver = Arc::new(Mutex::new(receiver));
+    for worker_index in 0..worker_count {
+        let receiver = Arc::clone(&receiver);
+        std::thread::Builder::new()
+            .name(format!("lethe-search-job-{worker_index}"))
+            .spawn(move || search_job_worker(receiver))
+            .map_err(|error| {
+                SelfHostError::ReadMode(format!(
+                    "failed to spawn search job worker {worker_index}: {error}"
+                ))
+            })?;
+    }
+    Ok(queue)
+}
+
+fn search_job_worker(receiver: Arc<Mutex<Receiver<SearchJobWork>>>) {
+    loop {
+        let next = match receiver.lock() {
+            Ok(receiver) => receiver.recv(),
+            Err(error) => {
+                tracing::error!(error = %error, "search job queue receiver lock poisoned");
+                return;
+            }
+        };
+        let work = match next {
+            Ok(work) => work,
+            Err(_) => return,
+        };
+        let service = work.service.clone();
+        let job_id = work.job_id.clone();
+        let outcome = catch_unwind(AssertUnwindSafe(|| service.run_search_job(work)));
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => service.mark_search_job_failed(&job_id, error.to_string()),
+            Err(panic) => service.mark_search_job_failed(
+                &job_id,
+                format!("search job worker panicked: {}", panic_message(panic)),
+            ),
+        }
+    }
+}
+
+fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_owned()
+    }
 }
 
 #[cfg(test)]
@@ -5786,6 +5881,8 @@ impl AppService {
             config.corpus.rebuild_page_size,
             Arc::clone(&persistence_read_pool[0]),
         );
+        let search_job_queue =
+            start_search_job_workers(config.resource_limits.max_search_job_workers)?;
         let slack_sources = config
             .slack_sources
             .iter()
@@ -5830,6 +5927,7 @@ impl AppService {
             bulk_import_operation: Arc::new(Mutex::new(())),
             search_index,
             search_jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            search_job_queue,
             config: Arc::new(config),
             slack_sources,
             google_sources,
@@ -5845,6 +5943,10 @@ impl AppService {
             non_corpus_rebuild_error: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             non_corpus_rebuild_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            search_job_test_gate: None,
+            #[cfg(test)]
+            search_job_test_fault: None,
         };
         if requires_background_rebuild {
             if !had_persisted_manifest {

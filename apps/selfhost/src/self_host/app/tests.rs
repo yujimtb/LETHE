@@ -18,10 +18,10 @@ use lethe_api::api::grep::GrepRequest;
 use lethe_core::domain::supplemental::InputAnchorSet;
 
 use super::{
-    AppCore, AppService, GoogleSourceRuntime, ImportOutcome, SelfHostError, SlackSourceRuntime,
-    classify_slack_ingress, discovered_slack_threads, extract_slide_text_fragments,
-    infer_profile_name_from_fragments, latest_revision_to_capture, namespace_draft,
-    non_empty_state, ranked_self_intro_slide_indices, thread_root_ts,
+    AppCore, AppService, GoogleSourceRuntime, ImportOutcome, SearchJobStatus, SelfHostError,
+    SlackSourceRuntime, classify_slack_ingress, discovered_slack_threads,
+    extract_slide_text_fragments, infer_profile_name_from_fragments, latest_revision_to_capture,
+    namespace_draft, non_empty_state, ranked_self_intro_slide_indices, thread_root_ts,
 };
 use crate::self_host::config::{
     ApiTokenConfig, CorpusProjectionConfig, FreshnessConfig, GoogleConfig, JsonWebKey,
@@ -177,6 +177,7 @@ fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
             max_payload_bytes: 1024 * 1024,
             max_sync_items: 10_000,
             max_page_size: 100,
+            max_search_job_workers: 2,
             max_leaf_observations: 100_000,
             retention_days: 30,
         },
@@ -407,6 +408,8 @@ fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppSe
         config.corpus.rebuild_page_size,
         Arc::clone(&persistence_read_pool[0]),
     );
+    let search_job_queue =
+        super::start_search_job_workers(config.resource_limits.max_search_job_workers).unwrap();
     let OperationalLedgerConfig::Sqlite {
         data_space_id,
         database_path,
@@ -466,6 +469,7 @@ fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppSe
         bulk_import_operation: Arc::new(Mutex::new(())),
         search_index,
         search_jobs: Arc::new(Mutex::new(BTreeMap::new())),
+        search_job_queue,
         config: Arc::new(config.clone()),
         slack_sources: vec![SlackSourceRuntime {
             config: config.slack_sources[0].clone(),
@@ -496,6 +500,8 @@ fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppSe
         non_corpus_rebuild_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         non_corpus_rebuild_error: Arc::new(Mutex::new(None)),
         non_corpus_rebuild_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        search_job_test_gate: None,
+        search_job_test_fault: None,
     };
     service
         .persistence
@@ -545,6 +551,135 @@ fn regex_search_job_lifecycle_reaches_a_terminal_state() {
 
     drop(service);
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn regex_search_job_queue_waits_and_rejects_after_bounded_capacity() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-self-host-search-job-queue-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let mut config = test_config(db.clone(), blobs.clone());
+    config.resource_limits.max_search_job_workers = 1;
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let mut service = test_service(config, persistence);
+    wait_for_search_index_ready(&service);
+    let gate = Arc::new(std::sync::Barrier::new(2));
+    service.search_job_test_gate = Some(Arc::clone(&gate));
+
+    let first = service
+        .submit_corpus_search_job(GrepRequest {
+            pattern: "[a-z]+".to_owned(),
+            ..GrepRequest::default()
+        })
+        .unwrap();
+    wait_for_search_job_status(&service, &first.job_id, |status| status == "running");
+    service.search_job_test_gate = None;
+
+    let second = service
+        .submit_corpus_search_job(GrepRequest {
+            pattern: "[0-9]+".to_owned(),
+            ..GrepRequest::default()
+        })
+        .unwrap();
+    assert_eq!(second.status, "queued");
+    assert_eq!(
+        service.search_job_status(&second.job_id).unwrap().status,
+        "queued"
+    );
+    assert!(
+        service
+            .submit_corpus_search_job(GrepRequest {
+                pattern: "[A-Z]+".to_owned(),
+                ..GrepRequest::default()
+            })
+            .is_err()
+    );
+
+    gate.wait();
+    let first_terminal = wait_for_search_job_terminal(&service, &first.job_id);
+    let second_terminal = wait_for_search_job_terminal(&service, &second.job_id);
+    assert_eq!(first_terminal.status, "completed");
+    assert_eq!(second_terminal.status, "completed");
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn regex_search_job_worker_error_and_panic_become_failed_terminal_states() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-self-host-search-job-failure-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let config = test_config(db.clone(), blobs.clone());
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let mut service = test_service(config, persistence);
+    wait_for_search_index_ready(&service);
+
+    service.search_job_test_fault = Some(super::SearchJobTestFault::Error);
+    let error_job = service
+        .submit_corpus_search_job(GrepRequest {
+            pattern: "[a-z]+".to_owned(),
+            ..GrepRequest::default()
+        })
+        .unwrap();
+    let error_terminal = wait_for_search_job_terminal(&service, &error_job.job_id);
+    assert_eq!(error_terminal.status, "failed");
+    assert!(
+        error_terminal
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("injected search job worker failure"))
+    );
+
+    service.search_job_test_fault = Some(super::SearchJobTestFault::Panic);
+    let panic_job = service
+        .submit_corpus_search_job(GrepRequest {
+            pattern: "[0-9]+".to_owned(),
+            ..GrepRequest::default()
+        })
+        .unwrap();
+    let panic_terminal = wait_for_search_job_terminal(&service, &panic_job.job_id);
+    assert_eq!(panic_terminal.status, "failed");
+    assert!(
+        panic_terminal
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("search job worker panicked"))
+    );
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+fn wait_for_search_job_status(
+    service: &AppService,
+    job_id: &str,
+    predicate: impl Fn(&str) -> bool,
+) -> SearchJobStatus {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let status = service.search_job_status(job_id).unwrap();
+        if predicate(&status.status) {
+            return status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "search job {job_id} did not reach the expected state"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn wait_for_search_job_terminal(service: &AppService, job_id: &str) -> SearchJobStatus {
+    wait_for_search_job_status(service, job_id, |status| {
+        status == "completed" || status == "failed"
+    })
 }
 
 fn wait_for_search_index_ready(service: &AppService) {

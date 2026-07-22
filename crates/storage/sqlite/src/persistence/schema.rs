@@ -56,14 +56,8 @@ impl SqlitePersistence {
             CREATE INDEX IF NOT EXISTS operational_events_stream_cursor
                 ON operational_events(data_space_id, stream_id, cursor);
 
-            CREATE INDEX IF NOT EXISTS operational_events_correlation_cursor
-                ON operational_events(data_space_id, correlation_id, cursor);
-            CREATE INDEX IF NOT EXISTS operational_events_causation_cursor
-                ON operational_events(data_space_id, causation_id, cursor);
             CREATE INDEX IF NOT EXISTS operational_events_type_cursor
                 ON operational_events(data_space_id, event_type, cursor);
-            CREATE INDEX IF NOT EXISTS operational_events_actor_cursor
-                ON operational_events(data_space_id, actor_id, cursor);
             CREATE INDEX IF NOT EXISTS operational_events_occurred_cursor
                 ON operational_events(data_space_id, occurred_at, cursor);
             CREATE INDEX IF NOT EXISTS operational_events_stream_occurred_cursor
@@ -476,6 +470,7 @@ impl SqlitePersistence {
         if !sync_columns.contains("last_error") {
             transaction.execute("ALTER TABLE sync_metrics ADD COLUMN last_error TEXT", [])?;
         }
+        transaction.execute("DROP TRIGGER IF EXISTS operational_events_no_update", [])?;
 
         let mut statement = transaction.prepare(
             "SELECT cursor, event_json FROM operational_events
@@ -501,6 +496,15 @@ impl SqlitePersistence {
                 ],
             )?;
         }
+        transaction.execute_batch(
+            "
+            CREATE TRIGGER IF NOT EXISTS operational_events_no_update
+            BEFORE UPDATE ON operational_events
+            BEGIN
+                SELECT RAISE(ABORT, 'operational_events is append-only');
+            END;
+            ",
+        )?;
         record_schema_migration(&transaction, CURRENT_SCHEMA_VERSION, "indexed_keyset_reads")?;
         transaction.commit()?;
         Ok(())
