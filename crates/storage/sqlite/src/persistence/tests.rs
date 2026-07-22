@@ -144,6 +144,47 @@ fn observation_stats_report_empty_and_appended_high_water() {
     let _ = fs::remove_dir_all(tmp);
 }
 
+#[test]
+fn durable_append_and_audit_enqueue_commit_or_rollback_as_one_transaction() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    let first = sample_observation();
+    let audit = lethe_storage_api::AuditEventRecord {
+        id: "audit:append-1".to_owned(),
+        timestamp: "2026-07-23T00:00:00Z".to_owned(),
+        actor: "actor:test".to_owned(),
+        event_json: serde_json::json!({"kind": "write_execution"}).to_string(),
+    };
+
+    store
+        .append_observations_idempotent_with_audit(
+            std::slice::from_ref(&first),
+            std::slice::from_ref(&audit),
+        )
+        .unwrap();
+    assert_eq!(store.observation_stats().unwrap().count, 1);
+    assert_eq!(
+        store.audit_event_page(None, 10).unwrap(),
+        vec![audit.event_json.clone()]
+    );
+
+    let second = sample_observation_with_identity("append-2", "second");
+    assert!(
+        store
+            .append_observations_idempotent_with_audit(
+                std::slice::from_ref(&second),
+                std::slice::from_ref(&audit),
+            )
+            .is_err()
+    );
+    assert_eq!(store.observation_stats().unwrap().count, 1);
+    assert!(store.observation_by_id(&second.id).unwrap().is_none());
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
 fn sample_supplemental(observation_id: &lethe_core::domain::ObservationId) -> SupplementalRecord {
     SupplementalRecord {
         id: SupplementalId::new("sup:test"),

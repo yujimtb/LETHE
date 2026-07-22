@@ -160,6 +160,16 @@
 - **修正方向**: canonical transaction/outbox内のmandatory auditに統合し、失敗時は保護操作も失敗させる。in-memory全履歴mirrorを削除し、永続台帳をpage queryする。
 - **重大度**: **高**
 
+## C. append-commit-and-lock-split 実装後の状態 (2026-07-23)
+
+性能フェーズ第1弾で、B-01〜B-05およびB-12の対象経路を修正した。canonical Observation append、per-item outcome、監査イベント登録、append-seq high-water更新はSQLiteの同一transactionで確定し、projection materializeと検索index追随は応答後のconsumerへ分離した。consumer失敗はACKを反転せず、projection healthと永続監査イベントで可視化する。
+
+AppCoreは`ArcSwap`のimmutable snapshotを読み取りへ公開し、canonical writer、derived consumer、read laneを分離した。SQLiteはwriter/read connectionを分け、PostgreSQL operational ledgerはwriter clientとread client poolを分けている。blob/page/network I/OではAppCore mutexを保持しない。
+
+`observation_stats`とoperational-event statsは保存済みscalarを読むようにし、partition treeは起動時replay後のimmutable snapshotを通常appendで再利用する。projection manifestはscalar metadataとper-field stateに分割し、変更fieldだけをtransactional upsertする。supplemental fingerprint/countはresident reducerの増分更新を使う。監査の診断mirrorは固定長に制限し、履歴取得は永続page queryを使う。
+
+受入確認には、durable appendとaudit enqueueの同一transaction rollback、duplicate後のappend-seq consumer、writer lane保持中のread lane非ブロック、派生失敗後もcanonical appendを成功とするテスト、および5,000件波形テストを含める。
+
 ### B-13. persistent search後も任意regexは全document scan
 
 - **原理・実装・判定**: safe literal n-gramを抽出できないregexは`AllQuery`になり、128件ずつ全documentを読みregex判定する。[search.rs:178](/D:/userdata/docs/projects/skcollege_database/crates/search-index/src/search.rs:178)。timeoutは固定500ms。[grep.rs:12](/D:/userdata/docs/projects/skcollege_database/crates/api/src/api/grep.rs:12)。設計文書でもこのtrade-offを認識している。[persistent-search-index/design.md:75](/D:/userdata/docs/projects/skcollege_database/openspec/changes/persistent-search-index/design.md:75)。**確証**。

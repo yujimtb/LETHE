@@ -6,12 +6,14 @@ impl AppService {
     }
 
     pub fn health(&self) -> Result<HealthResponse, SelfHostError> {
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
+        let append_consumer = self.append_consumer_health_dependency()?;
         Ok(
             HealthResponse::from_catalog(&core.catalog, env!("CARGO_PKG_VERSION")).with_runtime(
                 vec![
                     self.bulk_import_health_dependency()?,
                     self.search_index.health_dependency(),
+                    append_consumer,
                 ],
                 LastSyncHealth {
                     completed_at: core.last_sync_at,
@@ -35,13 +37,15 @@ impl AppService {
                 detail: Some(error.to_string()),
             },
         };
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
+        let append_consumer = self.append_consumer_health_dependency()?;
         Ok(
             HealthResponse::from_catalog(&core.catalog, env!("CARGO_PKG_VERSION")).with_runtime(
                 vec![
                     storage_dependency,
                     self.bulk_import_health_dependency()?,
                     self.search_index.deep_health_dependency(),
+                    append_consumer,
                 ],
                 LastSyncHealth {
                     completed_at: core.last_sync_at,
@@ -97,7 +101,7 @@ impl AppService {
     }
 
     pub fn lineage_manifest(&self, projection_id: &str) -> Result<LineageManifest, SelfHostError> {
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
         self.ensure_projection_fresh(&core.catalog, projection_id)?;
         match projection_id {
             "proj:person-page" => Ok(core.snapshot.lineage.clone()),
@@ -159,7 +163,10 @@ impl AppService {
         }
     }
 
-    pub(super) fn apply_filter(&self, payload: serde_json::Value) -> serde_json::Value {
+    pub(super) fn apply_filter(
+        &self,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, SelfHostError> {
         let result = FilteringGate::filter(&payload, AccessScope::Internal, &restricted_fields());
         self.emit_audit(
             "actor:self-host",
@@ -168,8 +175,8 @@ impl AppService {
                 "decision": "filtering-before-exposure",
                 "masked_fields": result.masked_fields,
             }),
-        );
-        result.payload
+        )?;
+        Ok(result.payload)
     }
 
     pub(super) fn resolve_read_mode(
@@ -265,6 +272,7 @@ impl AppService {
                     }
                     if let Ok(mut core) = service.core_lock() {
                         core.mark_non_corpus_materializations_stale();
+                        service.publish_core_snapshot(&core);
                     }
                 }
                 service
@@ -288,6 +296,10 @@ impl AppService {
         channels: &[lethe_registry::registry::ChannelRecord],
         reason: &'static str,
     ) -> Result<(), SelfHostError> {
+        let _derived_lane = self
+            .derived_projection_lane
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?;
         tracing::info!(
             import_timing = true,
             non_corpus_materialize_mode = "background",
@@ -326,6 +338,11 @@ impl AppService {
                 continue;
             }
             core.install_materialized(materialized);
+            self.publish_core_snapshot(&core);
+            self.persistence_lock()?.set_state(
+                "append_consumer:person-page",
+                &stats.max_append_seq.to_string(),
+            )?;
             return Ok(());
         }
     }
@@ -355,38 +372,57 @@ impl AppService {
         ))
     }
 
+    #[allow(dead_code)]
     pub(super) fn materialize_after_observation_append(
         &self,
         core: &mut AppCore,
         appended_observations: &[Observation],
     ) -> Result<(), SelfHostError> {
+        let stats = self.persistence_read_lock()?.observation_stats()?;
+        self.materialize_after_observation_append_with_stats(
+            core,
+            appended_observations,
+            stats,
+            None,
+        )
+    }
+
+    fn materialize_after_observation_append_with_stats(
+        &self,
+        core: &mut AppCore,
+        appended_observations: &[Observation],
+        stats: ObservationStats,
+        appended_fact_sequences: Option<&BTreeMap<String, u64>>,
+    ) -> Result<(), SelfHostError> {
         let result = (|| match classify_non_corpus_delta_with_reason(appended_observations).kind {
-            NonCorpusDeltaKind::NoOp | NonCorpusDeltaKind::DeclaredSchemaSkip => Ok(()),
+            NonCorpusDeltaKind::NoOp | NonCorpusDeltaKind::DeclaredSchemaSkip => {
+                core.observation_stats = stats;
+                Ok(())
+            }
             NonCorpusDeltaKind::FreshnessOnly
             | NonCorpusDeltaKind::SlackMessage
             | NonCorpusDeltaKind::Communication => {
-                let declared_observations = appended_observations
-                    .iter()
-                    .filter(|observation| {
-                        projection_fold_behavior(observation.schema.as_str()).is_some()
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if declared_observations.is_empty() {
-                    return Ok(());
-                }
                 let persistence = self.persistence_lock()?;
-                let stats = persistence.observation_stats()?;
                 let lookup = StorageComponentProjectionLookup {
                     storage: persistence.as_ref(),
                 };
-                let commit = apply_compact_incremental_delta(
-                    core,
-                    &declared_observations,
-                    stats,
-                    Utc::now(),
-                    &lookup,
-                )?;
+                let commit = match appended_fact_sequences {
+                    Some(sequences) => apply_compact_incremental_delta_with_sequences(
+                        core,
+                        appended_observations,
+                        stats,
+                        Utc::now(),
+                        sequences,
+                        &lookup,
+                    )?,
+                    None => apply_compact_incremental_delta(
+                        core,
+                        appended_observations,
+                        stats,
+                        Utc::now(),
+                        &lookup,
+                    )?,
+                };
                 let manifest = core.manifest_value()?;
                 persistence.commit_projection_items(
                     &ProjectionRef::new("proj:person-page"),
@@ -431,7 +467,7 @@ impl AppService {
             )));
         }
         let observation = {
-            let core = self.core_lock()?;
+            let core = self.core_snapshot();
             match prepare_draft(&core, draft) {
                 Ok(observation) => observation,
                 Err(IngestResult::Rejected { message, .. }) => {
@@ -463,17 +499,26 @@ impl AppService {
     ) -> Result<IngestResult, SelfHostError> {
         let recorded_at = observation.recorded_at;
 
-        let durable_outcome = self.persistence_lock()?.append_observation(&observation)?;
+        let audit_event = self.build_audit_event(
+            "actor:self-host",
+            AuditEventKind::WriteExecution,
+            serde_json::json!({"observation_id": observation.id.as_str()}),
+        )?;
+        let audit_record = AppService::audit_record(&audit_event)?;
+        let durable_outcome = self
+            .persistence_lock()?
+            .append_observations_with_audit(
+                std::slice::from_ref(&observation),
+                std::slice::from_ref(&audit_record),
+            )?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                SelfHostError::Ingestion("durable append returned no outcome".to_owned())
+            })?;
 
         let result = match durable_outcome {
-            DurableAppendOutcome::Appended(id) => {
-                self.emit_audit(
-                    "actor:self-host",
-                    AuditEventKind::WriteExecution,
-                    serde_json::json!({"observation_id": id.as_str()}),
-                );
-                IngestResult::Ingested { id, recorded_at }
-            }
+            DurableAppendOutcome::Appended(id) => IngestResult::Ingested { id, recorded_at },
             DurableAppendOutcome::Duplicate(existing_id) => IngestResult::Duplicate { existing_id },
             DurableAppendOutcome::CanonicalCollision(existing_id) => IngestResult::Quarantined {
                 ticket: lethe_core::domain::QuarantineTicket {
@@ -494,18 +539,21 @@ impl AppService {
         thread: &SlackThreadKey,
     ) -> Result<IngestResult, SelfHostError> {
         let recorded_at = observation.recorded_at;
+        let audit_event = self.build_audit_event(
+            "actor:self-host",
+            AuditEventKind::WriteExecution,
+            serde_json::json!({"observation_id": observation.id.as_str()}),
+        )?;
+        let audit_record = AppService::audit_record(&audit_event)?;
         let durable_outcome = self
             .persistence_lock()?
-            .append_slack_observation(&observation, thread)?;
+            .append_slack_observation_with_audit(
+                &observation,
+                thread,
+                std::slice::from_ref(&audit_record),
+            )?;
         let result = match durable_outcome {
-            DurableAppendOutcome::Appended(id) => {
-                self.emit_audit(
-                    "actor:self-host",
-                    AuditEventKind::WriteExecution,
-                    serde_json::json!({"observation_id": id.as_str()}),
-                );
-                IngestResult::Ingested { id, recorded_at }
-            }
+            DurableAppendOutcome::Appended(id) => IngestResult::Ingested { id, recorded_at },
             DurableAppendOutcome::Duplicate(existing_id) => IngestResult::Duplicate { existing_id },
             DurableAppendOutcome::CanonicalCollision(existing_id) => IngestResult::Quarantined {
                 ticket: lethe_core::domain::QuarantineTicket {
@@ -521,11 +569,12 @@ impl AppService {
     }
 
     pub(super) fn store_blob(&self, data: &[u8]) -> Result<BlobRef, SelfHostError> {
-        let mut core = self.core_lock()?;
         let blob_ref = self
             .persistence_lock()?
             .put_blob(data, self.config.resource_limits.max_blob_bytes)?;
+        let mut core = self.core_lock()?;
         core.blobs.put(data);
+        self.publish_core_snapshot(&core);
         Ok(blob_ref)
     }
 
@@ -533,7 +582,7 @@ impl AppService {
         &self,
         blob_ref: &BlobRef,
     ) -> Result<Option<Vec<u8>>, SelfHostError> {
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
         self.ensure_projection_fresh(&core.catalog, "proj:person-page")?;
         let referenced = core.person_components.values().any(|component| {
             component.consent != ConsentStatus::OptedOut
@@ -552,7 +601,7 @@ impl AppService {
                 "decision": "filtering-before-exposure",
                 "masked_fields": [],
             }),
-        );
+        )?;
         if !referenced {
             return Ok(None);
         }
@@ -621,7 +670,7 @@ impl AppService {
             )));
         }
         let observation = {
-            let core = self.core_lock()?;
+            let core = self.core_snapshot();
             match prepare_draft(&core, draft) {
                 Ok(observation) => observation,
                 Err(IngestResult::Rejected { message, .. }) => {
@@ -762,8 +811,17 @@ impl AppService {
         })
     }
 
-    pub(super) fn core_lock(&self) -> Result<std::sync::MutexGuard<'_, AppCore>, SelfHostError> {
-        self.core.lock().map_err(|_| SelfHostError::LockPoisoned)
+    pub(super) fn core_lock(&self) -> Result<AppCoreWriteGuard<'_>, SelfHostError> {
+        let guard = self.core.lock().map_err(|_| SelfHostError::LockPoisoned)?;
+        Ok(AppCoreWriteGuard { guard })
+    }
+
+    pub(super) fn core_snapshot(&self) -> Arc<AppCore> {
+        self.core_snapshot.load_full()
+    }
+
+    pub(super) fn publish_core_snapshot(&self, core: &AppCore) {
+        self.core_snapshot.store(Arc::new(core.clone()));
     }
 
     pub(super) fn persistence_lock(
@@ -772,6 +830,204 @@ impl AppService {
         self.persistence
             .lock()
             .map_err(|_| SelfHostError::LockPoisoned)
+    }
+
+    pub(super) fn persistence_read_lock(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Box<dyn StoragePorts>>, SelfHostError> {
+        let index = self
+            .persistence_read_next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % self.persistence_read_pool.len();
+        self.persistence_read_pool[index]
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)
+    }
+
+    pub(super) fn operational_ledger_read_lock(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Box<dyn OperationalStoragePorts>>, SelfHostError> {
+        let index = self
+            .operational_ledger_read_next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % self.operational_ledger_read_pool.len();
+        self.operational_ledger_read_pool[index]
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)
+    }
+
+    fn append_consumer_health_dependency(&self) -> Result<DependencyHealthInfo, SelfHostError> {
+        let error = self
+            .append_consumer_error
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?
+            .clone();
+        Ok(DependencyHealthInfo {
+            name: "append_seq_consumer".to_owned(),
+            status: if error.is_some() { "failed" } else { "ok" }.to_owned(),
+            detail: error,
+        })
+    }
+
+    pub(super) fn trigger_append_consumer(&self) {
+        if self
+            .append_consumer_in_flight
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let service = self.clone();
+        std::thread::spawn(move || {
+            let result = service.run_append_consumer();
+            if let Err(error) = result {
+                tracing::error!(error = %error, "append-seq consumer failed");
+                if let Ok(mut core) = service.core_lock() {
+                    core.mark_non_corpus_materializations_stale();
+                    service.publish_core_snapshot(&core);
+                }
+                if let Ok(mut state) = service.append_consumer_error.lock() {
+                    *state = Some(error.to_string());
+                }
+                if let Err(audit_error) = service.emit_audit(
+                    "actor:append-seq-consumer",
+                    AuditEventKind::Rejection,
+                    serde_json::json!({
+                        "projection": "proj:person-page",
+                        "error": error.to_string(),
+                        "kind": "projection_consumer_failure",
+                    }),
+                ) {
+                    tracing::error!(
+                        error = %audit_error,
+                        "failed to durably record append-seq consumer failure"
+                    );
+                    if let Ok(mut state) = service.append_consumer_error.lock() {
+                        *state = Some(format!("{error}; audit error: {audit_error}"));
+                    }
+                }
+            } else if let Ok(mut state) = service.append_consumer_error.lock() {
+                *state = None;
+            }
+            service
+                .append_consumer_in_flight
+                .store(false, std::sync::atomic::Ordering::Release);
+        });
+    }
+
+    pub(super) fn trigger_search_index_catch_up(&self) {
+        if self
+            .search_index_catch_up_in_flight
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let search_index = self.search_index.clone();
+        let in_flight = Arc::clone(&self.search_index_catch_up_in_flight);
+        let spawn_result = std::thread::Builder::new()
+            .name("lethe-search-index-catch-up".to_owned())
+            .spawn(move || {
+                if let Err(error) = search_index.catch_up_after_append() {
+                    tracing::error!(error = %error, "search index catch-up failed after canonical append");
+                }
+                in_flight.store(false, std::sync::atomic::Ordering::Release);
+            });
+        if let Err(error) = spawn_result {
+            self.search_index_catch_up_in_flight
+                .store(false, std::sync::atomic::Ordering::Release);
+            tracing::error!(error = %error, "failed to spawn search index catch-up");
+        }
+    }
+
+    fn run_append_consumer(&self) -> Result<(), SelfHostError> {
+        let _derived_lane = self
+            .derived_projection_lane
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?;
+        loop {
+            let cursor = self
+                .persistence_read_lock()?
+                .get_state("append_consumer:person-page")?
+                .ok_or_else(|| {
+                    SelfHostError::Ingestion(
+                        "append consumer cursor is missing from persistent state".to_owned(),
+                    )
+                })?
+                .parse::<u64>()
+                .map_err(|_| {
+                    SelfHostError::Ingestion("append consumer cursor is not a valid u64".to_owned())
+                })?;
+            let pending = self
+                .persistence_read_lock()?
+                .observation_stats()?
+                .max_append_seq
+                .saturating_sub(cursor);
+            let page_limit = usize::try_from(pending.min(16_384)).map_err(|_| {
+                SelfHostError::Ingestion(
+                    "append consumer pending count does not fit usize".to_owned(),
+                )
+            })?;
+            let page = self
+                .persistence_read_lock()?
+                .observation_page(cursor, page_limit.max(1))?;
+            if page.is_empty() {
+                self.trigger_search_index_catch_up();
+                return Ok(());
+            }
+            let observations = page
+                .iter()
+                .map(|stored| stored.observation.clone())
+                .collect::<Vec<_>>();
+            let next_cursor = page.last().map(|stored| stored.append_seq).ok_or_else(|| {
+                SelfHostError::Ingestion("append consumer received an empty page".to_owned())
+            })?;
+            let base_count = self.core_snapshot().observation_stats.count;
+            let batch_count = base_count
+                .checked_add(u64::try_from(observations.len()).map_err(|_| {
+                    SelfHostError::Ingestion(
+                        "append consumer page size does not fit u64".to_owned(),
+                    )
+                })?)
+                .ok_or_else(|| {
+                    SelfHostError::Ingestion(
+                        "append consumer observation count overflowed u64".to_owned(),
+                    )
+                })?;
+            let mut core = (*self.core_snapshot()).clone();
+            let appended_fact_sequences = page
+                .iter()
+                .filter(|stored| {
+                    stored.observation.schema.as_str() == "schema:slack-message"
+                        || identity_replay_event(&stored.observation, 1).is_some()
+                })
+                .map(|stored| (stored.observation.id.as_str().to_owned(), stored.append_seq))
+                .collect::<BTreeMap<_, _>>();
+            self.materialize_after_observation_append_with_stats(
+                &mut core,
+                &observations,
+                ObservationStats {
+                    count: batch_count,
+                    max_append_seq: next_cursor,
+                },
+                Some(&appended_fact_sequences),
+            )?;
+            let mut live_core = self.core_lock()?;
+            *live_core = core;
+            self.publish_core_snapshot(&live_core);
+            self.persistence_lock()?
+                .set_state("append_consumer:person-page", &next_cursor.to_string())?;
+        }
     }
 
     pub(super) fn slack_adapter_config(&self) -> AdapterConfig {
@@ -833,6 +1089,24 @@ impl AppService {
             },
             credential_ref: "env:LETHE_GOOGLE_ACCESS_TOKEN".into(),
         }
+    }
+}
+
+pub(super) struct AppCoreWriteGuard<'a> {
+    guard: std::sync::MutexGuard<'a, AppCore>,
+}
+
+impl std::ops::Deref for AppCoreWriteGuard<'_> {
+    type Target = AppCore;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for AppCoreWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
     }
 }
 

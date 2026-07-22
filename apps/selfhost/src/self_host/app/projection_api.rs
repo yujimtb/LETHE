@@ -145,7 +145,7 @@ impl AppService {
         pagination: &PaginationParams,
     ) -> Result<ResponseEnvelope<serde_json::Value>, SelfHostError> {
         self.validate_page_limit(pagination.limit, "person projection")?;
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
         let mode = self.resolve_read_mode(&core.catalog, "proj:person-page", read_mode, pin)?;
         self.authorize_read(
             EntityRef::new("projection:person-page"),
@@ -168,7 +168,7 @@ impl AppService {
         let payload = serde_json::to_value(PaginatedResponse::from_slice(page, total, pagination))?;
 
         Ok(ResponseEnvelope {
-            data: self.apply_filter(payload),
+            data: self.apply_filter(payload)?,
             projection_metadata: self.projection_metadata(
                 &core.catalog,
                 "proj:person-page",
@@ -185,7 +185,7 @@ impl AppService {
         read_mode: Option<&str>,
         pin: Option<&str>,
     ) -> Result<ResponseEnvelope<serde_json::Value>, SelfHostError> {
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
         let mode = self.resolve_read_mode(&core.catalog, "proj:person-page", read_mode, pin)?;
         let component = core
             .person_components
@@ -217,7 +217,7 @@ impl AppService {
         let detail: PersonDetailResponse =
             PersonPageProjector::to_detail(profile, &slides, &messages, activity);
         Ok(ResponseEnvelope {
-            data: self.apply_filter(serde_json::to_value(detail)?),
+            data: self.apply_filter(serde_json::to_value(detail)?)?,
             projection_metadata: self.projection_metadata(
                 &core.catalog,
                 "proj:person-page",
@@ -234,7 +234,7 @@ impl AppService {
         read_mode: Option<&str>,
         pin: Option<&str>,
     ) -> Result<ResponseEnvelope<serde_json::Value>, SelfHostError> {
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
         let mode = self.resolve_read_mode(&core.catalog, "proj:person-page", read_mode, pin)?;
         self.authorize_read(
             EntityRef::new(person_id.to_string()),
@@ -252,7 +252,7 @@ impl AppService {
         )?;
 
         Ok(ResponseEnvelope {
-            data: self.apply_filter(serde_json::to_value(slides)?),
+            data: self.apply_filter(serde_json::to_value(slides)?)?,
             projection_metadata: self.projection_metadata(
                 &core.catalog,
                 "proj:person-page",
@@ -269,7 +269,7 @@ impl AppService {
         read_mode: Option<&str>,
         pin: Option<&str>,
     ) -> Result<ResponseEnvelope<serde_json::Value>, SelfHostError> {
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
         let mode = self.resolve_read_mode(&core.catalog, "proj:person-page", read_mode, pin)?;
         self.authorize_read(
             EntityRef::new(person_id.to_string()),
@@ -287,7 +287,7 @@ impl AppService {
         )?;
 
         Ok(ResponseEnvelope {
-            data: self.apply_filter(serde_json::to_value(messages)?),
+            data: self.apply_filter(serde_json::to_value(messages)?)?,
             projection_metadata: self.projection_metadata(
                 &core.catalog,
                 "proj:person-page",
@@ -304,7 +304,7 @@ impl AppService {
         read_mode: Option<&str>,
         pin: Option<&str>,
     ) -> Result<ResponseEnvelope<serde_json::Value>, SelfHostError> {
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
         let mode = self.resolve_read_mode(&core.catalog, "proj:person-page", read_mode, pin)?;
         self.authorize_read(
             EntityRef::new(person_id.to_string()),
@@ -354,7 +354,7 @@ impl AppService {
         events.sort_by(|left, right| right.ts.cmp(&left.ts));
 
         Ok(ResponseEnvelope {
-            data: self.apply_filter(serde_json::to_value(events)?),
+            data: self.apply_filter(serde_json::to_value(events)?)?,
             projection_metadata: self.projection_metadata(
                 &core.catalog,
                 "proj:person-page",
@@ -381,7 +381,7 @@ impl AppService {
             SelfHostError::Ingestion("corpus record count does not fit usize".to_owned())
         })?;
         let lineage = corpus_index_lineage(&metadata)?;
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
         let mode = self.resolve_read_mode(&core.catalog, "proj:corpus", read_mode, pin)?;
         let payload = serde_json::to_value(PaginatedResponse::from_slice(page, total, pagination))?;
         Ok(ResponseEnvelope {
@@ -404,7 +404,7 @@ impl AppService {
             index.search_with_metadata(request, self.config.resource_limits.max_page_size)
         })?;
         let lineage = corpus_index_lineage(&metadata)?;
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
         let mode = self.resolve_read_mode(&core.catalog, "proj:corpus", None, None)?;
         Ok(ResponseEnvelope {
             data: response,
@@ -450,7 +450,7 @@ impl AppService {
             })
             .collect::<Result<Vec<_>, SelfHostError>>()?;
         let lineage = corpus_index_lineage(&metadata)?;
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
         let mode = self.resolve_read_mode(&core.catalog, "proj:corpus", None, None)?;
         let envelope = ResponseEnvelope {
             data: response,
@@ -495,7 +495,7 @@ impl AppService {
             .execute(|index| index.read_with_metadata(|snapshot| snapshot.record(record_id)))?;
         let record = record.ok_or_else(|| SelfHostError::NotFound(record_id.to_owned()))?;
         let lineage = corpus_index_lineage(&metadata)?;
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
         Ok(ResponseEnvelope {
             data: lethe_api::api::grep::RecordDetailResponse { record },
             projection_metadata: self.projection_metadata(
@@ -519,7 +519,7 @@ impl AppService {
         })?;
         let response = response.ok_or_else(|| SelfHostError::NotFound(thread_ref.to_owned()))?;
         let lineage = corpus_index_lineage(&metadata)?;
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
         Ok(ResponseEnvelope {
             data: response,
             projection_metadata: self.projection_metadata(
@@ -547,7 +547,7 @@ impl AppService {
         })?;
         let response = response.ok_or_else(|| SelfHostError::NotFound(thread_ref.to_owned()))?;
         let lineage = corpus_index_lineage(&metadata)?;
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
         Ok(ResponseEnvelope {
             data: response,
             projection_metadata: self.projection_metadata(
@@ -569,7 +569,7 @@ impl AppService {
         })?;
         let record = record.ok_or_else(|| SelfHostError::NotFound(request.url.clone()))?;
         let lineage = corpus_index_lineage(&metadata)?;
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
         Ok(ResponseEnvelope {
             data: lethe_api::api::grep::ResolveLinkResponse {
                 record_id: record.record_id,
@@ -595,7 +595,7 @@ impl AppService {
         >,
         SelfHostError,
     > {
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
         let limit = request
             .limit
             .unwrap_or(20)
@@ -644,7 +644,7 @@ impl AppService {
         self.validate_page_limit(limit, "claim queue")?;
         validate_verification_mode_filter(verification_mode)?;
         let offset = parse_cursor(cursor)?;
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
         self.ensure_projection_fresh(&core.catalog, "proj:claim-queue")?;
         let mode = self.resolve_read_mode(&core.catalog, "proj:claim-queue", None, None)?;
         let mut groups = core.snapshot.claim_queue.groups_matching(state, backfill);
@@ -700,7 +700,7 @@ impl AppService {
             .map(str::trim)
             .filter(|query| !query.is_empty())
             .ok_or_else(|| SelfHostError::ReadMode("q must not be blank".to_owned()))?;
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
         self.ensure_projection_fresh(&core.catalog, "proj:claim-queue")?;
         let mode = self.resolve_read_mode(&core.catalog, "proj:claim-queue", None, None)?;
         let all_matches = core
@@ -738,7 +738,7 @@ impl AppService {
         &self,
     ) -> Result<ResponseEnvelope<lethe_projection_cognition::FreshnessProjection>, SelfHostError>
     {
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
         self.ensure_projection_fresh(&core.catalog, "proj:freshness")?;
         let mode = self.resolve_read_mode(&core.catalog, "proj:freshness", None, None)?;
         let lineage = build_projection_lineage(
@@ -764,7 +764,7 @@ impl AppService {
         &self,
     ) -> Result<ResponseEnvelope<lethe_projection_cognition::ReplySloProjection>, SelfHostError>
     {
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
         self.ensure_projection_fresh(&core.catalog, "proj:reply-slo")?;
         let mode = self.resolve_read_mode(&core.catalog, "proj:reply-slo", None, None)?;
         let reply_slo = self.communication_projection_reply_slo(&core)?;
@@ -793,7 +793,7 @@ impl AppService {
     pub fn break_glass_response(
         &self,
     ) -> Result<ResponseEnvelope<BreakGlassProjection>, SelfHostError> {
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
         self.ensure_projection_fresh(&core.catalog, "proj:break-glass")?;
         let mode = self.resolve_read_mode(&core.catalog, "proj:break-glass", None, None)?;
         let lineage = build_channel_registry_projection_lineage(
@@ -818,7 +818,7 @@ impl AppService {
         &self,
     ) -> Result<ResponseEnvelope<lethe_projection_cognition::ResumeSnapshotProjection>, SelfHostError>
     {
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
         self.ensure_projection_fresh(&core.catalog, "proj:resume-snapshot")?;
         let mode = self.resolve_read_mode(&core.catalog, "proj:resume-snapshot", None, None)?;
         let lineage = build_supplemental_projection_lineage(
@@ -843,7 +843,7 @@ impl AppService {
         &self,
     ) -> Result<ResponseEnvelope<lethe_projection_cognition::PlanStateProjection>, SelfHostError>
     {
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
         self.ensure_projection_fresh(&core.catalog, "proj:plan-state")?;
         let mode = self.resolve_read_mode(&core.catalog, "proj:plan-state", None, None)?;
         let lineage = build_supplemental_projection_lineage(
@@ -874,7 +874,7 @@ impl AppService {
     ) -> Result<ResponseEnvelope<CardQueuePage>, SelfHostError> {
         self.validate_page_limit(limit, "card queue")?;
         let offset = parse_cursor(cursor)?;
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
         self.ensure_projection_fresh(&core.catalog, "proj:card-queue")?;
         let mode = self.resolve_read_mode(&core.catalog, "proj:card-queue", None, None)?;
         let cards = core

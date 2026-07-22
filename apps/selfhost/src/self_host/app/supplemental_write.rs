@@ -36,6 +36,10 @@ impl AppService {
         request: SupplementalWriteRequest,
     ) -> Result<SupplementalRecord, SelfHostError> {
         let _bulk_import_operation = self.bulk_import_operation_lock()?;
+        let _derived_lane = self
+            .derived_projection_lane
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?;
         self.ensure_bulk_import_session_inactive("supplemental write")?;
         validate_supplemental_id(&request.id)?;
 
@@ -75,7 +79,7 @@ impl AppService {
             .collect::<HashSet<_>>();
 
         {
-            let core = self.core_lock()?;
+            let core = self.core_snapshot();
             core.registry
                 .validate_supplemental_record_kind(
                     SupplementalKindValidationConfig {
@@ -98,7 +102,7 @@ impl AppService {
             return Err(append_only_conflict(&record.id));
         }
 
-        let mut core = self.core_lock()?;
+        let mut core = (*self.core_snapshot()).clone();
         self.ensure_projection_fresh(&core.catalog, "proj:person-page")?;
         if core.supplemental.get(&record.id).is_some() {
             return Err(append_only_conflict(&record.id));
@@ -133,12 +137,22 @@ impl AppService {
             }
         };
         let commit_result = (|| {
+            let audit_event = self.build_audit_event(
+                persisted_record.created_by.as_str(),
+                AuditEventKind::WriteExecution,
+                serde_json::json!({
+                    "supplemental_id": persisted_record.id.as_str(),
+                    "kind": persisted_record.kind
+                }),
+            )?;
+            let audit_record = AppService::audit_record(&audit_event)?;
             self.persistence_lock()?
-                .commit_supplemental_and_projection(
+                .commit_supplemental_and_projection_with_audit(
                     &persisted_record,
                     &ProjectionRef::new("proj:person-page"),
                     &manifest,
                     &item_commit,
+                    &audit_record,
                 )?;
             Ok::<_, SelfHostError>(())
         })();
@@ -148,16 +162,9 @@ impl AppService {
             return Err(error);
         }
         core.activate_non_corpus_projections();
-
-        drop(core);
-        self.emit_audit(
-            persisted_record.created_by.as_str(),
-            AuditEventKind::WriteExecution,
-            serde_json::json!({
-                "supplemental_id": persisted_record.id.as_str(),
-                "kind": persisted_record.kind
-            }),
-        );
+        let mut live_core = self.core_lock()?;
+        *live_core = core;
+        self.publish_core_snapshot(&live_core);
 
         Ok(persisted_record)
     }

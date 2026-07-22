@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 aes-gcm.workspace = true
+arc-swap.workspace = true
 chrono.workspace = true
 hex.workspace = true
 lethe-core = { path = "../../core" }

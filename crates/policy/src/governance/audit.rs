@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use crate::governance::types::{AuditEvent, AuditEventKind};
@@ -15,12 +16,14 @@ pub trait AuditLog: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// InMemoryAuditLog — MVP in-memory implementation
+// InMemoryAuditLog — bounded diagnostic mirror
 // ---------------------------------------------------------------------------
+
+const RECENT_AUDIT_EVENT_LIMIT: usize = 1024;
 
 #[derive(Debug, Default)]
 pub struct InMemoryAuditLog {
-    events: Mutex<Vec<AuditEvent>>,
+    events: Mutex<VecDeque<AuditEvent>>,
 }
 
 impl InMemoryAuditLog {
@@ -32,16 +35,22 @@ impl InMemoryAuditLog {
         self.events
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+            .iter()
+            .cloned()
+            .collect()
     }
 }
 
 impl AuditLog for InMemoryAuditLog {
     fn emit(&self, event: AuditEvent) {
-        self.events
+        let mut events = self
+            .events
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(event);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if events.len() == RECENT_AUDIT_EVENT_LIMIT {
+            events.pop_front();
+        }
+        events.push_back(event);
     }
 
     fn events_since(&self, since: chrono::DateTime<chrono::Utc>) -> Vec<AuditEvent> {
@@ -165,6 +174,20 @@ mod tests {
             .events_since(chrono::DateTime::<chrono::Utc>::MIN_UTC);
         assert_eq!(events[0].id, "audit:1");
         assert_eq!(events[1].id, "audit:2");
+    }
+
+    #[test]
+    fn in_memory_diagnostic_mirror_is_bounded() {
+        let (log, emitter) = make_emitter();
+        let actor = ActorRef::new("actor:test");
+        for _ in 0..=RECENT_AUDIT_EVENT_LIMIT {
+            emitter.emit(&actor, AuditEventKind::Approval, serde_json::json!({}));
+        }
+
+        let events = log.all_events();
+        assert_eq!(events.len(), RECENT_AUDIT_EVENT_LIMIT);
+        assert_eq!(events.first().unwrap().id, "audit:2");
+        assert_eq!(events.last().unwrap().id, "audit:1025");
     }
 
     #[test]

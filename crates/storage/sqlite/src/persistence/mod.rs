@@ -3,9 +3,11 @@ mod schema;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Key};
+use arc_swap::ArcSwapOption;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::Digest;
 
@@ -52,6 +54,7 @@ pub struct SqlitePersistence {
     blob_dir: PathBuf,
     secret_encryption_key: [u8; 32],
     routing_key_order: RoutingKeyOrder,
+    partition_tree: ArcSwapOption<PartitionTree>,
 }
 
 pub struct SqliteOperationalEventStore {
@@ -59,7 +62,7 @@ pub struct SqliteOperationalEventStore {
     data_space_id: DataSpaceId,
 }
 
-const CURRENT_SCHEMA_VERSION: i64 = 8;
+const CURRENT_SCHEMA_VERSION: i64 = 9;
 const CANONICAL_JSON_META_KEY: &str = "canonical_json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,13 +114,18 @@ impl SqlitePersistence {
         fs::create_dir_all(blob_dir)?;
 
         let conn = Connection::open(database_path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
         let store = Self {
             conn,
             blob_dir: blob_dir.to_path_buf(),
             secret_encryption_key: *secret_encryption_key,
             routing_key_order,
+            partition_tree: ArcSwapOption::empty(),
         };
         store.init_schema()?;
+        let partition_tree = store.rebuild_partition_tree_from_log()?;
+        store.partition_tree.store(Some(Arc::new(partition_tree)));
         Ok(store)
     }
 
@@ -138,7 +146,9 @@ impl SqlitePersistence {
     pub fn observation_stats(&self) -> Result<ObservationStats, PersistenceError> {
         self.conn
             .query_row(
-                "SELECT COUNT(*), COALESCE(MAX(append_seq), 0) FROM observations",
+                "SELECT observation_count, max_append_seq
+                 FROM observation_stats
+                 WHERE singleton = 1",
                 [],
                 |row| {
                     Ok(ObservationStats {
@@ -191,7 +201,15 @@ impl SqlitePersistence {
         &self,
         observations: &[Observation],
     ) -> Result<Vec<DurableAppendOutcome>, PersistenceError> {
-        let tree = self.load_partition_tree()?;
+        self.append_observations_idempotent_with_audit(observations, &[])
+    }
+
+    pub fn append_observations_idempotent_with_audit(
+        &self,
+        observations: &[Observation],
+        audit_events: &[lethe_storage_api::AuditEventRecord],
+    ) -> Result<Vec<DurableAppendOutcome>, PersistenceError> {
+        let tree = self.partition_tree_snapshot()?;
         let transaction = self.conn.unchecked_transaction()?;
         let outcomes = append_observations_in_transaction(
             &transaction,
@@ -199,6 +217,9 @@ impl SqlitePersistence {
             self.routing_key_order,
             observations,
         )?;
+        for audit in audit_events {
+            insert_audit_event(&transaction, audit)?;
+        }
 
         transaction.commit()?;
         Ok(outcomes)
@@ -209,8 +230,17 @@ impl SqlitePersistence {
         observation: &Observation,
         thread: &SlackThreadKey,
     ) -> Result<DurableAppendOutcome, PersistenceError> {
+        self.append_slack_observation_with_audit(observation, thread, &[])
+    }
+
+    pub fn append_slack_observation_with_audit(
+        &self,
+        observation: &Observation,
+        thread: &SlackThreadKey,
+        audit_events: &[lethe_storage_api::AuditEventRecord],
+    ) -> Result<DurableAppendOutcome, PersistenceError> {
         validate_slack_thread_key(thread)?;
-        let tree = self.load_partition_tree()?;
+        let tree = self.partition_tree_snapshot()?;
         let transaction = self.conn.unchecked_transaction()?;
         let mut outcomes = append_observations_in_transaction(
             &transaction,
@@ -228,6 +258,9 @@ impl SqlitePersistence {
                 |row| row.get::<_, u64>(0),
             )?;
             upsert_slack_thread(&transaction, thread, append_seq)?;
+        }
+        for audit in audit_events {
+            insert_audit_event(&transaction, audit)?;
         }
         transaction.commit()?;
         Ok(outcome)
@@ -731,7 +764,7 @@ impl SqlitePersistence {
     }
 
     pub fn leaf_positions(&self) -> Result<Vec<LeafPosition>, PersistenceError> {
-        let tree = self.load_partition_tree()?;
+        let tree = self.partition_tree_snapshot()?;
         let mut positions = Vec::new();
         for leaf_id in tree.current_leaf_ids() {
             let append_seq = self.conn.query_row(
@@ -753,7 +786,7 @@ impl SqlitePersistence {
                 "leaf capacity must be greater than zero".to_owned(),
             ));
         }
-        let tree = self.load_partition_tree()?;
+        let tree = self.partition_tree_snapshot()?;
         for parent_leaf_id in tree.current_leaf_ids() {
             let mut stmt = self.conn.prepare(
                 "SELECT id, observation_json FROM observations
@@ -825,6 +858,7 @@ impl SqlitePersistence {
                 plan.bit_index,
             )
             .map_err(|err| PersistenceError::SchemaInvariant(err.to_string()))?;
+            let next_tree = self.partition_tree_after_event(&commit_json)?;
             transaction.execute(
                 "INSERT INTO partition_log (
                     event_type, parent_leaf_id, left_child_leaf_id, right_child_leaf_id,
@@ -842,6 +876,7 @@ impl SqlitePersistence {
                 ],
             )?;
             transaction.commit()?;
+            self.partition_tree.store(Some(Arc::new(next_tree)));
             return Ok(true);
         }
         Ok(false)
@@ -1066,7 +1101,9 @@ impl SqlitePersistence {
             bit_index,
         )
         .map_err(|err| PersistenceError::SchemaInvariant(err.to_string()))?;
-        self.conn.execute(
+        let next_tree = self.partition_tree_after_event(&event_json)?;
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute(
             "INSERT INTO partition_log (
                 event_type,
                 parent_leaf_id,
@@ -1088,7 +1125,10 @@ impl SqlitePersistence {
                 event_json,
             ],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let event_seq = transaction.last_insert_rowid();
+        transaction.commit()?;
+        self.partition_tree.store(Some(Arc::new(next_tree)));
+        Ok(event_seq)
     }
 
     pub fn append_failover(
@@ -1139,7 +1179,7 @@ impl SqlitePersistence {
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn load_partition_tree(&self) -> Result<PartitionTree, PersistenceError> {
+    fn rebuild_partition_tree_from_log(&self) -> Result<PartitionTree, PersistenceError> {
         let mut stmt = self
             .conn
             .prepare("SELECT event_type, event_json FROM partition_log ORDER BY event_seq")?;
@@ -1158,6 +1198,32 @@ impl SqlitePersistence {
 
         PartitionTree::from_events(&events)
             .map_err(|err| PersistenceError::SchemaInvariant(err.to_string()))
+    }
+
+    fn partition_tree_snapshot(&self) -> Result<Arc<PartitionTree>, PersistenceError> {
+        self.partition_tree.load_full().ok_or_else(|| {
+            PersistenceError::SchemaInvariant(
+                "partition tree snapshot is unavailable before schema initialization".to_owned(),
+            )
+        })
+    }
+
+    fn partition_tree_after_event(
+        &self,
+        event_json: &str,
+    ) -> Result<PartitionTree, PersistenceError> {
+        let event = parse_partition_event(PARTITION_EVENT_SPLIT_COMMIT, event_json)
+            .map_err(|error| PersistenceError::SchemaInvariant(error.to_string()))?;
+        let mut next = (*self.partition_tree_snapshot()?).clone();
+        if let lethe_runtime::runtime::partition::PartitionLogEvent::SplitCommit(commit) = event {
+            next.apply_split_commit(&commit)
+                .map_err(|error| PersistenceError::SchemaInvariant(error.to_string()))?;
+        }
+        Ok(next)
+    }
+
+    pub fn load_partition_tree(&self) -> Result<PartitionTree, PersistenceError> {
+        Ok((*self.partition_tree_snapshot()?).clone())
     }
 
     pub fn garbage_collect_orphan_blobs(&self) -> Result<usize, PersistenceError> {
@@ -1247,19 +1313,18 @@ impl SqlitePersistence {
         projection: &lethe_core::domain::ProjectionRef,
         records: &serde_json::Value,
     ) -> Result<(), PersistenceError> {
-        self.conn.execute(
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute(
             "INSERT INTO projection_materializations (
                 projection_id, records_json, materialized_at
              ) VALUES (?1, ?2, ?3)
              ON CONFLICT(projection_id) DO UPDATE SET
                 records_json = excluded.records_json,
                 materialized_at = excluded.materialized_at",
-            params![
-                projection.as_str(),
-                serde_json::to_string(records)?,
-                chrono::Utc::now().to_rfc3339(),
-            ],
+            params![projection.as_str(), "{}", chrono::Utc::now().to_rfc3339(),],
         )?;
+        replace_manifest_fields(&transaction, projection, records)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1267,17 +1332,24 @@ impl SqlitePersistence {
         &self,
         projection: &lethe_core::domain::ProjectionRef,
     ) -> Result<Option<serde_json::Value>, PersistenceError> {
-        let json = self
-            .conn
-            .query_row(
-                "SELECT records_json FROM projection_materializations WHERE projection_id = ?1",
-                [projection.as_str()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        json.map(|value| serde_json::from_str(&value))
-            .transpose()
-            .map_err(PersistenceError::from)
+        let mut statement = self.conn.prepare(
+            "SELECT field_key, value_json
+             FROM projection_manifest_fields
+             WHERE projection_id = ?1
+             ORDER BY field_key",
+        )?;
+        let rows = statement.query_map([projection.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let fields = rows.collect::<Result<Vec<_>, _>>()?;
+        if fields.is_empty() {
+            return Ok(None);
+        }
+        let mut object = serde_json::Map::new();
+        for (field_key, value_json) in fields {
+            object.insert(field_key, serde_json::from_str(&value_json)?);
+        }
+        Ok(Some(serde_json::Value::Object(object)))
     }
 
     pub fn commit_projection_items(
@@ -1291,7 +1363,7 @@ impl SqlitePersistence {
             .validate()
             .map_err(projection_item_validation_error)?;
 
-        let manifest_json = serde_json::to_string(manifest)?;
+        let manifest_json = "{}";
         let materialized_at = chrono::Utc::now().to_rfc3339();
         let transaction = self.conn.unchecked_transaction()?;
         transaction.execute(
@@ -1303,6 +1375,7 @@ impl SqlitePersistence {
                 materialized_at = excluded.materialized_at",
             params![projection.as_str(), manifest_json, materialized_at],
         )?;
+        upsert_manifest_fields(&transaction, projection, manifest)?;
 
         match commit {
             ProjectionItemCommit::Replace { items } => {
@@ -1333,6 +1406,23 @@ impl SqlitePersistence {
         manifest: &serde_json::Value,
         item_delta: &ProjectionItemCommit,
     ) -> Result<(), PersistenceError> {
+        self.commit_supplemental_and_projection_with_audit(
+            record,
+            projection,
+            manifest,
+            item_delta,
+            &[],
+        )
+    }
+
+    pub fn commit_supplemental_and_projection_with_audit(
+        &self,
+        record: &SupplementalRecord,
+        projection: &lethe_core::domain::ProjectionRef,
+        manifest: &serde_json::Value,
+        item_delta: &ProjectionItemCommit,
+        audit_events: &[lethe_storage_api::AuditEventRecord],
+    ) -> Result<(), PersistenceError> {
         validate_projection_key(projection)?;
         let ProjectionItemCommit::Delta {
             inserts,
@@ -1349,7 +1439,7 @@ impl SqlitePersistence {
             .map_err(projection_item_validation_error)?;
 
         let supplemental_json = serde_json::to_string(record)?;
-        let manifest_json = serde_json::to_string(manifest)?;
+        let manifest_json = "{}";
         let materialized_at = chrono::Utc::now().to_rfc3339();
         let transaction = self.conn.unchecked_transaction()?;
         insert_new_supplemental(&transaction, record, &supplemental_json)?;
@@ -1363,6 +1453,10 @@ impl SqlitePersistence {
                 materialized_at = excluded.materialized_at",
             params![projection.as_str(), manifest_json, materialized_at],
         )?;
+        upsert_manifest_fields(&transaction, projection, manifest)?;
+        for audit in audit_events {
+            insert_audit_event(&transaction, audit)?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -1387,7 +1481,7 @@ impl SqlitePersistence {
                 "projection item staging expected count does not fit usize".to_owned(),
             )
         })?;
-        let manifest_json = serde_json::to_string(manifest)?;
+        let manifest_json = "{}";
         let materialized_at = chrono::Utc::now().to_rfc3339();
         let transaction = self.conn.unchecked_transaction()?;
         let staging_exists = transaction.query_row(
@@ -1442,6 +1536,7 @@ impl SqlitePersistence {
                 materialized_at = excluded.materialized_at",
             params![target.as_str(), manifest_json, materialized_at],
         )?;
+        upsert_manifest_fields(&transaction, target, manifest)?;
         let deleted_staging_items = transaction.execute(
             "DELETE FROM projection_materialization_items WHERE projection_id = ?1",
             [staging.as_str()],
@@ -1461,6 +1556,10 @@ impl SqlitePersistence {
                 staging.as_str()
             )));
         }
+        transaction.execute(
+            "DELETE FROM projection_manifest_fields WHERE projection_id = ?1",
+            [staging.as_str()],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -1629,7 +1728,7 @@ impl SqlitePersistence {
                 "SQLite quick_check failed: {integrity}"
             )));
         }
-        self.load_partition_tree()?;
+        self.partition_tree_snapshot()?;
         Ok(())
     }
 
@@ -1707,12 +1806,38 @@ impl SqlitePersistence {
         actor: &str,
         event_json: &str,
     ) -> Result<(), PersistenceError> {
-        self.conn.execute(
-            "INSERT INTO audit_events (id, timestamp, actor, event_json)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![id, timestamp, actor, event_json],
-        )?;
+        let audit = lethe_storage_api::AuditEventRecord {
+            id: id.to_owned(),
+            timestamp: timestamp.to_owned(),
+            actor: actor.to_owned(),
+            event_json: event_json.to_owned(),
+        };
+        insert_audit_event_connection(&self.conn, &audit)?;
         Ok(())
+    }
+
+    pub fn audit_event_page(
+        &self,
+        after_timestamp: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, PersistenceError> {
+        if limit == 0 {
+            return Err(PersistenceError::SchemaInvariant(
+                "audit event page limit must be greater than zero".to_owned(),
+            ));
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT event_json
+             FROM audit_events
+             WHERE ?1 IS NULL OR timestamp > ?1
+             ORDER BY timestamp, id
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![after_timestamp, limit], |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(PersistenceError::from)
     }
 
     pub fn record_sync_metrics(
@@ -1804,6 +1929,15 @@ impl SqliteOperationalEventStore {
                 )?;
             }
         }
+        persistence.conn.execute(
+            "INSERT OR IGNORE INTO operational_event_stats (
+                data_space_id, event_count, max_cursor
+             )
+             SELECT ?1, COUNT(*), COALESCE(MAX(cursor), 0)
+             FROM operational_events
+             WHERE data_space_id = ?1",
+            [data_space_id.as_str()],
+        )?;
         Ok(Self {
             persistence,
             data_space_id,
@@ -1848,7 +1982,7 @@ impl OperationalEventStore for SqliteOperationalEventStore {
 
         let tree = self
             .persistence
-            .load_partition_tree()
+            .partition_tree_snapshot()
             .map_err(Self::storage_error)?;
         let transaction = self
             .persistence
@@ -1976,6 +2110,15 @@ impl OperationalEventStore for SqliteOperationalEventStore {
                 )
                 .map_err(Self::storage_error)?;
             let cursor = transaction.last_insert_rowid() as u64;
+            transaction
+                .execute(
+                    "UPDATE operational_event_stats
+                     SET event_count = event_count + 1,
+                         max_cursor = MAX(max_cursor, ?2)
+                     WHERE data_space_id = ?1",
+                    params![self.data_space_id.as_str(), cursor],
+                )
+                .map_err(Self::storage_error)?;
             outcomes.push(OperationalAppendOutcome::Appended {
                 cursor,
                 stream_version: request.event.stream_version,
@@ -1989,8 +2132,8 @@ impl OperationalEventStore for SqliteOperationalEventStore {
         self.persistence
             .conn
             .query_row(
-                "SELECT COUNT(*), COALESCE(MAX(cursor), 0)
-                 FROM operational_events WHERE data_space_id = ?1",
+                "SELECT event_count, max_cursor
+                 FROM operational_event_stats WHERE data_space_id = ?1",
                 [self.data_space_id.as_str()],
                 |row| {
                     Ok(OperationalEventStats {
@@ -2229,6 +2372,14 @@ fn append_observations_in_transaction(
                 json,
             ],
         )?;
+        let append_seq = transaction.last_insert_rowid() as u64;
+        transaction.execute(
+            "UPDATE observation_stats
+             SET observation_count = observation_count + 1,
+                 max_append_seq = MAX(max_append_seq, ?1)
+             WHERE singleton = 1",
+            [append_seq],
+        )?;
         outcomes.push(DurableAppendOutcome::Appended(observation.id.clone()));
     }
     Ok(outcomes)
@@ -2295,6 +2446,89 @@ fn upsert_slack_thread(
             observation_append_seq,
         ],
     )?;
+    Ok(())
+}
+
+fn insert_audit_event(
+    transaction: &rusqlite::Transaction<'_>,
+    audit: &lethe_storage_api::AuditEventRecord,
+) -> Result<(), PersistenceError> {
+    transaction.execute(
+        "INSERT INTO audit_events (id, timestamp, actor, event_json)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![audit.id, audit.timestamp, audit.actor, audit.event_json],
+    )?;
+    Ok(())
+}
+
+fn insert_audit_event_connection(
+    connection: &Connection,
+    audit: &lethe_storage_api::AuditEventRecord,
+) -> Result<(), PersistenceError> {
+    connection.execute(
+        "INSERT INTO audit_events (id, timestamp, actor, event_json)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![audit.id, audit.timestamp, audit.actor, audit.event_json],
+    )?;
+    Ok(())
+}
+
+fn manifest_fields(
+    manifest: &serde_json::Value,
+) -> Result<&serde_json::Map<String, serde_json::Value>, PersistenceError> {
+    manifest.as_object().ok_or_else(|| {
+        PersistenceError::SchemaInvariant("projection manifest must be a JSON object".to_owned())
+    })
+}
+
+fn replace_manifest_fields(
+    transaction: &rusqlite::Transaction<'_>,
+    projection: &lethe_core::domain::ProjectionRef,
+    manifest: &serde_json::Value,
+) -> Result<(), PersistenceError> {
+    transaction.execute(
+        "DELETE FROM projection_manifest_fields WHERE projection_id = ?1",
+        [projection.as_str()],
+    )?;
+    upsert_manifest_fields(transaction, projection, manifest)
+}
+
+fn upsert_manifest_fields(
+    transaction: &rusqlite::Transaction<'_>,
+    projection: &lethe_core::domain::ProjectionRef,
+    manifest: &serde_json::Value,
+) -> Result<(), PersistenceError> {
+    let fields = manifest_fields(manifest)?;
+    let mut existing = transaction
+        .prepare("SELECT field_key FROM projection_manifest_fields WHERE projection_id = ?1")?;
+    let existing_keys = existing
+        .query_map([projection.as_str()], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(existing);
+    for field_key in existing_keys {
+        if !fields.contains_key(&field_key) {
+            transaction.execute(
+                "DELETE FROM projection_manifest_fields
+                 WHERE projection_id = ?1 AND field_key = ?2",
+                params![projection.as_str(), field_key],
+            )?;
+        }
+    }
+    for (field_key, field_value) in fields {
+        transaction.execute(
+            "INSERT INTO projection_manifest_fields (
+                projection_id, field_key, value_json
+             ) VALUES (?1, ?2, ?3)
+             ON CONFLICT(projection_id, field_key) DO UPDATE SET
+                value_json = excluded.value_json
+             WHERE projection_manifest_fields.value_json IS NOT excluded.value_json",
+            params![
+                projection.as_str(),
+                field_key,
+                serde_json::to_string(field_value)?
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -2506,6 +2740,16 @@ impl ObservationStorePort for SqlitePersistence {
             .map_err(storage_error)
     }
 
+    fn append_observations_with_audit(
+        &self,
+        observations: &[Observation],
+        audit_events: &[lethe_storage_api::AuditEventRecord],
+    ) -> StorageResult<Vec<PortAppendOutcome>> {
+        self.append_observations_idempotent_with_audit(observations, audit_events)
+            .map(|outcomes| outcomes.into_iter().map(port_outcome).collect())
+            .map_err(storage_error)
+    }
+
     fn load_observations(&self) -> StorageResult<Vec<Observation>> {
         SqlitePersistence::load_observations(self).map_err(storage_error)
     }
@@ -2630,6 +2874,25 @@ impl SupplementalProjectionCommitterPort for SqlitePersistence {
         )
         .map_err(storage_error)
     }
+
+    fn commit_supplemental_and_projection_with_audit(
+        &self,
+        record: &SupplementalRecord,
+        projection: &lethe_core::domain::ProjectionRef,
+        manifest: &serde_json::Value,
+        item_delta: &ProjectionItemCommit,
+        audit_event: &lethe_storage_api::AuditEventRecord,
+    ) -> StorageResult<()> {
+        SqlitePersistence::commit_supplemental_and_projection_with_audit(
+            self,
+            record,
+            projection,
+            manifest,
+            item_delta,
+            std::slice::from_ref(audit_event),
+        )
+        .map_err(storage_error)
+    }
 }
 
 impl ProjectionMaterializerPort for SqlitePersistence {
@@ -2733,6 +2996,14 @@ impl RuntimeStateStorePort for SqlitePersistence {
             .map_err(storage_error)
     }
 
+    fn audit_event_page(
+        &self,
+        after_timestamp: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<Vec<String>> {
+        SqlitePersistence::audit_event_page(self, after_timestamp, limit).map_err(storage_error)
+    }
+
     fn record_sync_metrics(&self, source: &str, metrics: &SyncMetricRecord) -> StorageResult<()> {
         SqlitePersistence::record_sync_metrics(self, source, metrics).map_err(storage_error)
     }
@@ -2759,6 +3030,22 @@ impl SlackThreadCatalogStorePort for SqlitePersistence {
         SqlitePersistence::append_slack_observation(self, observation, thread)
             .map(port_outcome)
             .map_err(storage_error)
+    }
+
+    fn append_slack_observation_with_audit(
+        &self,
+        observation: &Observation,
+        thread: &SlackThreadKey,
+        audit_events: &[lethe_storage_api::AuditEventRecord],
+    ) -> StorageResult<PortAppendOutcome> {
+        SqlitePersistence::append_slack_observation_with_audit(
+            self,
+            observation,
+            thread,
+            audit_events,
+        )
+        .map(port_outcome)
+        .map_err(storage_error)
     }
 
     fn slack_thread_discovery_high_water(&self) -> StorageResult<u64> {

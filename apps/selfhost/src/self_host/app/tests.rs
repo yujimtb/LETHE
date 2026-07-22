@@ -29,7 +29,6 @@ use lethe_core::domain::{
     SupplementalRecord,
 };
 use lethe_derivation_gemini::GeminiSlideAnalyzer;
-use lethe_policy::governance::audit::InMemoryAuditLog;
 use lethe_runtime::runtime::partition::RoutingKeyOrder;
 use lethe_storage_api::{
     OperationalAppendOutcome, OperationalAppendRequest, SlackThreadKey, StoredObservation,
@@ -292,6 +291,19 @@ fn operational_ledger_survives_interface_service_restart() {
 fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppService {
     let persistence: Arc<Mutex<Box<dyn lethe_storage_api::StoragePorts>>> =
         Arc::new(Mutex::new(Box::new(persistence)));
+    let mut persistence_read_pool = Vec::with_capacity(4);
+    for _ in 0..4 {
+        persistence_read_pool.push(Arc::new(Mutex::new(Box::new(
+            SqlitePersistence::open_with_routing_key_order(
+                &config.database_path,
+                &config.blob_dir,
+                &config.secret_encryption_key,
+                config.routing_key_order,
+            )
+            .unwrap(),
+        )
+            as Box<dyn lethe_storage_api::StoragePorts>)));
+    }
     let corpus_config = config.corpus.projector_config();
     let search_index = super::search_index::SearchIndexManager::bootstrap(
         lethe_search_index::IndexRoot::new(
@@ -302,7 +314,7 @@ fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppSe
         .unwrap(),
         lethe_projection_corpus::CorpusProjector::new(corpus_config),
         config.corpus.rebuild_page_size,
-        Arc::clone(&persistence),
+        Arc::clone(&persistence_read_pool[0]),
     );
     let OperationalLedgerConfig::Sqlite {
         data_space_id,
@@ -323,24 +335,43 @@ fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppSe
             )
             .unwrap(),
         )));
+    let mut operational_ledger_read_pool = Vec::with_capacity(4);
+    for _ in 0..4 {
+        operational_ledger_read_pool.push(Arc::new(Mutex::new(Box::new(
+            SqliteOperationalEventStore::open(
+                data_space_id.clone(),
+                database_path,
+                blob_dir,
+                secret_encryption_key,
+            )
+            .unwrap(),
+        )
+            as Box<dyn lethe_storage_api::OperationalStoragePorts>)));
+    }
     let history_projection = Arc::new(Mutex::new(
         lethe_history::HistoryProjection::rebuild(operational_ledger.lock().unwrap().as_ref())
             .unwrap(),
     ));
-    AppService {
-        core: Arc::new(Mutex::new(
-            AppCore::new_with_config(
-                vec![],
-                vec![],
-                vec![],
-                super::freshness_thresholds(&config),
-                config.channels.clone(),
-            )
-            .unwrap(),
-        )),
+    let core = AppCore::new_with_config(
+        vec![],
+        vec![],
+        vec![],
+        super::freshness_thresholds(&config),
+        config.channels.clone(),
+    )
+    .unwrap();
+    let core_snapshot = Arc::new(arc_swap::ArcSwap::from_pointee(core.clone()));
+    let service = AppService {
+        core: Arc::new(Mutex::new(core)),
+        core_snapshot,
         persistence,
+        persistence_read_pool,
+        persistence_read_next: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         operational_ledger,
+        operational_ledger_read_pool,
+        operational_ledger_read_next: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         history_projection,
+        derived_projection_lane: Arc::new(Mutex::new(())),
         bulk_import_operation: Arc::new(Mutex::new(())),
         search_index,
         config: Arc::new(config.clone()),
@@ -367,11 +398,20 @@ fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppSe
             3,
             std::time::Duration::from_secs(60),
         )),
-        audit_log: Arc::new(InMemoryAuditLog::new()),
+        append_consumer_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        append_consumer_error: Arc::new(Mutex::new(None)),
+        search_index_catch_up_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         non_corpus_rebuild_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         non_corpus_rebuild_error: Arc::new(Mutex::new(None)),
         non_corpus_rebuild_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-    }
+    };
+    service
+        .persistence
+        .lock()
+        .unwrap()
+        .set_state("append_consumer:person-page", "0")
+        .unwrap();
+    service
 }
 
 fn wait_for_search_index_ready(service: &AppService) {
@@ -380,6 +420,52 @@ fn wait_for_search_index_ready(service: &AppService) {
         assert!(
             std::time::Instant::now() < deadline,
             "search index did not become ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn wait_for_append_consumer(service: &AppService) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while service
+        .append_consumer_in_flight
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "append-seq consumer did not complete"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let error = service.append_consumer_error.lock().unwrap().clone();
+    assert!(error.is_none(), "append-seq consumer failed: {error:?}");
+}
+
+fn wait_for_append_consumer_stopped(service: &AppService) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while service
+        .append_consumer_in_flight
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "append-seq consumer did not stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn wait_for_search_index_high_water(service: &AppService, expected: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Ok(metadata) = service.search_index.execute(|index| index.metadata())
+            && metadata.last_append_seq >= expected
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "search index did not reach append sequence {expected}"
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -3384,6 +3470,7 @@ fn bulk_import_session_defers_non_corpus_keeps_corpus_ready_and_rebuilds_once() 
         ),
         Err(SelfHostError::ProjectionStale(_))
     ));
+    wait_for_search_index_high_water(&bulk_service, 4);
     let grep = bulk_service
         .corpus_grep_response(&lethe_api::api::grep::GrepRequest {
             pattern: "Wave2 bulk message 3".to_owned(),
@@ -3624,6 +3711,7 @@ fn bootstrap_recovers_abandoned_bulk_import_session() {
         ),
         Err(SelfHostError::ProjectionStale(_))
     ));
+    wait_for_search_index_high_water(&service, 1);
     drop(service);
 
     let restarted = AppService::bootstrap(config).unwrap();
@@ -3671,6 +3759,7 @@ fn duplicate_bulk_records_do_not_change_incremental_fingerprint() {
         .ingest_observation_drafts(vec![wave2_slack_draft(0)], "slack-test")
         .unwrap();
     assert_eq!(first.ingested, 1);
+    wait_for_append_consumer(&service);
     let (before, before_item_count) = {
         let persistence = service.persistence_lock().unwrap();
         (
@@ -3689,6 +3778,7 @@ fn duplicate_bulk_records_do_not_change_incremental_fingerprint() {
         .unwrap();
     assert_eq!(duplicate.ingested, 0);
     assert_eq!(duplicate.duplicates, 1);
+    wait_for_append_consumer(&service);
     let (after, after_item_count) = {
         let persistence = service.persistence_lock().unwrap();
         (
@@ -3746,17 +3836,23 @@ fn person_message_item_sql_failure_marks_in_memory_projection_stale() {
         .unwrap();
     drop(connection);
 
-    let error = service
+    let report = service
         .ingest_observation_drafts(vec![wave2_slack_draft(1)], "slack-test")
-        .unwrap_err();
+        .unwrap();
+    assert_eq!(report.ingested, 1);
+    wait_for_append_consumer_stopped(&service);
     assert!(
-        matches!(error, SelfHostError::Storage(_)),
-        "unexpected error: {error:?}"
+        service
+            .append_consumer_error
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some()
     );
     let core = service.core_lock().unwrap();
-    assert_eq!(core.observation_stats.count, 1);
-    assert_eq!(core.person_message_count, 1);
-    assert_eq!(core.reply_slo_count, 1);
+    assert_eq!(core.observation_stats.count, 0);
+    assert_eq!(core.person_message_count, 0);
+    assert_eq!(core.reply_slo_count, 0);
     assert_eq!(
         core.catalog
             .get(&ProjectionRef::new("proj:person-page"))
@@ -3772,6 +3868,13 @@ fn person_message_item_sql_failure_marks_in_memory_projection_stale() {
     assert_eq!(persistence.observation_stats().unwrap().count, 1);
     assert!(
         persistence
+            .audit_event_page(None, 100)
+            .unwrap()
+            .iter()
+            .any(|event| event.contains("projection_consumer_failure"))
+    );
+    assert!(
+        persistence
             .projection_records(&ProjectionRef::new("proj:person-page"))
             .unwrap()
             .is_none()
@@ -3784,6 +3887,33 @@ fn person_message_item_sql_failure_marks_in_memory_projection_stale() {
     );
     drop(persistence);
     drop(service);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn read_lane_does_not_wait_for_writer_lane() {
+    let root = std::env::temp_dir().join(format!("lethe-self-host-test-{}", uuid::Uuid::now_v7()));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let config = test_config(db, blobs);
+    let service = test_service(config, persistence);
+    let writer_guard = service.persistence_lock().unwrap();
+    let read_lane = Arc::clone(&service.persistence_read_pool[0]);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let result = read_lane.lock().unwrap().observation_stats();
+        sender.send(result).unwrap();
+    });
+
+    let stats = receiver
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("read lane was blocked by writer lane")
+        .unwrap();
+    assert_eq!(stats.count, 0);
+    drop(writer_guard);
+    reader.join().unwrap();
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -3808,6 +3938,7 @@ fn five_thousand_corpus_only_records_do_not_trigger_full_observation_load() {
     assert_eq!(report.ingested, 5_000);
     assert_eq!(report.duplicates, 0);
     assert_eq!(report.quarantined, 0);
+    wait_for_append_consumer(&service);
     assert_eq!(service.core_lock().unwrap().observation_stats.count, 5_000);
     assert_eq!(
         service
@@ -3829,24 +3960,26 @@ fn five_thousand_wave2_slack_records_use_compact_identity_without_full_load() {
     let mut config = test_config(db, blobs);
     config.corpus.mode = lethe_projection_corpus::CorpusMode::PersonalAllText;
     let service = test_service(config.clone(), persistence);
-    let drafts = (0..5_000).map(wave2_slack_draft).collect();
+    let total = 5_000;
+    let drafts = (0..total).map(wave2_slack_draft).collect();
 
     let report = service
         .ingest_observation_drafts(drafts, "slack-test")
         .unwrap();
 
-    assert_eq!(report.ingested, 5_000);
+    assert_eq!(report.ingested, total);
     assert_eq!(report.duplicates, 0);
     assert_eq!(report.quarantined, 0);
+    wait_for_append_consumer(&service);
     let core = service.core_lock().unwrap();
-    assert_eq!(core.observation_stats.count, 5_000);
+    assert_eq!(core.observation_stats.count, total as u64);
     assert_eq!(core.compact_state.identity.nodes().len(), 100);
     assert_eq!(core.person_components.len(), 100);
     assert!(core.snapshot.identity.resolved_persons.is_empty());
     assert!(core.snapshot.person_page.profiles.is_empty());
     assert!(core.snapshot.person_page.messages.is_empty());
-    assert_eq!(core.person_message_count, 5_000);
-    assert_eq!(core.reply_slo_count, 5_000);
+    assert_eq!(core.person_message_count, total as u64);
+    assert_eq!(core.reply_slo_count, total as u64);
     assert!(core.snapshot.reply_slo.rows.is_empty());
     assert!(core.snapshot.reply_slo.overdue.is_empty());
     let component = core.person_components.values().next().unwrap();
@@ -3867,7 +4000,7 @@ fn five_thousand_wave2_slack_records_use_compact_identity_without_full_load() {
             persistence
                 .projection_item_count(&ProjectionRef::new("proj:person-page"))
                 .unwrap(),
-            15_100
+            (total * 3 + 100) as u64
         );
         assert_eq!(
             persistence
@@ -3876,7 +4009,7 @@ fn five_thousand_wave2_slack_records_use_compact_identity_without_full_load() {
                     super::REPLY_SLO_ITEM_OWNER,
                 )
                 .unwrap(),
-            5_000
+            total as u64
         );
         let owner_message_count = fact_owners
             .iter()
@@ -3912,7 +4045,7 @@ fn five_thousand_wave2_slack_records_use_compact_identity_without_full_load() {
         timeline.data.as_array().unwrap().len(),
         expected_owner_messages
     );
-    assert_eq!(service.reply_slo_response().unwrap().data.rows.len(), 5_000);
+    assert_eq!(service.reply_slo_response().unwrap().data.rows.len(), total);
     assert_eq!(
         service
             .non_corpus_rebuild_count
@@ -3927,8 +4060,8 @@ fn five_thousand_wave2_slack_records_use_compact_identity_without_full_load() {
     let restarted_core = restarted.core_lock().unwrap();
     assert_eq!(restarted_core.snapshot.built_at, built_at);
     assert!(restarted_core.snapshot.person_page.messages.is_empty());
-    assert_eq!(restarted_core.person_message_count, 5_000);
-    assert_eq!(restarted_core.reply_slo_count, 5_000);
+    assert_eq!(restarted_core.person_message_count, total as u64);
+    assert_eq!(restarted_core.reply_slo_count, total as u64);
     assert!(restarted_core.snapshot.reply_slo.rows.is_empty());
     assert!(restarted_core.snapshot.reply_slo.overdue.is_empty());
     drop(restarted_core);
@@ -3950,7 +4083,7 @@ fn five_thousand_wave2_slack_records_use_compact_identity_without_full_load() {
     );
     assert_eq!(
         restarted.reply_slo_response().unwrap().data.rows.len(),
-        5_000
+        total
     );
     drop(restarted);
 

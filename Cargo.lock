@@ -1740,6 +1740,7 @@ dependencies = [
 name = "lethe-selfhost"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "axum",
  "base64",
  "chrono",
@@ -1815,6 +1816,7 @@ name = "lethe-storage-sqlite"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "arc-swap",
  "chrono",
  "hex",
  "lethe-core",

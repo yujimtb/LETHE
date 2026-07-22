@@ -4,6 +4,10 @@ use super::*;
 impl AppService {
     pub fn sync_all(&self) -> Result<SyncReport, SelfHostError> {
         let _bulk_import_operation = self.bulk_import_operation_lock()?;
+        let _derived_lane = self
+            .derived_projection_lane
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?;
         self.ensure_bulk_import_session_inactive("source sync")?;
         let started_at = std::time::Instant::now();
         let mut slack_ingested = 0usize;
@@ -307,7 +311,7 @@ impl AppService {
 
         let last_sync_at = Utc::now();
         let slide_obs_by_presentation = self.latest_workspace_slide_observations()?;
-        let mut core = self.core_lock()?;
+        let mut core = (*self.core_snapshot()).clone();
         core.last_sync_at = Some(last_sync_at);
         core.last_sync_error = None;
         let slide_analysis_records: Vec<lethe_core::domain::SupplementalRecord> = core
@@ -767,7 +771,10 @@ impl AppService {
             Some(format!("{} item(s) failed", dead_letters.len()))
         };
         let latency_ms = core.sync_metrics.latency_ms;
-        drop(core);
+        let mut live_core = self.core_lock()?;
+        *live_core = core;
+        self.publish_core_snapshot(&live_core);
+        drop(live_core);
         {
             let store = self.persistence_lock()?;
             for dead_letter in &dead_letters {

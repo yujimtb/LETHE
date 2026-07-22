@@ -26,6 +26,12 @@ impl SqlitePersistence {
                 canonical_json_sha256 TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS observation_stats (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                observation_count INTEGER NOT NULL CHECK (observation_count >= 0),
+                max_append_seq INTEGER NOT NULL CHECK (max_append_seq >= 0)
+            );
+
             CREATE TABLE IF NOT EXISTS operational_data_space (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 data_space_id TEXT NOT NULL CHECK (length(trim(data_space_id)) > 0)
@@ -120,6 +126,13 @@ impl SqlitePersistence {
                 PRIMARY KEY (projection_id, item_key)
             );
 
+            CREATE TABLE IF NOT EXISTS projection_manifest_fields (
+                projection_id TEXT NOT NULL,
+                field_key TEXT NOT NULL CHECK (length(trim(field_key)) > 0),
+                value_json TEXT NOT NULL,
+                PRIMARY KEY (projection_id, field_key)
+            );
+
             CREATE INDEX IF NOT EXISTS projection_materialization_items_owner_order
                 ON projection_materialization_items (
                     projection_id,
@@ -151,6 +164,15 @@ impl SqlitePersistence {
                 timestamp TEXT NOT NULL,
                 actor TEXT NOT NULL,
                 event_json TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS audit_events_timestamp_id
+                ON audit_events(timestamp, id);
+
+            CREATE TABLE IF NOT EXISTS operational_event_stats (
+                data_space_id TEXT PRIMARY KEY CHECK (length(trim(data_space_id)) > 0),
+                event_count INTEGER NOT NULL CHECK (event_count >= 0),
+                max_cursor INTEGER NOT NULL CHECK (max_cursor >= 0)
             );
 
             CREATE TABLE IF NOT EXISTS sync_metrics (
@@ -273,10 +295,57 @@ impl SqlitePersistence {
             "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
             params![
                 CURRENT_SCHEMA_VERSION,
-                "global_observation_identity_registry",
+                "append_commit_lock_split_scalars",
                 chrono::Utc::now().to_rfc3339(),
             ],
         )?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO observation_stats (
+                singleton, observation_count, max_append_seq
+             )
+             SELECT 1, COUNT(*), COALESCE(MAX(append_seq), 0) FROM observations",
+            [],
+        )?;
+        self.backfill_projection_manifest_fields()?;
+        Ok(())
+    }
+
+    fn backfill_projection_manifest_fields(&self) -> Result<(), PersistenceError> {
+        let mut statement = self.conn.prepare(
+            "SELECT projection_id, records_json
+             FROM projection_materializations
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM projection_manifest_fields fields
+                 WHERE fields.projection_id = projection_materializations.projection_id
+             )",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let pending = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for (projection_id, records_json) in pending {
+            let value: serde_json::Value = serde_json::from_str(&records_json)?;
+            let object = value.as_object().ok_or_else(|| {
+                PersistenceError::SchemaInvariant(format!(
+                    "projection {projection_id} manifest must be a JSON object"
+                ))
+            })?;
+            let transaction = self.conn.unchecked_transaction()?;
+            for (field_key, field_value) in object {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO projection_manifest_fields (
+                        projection_id, field_key, value_json
+                     ) VALUES (?1, ?2, ?3)",
+                    params![
+                        projection_id,
+                        field_key,
+                        serde_json::to_string(field_value)?
+                    ],
+                )?;
+            }
+            transaction.commit()?;
+        }
         Ok(())
     }
 
