@@ -133,7 +133,23 @@ IngestResult
   | Duplicate { existingId: ObservationId }
   | Rejected { error: ValidationFailure | PolicyFailure }
   | Quarantined { ticket: QuarantineTicket }
+
 ```
+
+Ingestion API v2 (POST /api/v2/import/observation-drafts) はこの domain result
+を次の wire result へ 1 対 1 で写像する。input order と client_ref を保持し、
+件数は summary に付随する集計値であって per-item result の代替ではない。
+
+| Domain / storage result | Wire outcome | Wire identity field |
+|---|---|---|
+| Ingested { id } / DurableAppendOutcome::Appended(id) | ingested | observation_id=id |
+| Duplicate { existingId } / Duplicate(existingId) | duplicate | existing_id=existingId |
+| Quarantined { ticket } / CanonicalCollision(existingId) | quarantined | existing_id, ticket, error_code=canonical_collision |
+| Rejected { class, message } | rejected | failure_class, error_code, reason |
+
+v1 (POST /api/import/observation-drafts) の既存 summary と request-level error
+semantics は凍結し、v2 の partial success と strict identity validation は
+v2 endpoint でのみ有効にする。
 
 ---
 

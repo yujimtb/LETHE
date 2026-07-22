@@ -370,6 +370,7 @@ impl GitHubDumpMapper {
             attachments: vec![],
             published,
             idempotency_key,
+            client_ref: None,
             meta: serde_json::json!({
                 "sourceAdapterVersion": self.adapter_version.as_str(),
                 "source_container": repo,

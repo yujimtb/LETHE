@@ -20,6 +20,12 @@ impl SqlitePersistence {
                 UNIQUE (leaf_id, identity_key)
             );
 
+            CREATE TABLE IF NOT EXISTS observation_identity_registry (
+                identity_key TEXT PRIMARY KEY,
+                observation_id TEXT NOT NULL UNIQUE,
+                canonical_json_sha256 TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS operational_data_space (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 data_space_id TEXT NOT NULL CHECK (length(trim(data_space_id)) > 0)
@@ -267,7 +273,7 @@ impl SqlitePersistence {
             "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
             params![
                 CURRENT_SCHEMA_VERSION,
-                "canonical_json_sha256_backfill",
+                "global_observation_identity_registry",
                 chrono::Utc::now().to_rfc3339(),
             ],
         )?;
@@ -317,6 +323,8 @@ impl SqlitePersistence {
             self.rebuild_observations_with_current_columns()?;
             columns = self.observation_columns()?;
         }
+
+        self.backfill_global_identity_registry()?;
 
         self.require_observation_columns(&columns)
     }
@@ -497,6 +505,19 @@ impl SqlitePersistence {
             ",
         )?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    fn backfill_global_identity_registry(&self) -> Result<(), PersistenceError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO observation_identity_registry (
+                identity_key, observation_id, canonical_json_sha256
+             )
+             SELECT identity_key, id, canonical_json_sha256
+             FROM observations
+             ORDER BY append_seq",
+            [],
+        )?;
         Ok(())
     }
 

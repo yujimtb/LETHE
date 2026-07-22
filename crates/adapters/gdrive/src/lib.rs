@@ -173,6 +173,7 @@ impl<C: GoogleDriveClient> GoogleDriveAdapter<C> {
             attachments: vec![],
             published: file.modified_time,
             idempotency_key: identity_key("google-drive", &object_id, &canonical_json),
+            client_ref: None,
             meta: serde_json::json!({
                 "sourceAdapterVersion": self.config.adapter_version.as_str(),
                 OBJECT_ID_META_KEY: object_id,

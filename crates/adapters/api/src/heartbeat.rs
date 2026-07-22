@@ -51,6 +51,7 @@ pub fn heartbeat_draft(
         attachments: vec![],
         published: now,
         idempotency_key: heartbeat_key(observer_name, &window),
+        client_ref: None,
         meta: serde_json::json!({}),
     }
 }

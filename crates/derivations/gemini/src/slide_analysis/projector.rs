@@ -218,6 +218,7 @@ impl SlideAnalysisProjector {
             attachments: vec![],
             published: result.analyzed_at,
             idempotency_key: idem_key,
+            client_ref: None,
             meta: serde_json::json!({
                 "projector_version": "1.0.0",
             }),

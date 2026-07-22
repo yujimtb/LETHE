@@ -88,6 +88,7 @@ impl GmailAdapter {
             attachments: vec![],
             published,
             idempotency_key: identity.idempotency_key,
+            client_ref: None,
             meta: serde_json::json!({
                 "sourceAdapterVersion": self.config.adapter_version.as_str(),
                 OBJECT_ID_META_KEY: identity.object_id,

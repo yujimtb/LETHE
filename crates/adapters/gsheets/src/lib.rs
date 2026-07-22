@@ -170,6 +170,7 @@ impl<C: GoogleSheetsClient> GoogleSheetsAdapter<C> {
             attachments: vec![],
             published: sheet.modified_time,
             idempotency_key: identity_key("google-sheets", &object_id, &canonical_json),
+            client_ref: None,
             meta: serde_json::json!({
                 "sourceAdapterVersion": self.config.adapter_version.as_str(),
                 OBJECT_ID_META_KEY: object_id,

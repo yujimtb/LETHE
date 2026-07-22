@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
+use lethe_adapter_api::idempotency::identity_key;
 use lethe_adapter_api::retry::ResilientExecutor;
 use lethe_adapter_api::traits::ObservationDraft;
 use lethe_adapter_gslides::gslides::client::{PresentationNative, SlideNative, SlideRevision};
@@ -10,7 +11,7 @@ use lethe_adapter_slack::slack::mapper::SlackAdapter;
 use lethe_core::domain::supplemental::InputAnchorSet;
 
 use super::{
-    AppCore, AppService, GoogleSourceRuntime, SelfHostError, SlackSourceRuntime,
+    AppCore, AppService, GoogleSourceRuntime, ImportOutcome, SelfHostError, SlackSourceRuntime,
     classify_slack_ingress, discovered_slack_threads, extract_slide_text_fragments,
     infer_profile_name_from_fragments, latest_revision_to_capture, namespace_draft,
     non_empty_state, ranked_self_intro_slide_indices, thread_root_ts,
@@ -61,6 +62,7 @@ fn source_instance_namespace_separates_identical_source_keys() {
         attachments: vec![],
         published: Utc::now(),
         idempotency_key: IdempotencyKey::new("same-key"),
+        client_ref: None,
         meta: serde_json::json!({
             "canonical_json": "{}",
             "source_container": "same-container",
@@ -1170,6 +1172,7 @@ fn ingest_draft_duplicate_is_decided_by_persistence_without_cache_append() {
         attachments: vec![],
         published: Utc::now(),
         idempotency_key: IdempotencyKey::new("slack:C01ABC:dup-ts"),
+        client_ref: None,
         meta: serde_json::json!({
             "canonical_json": serde_json::json!({
                 "source": "slack",
@@ -1998,6 +2001,7 @@ fn freshness_only_draft(key: &str) -> ObservationDraft {
         attachments: vec![],
         published: Utc::now(),
         idempotency_key: IdempotencyKey::new(key),
+        client_ref: None,
         meta: serde_json::json!({
             "canonical_json": serde_json::json!({
                 "source": "claude-ai",
@@ -3107,6 +3111,7 @@ fn wave2_slack_draft(index: usize) -> ObservationDraft {
         attachments: vec![],
         published: Utc::now(),
         idempotency_key: IdempotencyKey::new(format!("slack:C01ABC:{key}")),
+        client_ref: None,
         meta: serde_json::json!({
             "canonical_json": serde_json::json!({
                 "sender": user_id,
@@ -3120,6 +3125,164 @@ fn wave2_slack_draft(index: usize) -> ObservationDraft {
             "communication_thread_ref": format!("slack:thread:{key}"),
         }),
     }
+}
+
+fn v2_slack_draft(index: usize, published: chrono::DateTime<Utc>) -> ObservationDraft {
+    let mut draft = wave2_slack_draft(index);
+    let key = format!("{index:010}.000001");
+    let object_id = format!("channel:C01ABC:ts:{key}");
+    let canonical_json = draft
+        .meta
+        .get("canonical_json")
+        .and_then(serde_json::Value::as_str)
+        .expect("wave2 fixture must contain canonical_json")
+        .to_owned();
+    let meta = draft.meta.as_object_mut().unwrap();
+    meta.insert("object_id".to_owned(), serde_json::json!(object_id));
+    draft.idempotency_key = identity_key("slack-test", &object_id, &canonical_json);
+    draft.published = published;
+    draft.client_ref = Some(format!("client-{index}"));
+    draft
+}
+
+#[test]
+fn v2_import_returns_per_item_results_and_keeps_valid_items_on_quarantine() {
+    let root = std::env::temp_dir().join(format!("lethe-v2-import-{}", uuid::Uuid::now_v7()));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let service = test_service(test_config(db, blobs), persistence);
+    let now = Utc::now();
+    let mut drafts = (0..9)
+        .map(|index| v2_slack_draft(index, now - chrono::Duration::minutes(1)))
+        .collect::<Vec<_>>();
+    drafts.push(v2_slack_draft(9, now + chrono::Duration::minutes(11)));
+
+    let report = service
+        .ingest_observation_drafts_v2(drafts, "slack-test")
+        .unwrap();
+
+    assert_eq!(report.results.len(), 10);
+    assert_eq!(report.ingested, 9);
+    assert_eq!(report.quarantined, 1);
+    assert_eq!(report.rejected, 0);
+    assert!(
+        report
+            .results
+            .iter()
+            .take(9)
+            .all(|result| result.outcome == ImportOutcome::Ingested)
+    );
+    assert_eq!(report.results[9].outcome, ImportOutcome::Quarantined);
+    assert_eq!(
+        report.results[9].error_code.as_deref(),
+        Some("clock_skew_future")
+    );
+    assert!(report.results[9].ticket.is_some());
+    assert_eq!(
+        service
+            .persistence_lock()
+            .unwrap()
+            .observation_stats()
+            .unwrap()
+            .count,
+        9
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn v2_identity_is_server_validated_and_retry_time_does_not_change_identity() {
+    let root = std::env::temp_dir().join(format!("lethe-v2-identity-{}", uuid::Uuid::now_v7()));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let service = test_service(test_config(db, blobs), persistence);
+    let first = v2_slack_draft(10, Utc::now() - chrono::Duration::minutes(2));
+    let retry = v2_slack_draft(10, Utc::now() - chrono::Duration::minutes(1));
+
+    let report = service
+        .ingest_observation_drafts_v2(vec![first, retry], "slack-test")
+        .unwrap();
+
+    assert_eq!(report.results[0].outcome, ImportOutcome::Ingested);
+    assert_eq!(report.results[1].outcome, ImportOutcome::Duplicate);
+    assert_eq!(
+        report.results[0].observation_id,
+        report.results[1].existing_id
+    );
+    assert_eq!(report.summary.ingested, 1);
+    assert_eq!(report.summary.duplicates, 1);
+
+    let mut mismatched = v2_slack_draft(11, Utc::now() - chrono::Duration::minutes(1));
+    mismatched.idempotency_key = IdempotencyKey::new("client-controlled-key");
+    let report = service
+        .ingest_observation_drafts_v2(vec![mismatched], "slack-test")
+        .unwrap();
+    assert_eq!(report.results[0].outcome, ImportOutcome::Rejected);
+    assert_eq!(
+        report.results[0].error_code.as_deref(),
+        Some("identity_mismatch")
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn v2_payload_limit_is_an_item_error_with_actual_and_maximum() {
+    let root =
+        std::env::temp_dir().join(format!("lethe-v2-payload-limit-{}", uuid::Uuid::now_v7()));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let mut config = test_config(db, blobs);
+    config.resource_limits.max_payload_bytes = 1;
+    let service = test_service(config, persistence);
+
+    let report = service
+        .ingest_observation_drafts_v2(
+            vec![v2_slack_draft(0, Utc::now() - chrono::Duration::minutes(1))],
+            "slack-test",
+        )
+        .unwrap();
+
+    assert_eq!(report.ingested, 0);
+    assert_eq!(report.rejected, 1);
+    assert_eq!(
+        report.results[0].error_code.as_deref(),
+        Some("payload_too_large")
+    );
+    assert_eq!(
+        report.results[0]
+            .details
+            .as_ref()
+            .and_then(|details| details.get("max_bytes"))
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn v2_transient_failures_are_machine_classified() {
+    let result = super::transient_item(
+        "client-transient".to_owned(),
+        "storage temporarily unavailable".to_owned(),
+        serde_json::json!({"stage": "durable_append"}),
+    );
+
+    assert_eq!(result.outcome, ImportOutcome::Rejected);
+    assert_eq!(
+        result.failure_class,
+        Some(super::ImportFailureClass::Transient)
+    );
+    assert_eq!(result.error_code.as_deref(), Some("transient_failure"));
+    assert_eq!(
+        super::error_code_for_failure(lethe_core::domain::FailureClass::RetryableEffectFailure),
+        "transient_failure"
+    );
 }
 
 fn normalized_non_corpus_manifest(mut value: serde_json::Value) -> serde_json::Value {
@@ -3874,6 +4037,7 @@ fn ingest_observation_drafts_enforces_payload_limit_before_bulk_append() {
         attachments: vec![],
         published: Utc::now(),
         idempotency_key: IdempotencyKey::new("slack:C01ABC:too-large"),
+        client_ref: None,
         meta: serde_json::json!({
             "canonical_json": serde_json::json!({
                 "source": "slack",

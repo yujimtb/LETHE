@@ -78,6 +78,7 @@ impl BackboneRecord {
             attachments: vec![],
             published: self.published,
             idempotency_key,
+            client_ref: None,
             meta: serde_json::json!({
                 "sourceAdapterVersion": adapter_version.as_str(),
                 "coding_agent_source": config.source_key,

@@ -137,6 +137,7 @@ impl<C: SlackClient> SlackAdapter<C> {
             attachments,
             published,
             idempotency_key: identity.idempotency_key,
+            client_ref: None,
             meta,
         })
     }
@@ -173,6 +174,7 @@ impl<C: SlackClient> SlackAdapter<C> {
             attachments: vec![],
             published: snap.snapshot_at,
             idempotency_key: idem_key,
+            client_ref: None,
             meta: serde_json::json!({
                 "sourceAdapterVersion": self.config.adapter_version.as_str(),
             }),

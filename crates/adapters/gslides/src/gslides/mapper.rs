@@ -141,6 +141,7 @@ impl<C: GoogleSlidesClient> GoogleSlidesAdapter<C> {
             attachments,
             published: revision.modified_time,
             idempotency_key: idem_key,
+            client_ref: None,
             meta: serde_json::json!({
                 "sourceAdapterVersion": self.config.adapter_version.as_str(),
                 OBJECT_ID_META_KEY: object_id,
