@@ -284,6 +284,63 @@ fn identity_registry_is_global_across_routing_time_changes() {
 }
 
 #[test]
+fn identity_lookup_and_legacy_fallback_use_indexes() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let store =
+        SqlitePersistence::open(&tmp.join("test.sqlite3"), &tmp.join("blobs"), &[7; 32]).unwrap();
+
+    let registry_plan = explain_query_plan(
+        &store,
+        "SELECT r.observation_id, r.canonical_json_sha256, o.observation_json
+         FROM observation_identity_registry r
+         JOIN observations o ON o.id = r.observation_id
+         WHERE r.identity_key = ?1",
+    );
+    assert_no_table_scan(&registry_plan, "observation_identity_registry");
+    assert_no_table_scan(&registry_plan, "observations");
+
+    let fallback_plan = explain_query_plan(
+        &store,
+        "SELECT id, canonical_json_sha256, observation_json
+         FROM observations
+         WHERE identity_key = ?1
+         ORDER BY append_seq
+         LIMIT 1",
+    );
+    assert!(
+        fallback_plan
+            .iter()
+            .any(|detail| detail.contains("observations_identity_append")),
+        "legacy identity fallback must use observations_identity_append: {fallback_plan:?}"
+    );
+    assert_no_table_scan(&fallback_plan, "observations");
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+fn explain_query_plan(store: &SqlitePersistence, sql: &str) -> Vec<String> {
+    let mut statement = store
+        .conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap();
+    statement
+        .query_map([""], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn assert_no_table_scan(plan: &[String], table: &str) {
+    assert!(
+        !plan.iter().any(|detail| {
+            detail.contains(&format!("SCAN {table}"))
+                || detail.contains(&format!("SCAN {} ", table))
+        }),
+        "query plan unexpectedly scans {table}: {plan:?}"
+    );
+}
+
+#[test]
 fn bulk_idempotent_append_uses_one_transaction_and_preserves_outcomes() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let db = tmp.join("test.sqlite3");
