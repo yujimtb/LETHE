@@ -170,7 +170,7 @@ fn durable_append_and_audit_enqueue_commit_or_rollback_as_one_transaction() {
     assert_eq!(store.observation_stats().unwrap().count, 1);
     assert_eq!(
         store.audit_event_page(None, 10).unwrap(),
-        vec![audit.event_json.clone()]
+        vec![audit.clone()]
     );
 
     let second = sample_observation_with_identity("append-2", "second");
@@ -184,6 +184,49 @@ fn durable_append_and_audit_enqueue_commit_or_rollback_as_one_transaction() {
     );
     assert_eq!(store.observation_stats().unwrap().count, 1);
     assert!(store.observation_by_id(&second.id).unwrap().is_none());
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn audit_event_page_uses_timestamp_and_id_keyset_at_boundary() {
+    let tmp = std::env::temp_dir().join(format!("lethe-audit-page-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    let timestamp = "2026-07-23T00:00:00Z";
+
+    for id in ["audit:1", "audit:2", "audit:3"] {
+        store
+            .record_audit_event(
+                id,
+                timestamp,
+                "actor:test",
+                &serde_json::json!({"id": id}).to_string(),
+            )
+            .unwrap();
+    }
+
+    let first_page = store.audit_event_page(None, 2).unwrap();
+    assert_eq!(
+        first_page
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["audit:1", "audit:2"]
+    );
+    let cursor = lethe_storage_api::AuditEventCursor {
+        timestamp: first_page.last().unwrap().timestamp.clone(),
+        id: first_page.last().unwrap().id.clone(),
+    };
+    let second_page = store.audit_event_page(Some(&cursor), 2).unwrap();
+    assert_eq!(
+        second_page
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["audit:3"]
+    );
 
     let _ = fs::remove_dir_all(tmp);
 }

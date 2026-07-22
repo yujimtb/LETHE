@@ -1819,23 +1819,33 @@ impl SqlitePersistence {
 
     pub fn audit_event_page(
         &self,
-        after_timestamp: Option<&str>,
+        after: Option<&lethe_storage_api::AuditEventCursor>,
         limit: usize,
-    ) -> Result<Vec<String>, PersistenceError> {
+    ) -> Result<Vec<lethe_storage_api::AuditEventRecord>, PersistenceError> {
         if limit == 0 {
             return Err(PersistenceError::SchemaInvariant(
                 "audit event page limit must be greater than zero".to_owned(),
             ));
         }
+        let (after_timestamp, after_id) = after.map_or((None, None), |cursor| {
+            (Some(cursor.timestamp.as_str()), Some(cursor.id.as_str()))
+        });
         let mut statement = self.conn.prepare(
-            "SELECT event_json
+            "SELECT id, timestamp, actor, event_json
              FROM audit_events
-             WHERE ?1 IS NULL OR timestamp > ?1
+             WHERE ?1 IS NULL
+                OR timestamp > ?1
+                OR (timestamp = ?1 AND id > ?2)
              ORDER BY timestamp, id
-             LIMIT ?2",
+             LIMIT ?3",
         )?;
-        let rows = statement.query_map(params![after_timestamp, limit], |row| {
-            row.get::<_, String>(0)
+        let rows = statement.query_map(params![after_timestamp, after_id, limit], |row| {
+            Ok(lethe_storage_api::AuditEventRecord {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                actor: row.get(2)?,
+                event_json: row.get(3)?,
+            })
         })?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(PersistenceError::from)
@@ -2999,10 +3009,10 @@ impl RuntimeStateStorePort for SqlitePersistence {
 
     fn audit_event_page(
         &self,
-        after_timestamp: Option<&str>,
+        after: Option<&lethe_storage_api::AuditEventCursor>,
         limit: usize,
-    ) -> StorageResult<Vec<String>> {
-        SqlitePersistence::audit_event_page(self, after_timestamp, limit).map_err(storage_error)
+    ) -> StorageResult<Vec<lethe_storage_api::AuditEventRecord>> {
+        SqlitePersistence::audit_event_page(self, after, limit).map_err(storage_error)
     }
 
     fn record_sync_metrics(&self, source: &str, metrics: &SyncMetricRecord) -> StorageResult<()> {

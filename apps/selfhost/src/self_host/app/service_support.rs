@@ -270,9 +270,13 @@ impl AppService {
                     if let Ok(mut rebuild_error) = service.non_corpus_rebuild_error.lock() {
                         *rebuild_error = Some(error.to_string());
                     }
-                    if let Ok(mut core) = service.core_lock() {
-                        core.mark_non_corpus_materializations_stale();
-                        service.publish_core_snapshot(&core);
+                    if let Err(mark_error) =
+                        service.mark_live_core_non_corpus_materializations_stale()
+                    {
+                        tracing::error!(
+                            error = %mark_error,
+                            "failed to mark non-corpus materializations stale"
+                        );
                     }
                 }
                 service
@@ -282,11 +286,26 @@ impl AppService {
         if let Err(error) = spawn_result {
             self.non_corpus_rebuild_in_flight
                 .store(false, std::sync::atomic::Ordering::Release);
+            let _derived_lane = self
+                .derived_projection_lane
+                .lock()
+                .map_err(|_| SelfHostError::LockPoisoned)?;
             core.mark_non_corpus_materializations_stale();
             return Err(SelfHostError::Ingestion(format!(
                 "failed to spawn background non-corpus materialization: {error}"
             )));
         }
+        Ok(())
+    }
+
+    fn mark_live_core_non_corpus_materializations_stale(&self) -> Result<(), SelfHostError> {
+        let _derived_lane = self
+            .derived_projection_lane
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?;
+        let mut core = self.core_lock()?;
+        core.mark_non_corpus_materializations_stale();
+        self.publish_core_snapshot(&core);
         Ok(())
     }
 
@@ -372,21 +391,6 @@ impl AppService {
         ))
     }
 
-    #[allow(dead_code)]
-    pub(super) fn materialize_after_observation_append(
-        &self,
-        core: &mut AppCore,
-        appended_observations: &[Observation],
-    ) -> Result<(), SelfHostError> {
-        let stats = self.persistence_read_lock()?.observation_stats()?;
-        self.materialize_after_observation_append_with_stats(
-            core,
-            appended_observations,
-            stats,
-            None,
-        )
-    }
-
     fn materialize_after_observation_append_with_stats(
         &self,
         core: &mut AppCore,
@@ -394,7 +398,7 @@ impl AppService {
         stats: ObservationStats,
         appended_fact_sequences: Option<&BTreeMap<String, u64>>,
     ) -> Result<(), SelfHostError> {
-        let result = (|| match classify_non_corpus_delta_with_reason(appended_observations).kind {
+        (|| match classify_non_corpus_delta_with_reason(appended_observations).kind {
             NonCorpusDeltaKind::NoOp | NonCorpusDeltaKind::DeclaredSchemaSkip => {
                 core.observation_stats = stats;
                 Ok(())
@@ -448,11 +452,7 @@ impl AppService {
                 }
                 Ok(())
             }
-        })();
-        if result.is_err() {
-            core.mark_non_corpus_materializations_stale();
-        }
-        result
+        })()
     }
 
     pub(super) fn ingest_draft(
@@ -887,9 +887,12 @@ impl AppService {
             let result = service.run_append_consumer();
             if let Err(error) = result {
                 tracing::error!(error = %error, "append-seq consumer failed");
-                if let Ok(mut core) = service.core_lock() {
-                    core.mark_non_corpus_materializations_stale();
-                    service.publish_core_snapshot(&core);
+                if let Err(mark_error) = service.mark_live_core_non_corpus_materializations_stale()
+                {
+                    tracing::error!(
+                        error = %mark_error,
+                        "failed to mark non-corpus materializations stale"
+                    );
                 }
                 if let Ok(mut state) = service.append_consumer_error.lock() {
                     *state = Some(error.to_string());

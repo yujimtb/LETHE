@@ -83,3 +83,9 @@ canonical Observation ledger は append-only の正本で、projection は破棄
 ## Open Questions(オーナー確定が必要)
 
 1. **Q2 同期必須 audit の操作リスト(細部):** commit 境界内で同期 enqueue を必須とする保護操作の具体リスト(全保護操作 / write 系のみ / 認可 deny を含むか)。durability を広げるほど commit 境界コストが増える。方式(commit 境界内・同期・fail-closed)は確定済みで、残るのは対象操作の粒度のみ。
+
+## Review fixes (2026-07-23)
+
+- `derived_projection_lane` は派生 consumer の snapshot 全置換 writeback と、bulk 開始／deferred append／consumer failure の stale 公開を同一 lane で直列化する。bulk end やその他の full-core writeback も publish 時にこの lane を保持する。
+- audit page は `(timestamp, id)` の複合 keyset cursor と、cursor を再利用できる `AuditEventRecord` を返す。wire v1/v2 応答は変更しない。
+- 応答経路から外れた `materialize_after_observation_append` は削除し、同等の回帰確認は append-seq consumer の実経路で行う。実使用中の `ImportTimingStage` から不要な dead-code 抑制属性も削除する。

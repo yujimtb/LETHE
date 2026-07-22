@@ -1912,30 +1912,18 @@ fn non_corpus_delta_classification_uses_declared_incremental_folds_im03() {
 }
 
 #[test]
-fn observation_import_timer_records_each_stage_duration() {
+fn observation_import_timer_records_commit_stage_duration() {
     let mut timer = super::ObservationImportTimer::new();
     timer.record_stage(
         super::ImportTimingStage::LedgerAppend,
         std::time::Duration::from_millis(11),
     );
-    timer.record_stage(
-        super::ImportTimingStage::NonCorpusMaterialize,
-        std::time::Duration::from_millis(22),
-    );
-    timer.record_stage(
-        super::ImportTimingStage::SearchIndexCatchUp,
-        std::time::Duration::from_millis(33),
-    );
-    timer.record_stage(
-        super::ImportTimingStage::Audit,
-        std::time::Duration::from_millis(44),
-    );
 
     let timing = timer.finish();
     assert_eq!(timing.ledger_append_ms, 11);
-    assert_eq!(timing.non_corpus_materialize_ms, 22);
-    assert_eq!(timing.search_index_catch_up_ms, 33);
-    assert_eq!(timing.audit_ms, 44);
+    assert_eq!(timing.non_corpus_materialize_ms, 0);
+    assert_eq!(timing.search_index_catch_up_ms, 0);
+    assert_eq!(timing.audit_ms, 0);
 }
 
 #[test]
@@ -3631,11 +3619,9 @@ fn bulk_import_session_defers_non_corpus_keeps_corpus_ready_and_rebuilds_once() 
             .unwrap()
             .append_observation(observation)
             .unwrap();
-        let mut core = reference_service.core_lock().unwrap();
-        reference_service
-            .materialize_after_observation_append(&mut core, std::slice::from_ref(observation))
-            .unwrap();
     }
+    reference_service.trigger_append_consumer();
+    wait_for_append_consumer(&reference_service);
 
     let bulk_manifest = normalized_non_corpus_manifest(
         bulk_service
@@ -3683,6 +3669,76 @@ fn bulk_import_session_defers_non_corpus_keeps_corpus_ready_and_rebuilds_once() 
     drop(bulk_service);
     let _ = std::fs::remove_dir_all(reference_root);
     let _ = std::fs::remove_dir_all(bulk_root);
+}
+
+#[test]
+fn bulk_stale_publication_waits_for_derived_projection_lane() {
+    fn assert_waits_for_lane<F, T>(service: &AppService, operation: F) -> T
+    where
+        F: FnOnce(AppService) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let lane = service.derived_projection_lane.lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_service = service.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx.send(operation(worker_service)).unwrap();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("lane test worker did not start");
+
+        let early_result = done_rx.recv_timeout(std::time::Duration::from_millis(100));
+        let completed_while_lane_held = early_result.is_ok();
+        drop(lane);
+        let result = match early_result {
+            Ok(result) => result,
+            Err(_) => done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("lane test worker did not finish after lane release"),
+        };
+        worker.join().unwrap();
+        assert!(
+            !completed_while_lane_held,
+            "stale publication completed while derived lane was held"
+        );
+        result
+    }
+
+    let root = std::env::temp_dir().join(format!(
+        "lethe-derived-lane-stale-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let service = test_service(test_config(db, blobs), persistence);
+
+    let session =
+        assert_waits_for_lane(&service, |service| service.begin_bulk_import_session()).unwrap();
+    let legacy_session_id = session.session_id.clone();
+    assert_waits_for_lane(&service, move |service| {
+        service.ingest_observation_drafts_with_session(
+            vec![wave2_slack_draft(0)],
+            "slack-test",
+            Some(&legacy_session_id),
+        )
+    })
+    .unwrap();
+    let v2_session_id = session.session_id.clone();
+    assert_waits_for_lane(&service, move |service| {
+        service.ingest_observation_drafts_v2_with_session(
+            vec![v2_slack_draft(1, Utc::now())],
+            "slack-test",
+            Some(&v2_session_id),
+        )
+    })
+    .unwrap();
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3960,7 +4016,7 @@ fn person_message_item_sql_failure_marks_in_memory_projection_stale() {
             .audit_event_page(None, 100)
             .unwrap()
             .iter()
-            .any(|event| event.contains("projection_consumer_failure"))
+            .any(|event| event.event_json.contains("projection_consumer_failure"))
     );
     assert!(
         persistence

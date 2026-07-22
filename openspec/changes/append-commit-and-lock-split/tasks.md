@@ -1,7 +1,7 @@
 ## 1. commit 境界と派生分離
 
 - [x] 1.1 [Spec Designer] `commit-ack-boundary` CAB-01 の commit 境界(canonical append + per-item ID + 最小 durable audit/outbox marker)を確定し、ingestion-api-contract IRC-04 の ACK 宣言との対応表を文書化する(参照: `mod.rs:5478-5556`)。受入: 境界に含む / 含まないの区分が一意に定まり、IRC-04 の宣言と矛盾しないことを確認する。
-- [x] 1.2 [Implementer] CAB-01 に従い取り込み応答を commit 境界成功で確定し、projection materialize・検索 index catch-up・遅延 audit を応答経路から外す(`service_support.rs::materialize_after_observation_append`)。受入: 応答経路が commit 境界のみを含み、派生処理完了を待たないテストが通る。
+- [x] 1.2 [Implementer] CAB-01 に従い取り込み応答を commit 境界成功で確定し、projection materialize・検索 index catch-up・遅延 audit を応答経路から外す(`service_support.rs::run_append_consumer`)。受入: 応答経路が commit 境界のみを含み、派生処理完了を待たないテストが通る。
 - [x] 1.3 [Implementer] CAB-02/CAB-03 に従い派生処理を append-seq(cursor / high-water)consumer として駆動し、request 成否・duplicate 判定に依存させない。派生失敗は canonical 台帳の専用エラーイベント + projection health で surface する(旧 Q4 確定)。受入: 派生失敗が outcome を反転せず台帳エラーイベント + health で surface し、duplicate 応答後も未消費 append-seq を consumer が追いつくテストが通る。
 
 ## 2. lock lane 分割

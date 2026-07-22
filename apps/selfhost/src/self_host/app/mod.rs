@@ -653,12 +653,8 @@ fn validate_projection_fold_declarations(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 enum ImportTimingStage {
     LedgerAppend,
-    NonCorpusMaterialize,
-    SearchIndexCatchUp,
-    Audit,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -689,13 +685,6 @@ impl ObservationImportTimer {
             .expect("observation import stage duration does not fit u64 milliseconds");
         match stage {
             ImportTimingStage::LedgerAppend => self.timing.ledger_append_ms = elapsed_ms,
-            ImportTimingStage::NonCorpusMaterialize => {
-                self.timing.non_corpus_materialize_ms = elapsed_ms;
-            }
-            ImportTimingStage::SearchIndexCatchUp => {
-                self.timing.search_index_catch_up_ms = elapsed_ms;
-            }
-            ImportTimingStage::Audit => self.timing.audit_ms = elapsed_ms,
         }
     }
 
@@ -5676,11 +5665,16 @@ impl AppService {
             non_corpus_rebuild_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         if requires_background_rebuild {
-            let mut core = service.core_lock()?;
             if !had_persisted_manifest {
+                let _derived_lane = service
+                    .derived_projection_lane
+                    .lock()
+                    .map_err(|_| SelfHostError::LockPoisoned)?;
+                let mut core = service.core_lock()?;
                 core.mark_non_corpus_materializations_stale();
                 service.publish_core_snapshot(&core);
             }
+            let mut core = service.core_lock()?;
             service.refresh_materialized_snapshot_with_reason(
                 &mut core,
                 if had_persisted_manifest {
@@ -6170,6 +6164,10 @@ impl AppService {
             if request_had_canonical_attempt {
                 if let Some(session) = bulk_session.clone() {
                     self.record_deferred_bulk_import_append(session)?;
+                    let _derived_lane = self
+                        .derived_projection_lane
+                        .lock()
+                        .map_err(|_| SelfHostError::LockPoisoned)?;
                     let mut core = self.core_lock()?;
                     core.mark_non_corpus_materializations_stale();
                     self.publish_core_snapshot(&core);
@@ -6457,6 +6455,10 @@ impl AppService {
                             "v2 import deferred-materialization bookkeeping failed after durable append"
                         );
                     }
+                    let _derived_lane = self
+                        .derived_projection_lane
+                        .lock()
+                        .map_err(|_| SelfHostError::LockPoisoned)?;
                     let mut core = self.core_lock()?;
                     core.mark_non_corpus_materializations_stale();
                     self.publish_core_snapshot(&core);

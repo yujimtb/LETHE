@@ -211,6 +211,10 @@ impl AppService {
             persist_bulk_import_session(persistence.as_ref(), &session)?;
             session
         };
+        let _derived_lane = self
+            .derived_projection_lane
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?;
         let mut live_core = self.core_lock()?;
         live_core.mark_non_corpus_materializations_stale();
         self.publish_core_snapshot(&live_core);
@@ -282,7 +286,12 @@ impl AppService {
             session
         };
 
+        let _derived_lane = self
+            .derived_projection_lane
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?;
         core.mark_non_corpus_materializations_stale();
+        drop(_derived_lane);
         self.search_index.catch_up_after_append()?;
         let person_page_ref = ProjectionRef::new("proj:person-page");
         let non_corpus_ready = core.catalog.get(&person_page_ref).is_some_and(|entry| {
@@ -314,6 +323,10 @@ impl AppService {
             persist_bulk_import_session(self.persistence_lock()?.as_ref(), &session)
         })();
         if let Err(error) = ready_result {
+            let _derived_lane = self
+                .derived_projection_lane
+                .lock()
+                .map_err(|_| SelfHostError::LockPoisoned)?;
             core.mark_non_corpus_materializations_stale();
             let mut live_core = self.core_lock()?;
             *live_core = core;
@@ -323,6 +336,10 @@ impl AppService {
         if target_already_materialized {
             core.activate_non_corpus_projections();
         }
+        let _derived_lane = self
+            .derived_projection_lane
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?;
         let mut live_core = self.core_lock()?;
         *live_core = core;
         self.publish_core_snapshot(&live_core);

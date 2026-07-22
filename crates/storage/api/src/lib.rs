@@ -440,6 +440,12 @@ pub struct AuditEventRecord {
     pub event_json: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditEventCursor {
+    pub timestamp: String,
+    pub id: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum RehomeMode {
     StoredIdentity,
@@ -713,9 +719,9 @@ pub trait RuntimeStateStore: Send {
     ) -> StorageResult<()>;
     fn audit_event_page(
         &self,
-        after_timestamp: Option<&str>,
+        after: Option<&AuditEventCursor>,
         limit: usize,
-    ) -> StorageResult<Vec<String>>;
+    ) -> StorageResult<Vec<AuditEventRecord>>;
     fn record_sync_metrics(&self, source: &str, metrics: &SyncMetricRecord) -> StorageResult<()>;
     fn apply_retention(&self, retention_days: u32) -> StorageResult<usize>;
     fn garbage_collect_orphan_blobs(&self) -> StorageResult<usize>;
