@@ -366,6 +366,8 @@ fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppSe
             std::time::Duration::from_secs(60),
         )),
         audit_log: Arc::new(InMemoryAuditLog::new()),
+        non_corpus_rebuild_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        non_corpus_rebuild_error: Arc::new(Mutex::new(None)),
         non_corpus_rebuild_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     }
 }
@@ -413,7 +415,7 @@ fn test_channels() -> Vec<lethe_registry::registry::ChannelRecord> {
 }
 
 #[test]
-fn bootstrap_migrates_legacy_manifest_to_v7_without_data_loss() {
+fn bootstrap_migrates_legacy_manifest_to_current_version_without_data_loss() {
     let root = std::env::temp_dir().join(format!("lethe-self-host-test-{}", uuid::Uuid::now_v7()));
     let db = root.join("lethe.sqlite3");
     let blobs = root.join("blobs");
@@ -472,6 +474,7 @@ fn bootstrap_migrates_legacy_manifest_to_v7_without_data_loss() {
     let mut config = test_config(db.clone(), blobs.clone());
     config.corpus.mode = lethe_projection_corpus::CorpusMode::PersonalAllText;
     let service = AppService::bootstrap(config.clone()).unwrap();
+    service.wait_for_non_corpus_rebuild().unwrap();
     assert_eq!(
         service
             .persistence_lock()
@@ -583,6 +586,7 @@ fn bootstrap_migrates_legacy_manifest_to_v7_without_data_loss() {
     drop(service);
 
     let restarted = AppService::bootstrap(config).unwrap();
+    restarted.wait_for_non_corpus_rebuild().unwrap();
     assert_eq!(restarted.search_index.rebuild_started(), 0);
     assert_eq!(restarted.core_lock().unwrap().snapshot.built_at, built_at);
     assert!(
@@ -1262,7 +1266,7 @@ fn materialized_snapshot_selection_is_versioned_strict_and_stats_bound() {
             0
         )
         .unwrap()
-        .is_none()
+        .is_some()
     );
 
     let mut missing_version = value.clone();
@@ -1642,7 +1646,7 @@ fn freshness_only_observation(
 }
 
 #[test]
-fn non_corpus_delta_classification_is_an_explicit_closed_whitelist() {
+fn non_corpus_delta_classification_uses_declared_incremental_folds_im03() {
     let published = chrono::DateTime::parse_from_rfc3339("2026-07-13T00:00:00Z")
         .unwrap()
         .to_utc();
@@ -1670,11 +1674,7 @@ fn non_corpus_delta_classification_is_an_explicit_closed_whitelist() {
     let unknown_classification = super::classify_non_corpus_delta_with_reason(&[unknown]);
     assert_eq!(
         unknown_classification.kind,
-        super::NonCorpusDeltaKind::FullRebuild
-    );
-    assert_eq!(
-        unknown_classification.reason,
-        Some(super::NonCorpusDeltaReason::UnsupportedSchema)
+        super::NonCorpusDeltaKind::DeclaredSchemaSkip
     );
 
     let mut reply_relevant = freshness_only_observation(
@@ -1696,12 +1696,13 @@ fn non_corpus_delta_classification_is_an_explicit_closed_whitelist() {
     let reply_slo_classification = super::classify_non_corpus_delta_with_reason(&[reply_relevant]);
     assert_eq!(
         reply_slo_classification.kind,
-        super::NonCorpusDeltaKind::FullRebuild
+        super::NonCorpusDeltaKind::Communication
     );
     assert_eq!(
-        reply_slo_classification.reason,
-        Some(super::NonCorpusDeltaReason::ReplySloRequired)
+        reply_slo_classification.materialization_mode(),
+        "incremental"
     );
+    assert_eq!(reply_slo_classification.kind_as_str(), "communication");
 
     let missing_slack_user_id = freshness_only_observation(
         "schema:slack-message",
@@ -1713,12 +1714,23 @@ fn non_corpus_delta_classification_is_an_explicit_closed_whitelist() {
         super::classify_non_corpus_delta_with_reason(&[missing_slack_user_id]);
     assert_eq!(
         slack_classification.kind,
-        super::NonCorpusDeltaKind::FullRebuild
+        super::NonCorpusDeltaKind::SlackMessage
     );
+    let empty_classification = super::classify_non_corpus_delta_with_reason(&[]);
+    assert_eq!(empty_classification.kind, super::NonCorpusDeltaKind::NoOp);
     assert_eq!(
-        slack_classification.reason,
-        Some(super::NonCorpusDeltaReason::SlackUserIdMissing)
+        empty_classification.materialization_mode(),
+        "not_applicable"
     );
+    assert_eq!(empty_classification.kind_as_str(), "no_op");
+    assert_eq!(unknown_classification.materialization_mode(), "incremental");
+    assert_eq!(unknown_classification.kind_as_str(), "declared_schema_skip");
+    let registry = super::seed_registry();
+    super::validate_projection_fold_declarations(&registry, super::PROJECTION_FOLD_DECLARATIONS)
+        .unwrap();
+    let drifted =
+        &super::PROJECTION_FOLD_DECLARATIONS[..super::PROJECTION_FOLD_DECLARATIONS.len() - 1];
+    assert!(super::validate_projection_fold_declarations(&registry, drifted).is_err());
 }
 
 #[test]
@@ -1765,6 +1777,35 @@ fn observation_import_timing_log_declares_required_fields() {
     ] {
         assert!(fields.contains(&required), "missing log field {required}");
     }
+}
+
+#[test]
+fn communication_message_keeps_freshness_and_reply_projection_cp04() {
+    let published = Utc::now();
+    let mut observation = freshness_only_observation(
+        "schema:gmail-message",
+        "sys:gmail",
+        "cp04-message",
+        published,
+    );
+    observation.meta["communication_channel_id"] = serde_json::json!("chan:gmail");
+    observation.meta["communication_sender_id"] = serde_json::json!("sender@example.test");
+    observation.meta["communication_thread_ref"] = serde_json::json!("gmail:thread:cp04");
+    observation.meta["communication"] = serde_json::json!({
+        "reply_due_at": (published + chrono::Duration::hours(1)).to_rfc3339()
+    });
+    let snapshot = super::ProjectionSnapshot::build(
+        vec![observation],
+        vec![],
+        vec![super::FreshnessThreshold {
+            source_id: "chan:gmail".to_owned(),
+            max_age_seconds: 300,
+        }],
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(snapshot.freshness.sources.len(), 1);
+    assert_eq!(snapshot.reply_slo.rows.len(), 1);
 }
 
 fn apply_projection_item_commit(
@@ -2907,7 +2948,7 @@ fn wave2_slack_incremental_materialization_matches_normalized_full_rebuild() {
     ];
     assert_eq!(
         super::classify_non_corpus_delta_with_reason(&appended).kind,
-        super::NonCorpusDeltaKind::SlackMessage
+        super::NonCorpusDeltaKind::Communication
     );
     let initial_materialized = super::MaterializedProjectionSnapshot::build_at(
         initial.clone(),
@@ -3749,6 +3790,63 @@ fn five_thousand_wave2_slack_records_use_compact_identity_without_full_load() {
         5_000
     );
     drop(restarted);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn communication_import_latency_p95_is_bounded_without_full_rebuild_im07() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-communication-p95-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let mut config = test_config(db, blobs);
+    config.corpus.mode = lethe_projection_corpus::CorpusMode::PersonalAllText;
+    let service = test_service(config, persistence);
+    let mut previous_target = 0;
+    for target in [500, 2_500, 5_000] {
+        let seed = (previous_target..target)
+            .map(|index| freshness_only_draft(&format!("p95-seed-{index:05}")))
+            .collect::<Vec<_>>();
+        service.ingest_observation_drafts(seed, "p95-seed").unwrap();
+
+        let mut samples = Vec::new();
+        for index in 0..10 {
+            let published = Utc::now();
+            let mut draft = freshness_only_draft(&format!("p95-communication-{target}-{index}"));
+            draft.published = published;
+            draft.meta["communication_channel_id"] = serde_json::json!("chan:p95");
+            draft.meta["communication_sender_id"] = serde_json::json!("sender:p95");
+            draft.meta["communication_thread_ref"] =
+                serde_json::json!(format!("thread:p95:{target}:{index}"));
+            draft.meta["communication"] = serde_json::json!({
+                "reply_due_at": (published + chrono::Duration::hours(1)).to_rfc3339(),
+            });
+            let started = std::time::Instant::now();
+            service
+                .ingest_observation_drafts(vec![draft], "p95-communication")
+                .unwrap();
+            samples.push(started.elapsed());
+        }
+        samples.sort_unstable();
+        let p95_index = (samples.len() * 95).div_ceil(100) - 1;
+        assert!(
+            samples[p95_index] < std::time::Duration::from_secs(2),
+            "communication import p95 at {target} observations was {:?}",
+            samples[p95_index]
+        );
+        previous_target = target;
+    }
+    assert_eq!(
+        service
+            .non_corpus_rebuild_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "normal communication imports must not start a full rebuild"
+    );
 
     let _ = std::fs::remove_dir_all(root);
 }

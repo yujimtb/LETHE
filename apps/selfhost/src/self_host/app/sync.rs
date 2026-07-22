@@ -310,7 +310,6 @@ impl AppService {
         let mut core = self.core_lock()?;
         core.last_sync_at = Some(last_sync_at);
         core.last_sync_error = None;
-        let should_rebuild_snapshot = slack_ingested > 0 || google_ingested > 0;
         let slide_analysis_records: Vec<lethe_core::domain::SupplementalRecord> = core
             .supplemental
             .by_kind("slide-analysis")
@@ -734,7 +733,7 @@ impl AppService {
         let retained_observations = self
             .persistence_lock()?
             .apply_retention(self.config.resource_limits.retention_days)?;
-        if should_rebuild_snapshot || slide_analyses > 0 || retained_observations > 0 {
+        if slide_analyses > 0 || retained_observations > 0 {
             let materialize_result = self.refresh_materialized_snapshot(&mut core);
             let index_result = self.search_index.catch_up_after_append();
             if let Err(error) = materialize_result {

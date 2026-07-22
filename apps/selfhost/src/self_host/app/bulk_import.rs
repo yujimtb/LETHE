@@ -180,28 +180,6 @@ pub(super) fn persist_bulk_import_session(
     Ok(())
 }
 
-pub(super) fn recover_bulk_import_session_after_bootstrap(
-    persistence: &dyn StoragePorts,
-    stats: ObservationStats,
-) -> Result<(), SelfHostError> {
-    let Some(mut session) = load_persisted_bulk_import_session(persistence)? else {
-        return Ok(());
-    };
-    if !session.is_active() {
-        return Ok(());
-    }
-    let recovered_phase = session.phase;
-    session.complete(stats, Utc::now())?;
-    persist_bulk_import_session(persistence, &session)?;
-    tracing::warn!(
-        session_id = %session.session_id,
-        ?recovered_phase,
-        target_append_seq = stats.max_append_seq,
-        "recovered abandoned bulk import session after non-corpus bootstrap catch-up"
-    );
-    Ok(())
-}
-
 impl AppService {
     pub(super) fn bulk_import_operation_lock(
         &self,
@@ -304,11 +282,20 @@ impl AppService {
 
         core.mark_non_corpus_materializations_stale();
         self.search_index.catch_up_after_append()?;
-        let target_already_materialized = core.observation_stats.max_append_seq
-            == session.target_append_seq
+        let person_page_ref = ProjectionRef::new("proj:person-page");
+        let non_corpus_ready = core.catalog.get(&person_page_ref).is_some_and(|entry| {
+            entry.status == ProjectionStatus::Active && entry.health == ProjectionHealth::Healthy
+        }) && !self
+            .non_corpus_rebuild_in_flight
+            .load(std::sync::atomic::Ordering::Acquire);
+        let target_already_materialized = non_corpus_ready
+            && core.observation_stats.max_append_seq == session.target_append_seq
             && core.observation_stats.count == session.target_observation_count;
         if !target_already_materialized {
             self.refresh_materialized_snapshot(&mut core)?;
+            drop(core);
+            self.wait_for_non_corpus_rebuild()?;
+            core = self.core_lock()?;
         }
 
         let ready_result = (|| {
