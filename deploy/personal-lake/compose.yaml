@@ -4,6 +4,7 @@ services:
       context: ../..
       dockerfile: apps/selfhost/Dockerfile
     environment:
+      RUST_LOG: info
       LETHE_CONFIG_PATH: /etc/lethe/config.toml
       LETHE_STORAGE_ENCRYPTION_KEY: ${LETHE_STORAGE_ENCRYPTION_KEY:?}
       LETHE_OPERATIONAL_STORAGE_ENCRYPTION_KEY: ${LETHE_OPERATIONAL_STORAGE_ENCRYPTION_KEY:?}
