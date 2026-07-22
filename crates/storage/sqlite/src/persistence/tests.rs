@@ -71,6 +71,9 @@ fn replace_with_legacy_canonical_json_observations_table(
             "
             DROP INDEX IF EXISTS observations_leaf_append;
             DROP TABLE observations;
+            DELETE FROM schema_migrations WHERE version >= 9;
+            INSERT INTO schema_migrations (version, name, applied_at)
+            VALUES (8, 'global_observation_identity_registry', '2026-07-22T00:00:00Z');
             CREATE TABLE observations (
                 append_seq INTEGER PRIMARY KEY AUTOINCREMENT,
                 id TEXT NOT NULL UNIQUE,
@@ -325,6 +328,63 @@ fn identity_registry_is_global_across_routing_time_changes() {
 }
 
 #[test]
+fn identity_lookup_and_legacy_fallback_use_indexes() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let store =
+        SqlitePersistence::open(&tmp.join("test.sqlite3"), &tmp.join("blobs"), &[7; 32]).unwrap();
+
+    let registry_plan = explain_query_plan(
+        &store,
+        "SELECT r.observation_id, r.canonical_json_sha256, o.observation_json
+         FROM observation_identity_registry r
+         JOIN observations o ON o.id = r.observation_id
+         WHERE r.identity_key = ?1",
+    );
+    assert_no_table_scan(&registry_plan, "observation_identity_registry");
+    assert_no_table_scan(&registry_plan, "observations");
+
+    let fallback_plan = explain_query_plan(
+        &store,
+        "SELECT id, canonical_json_sha256, observation_json
+         FROM observations
+         WHERE identity_key = ?1
+         ORDER BY append_seq
+         LIMIT 1",
+    );
+    assert!(
+        fallback_plan
+            .iter()
+            .any(|detail| detail.contains("observations_identity_append")),
+        "legacy identity fallback must use observations_identity_append: {fallback_plan:?}"
+    );
+    assert_no_table_scan(&fallback_plan, "observations");
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+fn explain_query_plan(store: &SqlitePersistence, sql: &str) -> Vec<String> {
+    let mut statement = store
+        .conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap();
+    statement
+        .query_map([""], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn assert_no_table_scan(plan: &[String], table: &str) {
+    assert!(
+        !plan.iter().any(|detail| {
+            detail.contains(&format!("SCAN {table}"))
+                || detail.contains(&format!("SCAN {} ", table))
+        }),
+        "query plan unexpectedly scans {table}: {plan:?}"
+    );
+}
+
+#[test]
 fn bulk_idempotent_append_uses_one_transaction_and_preserves_outcomes() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let db = tmp.join("test.sqlite3");
@@ -542,6 +602,144 @@ fn migration_ledger_records_current_schema_version() {
 }
 
 #[test]
+fn schema_v10_converges_from_fresh_v9_and_v8_upgrade_paths() {
+    let fresh_tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let fresh = SqlitePersistence::open(
+        &fresh_tmp.join("test.sqlite3"),
+        &fresh_tmp.join("blobs"),
+        &[7; 32],
+    )
+    .unwrap();
+    let fresh_signature = schema_object_signature(&fresh);
+    let current_ledger = vec![
+        (
+            SCHEMA_VERSION_IDENTITY_LOOKUP_INDEX,
+            "observation_identity_lookup_index".to_owned(),
+        ),
+        (
+            CURRENT_SCHEMA_VERSION,
+            "append_commit_lock_split_scalars".to_owned(),
+        ),
+    ];
+    assert_eq!(migration_ledger(&fresh), current_ledger.clone());
+    drop(fresh);
+
+    let v9_tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    {
+        let seed = SqlitePersistence::open(
+            &v9_tmp.join("test.sqlite3"),
+            &v9_tmp.join("blobs"),
+            &[7; 32],
+        )
+        .unwrap();
+        seed.append_observation_idempotent(&sample_observation())
+            .unwrap();
+        seed.conn
+            .execute_batch(
+                "
+                DROP TABLE operational_event_stats;
+                DROP INDEX audit_events_timestamp_id;
+                DROP TABLE projection_manifest_fields;
+                DROP TABLE observation_stats;
+                DELETE FROM schema_migrations WHERE version = 10;
+                ",
+            )
+            .unwrap();
+    }
+    let v9 = SqlitePersistence::open(
+        &v9_tmp.join("test.sqlite3"),
+        &v9_tmp.join("blobs"),
+        &[7; 32],
+    )
+    .unwrap();
+    assert_eq!(schema_object_signature(&v9), fresh_signature);
+    assert_eq!(migration_ledger(&v9), current_ledger);
+    assert_eq!(v9.observation_stats().unwrap().count, 1);
+    drop(v9);
+
+    let v8_tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    {
+        let seed = SqlitePersistence::open(
+            &v8_tmp.join("test.sqlite3"),
+            &v8_tmp.join("blobs"),
+            &[7; 32],
+        )
+        .unwrap();
+        seed.append_observation_idempotent(&sample_observation())
+            .unwrap();
+        seed.conn
+            .execute_batch(
+                "
+                DROP INDEX observations_identity_append;
+                DROP TABLE operational_event_stats;
+                DROP INDEX audit_events_timestamp_id;
+                DROP TABLE projection_manifest_fields;
+                DROP TABLE observation_stats;
+                DELETE FROM schema_migrations WHERE version >= 9;
+                INSERT INTO schema_migrations (version, name, applied_at)
+                VALUES (8, 'global_observation_identity_registry', '2026-07-22T00:00:00Z');
+                ",
+            )
+            .unwrap();
+    }
+    let v8 = SqlitePersistence::open(
+        &v8_tmp.join("test.sqlite3"),
+        &v8_tmp.join("blobs"),
+        &[7; 32],
+    )
+    .unwrap();
+    assert_eq!(schema_object_signature(&v8), fresh_signature);
+    assert_eq!(
+        migration_ledger(&v8),
+        vec![
+            (8, "global_observation_identity_registry".to_owned()),
+            (
+                SCHEMA_VERSION_IDENTITY_LOOKUP_INDEX,
+                "observation_identity_lookup_index".to_owned(),
+            ),
+            (
+                CURRENT_SCHEMA_VERSION,
+                "append_commit_lock_split_scalars".to_owned(),
+            ),
+        ]
+    );
+    assert_eq!(v8.observation_stats().unwrap().count, 1);
+
+    let _ = fs::remove_dir_all(fresh_tmp);
+    let _ = fs::remove_dir_all(v9_tmp);
+    let _ = fs::remove_dir_all(v8_tmp);
+}
+
+fn migration_ledger(store: &SqlitePersistence) -> Vec<(i64, String)> {
+    let mut statement = store
+        .conn
+        .prepare("SELECT version, name FROM schema_migrations ORDER BY version")
+        .unwrap();
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn schema_object_signature(store: &SqlitePersistence) -> Vec<(String, String, String)> {
+    let mut statement = store
+        .conn
+        .prepare(
+            "SELECT type, name, sql
+             FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_%'
+             ORDER BY type, name",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+#[test]
 fn open_migrates_legacy_canonical_json_column_and_keeps_bulk_dedupe_idempotent() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let db = tmp.join("test.sqlite3");
@@ -627,6 +825,9 @@ fn schema_v8_backfill_keeps_oldest_cross_leaf_identity_duplicate() {
             DROP INDEX IF EXISTS observations_leaf_append;
             DROP TABLE observations;
             DROP TABLE observation_identity_registry;
+            DELETE FROM schema_migrations WHERE version >= 9;
+            INSERT INTO schema_migrations (version, name, applied_at)
+            VALUES (8, 'global_observation_identity_registry', '2026-07-22T00:00:00Z');
             CREATE TABLE observations (
                 append_seq INTEGER PRIMARY KEY AUTOINCREMENT,
                 id TEXT NOT NULL UNIQUE,

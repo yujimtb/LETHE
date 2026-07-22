@@ -112,6 +112,8 @@ Lake を物理分割（sharding）する場合の routing layer・partition rule
 
 `observations` table は `append_seq INTEGER PRIMARY KEY AUTOINCREMENT` を leaf-local cursor とし、`identity_key TEXT NOT NULL UNIQUE` と `canonical_json_sha256 TEXT NOT NULL` を持ちます。canonical JSON 本文は Observation metadata を正本とします。schema version 7 の起動時 migration は、旧 `canonical_json` 列だけを持つ既存DBに `canonical_json_sha256` を追加し、canonical JSON の SHA-256 をバッチ backfill してから現行shapeへ表を再構築します。self-host の通常 ingest は SQLite INSERT を先に行い、成功した行だけを in-memory Lake cache に反映します。`identity_key` UNIQUE 違反時は digest と canonical JSON 本文を exact compare し、`Duplicate(existing_id)` / collision quarantine を分けます。
 
+schema version 9 は `(identity_key, append_seq)` の `observations_identity_append` 索引を追加します。schema version 10 は append/operational の保存済み high-water scalar、projection manifest の per-field 表、監査 page query 用索引を追加します。fresh install は v9→v10、既存 v9 は v10、既存 v8 は v9→v10 の順で適用し、いずれも同一の最終 schema になります。
+
 Slack thread discovery は schema version 6 の `slack_thread_catalog` と `slack_thread_catalog_state` を使います。catalog key は `(source_instance, channel_id, thread_ts)`、discovery cursor は canonical `append_seq` の global high-water です。Slack message append と thread upsert、または backfill page の catalog upsert と high-water 更新は、それぞれ同じ SQLite transaction で commit します。通常 poll は high-water より後の Observation tail と indexed active/due queue だけを処理します。新規 reply があった thread は次世代も active、空だった thread は 8 世代後に due とし、古い thread に後から付いた reply も再確認します。
 
 sharding runtime の実装対応:

@@ -185,7 +185,7 @@ async fn append_operational_events(
     headers: HeaderMap,
     Json(request): Json<AppendOperationalEventsRequest>,
 ) -> Result<Json<AppendOperationalEventsResponse>, ApiError> {
-    service.authorize_headers(&headers, "write:operational")?;
+    authorize_headers_blocking(service.clone(), headers, "write:operational").await?;
     if request.requests.is_empty() {
         return Err(ApiError::unprocessable_entity(
             "operational_append_empty",
@@ -203,7 +203,7 @@ async fn operational_event_stats(
     State(service): State<AppService>,
     headers: HeaderMap,
 ) -> Result<Json<OperationalEventStats>, ApiError> {
-    service.authorize_headers(&headers, "read:operational")?;
+    authorize_headers_blocking(service.clone(), headers, "read:operational").await?;
     let stats = tokio::task::spawn_blocking(move || service.operational_event_stats())
         .await
         .map_err(|error| ApiError::internal(error.to_string()))??;
@@ -215,7 +215,7 @@ async fn operational_event_page(
     headers: HeaderMap,
     Query(query): Query<OperationalCursorQuery>,
 ) -> Result<Json<OperationalEventPageResponse>, ApiError> {
-    service.authorize_headers(&headers, "read:operational")?;
+    authorize_headers_blocking(service.clone(), headers, "read:operational").await?;
     service.validate_operational_page_limit(query.limit)?;
     let events = tokio::task::spawn_blocking(move || {
         service.operational_event_page(query.after_cursor, query.limit)
@@ -237,7 +237,7 @@ async fn operational_stream_page(
     Path(stream_id): Path<String>,
     Query(query): Query<OperationalStreamQuery>,
 ) -> Result<Json<OperationalStreamPageResponse>, ApiError> {
-    service.authorize_headers(&headers, "read:operational")?;
+    authorize_headers_blocking(service.clone(), headers, "read:operational").await?;
     service.validate_operational_page_limit(query.limit)?;
     let events = tokio::task::spawn_blocking(move || {
         service.operational_events_for_stream(&stream_id, query.after_stream_version, query.limit)
@@ -258,7 +258,7 @@ async fn operational_event_by_id(
     headers: HeaderMap,
     Path(event_id): Path<String>,
 ) -> Result<Json<StoredOperationalEvent>, ApiError> {
-    service.authorize_headers(&headers, "read:operational")?;
+    authorize_headers_blocking(service.clone(), headers, "read:operational").await?;
     let stored = tokio::task::spawn_blocking(move || {
         service.operational_event_by_id(&OperationalEventId::new(event_id))
     })
@@ -273,7 +273,7 @@ async fn put_operational_blob(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<BlobRef>, ApiError> {
-    service.authorize_headers(&headers, "write:operational")?;
+    authorize_headers_blocking(service.clone(), headers, "write:operational").await?;
     let blob_ref = tokio::task::spawn_blocking(move || service.put_operational_blob(&body))
         .await
         .map_err(|error| ApiError::internal(error.to_string()))??;
@@ -285,7 +285,7 @@ async fn get_operational_blob(
     headers: HeaderMap,
     Path(blob_hash): Path<String>,
 ) -> Result<Response, ApiError> {
-    service.authorize_headers(&headers, "read:operational")?;
+    authorize_headers_blocking(service.clone(), headers, "read:operational").await?;
     let blob_ref = blob_ref_from_hash(&blob_hash).ok_or_else(ApiError::not_found)?;
     let bytes = tokio::task::spawn_blocking(move || service.get_operational_blob(&blob_ref))
         .await
@@ -383,15 +383,32 @@ struct ImportObservationDraftsRequest {
 }
 
 async fn health(State(service): State<AppService>) -> Result<Json<HealthResponse>, ApiError> {
-    Ok(Json(service.health()?))
+    let health = tokio::task::spawn_blocking(move || service.health())
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))??;
+    Ok(Json(health))
+}
+
+async fn authorize_headers_blocking(
+    service: AppService,
+    headers: HeaderMap,
+    required_scope: &'static str,
+) -> Result<(), ApiError> {
+    tokio::task::spawn_blocking(move || service.authorize_headers(&headers, required_scope))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))??;
+    Ok(())
 }
 
 async fn deep_health(
     State(service): State<AppService>,
     headers: HeaderMap,
 ) -> Result<Json<HealthResponse>, ApiError> {
-    service.authorize_headers(&headers, "admin:health")?;
-    Ok(Json(service.deep_health()?))
+    authorize_headers_blocking(service.clone(), headers, "admin:health").await?;
+    let health = tokio::task::spawn_blocking(move || service.deep_health())
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))??;
+    Ok(Json(health))
 }
 
 async fn sync_now(

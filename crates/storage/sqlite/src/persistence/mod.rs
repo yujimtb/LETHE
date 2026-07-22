@@ -62,7 +62,8 @@ pub struct SqliteOperationalEventStore {
     data_space_id: DataSpaceId,
 }
 
-const CURRENT_SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION_IDENTITY_LOOKUP_INDEX: i64 = 9;
+const CURRENT_SCHEMA_VERSION: i64 = 10;
 const CANONICAL_JSON_META_KEY: &str = "canonical_json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
