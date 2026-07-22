@@ -59,7 +59,7 @@ pub struct SqliteOperationalEventStore {
     data_space_id: DataSpaceId,
 }
 
-const CURRENT_SCHEMA_VERSION: i64 = 7;
+const CURRENT_SCHEMA_VERSION: i64 = 8;
 const CANONICAL_JSON_META_KEY: &str = "canonical_json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2150,8 +2150,66 @@ fn append_observations_in_transaction(
                 )
             })?;
         let canonical_json_sha256 = canonical_json_sha256(canonical_json);
+
+        let existing = transaction
+            .query_row(
+                "SELECT r.observation_id, r.canonical_json_sha256, o.observation_json
+                 FROM observation_identity_registry r
+                 JOIN observations o ON o.id = r.observation_id
+                 WHERE r.identity_key = ?1",
+                [identity_key.as_str()],
+                |row| {
+                    Ok((
+                        ObservationId::new(row.get::<_, String>(0)?),
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let mut existing = existing;
+        if existing.is_none() {
+            existing = transaction
+                .query_row(
+                    "SELECT id, canonical_json_sha256, observation_json
+                     FROM observations
+                     WHERE identity_key = ?1
+                     ORDER BY append_seq
+                     LIMIT 1",
+                    [identity_key.as_str()],
+                    |row| {
+                        Ok((
+                            ObservationId::new(row.get::<_, String>(0)?),
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+        }
+        if let Some((existing_id, existing_hash, existing_json)) = existing {
+            let same = existing_hash == canonical_json_sha256
+                && canonical_json_from_observation_json(&existing_json)? == canonical_json;
+            outcomes.push(if same {
+                DurableAppendOutcome::Duplicate(existing_id)
+            } else {
+                DurableAppendOutcome::CanonicalCollision(existing_id)
+            });
+            continue;
+        }
+
+        transaction.execute(
+            "INSERT INTO observation_identity_registry (
+                identity_key, observation_id, canonical_json_sha256
+             ) VALUES (?1, ?2, ?3)",
+            params![
+                identity_key.as_str(),
+                observation.id.as_str(),
+                canonical_json_sha256,
+            ],
+        )?;
         let json = serde_json::to_string(observation)?;
-        let inserted = transaction.execute(
+        transaction.execute(
             "INSERT INTO observations (
                 id,
                 leaf_id,
@@ -2170,40 +2228,8 @@ fn append_observations_in_transaction(
                 observation.recorded_at.to_rfc3339(),
                 json,
             ],
-        );
-
-        let outcome = match inserted {
-            Ok(_) => DurableAppendOutcome::Appended(observation.id.clone()),
-            Err(insert_err) => {
-                let existing = transaction
-                    .query_row(
-                        "SELECT id, canonical_json_sha256, observation_json FROM observations
-                         WHERE leaf_id = ?1 AND identity_key = ?2",
-                        params![leaf_id, identity_key.as_str()],
-                        |row| {
-                            Ok((
-                                ObservationId::new(row.get::<_, String>(0)?),
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                            ))
-                        },
-                    )
-                    .optional()?;
-
-                if let Some((existing_id, existing_hash, existing_json)) = existing {
-                    let same = existing_hash == canonical_json_sha256
-                        && canonical_json_from_observation_json(&existing_json)? == canonical_json;
-                    if same {
-                        DurableAppendOutcome::Duplicate(existing_id)
-                    } else {
-                        DurableAppendOutcome::CanonicalCollision(existing_id)
-                    }
-                } else {
-                    return Err(PersistenceError::Sqlite(insert_err));
-                }
-            }
-        };
-        outcomes.push(outcome);
+        )?;
+        outcomes.push(DurableAppendOutcome::Appended(observation.id.clone()));
     }
     Ok(outcomes)
 }

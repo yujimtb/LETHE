@@ -241,6 +241,49 @@ fn idempotent_append_detects_canonical_json_collision() {
 }
 
 #[test]
+fn identity_registry_is_global_across_routing_time_changes() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let store =
+        SqlitePersistence::open(&tmp.join("test.sqlite3"), &tmp.join("blobs"), &[7; 32]).unwrap();
+    let mut first = sample_observation_with_identity("global-retry", "stable");
+    first.published = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    let mut retry = first.clone();
+    retry.id = Observation::new_id();
+    retry.published = chrono::DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    let mut retry_again = retry.clone();
+    retry_again.id = Observation::new_id();
+    retry_again.published = chrono::DateTime::parse_from_rfc3339("2027-01-01T00:00:00Z")
+        .unwrap()
+        .to_utc();
+
+    store.append_observation_idempotent(&first).unwrap();
+    assert_eq!(
+        store.append_observation_idempotent(&retry).unwrap(),
+        DurableAppendOutcome::Duplicate(first.id.clone())
+    );
+    assert_eq!(
+        store.append_observation_idempotent(&retry_again).unwrap(),
+        DurableAppendOutcome::Duplicate(first.id.clone())
+    );
+    assert_eq!(store.load_observations().unwrap().len(), 1);
+    let registry_count: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM observation_identity_registry WHERE identity_key = ?1",
+            ["global-retry"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(registry_count, 1);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
 fn bulk_idempotent_append_uses_one_transaction_and_preserves_outcomes() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let db = tmp.join("test.sqlite3");
@@ -497,6 +540,15 @@ fn open_migrates_legacy_canonical_json_column_and_keeps_bulk_dedupe_idempotent()
         .and_then(serde_json::Value::as_str)
         .unwrap();
     assert_eq!(stored_hash, canonical_json_sha256(canonical_json));
+    let registry_count: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM observation_identity_registry WHERE identity_key = ?1",
+            [legacy_observation.idempotency_key.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(registry_count, 1);
 
     let mut duplicate = legacy_observation.clone();
     duplicate.id = Observation::new_id();
