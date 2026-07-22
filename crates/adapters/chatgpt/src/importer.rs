@@ -208,6 +208,7 @@ impl ChatGptImporter {
             attachments: vec![],
             published,
             idempotency_key,
+            client_ref: None,
             meta,
         }))
     }

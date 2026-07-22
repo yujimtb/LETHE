@@ -246,6 +246,7 @@ impl<C: GoogleFormsClient> GoogleFormsAdapter<C> {
             attachments: vec![],
             published,
             idempotency_key: identity_key("google-forms", object_id, &canonical_json),
+            client_ref: None,
             meta: serde_json::json!({
                 "sourceAdapterVersion": self.config.adapter_version.as_str(),
                 OBJECT_ID_META_KEY: object_id,

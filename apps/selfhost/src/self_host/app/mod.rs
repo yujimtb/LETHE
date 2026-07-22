@@ -17,6 +17,7 @@ use lethe_adapter_api::config::{
     AdapterConfig, BackoffStrategy, RateLimitConfig, RetryConfig, SchemaBinding,
 };
 use lethe_adapter_api::error::AdapterError;
+use lethe_adapter_api::idempotency::{CANONICAL_JSON_META_KEY, OBJECT_ID_META_KEY, identity_key};
 use lethe_adapter_api::retry::ResilientExecutor;
 use lethe_adapter_api::traits::{ObservationDraft, SourceAdapter};
 use lethe_adapter_gslides::gslides::client::GoogleSlidesClient;
@@ -29,9 +30,10 @@ use lethe_api::api::health::{DependencyHealthInfo, HealthResponse, LastSyncHealt
 use lethe_api::api::pagination::{PaginatedResponse, PaginationParams, paginate};
 use lethe_api::api::read_mode::{ReadModeError, ReadModeResolver};
 use lethe_core::domain::{
-    ActorRef, AuthorityModel, BlobRef, CaptureModel, EntityRef, IngestResult, Observation,
-    ObservationId, ObserverRef, ProjectionHealth, ProjectionRef, ProjectionStatus, ReadMode,
-    SchemaRef, SemVer, SourceSystemRef, SupplementalId, SupplementalRecord,
+    ActorRef, AuthorityModel, BlobRef, CaptureModel, EntityRef, FailureClass, IngestResult,
+    MAX_CLOCK_SKEW, Observation, ObservationId, ObserverRef, ProjectionHealth, ProjectionRef,
+    ProjectionStatus, ReadMode, SchemaRef, SemVer, SourceSystemRef, SupplementalId,
+    SupplementalRecord,
 };
 use lethe_derivation_gemini::{GeminiSlideAnalyzer, SlideAnalysisProjector};
 use lethe_engine::identity::projector::IdentityProjector;
@@ -126,6 +128,12 @@ pub enum SelfHostError {
     LockPoisoned,
     #[error("ingestion rejected: {0}")]
     Ingestion(String),
+    #[error("ingestion request rejected ({code}): {detail}")]
+    IngestionRequest {
+        code: &'static str,
+        detail: String,
+        details: serde_json::Value,
+    },
     #[error("operational ledger startup failed: {0}")]
     OperationalLedger(String),
     #[error("serialization error: {0}")]
@@ -148,6 +156,278 @@ pub struct ImportReport {
     pub ingested: usize,
     pub duplicates: usize,
     pub quarantined: usize,
+    #[serde(default)]
+    pub rejected: usize,
+    #[serde(default)]
+    pub results: Vec<ImportItemResult>,
+    #[serde(default)]
+    pub summary: ImportSummary,
+}
+
+#[derive(Debug)]
+struct PreparedImportObservation {
+    index: usize,
+    client_ref: String,
+    observation: Observation,
+}
+
+#[derive(Debug)]
+struct V2IdentityError {
+    code: &'static str,
+    reason: String,
+    details: Option<serde_json::Value>,
+}
+
+fn derive_v2_identity(
+    mut draft: ObservationDraft,
+    source_instance_id: &str,
+) -> Result<ObservationDraft, V2IdentityError> {
+    let meta = draft.meta.as_object().cloned().unwrap_or_default();
+    let object_id = meta
+        .get(OBJECT_ID_META_KEY)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| V2IdentityError {
+            code: "identity_components_missing",
+            reason: "meta.object_id is required for v2 ingestion".to_owned(),
+            details: Some(serde_json::json!({"required": ["object_id", "canonical_json"]})),
+        })?;
+    let canonical_json = meta
+        .get(CANONICAL_JSON_META_KEY)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| V2IdentityError {
+            code: "identity_components_missing",
+            reason: "meta.canonical_json is required for v2 ingestion".to_owned(),
+            details: Some(serde_json::json!({"required": ["object_id", "canonical_json"]})),
+        })?;
+    if serde_json::from_str::<serde_json::Value>(canonical_json).is_err() {
+        return Err(V2IdentityError {
+            code: "canonical_json_invalid",
+            reason: "meta.canonical_json must contain valid JSON".to_owned(),
+            details: None,
+        });
+    }
+
+    let expected = identity_key(source_instance_id, object_id, canonical_json);
+    if draft.idempotency_key != expected {
+        return Err(V2IdentityError {
+            code: "identity_mismatch",
+            reason: "idempotency_key does not match the server-derived canonical identity"
+                .to_owned(),
+            details: Some(serde_json::json!({
+                "expected_identity": expected.as_str(),
+                "provided_identity": draft.idempotency_key.as_str(),
+                "source_instance_id": source_instance_id,
+                "object_id": object_id,
+            })),
+        });
+    }
+
+    let mut meta = meta;
+    meta.insert(
+        "source_instance".to_owned(),
+        serde_json::Value::String(source_instance_id.to_owned()),
+    );
+    let container = meta
+        .get("source_container")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("root")
+        .to_owned();
+    meta.insert(
+        "source_container".to_owned(),
+        serde_json::Value::String(format!("{source_instance_id}:{container}")),
+    );
+    draft.meta = serde_json::Value::Object(meta);
+    Ok(draft)
+}
+
+fn rejected_item(
+    client_ref: String,
+    error_code: &'static str,
+    reason: String,
+    details: Option<serde_json::Value>,
+) -> ImportItemResult {
+    ImportItemResult {
+        client_ref,
+        outcome: ImportOutcome::Rejected,
+        observation_id: None,
+        existing_id: None,
+        ticket: None,
+        error_code: Some(error_code.to_owned()),
+        failure_class: Some(ImportFailureClass::Validation),
+        reason: Some(reason),
+        details,
+    }
+}
+
+fn transient_item(
+    client_ref: String,
+    reason: String,
+    details: serde_json::Value,
+) -> ImportItemResult {
+    ImportItemResult {
+        client_ref,
+        outcome: ImportOutcome::Rejected,
+        observation_id: None,
+        existing_id: None,
+        ticket: None,
+        error_code: Some("transient_failure".to_owned()),
+        failure_class: Some(ImportFailureClass::Transient),
+        reason: Some(reason),
+        details: Some(details),
+    }
+}
+
+fn item_result_from_ingest_result(client_ref: String, result: IngestResult) -> ImportItemResult {
+    match result {
+        IngestResult::Ingested { id, .. } => ImportItemResult {
+            client_ref,
+            outcome: ImportOutcome::Ingested,
+            observation_id: Some(id),
+            existing_id: None,
+            ticket: None,
+            error_code: None,
+            failure_class: None,
+            reason: None,
+            details: None,
+        },
+        IngestResult::Duplicate { existing_id } => ImportItemResult {
+            client_ref,
+            outcome: ImportOutcome::Duplicate,
+            observation_id: None,
+            existing_id: Some(existing_id),
+            ticket: None,
+            error_code: None,
+            failure_class: None,
+            reason: None,
+            details: None,
+        },
+        IngestResult::Rejected { class, message } => ImportItemResult {
+            client_ref,
+            outcome: ImportOutcome::Rejected,
+            observation_id: None,
+            existing_id: None,
+            ticket: None,
+            error_code: Some(error_code_for_failure(class).to_owned()),
+            failure_class: Some(import_failure_class(class)),
+            reason: Some(message),
+            details: None,
+        },
+        IngestResult::Quarantined { ticket } => {
+            let error_code = if ticket.reason.contains("too far in the future") {
+                "clock_skew_future"
+            } else if ticket.reason.starts_with("policy denied:") {
+                "policy_quarantine"
+            } else {
+                "quarantine_required"
+            };
+            ImportItemResult {
+                client_ref,
+                outcome: ImportOutcome::Quarantined,
+                observation_id: None,
+                existing_id: None,
+                ticket: Some(ImportTicket {
+                    id: ticket.id,
+                    reason: ticket.reason.clone(),
+                }),
+                error_code: Some(error_code.to_owned()),
+                failure_class: Some(ImportFailureClass::Quarantine),
+                reason: Some(ticket.reason),
+                details: (error_code == "clock_skew_future").then(|| {
+                    serde_json::json!({
+                        "max_clock_skew_seconds": MAX_CLOCK_SKEW.num_seconds(),
+                    })
+                }),
+            }
+        }
+    }
+}
+
+fn import_failure_class(class: FailureClass) -> ImportFailureClass {
+    match class {
+        FailureClass::RetryableEffectFailure => ImportFailureClass::Transient,
+        FailureClass::QuarantineFailure => ImportFailureClass::Quarantine,
+        FailureClass::ValidationFailure
+        | FailureClass::PolicyFailure
+        | FailureClass::ConflictFailure
+        | FailureClass::DeterminismFailure
+        | FailureClass::NonRetryableEffectFailure => ImportFailureClass::Validation,
+    }
+}
+
+fn error_code_for_failure(class: FailureClass) -> &'static str {
+    match class {
+        FailureClass::RetryableEffectFailure => "transient_failure",
+        FailureClass::ValidationFailure => "schema_validation",
+        FailureClass::PolicyFailure => "policy_validation",
+        FailureClass::ConflictFailure => "identity_conflict",
+        FailureClass::DeterminismFailure => "determinism_failure",
+        FailureClass::NonRetryableEffectFailure => "non_retryable_failure",
+        FailureClass::QuarantineFailure => "quarantine_required",
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ImportSummary {
+    pub ingested: usize,
+    pub duplicates: usize,
+    pub quarantined: usize,
+    pub rejected: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImportOutcome {
+    Ingested,
+    Duplicate,
+    Quarantined,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImportFailureClass {
+    Transient,
+    Validation,
+    Quarantine,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ImportTicket {
+    pub id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ImportItemResult {
+    pub client_ref: String,
+    pub outcome: ImportOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observation_id: Option<ObservationId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub existing_id: Option<ObservationId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<ImportTicket>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<ImportFailureClass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+}
+
+impl ImportReport {
+    fn refresh_summary(&mut self) {
+        self.summary = ImportSummary {
+            ingested: self.ingested,
+            duplicates: self.duplicates,
+            quarantined: self.quarantined,
+            rejected: self.rejected,
+        };
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -5372,14 +5652,26 @@ impl AppService {
             .map_err(Into::into)
     }
 
-    pub fn validate_operational_page_limit(&self, limit: usize) -> Result<(), SelfHostError> {
+    pub fn validate_page_limit(&self, limit: usize, resource: &str) -> Result<(), SelfHostError> {
         if limit == 0 || limit > self.config.resource_limits.max_page_size {
-            return Err(SelfHostError::Ingestion(format!(
-                "operational event page limit must be between 1 and {}",
-                self.config.resource_limits.max_page_size
-            )));
+            return Err(SelfHostError::IngestionRequest {
+                code: "page_limit_exceeded",
+                detail: format!(
+                    "{resource} page limit {limit} must be between 1 and {}",
+                    self.config.resource_limits.max_page_size
+                ),
+                details: serde_json::json!({
+                    "resource": resource,
+                    "actual": limit,
+                    "maximum": self.config.resource_limits.max_page_size,
+                }),
+            });
         }
         Ok(())
+    }
+
+    pub fn validate_operational_page_limit(&self, limit: usize) -> Result<(), SelfHostError> {
+        self.validate_page_limit(limit, "operational event")
     }
 
     pub fn operational_events_for_stream(
@@ -5624,6 +5916,9 @@ impl AppService {
                 ingested: 0,
                 duplicates: 0,
                 quarantined: 0,
+                rejected: 0,
+                results: Vec::new(),
+                summary: ImportSummary::default(),
             };
 
             let mut prepared_observations = Vec::new();
@@ -5636,7 +5931,7 @@ impl AppService {
                 if batch.is_empty() {
                     break;
                 }
-                self.prepare_observation_draft_batch(
+                self.prepare_legacy_observation_draft_batch(
                     &mut core,
                     batch,
                     source_instance_id,
@@ -5674,10 +5969,53 @@ impl AppService {
                             )));
                         }
                         report.ingested += 1;
+                        report.results.push(ImportItemResult {
+                            client_ref: report.results.len().to_string(),
+                            outcome: ImportOutcome::Ingested,
+                            observation_id: Some(id),
+                            existing_id: None,
+                            ticket: None,
+                            error_code: None,
+                            failure_class: None,
+                            reason: None,
+                            details: None,
+                        });
                         request_appended_observations.push(observation);
                     }
-                    DurableAppendOutcome::Duplicate(_) => report.duplicates += 1,
-                    DurableAppendOutcome::CanonicalCollision(_) => report.quarantined += 1,
+                    DurableAppendOutcome::Duplicate(existing_id) => {
+                        report.duplicates += 1;
+                        report.results.push(ImportItemResult {
+                            client_ref: report.results.len().to_string(),
+                            outcome: ImportOutcome::Duplicate,
+                            observation_id: None,
+                            existing_id: Some(existing_id),
+                            ticket: None,
+                            error_code: None,
+                            failure_class: None,
+                            reason: None,
+                            details: None,
+                        });
+                    }
+                    DurableAppendOutcome::CanonicalCollision(existing_id) => {
+                        report.quarantined += 1;
+                        let reason = format!(
+                            "canonical identity collision with existing observation {existing_id}"
+                        );
+                        report.results.push(ImportItemResult {
+                            client_ref: report.results.len().to_string(),
+                            outcome: ImportOutcome::Quarantined,
+                            observation_id: None,
+                            existing_id: Some(existing_id),
+                            ticket: Some(ImportTicket {
+                                id: uuid::Uuid::now_v7().to_string(),
+                                reason: reason.clone(),
+                            }),
+                            error_code: Some("canonical_collision".to_owned()),
+                            failure_class: Some(ImportFailureClass::Quarantine),
+                            reason: Some(reason),
+                            details: None,
+                        });
+                    }
                 }
             }
 
@@ -5728,6 +6066,7 @@ impl AppService {
                 search_index_result?;
             }
 
+            report.refresh_summary();
             Ok(report)
         })();
         let timing = timer.finish();
@@ -5750,7 +6089,313 @@ impl AppService {
         result
     }
 
-    fn prepare_observation_draft_batch(
+    /// Ingest using the v2 wire contract. The legacy method above deliberately
+    /// keeps its historical request-level failure semantics for the frozen v1
+    /// endpoint.
+    pub fn ingest_observation_drafts_v2(
+        &self,
+        drafts: Vec<ObservationDraft>,
+        source_instance_id: &str,
+    ) -> Result<ImportReport, SelfHostError> {
+        self.ingest_observation_drafts_v2_with_session(drafts, source_instance_id, None)
+    }
+
+    pub fn ingest_observation_drafts_v2_with_session(
+        &self,
+        drafts: Vec<ObservationDraft>,
+        source_instance_id: &str,
+        bulk_session_id: Option<&str>,
+    ) -> Result<ImportReport, SelfHostError> {
+        let context = ObservationImportContext::from_drafts(&drafts);
+        let bulk_session_requested = bulk_session_id.is_some();
+        let mut timer = ObservationImportTimer::new();
+        let mut materialization_state = ImportMaterializationState::NotRun;
+        let result = (|| {
+            if source_instance_id.trim().is_empty() {
+                return Err(SelfHostError::IngestionRequest {
+                    code: "source_instance_required",
+                    detail: "source_instance_id must not be blank".to_owned(),
+                    details: serde_json::json!({"field": "source_instance_id"}),
+                });
+            }
+            if drafts.len() > self.config.resource_limits.max_sync_items {
+                return Err(SelfHostError::IngestionRequest {
+                    code: "draft_count_exceeded",
+                    detail: format!(
+                        "draft count {} exceeds configured maximum {}",
+                        drafts.len(),
+                        self.config.resource_limits.max_sync_items
+                    ),
+                    details: serde_json::json!({
+                        "field": "drafts",
+                        "actual": drafts.len(),
+                        "maximum": self.config.resource_limits.max_sync_items,
+                    }),
+                });
+            }
+
+            let _operation = self.bulk_import_operation_lock()?;
+            let mut core = self.core_lock()?;
+            let bulk_session = self.bulk_import_session_for_append(bulk_session_id)?;
+            let mut report = ImportReport {
+                ingested: 0,
+                duplicates: 0,
+                quarantined: 0,
+                rejected: 0,
+                results: Vec::new(),
+                summary: ImportSummary::default(),
+            };
+            let mut item_results: Vec<Option<ImportItemResult>> =
+                (0..drafts.len()).map(|_| None).collect();
+            let mut prepared = Vec::new();
+
+            for (index, draft) in drafts.into_iter().enumerate() {
+                let client_ref = draft
+                    .client_ref
+                    .clone()
+                    .unwrap_or_else(|| index.to_string());
+                if client_ref.trim().is_empty() {
+                    item_results[index] = Some(rejected_item(
+                        client_ref,
+                        "client_ref_required",
+                        "client_ref must not be blank".to_owned(),
+                        None,
+                    ));
+                    continue;
+                }
+
+                let payload_bytes = serde_json::to_vec(&draft.payload)?.len();
+                if payload_bytes > self.config.resource_limits.max_payload_bytes {
+                    item_results[index] = Some(rejected_item(
+                        client_ref,
+                        "payload_too_large",
+                        format!(
+                            "payload size {payload_bytes} exceeds configured maximum {}",
+                            self.config.resource_limits.max_payload_bytes
+                        ),
+                        Some(serde_json::json!({
+                            "field": "payload",
+                            "actual_bytes": payload_bytes,
+                            "max_bytes": self.config.resource_limits.max_payload_bytes,
+                        })),
+                    ));
+                    continue;
+                }
+
+                let draft = match derive_v2_identity(draft, source_instance_id) {
+                    Ok(draft) => draft,
+                    Err(error) => {
+                        item_results[index] = Some(rejected_item(
+                            client_ref,
+                            error.code,
+                            error.reason,
+                            error.details,
+                        ));
+                        continue;
+                    }
+                };
+                match prepare_draft(&core, draft) {
+                    Ok(observation) => prepared.push(PreparedImportObservation {
+                        index,
+                        client_ref,
+                        observation,
+                    }),
+                    Err(result) => {
+                        item_results[index] =
+                            Some(item_result_from_ingest_result(client_ref, result));
+                    }
+                }
+            }
+
+            let append_input = prepared
+                .iter()
+                .map(|item| item.observation.clone())
+                .collect::<Vec<_>>();
+            let outcomes = if append_input.is_empty() {
+                Vec::new()
+            } else {
+                let stage_started_at = Instant::now();
+                let append_result = self.persistence_lock()?.append_observations(&append_input);
+                timer.record_stage(ImportTimingStage::LedgerAppend, stage_started_at.elapsed());
+                match append_result {
+                    Ok(outcomes) => outcomes,
+                    Err(error) => {
+                        let reason = format!("durable append temporarily failed: {error}");
+                        for item in &prepared {
+                            item_results[item.index] = Some(transient_item(
+                                item.client_ref.clone(),
+                                reason.clone(),
+                                serde_json::json!({"stage": "durable_append"}),
+                            ));
+                        }
+                        Vec::new()
+                    }
+                }
+            };
+            if !outcomes.is_empty() && outcomes.len() != prepared.len() {
+                return Err(SelfHostError::Ingestion(
+                    "v2 bulk append returned an unexpected outcome count".to_owned(),
+                ));
+            }
+
+            let mut request_appended_observations = Vec::new();
+            for (item, outcome) in prepared.into_iter().zip(outcomes) {
+                let result = match outcome {
+                    DurableAppendOutcome::Appended(id) => {
+                        if id != item.observation.id {
+                            return Err(SelfHostError::Ingestion(
+                                "v2 append returned a mismatched observation id".to_owned(),
+                            ));
+                        }
+                        report.ingested += 1;
+                        request_appended_observations.push(item.observation);
+                        ImportItemResult {
+                            client_ref: item.client_ref,
+                            outcome: ImportOutcome::Ingested,
+                            observation_id: Some(id),
+                            existing_id: None,
+                            ticket: None,
+                            error_code: None,
+                            failure_class: None,
+                            reason: None,
+                            details: None,
+                        }
+                    }
+                    DurableAppendOutcome::Duplicate(existing_id) => {
+                        report.duplicates += 1;
+                        ImportItemResult {
+                            client_ref: item.client_ref,
+                            outcome: ImportOutcome::Duplicate,
+                            observation_id: None,
+                            existing_id: Some(existing_id),
+                            ticket: None,
+                            error_code: None,
+                            failure_class: None,
+                            reason: None,
+                            details: None,
+                        }
+                    }
+                    DurableAppendOutcome::CanonicalCollision(existing_id) => {
+                        report.quarantined += 1;
+                        let ticket = ImportTicket {
+                            id: uuid::Uuid::now_v7().to_string(),
+                            reason: format!(
+                                "canonical identity collision with existing observation {existing_id}"
+                            ),
+                        };
+                        ImportItemResult {
+                            client_ref: item.client_ref,
+                            outcome: ImportOutcome::Quarantined,
+                            observation_id: None,
+                            existing_id: Some(existing_id),
+                            ticket: Some(ticket.clone()),
+                            error_code: Some("canonical_collision".to_owned()),
+                            failure_class: Some(ImportFailureClass::Quarantine),
+                            reason: Some(ticket.reason),
+                            details: None,
+                        }
+                    }
+                };
+                item_results[item.index] = Some(result);
+            }
+
+            report.results = item_results
+                .into_iter()
+                .map(|result| result.expect("v2 import must produce one result per draft"))
+                .collect();
+            report.quarantined = report
+                .results
+                .iter()
+                .filter(|result| result.outcome == ImportOutcome::Quarantined)
+                .count();
+            report.rejected = report
+                .results
+                .iter()
+                .filter(|result| result.outcome == ImportOutcome::Rejected)
+                .count();
+
+            if !request_appended_observations.is_empty() {
+                if let Some(session) = bulk_session {
+                    if let Err(error) = self.record_deferred_bulk_import_append(session) {
+                        tracing::error!(
+                            error = %error,
+                            "v2 import deferred-materialization bookkeeping failed after durable append"
+                        );
+                    }
+                    core.mark_non_corpus_materializations_stale();
+                    materialization_state = ImportMaterializationState::Deferred;
+                } else {
+                    let classification =
+                        classify_non_corpus_delta_with_reason(&request_appended_observations);
+                    materialization_state = ImportMaterializationState::Classified(classification);
+                    let stage_started_at = Instant::now();
+                    if let Err(error) = self.materialize_after_observation_append(
+                        &mut core,
+                        &request_appended_observations,
+                    ) {
+                        core.mark_non_corpus_materializations_stale();
+                        tracing::error!(error = %error, "v2 import materialization failed after durable append");
+                    }
+                    timer.record_stage(
+                        ImportTimingStage::NonCorpusMaterialize,
+                        stage_started_at.elapsed(),
+                    );
+                }
+            }
+
+            if report.ingested > 0 {
+                let stage_started_at = Instant::now();
+                self.emit_audit(
+                    "actor:self-host",
+                    AuditEventKind::WriteExecution,
+                    serde_json::json!({
+                        "mode": "v2_bulk_observation_import",
+                        "source_instance_id": source_instance_id,
+                        "ingested": report.ingested,
+                        "duplicates": report.duplicates,
+                        "quarantined": report.quarantined,
+                        "rejected": report.rejected,
+                        "bulk_session_id": bulk_session_id,
+                    }),
+                );
+                timer.record_stage(ImportTimingStage::Audit, stage_started_at.elapsed());
+
+                let stage_started_at = Instant::now();
+                if let Err(error) = self.search_index.catch_up_after_append() {
+                    tracing::error!(error = %error, "v2 import search index catch-up failed after durable append");
+                }
+                timer.record_stage(
+                    ImportTimingStage::SearchIndexCatchUp,
+                    stage_started_at.elapsed(),
+                );
+            }
+
+            report.refresh_summary();
+            Ok(report)
+        })();
+        let timing = timer.finish();
+        let (result_name, ingested, duplicates, quarantined) = match &result {
+            Ok(report) => ("ok", report.ingested, report.duplicates, report.quarantined),
+            Err(_) => ("error", 0, 0, 0),
+        };
+        ObservationImportTimingLog {
+            context,
+            source_instance_id: source_instance_id.to_owned(),
+            timing,
+            materialization_state,
+            bulk_session_requested,
+            result: result_name,
+            ingested,
+            duplicates,
+            quarantined,
+        }
+        .emit();
+        result
+    }
+
+    // v1 deliberately retains request-level abort semantics. v2 prepares each
+    // draft independently in ingest_observation_drafts_v2_with_session.
+    fn prepare_legacy_observation_draft_batch(
         &self,
         core: &mut AppCore,
         drafts: Vec<ObservationDraft>,

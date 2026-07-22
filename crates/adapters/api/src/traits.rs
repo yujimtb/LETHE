@@ -37,6 +37,10 @@ pub struct ObservationDraft {
     pub attachments: Vec<BlobRef>,
     pub published: DateTime<Utc>,
     pub idempotency_key: IdempotencyKey,
+    /// Optional request-local correlation key. The v2 ingestion API uses the
+    /// input index when this field is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ref: Option<String>,
     #[serde(default)]
     pub meta: serde_json::Value,
 }

@@ -147,6 +147,7 @@ impl ClaudeAiImporter {
             attachments: vec![],
             published: message.created_at,
             idempotency_key,
+            client_ref: None,
             meta: serde_json::json!({
                 "sourceAdapterVersion": self.adapter_version.as_str(),
                 OBJECT_ID_META_KEY: object_id,

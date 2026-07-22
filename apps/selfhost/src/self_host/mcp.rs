@@ -773,6 +773,9 @@ impl From<SelfHostError> for JsonRpcAppError {
                 Self::internal(format!("{code}: {detail}"))
             }
             SelfHostError::ReadMode(detail) => Self::invalid_params(detail),
+            SelfHostError::IngestionRequest { code, detail, .. } => {
+                Self::invalid_params(format!("{code}: {detail}"))
+            }
             SelfHostError::SupplementalValidation { code, detail } => {
                 Self::invalid_params(format!("SupplementalValidation:{code}: {detail}"))
             }

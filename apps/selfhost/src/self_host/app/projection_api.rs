@@ -144,12 +144,7 @@ impl AppService {
         pin: Option<&str>,
         pagination: &PaginationParams,
     ) -> Result<ResponseEnvelope<serde_json::Value>, SelfHostError> {
-        if pagination.limit == 0 || pagination.limit > self.config.resource_limits.max_page_size {
-            return Err(SelfHostError::ReadMode(format!(
-                "page limit must be between 1 and {}",
-                self.config.resource_limits.max_page_size
-            )));
-        }
+        self.validate_page_limit(pagination.limit, "person projection")?;
         let core = self.core_lock()?;
         let mode = self.resolve_read_mode(&core.catalog, "proj:person-page", read_mode, pin)?;
         self.authorize_read(
@@ -376,12 +371,7 @@ impl AppService {
         pin: Option<&str>,
         pagination: &PaginationParams,
     ) -> Result<ResponseEnvelope<serde_json::Value>, SelfHostError> {
-        if pagination.limit == 0 || pagination.limit > self.config.resource_limits.max_page_size {
-            return Err(SelfHostError::ReadMode(format!(
-                "page limit must be between 1 and {}",
-                self.config.resource_limits.max_page_size
-            )));
-        }
+        self.validate_page_limit(pagination.limit, "corpus records")?;
         let ((page, total), metadata) = self.search_index.execute(|index| {
             index.read_with_metadata(|snapshot| {
                 snapshot.records_page(pagination.offset, pagination.limit)
@@ -548,12 +538,7 @@ impl AppService {
         limit: usize,
         cursor: Option<&str>,
     ) -> Result<ResponseEnvelope<lethe_api::api::grep::ThreadResponse>, SelfHostError> {
-        if limit == 0 || limit > self.config.resource_limits.max_page_size {
-            return Err(SelfHostError::ReadMode(format!(
-                "page limit must be between 1 and {}",
-                self.config.resource_limits.max_page_size
-            )));
-        }
+        self.validate_page_limit(limit, "corpus thread")?;
         let offset = parse_cursor(cursor)?;
         let (response, metadata) = self.search_index.execute(|index| {
             index.read_with_metadata(|snapshot| {
@@ -656,12 +641,7 @@ impl AppService {
         limit: usize,
         cursor: Option<&str>,
     ) -> Result<ResponseEnvelope<ClaimQueuePage>, SelfHostError> {
-        if limit == 0 || limit > self.config.resource_limits.max_page_size {
-            return Err(SelfHostError::ReadMode(format!(
-                "page limit must be between 1 and {}",
-                self.config.resource_limits.max_page_size
-            )));
-        }
+        self.validate_page_limit(limit, "claim queue")?;
         validate_verification_mode_filter(verification_mode)?;
         let offset = parse_cursor(cursor)?;
         let core = self.core_lock()?;
@@ -715,12 +695,7 @@ impl AppService {
         query: Option<&str>,
         limit: usize,
     ) -> Result<ResponseEnvelope<DecisionSearchPage>, SelfHostError> {
-        if limit == 0 || limit > self.config.resource_limits.max_page_size {
-            return Err(SelfHostError::ReadMode(format!(
-                "page limit must be between 1 and {}",
-                self.config.resource_limits.max_page_size
-            )));
-        }
+        self.validate_page_limit(limit, "decision search")?;
         let query = query
             .map(str::trim)
             .filter(|query| !query.is_empty())
@@ -897,12 +872,7 @@ impl AppService {
         limit: usize,
         cursor: Option<&str>,
     ) -> Result<ResponseEnvelope<CardQueuePage>, SelfHostError> {
-        if limit == 0 || limit > self.config.resource_limits.max_page_size {
-            return Err(SelfHostError::ReadMode(format!(
-                "page limit must be between 1 and {}",
-                self.config.resource_limits.max_page_size
-            )));
-        }
+        self.validate_page_limit(limit, "card queue")?;
         let offset = parse_cursor(cursor)?;
         let core = self.core_lock()?;
         self.ensure_projection_fresh(&core.catalog, "proj:card-queue")?;

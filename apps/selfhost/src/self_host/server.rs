@@ -1,6 +1,7 @@
 use axum::body::{Body, Bytes};
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
+use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -28,6 +29,8 @@ use lethe_storage_api::{
     StoredOperationalEvent,
 };
 
+const IMPORT_REQUEST_BODY_LIMIT_BYTES: usize = 128 * 1024 * 1024;
+
 pub fn build_router(service: AppService) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -35,7 +38,13 @@ pub fn build_router(service: AppService) -> Router {
         .route("/admin/sync", post(sync_now))
         .route(
             "/api/import/observation-drafts",
-            post(import_observation_drafts).layer(DefaultBodyLimit::max(128 * 1024 * 1024)),
+            post(import_observation_drafts)
+                .layer(DefaultBodyLimit::max(IMPORT_REQUEST_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/api/v2/import/observation-drafts",
+            post(import_observation_drafts_v2)
+                .layer(DefaultBodyLimit::max(IMPORT_REQUEST_BODY_LIMIT_BYTES)),
         )
         .route(
             "/api/import/bulk-sessions/begin",
@@ -414,6 +423,41 @@ async fn import_observation_drafts(
     Ok(Json(report))
 }
 
+async fn import_observation_drafts_v2(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    request: Result<Json<ImportObservationDraftsRequest>, JsonRejection>,
+) -> Result<Json<ImportReport>, ApiError> {
+    service.authorize_headers(&headers, "write:observations")?;
+    let request = match request {
+        Ok(Json(request)) => request,
+        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            let actual_bytes = headers
+                .get(CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<usize>().ok());
+            return Err(ApiError::payload_too_large(actual_bytes));
+        }
+        Err(rejection) => {
+            return Err(ApiError::bad_request_with_details(
+                "invalid_json",
+                rejection.to_string(),
+                serde_json::json!({"field": "request_body"}),
+            ));
+        }
+    };
+    let report = tokio::task::spawn_blocking(move || {
+        service.ingest_observation_drafts_v2_with_session(
+            request.drafts,
+            &request.source_instance_id,
+            request.bulk_session_id.as_deref(),
+        )
+    })
+    .await
+    .map_err(|err| ApiError::internal(err.to_string()))??;
+    Ok(Json(report))
+}
+
 async fn begin_bulk_import_session(
     State(service): State<AppService>,
     headers: HeaderMap,
@@ -762,6 +806,39 @@ impl ApiError {
             body: ErrorResponse::conflict(code, detail),
         }
     }
+
+    fn bad_request_with_details(
+        code: &'static str,
+        detail: String,
+        details: serde_json::Value,
+    ) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            body: ErrorResponse {
+                error: code.to_owned(),
+                detail: Some(detail),
+                details: Some(details),
+                retry_after: None,
+            },
+        }
+    }
+
+    fn payload_too_large(actual_bytes: Option<usize>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            body: ErrorResponse {
+                error: "body_too_large".to_owned(),
+                detail: Some(format!(
+                    "request body exceeds configured maximum {IMPORT_REQUEST_BODY_LIMIT_BYTES} bytes"
+                )),
+                details: Some(serde_json::json!({
+                    "actual_bytes": actual_bytes,
+                    "max_bytes": IMPORT_REQUEST_BODY_LIMIT_BYTES,
+                })),
+                retry_after: None,
+            },
+        }
+    }
 }
 
 impl From<SelfHostError> for ApiError {
@@ -880,6 +957,11 @@ impl From<SelfHostError> for ApiError {
                 status: StatusCode::BAD_REQUEST,
                 body: ErrorResponse::bad_request(&detail),
             },
+            SelfHostError::IngestionRequest {
+                code,
+                detail,
+                details,
+            } => Self::bad_request_with_details(code, detail, details),
             other => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 body: ErrorResponse::internal_server_error(&other.to_string()),
@@ -989,5 +1071,45 @@ mod search_index_error_tests {
         assert_eq!(error.status, StatusCode::CONFLICT);
         assert_eq!(error.body.error, "bulk_import_session_mismatch");
         assert_eq!(error.body.detail.as_deref(), Some("wrong session"));
+    }
+
+    #[test]
+    fn v2_request_errors_expose_structured_limit_details() {
+        let error = ApiError::from(SelfHostError::IngestionRequest {
+            code: "draft_count_exceeded",
+            detail: "draft count 11 exceeds configured maximum 10".to_owned(),
+            details: serde_json::json!({"actual": 11, "maximum": 10}),
+        });
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.body.error, "draft_count_exceeded");
+        assert_eq!(
+            error.body.details,
+            Some(serde_json::json!({"actual": 11, "maximum": 10}))
+        );
+    }
+
+    #[test]
+    fn page_limit_error_uses_the_frozen_machine_code() {
+        let error = ApiError::from(SelfHostError::IngestionRequest {
+            code: "page_limit_exceeded",
+            detail: "person projection page limit 501 must be between 1 and 500".to_owned(),
+            details: serde_json::json!({
+                "resource": "person projection",
+                "actual": 501,
+                "maximum": 500,
+            }),
+        });
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.body.error, "page_limit_exceeded");
+        assert_eq!(
+            error
+                .body
+                .details
+                .as_ref()
+                .and_then(|details| details.get("maximum")),
+            Some(&serde_json::json!(500))
+        );
     }
 }
