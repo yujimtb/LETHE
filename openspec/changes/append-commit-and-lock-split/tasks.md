@@ -2,7 +2,7 @@
 
 - [ ] 1.1 [Spec Designer] `commit-ack-boundary` CAB-01 の commit 境界(canonical append + per-item ID + 最小 durable audit/outbox marker)を確定し、ingestion-api-contract IRC-04 の ACK 宣言との対応表を文書化する(参照: `mod.rs:5478-5556`)。受入: 境界に含む / 含まないの区分が一意に定まり、IRC-04 の宣言と矛盾しないことを確認する。
 - [ ] 1.2 [Implementer] CAB-01 に従い取り込み応答を commit 境界成功で確定し、projection materialize・検索 index catch-up・遅延 audit を応答経路から外す(`service_support.rs::materialize_after_observation_append`)。受入: 応答経路が commit 境界のみを含み、派生処理完了を待たないテストが通る。
-- [ ] 1.3 [Implementer] CAB-02/CAB-03 に従い派生処理を append-seq(cursor / high-water)consumer として駆動し、request 成否・duplicate 判定に依存させない。受入: 派生失敗が outcome を反転せず projection health で surface し、duplicate 応答後も未消費 append-seq を consumer が追いつくテストが通る。
+- [ ] 1.3 [Implementer] CAB-02/CAB-03 に従い派生処理を append-seq(cursor / high-water)consumer として駆動し、request 成否・duplicate 判定に依存させない。派生失敗は canonical 台帳の専用エラーイベント + projection health で surface する(旧 Q4 確定)。受入: 派生失敗が outcome を反転せず台帳エラーイベント + health で surface し、duplicate 応答後も未消費 append-seq を consumer が追いつくテストが通る。
 
 ## 2. lock lane 分割
 
@@ -19,8 +19,8 @@
 
 ## 4. audit durability
 
-- [ ] 4.1 [Implementer] ADC-01 に従い mandatory audit を commit 境界内 durable append にし、永続化失敗時に保護操作も失敗させる fail-closed へ改める(`mod.rs:5388` の fail-open 廃止)。受入: audit 永続化失敗で保護操作も失敗するテストが通る。
-- [ ] 4.2 [Spec Designer] ADC-02 に従い同期必須 / 遅延許容の audit 区分(mandatory とする範囲)を確定する。受入: どの audit が commit 境界内 / consumer かが一意に定まる(design Q2 のオーナー確定を反映)。
+- [ ] 4.1 [Implementer] ADC-01 に従い監査イベントの durable enqueue を commit 境界内・同期・fail-closed にし、enqueue 永続化失敗時に保護操作も失敗させる(`mod.rs:5388` の fail-open 廃止)。保護操作成功=監査イベントが台帳に載っている保証。受入: enqueue 失敗で保護操作も失敗するテストが通る。
+- [ ] 4.2 [Spec Designer] ADC-02 に従い commit 境界内で同期 enqueue を必須とする保護操作の具体リスト(design Q2 の細部)を確定する。方式(commit 境界内・同期・fail-closed)は確定済みで、残るのは対象操作の粒度のみ。受入: どの保護操作が同期 enqueue 必須かが一意に定まる。
 - [ ] 4.3 [Implementer] ADC-03 に従い無制限 in-memory audit mirror(`audit.rs:18`)を廃止し audit 読みを永続台帳の page query に置換する。受入: 全履歴を in-memory に保持せず page query で供給するテストが通る。
 
 ## 5. 検証と回帰

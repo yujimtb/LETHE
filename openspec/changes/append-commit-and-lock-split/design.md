@@ -55,9 +55,9 @@ canonical Observation ledger は append-only の正本で、projection は破棄
 
 全 write での manifest 全体 JSON 上書き(`mod.rs:969`、`persistence/mod.rs:1283`)を廃止し、manifest を scalar metadata と個別 row state へ分割して変更 row だけ transactional upsert する。ClaimQueue / Decision(`mod.rs:685/2426`)は keyed reducer と逆 index へ分解し affected record に対する O(Δ log S) で更新する。lineage digest / count(`service_support.rs:813`)は全 supplemental ID を毎回 collect・sort・hash せず、affected 分だけ増分更新した保存済み scalar を供給する。**読み取り経路の lineage pagination は indexed-keyset-reads の責務**で、本 change は write 時の digest 計算のみを扱う。
 
-### D7: audit を fail-closed にし区分する(ADC-01/02/03)
+### D7: 監査イベントの durable enqueue を commit 境界内・同期・fail-closed にする(ADC-01/02/03)
 
-mandatory audit は commit 境界(D1)内で durable append し、その失敗時は保護操作も失敗させる(`mod.rs:5388` の fail-open 廃止)。audit を同期必須(mandatory durable)部分と遅延許容部分に区分し、遅延許容部分は append-seq consumer(D2)として応答後に実行する。無制限 `Vec` の InMemoryAuditLog(`audit.rs:18`)を廃止し、audit 読みは永続台帳の page query で供給する。
+オーナー懸念(「遅延許容だと実装の漏れで監査ができない可能性」)への設計回答として、**遅延を許すのは監査記録の書き出し・整形(projection 化・可読レンダリング・集計)のみ**とし、**監査イベントの durable な登録(enqueue)は canonical commit 境界(D1)内で同期・fail-closed** に行う。すなわち本体保護操作の成功は「監査イベントが canonical 台帳に載っていること」と等価であり、enqueue の永続化に失敗したら保護操作も失敗させる(`mod.rs:5388` の fail-open 廃止)。台帳に載った監査イベントの後続の書き出し・整形は append-seq consumer(D2)として応答後に実行してよく、その consumer 遅延(想定 数秒〜数十秒)は audit / projection health で可視化する。無制限 `Vec` の InMemoryAuditLog(`audit.rs:18`)を廃止し、audit 読みは永続台帳の page query で供給する。
 
 ## Risks / Trade-offs
 
@@ -73,9 +73,13 @@ mandatory audit は commit 境界(D1)内で durable append し、その失敗時
 - **indexed-keyset-reads:** 読み取り lane(SLP)の並行性は本 change が提供し、その lane 上の keyset/index query は indexed-keyset-reads が定義する。lineage は write digest(本 change)と read pagination(indexed-keyset-reads)で責務分割。
 - **observation-lake / operational-event-ledger:** append 契約を変更せず内部 commit 境界・計算量を規定する。
 
+## 確定事項(オーナー決定 2026-07-23)
+
+1. **outbox = append-seq 直接消費(旧 Q1 確定):** 派生駆動は canonical ledger の append-seq(cursor / high-water)を直接消費し、専用 outbox テーブルは設けない。append-only 原則(canonical 台帳が唯一の順序源)からの導出で、二重書き込みと二台帳同期を避ける。consumer は自身の再開位置(消費済み cursor)のみを保持する。
+2. **派生失敗 = 台帳の専用エラーイベント + health(旧 Q4 確定):** 派生 consumer の失敗は lake authoritative に従い canonical 台帳へ専用のエラーイベントとして記録し、加えて projection health で可視化する。取り込み応答の outcome は反転しない。
+3. **audit の durable enqueue は commit 境界内・同期・fail-closed(D7):** 遅延を許すのは監査記録の書き出し・整形のみ。監査イベントの durable enqueue は commit 境界内で同期・fail-closed とし、保護操作成功=監査イベントが台帳に載っていることの保証とする。consumer 遅延の想定は数秒〜数十秒で health 可視化する。
+
 ## Open Questions(オーナー確定が必要)
 
-1. **Q1 outbox 実体:** 派生駆動を (a) canonical ledger の append-seq を直接消費する(専用 outbox テーブルなし)か、(b) 明示的 outbox テーブルへ marker を書くか。(a) は二重書き込みを避けるが consumer の再開位置管理が要る。
-2. **Q2 audit の同期必須境界:** mandatory とする audit の範囲(全保護操作 / write 系のみ / 認可 deny のみ)をどこで引くか。広いほど durability が強いが commit 境界のコストが増える。
-3. **Q3 lane 分割の storage 対象:** read connection pool を SQLite / PostgreSQL 双方で入れるか、personal(SQLite)を先行させるか。
-4. **Q4 派生 consumer の failure surface:** projection health の露出先(既存 health endpoint 拡張 / 新規運用シグナル)。
+1. **Q2 同期必須 audit の操作リスト(細部):** commit 境界内で同期 enqueue を必須とする保護操作の具体リスト(全保護操作 / write 系のみ / 認可 deny を含むか)。durability を広げるほど commit 境界コストが増える。方式(commit 境界内・同期・fail-closed)は確定済みで、残るのは対象操作の粒度のみ。
+2. **Q3 lane 分割の storage 適用順(運用判断):** read connection pool を SQLite / PostgreSQL のどちらから入れるか。personal(SQLite)先行が既定案。

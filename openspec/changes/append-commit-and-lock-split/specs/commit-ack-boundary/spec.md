@@ -15,7 +15,7 @@ canonical append の成功応答は、(a) canonical Observation ledger への du
 
 ### Requirement: CAB-02 派生処理は append-seq consumer として応答後に実行される
 
-projection materialization・検索 index catch-up・遅延許容の監査記録は、canonical commit 境界の外で append-sequence(append-seq / cursor)を消費する consumer として実行 SHALL する。派生処理の失敗は取り込み応答の outcome を反転 SHALL NOT し、projection health / 運用シグナルで surface SHALL する。
+projection materialization・検索 index catch-up・登録済み監査イベントの書き出し整形は、canonical commit 境界の外で append-sequence(append-seq / cursor)を消費する consumer として実行 SHALL する。派生処理の失敗は取り込み応答の outcome を反転 SHALL NOT し、lake authoritative に従い canonical 台帳の専用エラーイベントとして記録し、加えて projection health で surface SHALL する。
 
 #### Scenario: 派生処理は commit 境界外の consumer
 - **WHEN** commit 境界が成功し応答が返った後に派生処理が駆動される
@@ -24,7 +24,7 @@ projection materialization・検索 index catch-up・遅延許容の監査記録
 #### Scenario: 派生失敗が ACK を反転しない
 - **WHEN** append 成功後の projection materialize または検索 index catch-up が失敗する
 - **THEN** その item の取り込み outcome は成功(ID 付き)のままである
-- **AND** 派生失敗は projection health / 運用シグナルで surface し応答 outcome を反転しない
+- **AND** 派生失敗は canonical 台帳の専用エラーイベントと projection health で surface し応答 outcome を反転しない
 
 ### Requirement: CAB-03 consumer は request 成否に依存せず append-seq を追う
 
