@@ -14,6 +14,34 @@ break_glass_channel = false
 break_glass_senders = []
 enabled = true
 
+# Intercom LETHEブリッジ(nanihold_intercom)が受け持つDiscordチャネル(2026-07-21登録)
+[[channels]]
+id = "chan:discord-intercom:1509933604820746425"
+kind = "discord"
+source_instance_id = "device:intercom"
+external_id = "1509933604820746425"
+connection_ref = "discord-intercom-bridge"
+default_consent_scope = "personal"
+reply_slo_seconds = 1800
+freshness_threshold_seconds = 1800
+break_glass_channel = false
+break_glass_senders = []
+enabled = true
+
+# Intercom LETHEブリッジが受け持つSlackチャネル(2026-07-21登録)
+[[channels]]
+id = "chan:slack-intercom:C0BH1P6MXJ8"
+kind = "slack"
+source_instance_id = "device:intercom"
+external_id = "C0BH1P6MXJ8"
+connection_ref = "slack-intercom-bridge"
+default_consent_scope = "personal"
+reply_slo_seconds = 1800
+freshness_threshold_seconds = 1800
+break_glass_channel = false
+break_glass_senders = []
+enabled = true
+
 [server]
 bind_addr = "0.0.0.0:8080"
 mcp_bind_addr = "0.0.0.0:8090"
