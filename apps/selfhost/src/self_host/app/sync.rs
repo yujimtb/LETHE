@@ -771,6 +771,18 @@ impl AppService {
             Some(format!("{} item(s) failed", dead_letters.len()))
         };
         let latency_ms = core.sync_metrics.latency_ms;
+        let persisted_sync_state = lethe_storage_api::PersistedSyncState {
+            metrics: lethe_storage_api::SyncMetricRecord {
+                fetched: core.sync_metrics.fetched,
+                ingested: core.sync_metrics.ingested,
+                skipped: core.sync_metrics.skipped,
+                failed: core.sync_metrics.failed,
+                quarantined: core.sync_metrics.quarantined,
+                latency_ms,
+            },
+            completed_at: last_sync_at,
+            error: core.last_sync_error.clone(),
+        };
         let mut live_core = self.core_lock()?;
         *live_core = core;
         self.publish_core_snapshot(&live_core);
@@ -780,17 +792,7 @@ impl AppService {
             for dead_letter in &dead_letters {
                 store.record_dead_letter(&dead_letter.source, &dead_letter.reason)?;
             }
-            store.record_sync_metrics(
-                "all",
-                &lethe_storage_api::SyncMetricRecord {
-                    fetched: fetched as u64,
-                    ingested: (slack_ingested + google_ingested + slide_analyses) as u64,
-                    skipped: duplicates as u64,
-                    failed: dead_letters.len() as u64,
-                    quarantined: quarantined as u64,
-                    latency_ms,
-                },
-            )?;
+            store.record_sync_state("all", &persisted_sync_state)?;
             store.garbage_collect_orphan_blobs()?;
         }
 

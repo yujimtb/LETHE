@@ -584,16 +584,10 @@ impl AppService {
     ) -> Result<Option<Vec<u8>>, SelfHostError> {
         let core = self.core_snapshot();
         self.ensure_projection_fresh(&core.catalog, "proj:person-page")?;
-        let referenced = core.person_components.values().any(|component| {
-            component.consent != ConsentStatus::OptedOut
-                && (component.slide_blob_refs.contains(blob_ref.as_str())
-                    || component
-                        .frontend_profile
-                        .as_ref()
-                        .and_then(|profile| profile.thumbnail_ref.as_deref())
-                        == Some(blob_ref.as_str()))
-        });
         drop(core);
+        let referenced = self
+            .persistence_read_lock()?
+            .projection_blob_ref_visible(&ProjectionRef::new("proj:person-page"), blob_ref)?;
         self.emit_audit(
             "actor:self-host",
             AuditEventKind::ReadRestricted,
@@ -605,7 +599,7 @@ impl AppService {
         if !referenced {
             return Ok(None);
         }
-        Ok(self.persistence_lock()?.get_blob(blob_ref)?)
+        Ok(self.persistence_read_lock()?.get_blob(blob_ref)?)
     }
 
     pub(super) fn ingest_slack_message<A: SlackClient, F: SlackClient>(

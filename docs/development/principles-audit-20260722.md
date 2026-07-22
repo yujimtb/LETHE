@@ -326,3 +326,11 @@ AppCoreは`ArcSwap`のimmutable snapshotを読み取りへ公開し、canonical 
    correlation/causation/type indexを追加し、offset・全sort・全lineage生成・全person/blob scanを廃止する。cursor pageの計算量を実際にO(k)へ固定する。
 
 既知の51秒フルリビルドは単独事故ではなく、**「全量から整合性を再証明してから応答する」設計癖の最も大きく表面化した例**と判断する。
+
+---
+
+## E. indexed-keyset-reads 実装フォローアップ (2026-07-23)
+
+性能フェーズ第2弾では、OEL の actor/correlation/causation/type/stream/occurred_at 索引付き keyset query、v2 projection cursor、可視 BlobRef 表、exact 検索経路、regex search job、persisted sync state 復元を実装した。SQLite は schema v11 へ移行し、PostgreSQL も同じ OEL scalar/index 契約と read pool を持つ。
+
+新しい一覧・履歴 API は `/api/v2` の opaque cursor 契約に限定し、既存 v1 の cursor semantics は変更していない。検証では同一 sort key を跨ぐページ境界、SQLite `EXPLAIN QUERY PLAN` の OIQ/projection 索引、exact object-id、BlobRef 可視表、sync state 再起動、regex job lifecycle を固定した。

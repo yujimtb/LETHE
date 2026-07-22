@@ -3,6 +3,8 @@ use lethe_projection_claim_queue::{ClaimGroup, ClaimState, DecisionView, Project
 use lethe_projection_cognition::{CardState, ReplyCard};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+const PROJECTION_CURSOR_SEPARATOR: char = '\u{001f}';
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CorpusSourceTypeSummary {
     pub source_type: String,
@@ -167,6 +169,277 @@ impl AppService {
         let (page, total) = paginate(&list, pagination);
         let payload = serde_json::to_value(PaginatedResponse::from_slice(page, total, pagination))?;
 
+        Ok(ResponseEnvelope {
+            data: self.apply_filter(payload)?,
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:person-page",
+                mode,
+                core.snapshot.built_at,
+                &core.snapshot.lineage,
+            )?,
+        })
+    }
+
+    pub fn persons_keyset_response(
+        &self,
+        read_mode: Option<&str>,
+        pin: Option<&str>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ResponseEnvelope<serde_json::Value>, SelfHostError> {
+        self.validate_page_limit(limit, "person projection")?;
+        let core = self.core_snapshot();
+        let mode = self.resolve_read_mode(&core.catalog, "proj:person-page", read_mode, pin)?;
+        self.authorize_read(
+            EntityRef::new("projection:person-page"),
+            ConsentStatus::RestrictedCapture,
+        )?;
+        let after = decode_keyset_after(cursor, "v2:persons")?;
+        let items = self.persistence_read_lock()?.projection_items_page(
+            &ProjectionRef::new("proj:person-page"),
+            &[PERSON_COMPONENT_ITEM_OWNER.to_owned()],
+            Some("person-component:"),
+            after.as_deref(),
+            limit,
+        )?;
+        let next_cursor = keyset_next_cursor("v2:persons", &items, limit)?;
+        let data = items
+            .iter()
+            .map(person_component_from_projection_item)
+            .map(|component| {
+                let component = component?;
+                let profile = component.profile.as_ref().ok_or_else(|| {
+                    SelfHostError::Ingestion("visible person component has no profile".to_owned())
+                })?;
+                let activity = component.activity.as_ref().ok_or_else(|| {
+                    SelfHostError::Ingestion("visible person component has no activity".to_owned())
+                })?;
+                Ok(PersonPageProjector::to_list_item(profile, activity))
+            })
+            .collect::<Result<Vec<_>, SelfHostError>>()?;
+        let payload = serde_json::to_value(KeysetPage { data, next_cursor })?;
+        Ok(ResponseEnvelope {
+            data: self.apply_filter(payload)?,
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:person-page",
+                mode,
+                core.snapshot.built_at,
+                &core.snapshot.lineage,
+            )?,
+        })
+    }
+
+    pub fn person_detail_keyset_response(
+        &self,
+        person_id: &str,
+        read_mode: Option<&str>,
+        pin: Option<&str>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ResponseEnvelope<serde_json::Value>, SelfHostError> {
+        self.validate_page_limit(limit, "person detail")?;
+        let core = self.core_snapshot();
+        let mode = self.resolve_read_mode(&core.catalog, "proj:person-page", read_mode, pin)?;
+        let component = core
+            .person_components
+            .get(person_id)
+            .ok_or_else(|| SelfHostError::NotFound(person_id.to_owned()))?;
+        let profile = component
+            .profile
+            .as_ref()
+            .ok_or_else(|| SelfHostError::NotFound(person_id.to_owned()))?;
+        self.authorize_read(
+            EntityRef::new(person_id.to_owned()),
+            consent_status_for_person_id(&core, person_id)?,
+        )?;
+        let activity = component
+            .activity
+            .as_ref()
+            .ok_or_else(|| SelfHostError::NotFound(format!("activity for {person_id}")))?;
+        let after = decode_keyset_after(cursor, &format!("v2:person-detail:{person_id}"))?;
+        let owners = person_identity_owners(&core, person_id)?;
+        let items = self.persistence_read_lock()?.projection_items_page(
+            &ProjectionRef::new("proj:person-page"),
+            &owners,
+            None,
+            after.as_deref(),
+            limit,
+        )?;
+        let next_cursor =
+            keyset_next_cursor(&format!("v2:person-detail:{person_id}"), &items, limit)?;
+        let mut slides = Vec::new();
+        let mut messages = Vec::new();
+        for item in &items {
+            if item.item_key.starts_with("ps:") {
+                slides.push(person_slide_from_projection_item(
+                    item,
+                    &core.compact_state,
+                )?);
+            } else if item.item_key.starts_with("pm:") {
+                messages.push(person_message_from_projection_item(
+                    item,
+                    &core.compact_state,
+                )?);
+            }
+        }
+        let mut detail = serde_json::to_value(PersonPageProjector::to_detail(
+            profile, &slides, &messages, activity,
+        ))?;
+        detail["next_cursor"] = serde_json::to_value(next_cursor)?;
+        Ok(ResponseEnvelope {
+            data: self.apply_filter(detail)?,
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:person-page",
+                mode,
+                core.snapshot.built_at,
+                &core.snapshot.lineage,
+            )?,
+        })
+    }
+
+    pub fn person_slides_keyset_response(
+        &self,
+        person_id: &str,
+        read_mode: Option<&str>,
+        pin: Option<&str>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ResponseEnvelope<serde_json::Value>, SelfHostError> {
+        self.validate_page_limit(limit, "person slides")?;
+        let core = self.core_snapshot();
+        let mode = self.resolve_read_mode(&core.catalog, "proj:person-page", read_mode, pin)?;
+        self.authorize_read(
+            EntityRef::new(person_id.to_owned()),
+            consent_status_for_person_id(&core, person_id)?,
+        )?;
+        let scope = format!("v2:person-slides:{person_id}");
+        let after = decode_keyset_after(cursor, &scope)?;
+        let items = self.persistence_read_lock()?.projection_items_page(
+            &ProjectionRef::new("proj:person-page"),
+            &person_identity_owners(&core, person_id)?,
+            Some("ps:"),
+            after.as_deref(),
+            limit,
+        )?;
+        let next_cursor = keyset_next_cursor(&scope, &items, limit)?;
+        let data = items
+            .iter()
+            .map(|item| person_slide_from_projection_item(item, &core.compact_state))
+            .collect::<Result<Vec<_>, _>>()?;
+        let payload = serde_json::to_value(KeysetPage { data, next_cursor })?;
+        Ok(ResponseEnvelope {
+            data: self.apply_filter(payload)?,
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:person-page",
+                mode,
+                core.snapshot.built_at,
+                &core.snapshot.lineage,
+            )?,
+        })
+    }
+
+    pub fn person_messages_keyset_response(
+        &self,
+        person_id: &str,
+        read_mode: Option<&str>,
+        pin: Option<&str>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ResponseEnvelope<serde_json::Value>, SelfHostError> {
+        self.validate_page_limit(limit, "person messages")?;
+        let core = self.core_snapshot();
+        let mode = self.resolve_read_mode(&core.catalog, "proj:person-page", read_mode, pin)?;
+        self.authorize_read(
+            EntityRef::new(person_id.to_owned()),
+            consent_status_for_person_id(&core, person_id)?,
+        )?;
+        let scope = format!("v2:person-messages:{person_id}");
+        let after = decode_keyset_after(cursor, &scope)?;
+        let items = self.persistence_read_lock()?.projection_items_page(
+            &ProjectionRef::new("proj:person-page"),
+            &person_identity_owners(&core, person_id)?,
+            Some("pm:"),
+            after.as_deref(),
+            limit,
+        )?;
+        let next_cursor = keyset_next_cursor(&scope, &items, limit)?;
+        let data = items
+            .iter()
+            .map(|item| person_message_from_projection_item(item, &core.compact_state))
+            .collect::<Result<Vec<_>, _>>()?;
+        let payload = serde_json::to_value(KeysetPage { data, next_cursor })?;
+        Ok(ResponseEnvelope {
+            data: self.apply_filter(payload)?,
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:person-page",
+                mode,
+                core.snapshot.built_at,
+                &core.snapshot.lineage,
+            )?,
+        })
+    }
+
+    pub fn person_timeline_keyset_response(
+        &self,
+        person_id: &str,
+        read_mode: Option<&str>,
+        pin: Option<&str>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ResponseEnvelope<serde_json::Value>, SelfHostError> {
+        self.validate_page_limit(limit, "person timeline")?;
+        let core = self.core_snapshot();
+        let mode = self.resolve_read_mode(&core.catalog, "proj:person-page", read_mode, pin)?;
+        self.authorize_read(
+            EntityRef::new(person_id.to_owned()),
+            consent_status_for_person_id(&core, person_id)?,
+        )?;
+        let scope = format!("v2:person-timeline:{person_id}");
+        let after = decode_keyset_after(cursor, &scope)?;
+        let items = self.persistence_read_lock()?.projection_items_page(
+            &ProjectionRef::new("proj:person-page"),
+            &person_identity_owners(&core, person_id)?,
+            None,
+            after.as_deref(),
+            limit,
+        )?;
+        let next_cursor = keyset_next_cursor(&scope, &items, limit)?;
+        let mut events = Vec::with_capacity(items.len());
+        for item in &items {
+            if item.item_key.starts_with("ps:") {
+                let slide = person_slide_from_projection_item(item, &core.compact_state)?;
+                if let Some(ts) = slide.last_modified {
+                    events.push(TimelineEvent {
+                        event_type: "slide".to_owned(),
+                        document_id: Some(slide.document_id),
+                        channel: None,
+                        title: Some(slide.title),
+                        text: None,
+                        ts,
+                    });
+                }
+            } else if item.item_key.starts_with("pm:") {
+                let message = person_message_from_projection_item(item, &core.compact_state)?;
+                events.push(TimelineEvent {
+                    event_type: "message".to_owned(),
+                    document_id: None,
+                    channel: Some(message.channel),
+                    title: None,
+                    text: Some(message.text),
+                    ts: message.ts,
+                });
+            }
+        }
+        events.sort_by(|left, right| right.ts.cmp(&left.ts));
+        let payload = serde_json::to_value(KeysetPage {
+            data: events,
+            next_cursor,
+        })?;
         Ok(ResponseEnvelope {
             data: self.apply_filter(payload)?,
             projection_metadata: self.projection_metadata(
@@ -396,6 +669,86 @@ impl AppService {
         })
     }
 
+    pub fn corpus_records_keyset_response(
+        &self,
+        read_mode: Option<&str>,
+        pin: Option<&str>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ResponseEnvelope<serde_json::Value>, SelfHostError> {
+        self.validate_page_limit(limit, "corpus records")?;
+        let after = decode_keyset_after(cursor, "v2:corpus-records")?;
+        let ((records, next_sort_key), metadata) = self.search_index.execute(|index| {
+            index.read_with_metadata(|snapshot| {
+                snapshot.records_keyset_page(after.as_deref(), limit)
+            })
+        })?;
+        let lineage = corpus_index_lineage(&metadata)?;
+        let core = self.core_snapshot();
+        let mode = self.resolve_read_mode(&core.catalog, "proj:corpus", read_mode, pin)?;
+        let next_cursor = next_sort_key
+            .map(|sort_key| encode_keyset_cursor("v2:corpus-records", &sort_key))
+            .transpose()
+            .map_err(|_| {
+                SelfHostError::Ingestion("corpus keyset cursor could not be encoded".to_owned())
+            })?;
+        let payload = serde_json::to_value(KeysetPage {
+            data: records,
+            next_cursor,
+        })?;
+        Ok(ResponseEnvelope {
+            data: payload,
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:corpus",
+                mode,
+                metadata.committed_at,
+                &lineage,
+            )?,
+        })
+    }
+
+    pub fn corpus_exact_response(
+        &self,
+        request: &lethe_api::api::grep::ExactSearchRequest,
+    ) -> Result<ResponseEnvelope<lethe_api::api::grep::ExactSearchResponse>, SelfHostError> {
+        self.validate_page_limit(request.limit, "corpus exact search")?;
+        let scope = format!("v2:corpus-exact:{:?}:{}", request.field, request.value);
+        let after = decode_keyset_after(request.cursor.as_deref(), &scope)?;
+        let ((matches, next_sort_key), metadata) = self.search_index.execute(|index| {
+            index.read_with_metadata(|snapshot| {
+                snapshot.exact_records_page(
+                    request.field,
+                    &request.value,
+                    after.as_deref(),
+                    request.limit,
+                )
+            })
+        })?;
+        let next_cursor = next_sort_key
+            .map(|sort_key| encode_keyset_cursor(&scope, &sort_key))
+            .transpose()
+            .map_err(|_| {
+                SelfHostError::Ingestion("exact search cursor could not be encoded".to_owned())
+            })?;
+        let lineage = corpus_index_lineage(&metadata)?;
+        let core = self.core_snapshot();
+        let mode = self.resolve_read_mode(&core.catalog, "proj:corpus", None, None)?;
+        Ok(ResponseEnvelope {
+            data: lethe_api::api::grep::ExactSearchResponse {
+                matches,
+                next_cursor,
+            },
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:corpus",
+                mode,
+                metadata.committed_at,
+                &lineage,
+            )?,
+        })
+    }
+
     pub fn corpus_grep_response(
         &self,
         request: &lethe_api::api::grep::GrepRequest,
@@ -415,6 +768,114 @@ impl AppService {
                 metadata.committed_at,
                 &lineage,
             )?,
+        })
+    }
+
+    pub fn corpus_grep_job_response(
+        &self,
+        request: &lethe_api::api::grep::GrepRequest,
+    ) -> Result<ResponseEnvelope<lethe_api::api::grep::GrepResponse>, SelfHostError> {
+        let (response, metadata) = self.search_index.execute(|index| {
+            index.search_with_metadata_async(request, self.config.resource_limits.max_page_size)
+        })?;
+        let lineage = corpus_index_lineage(&metadata)?;
+        let core = self.core_snapshot();
+        let mode = self.resolve_read_mode(&core.catalog, "proj:corpus", None, None)?;
+        Ok(ResponseEnvelope {
+            data: response,
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:corpus",
+                mode,
+                metadata.committed_at,
+                &lineage,
+            )?,
+        })
+    }
+
+    pub fn submit_corpus_search_job(
+        &self,
+        request: GrepRequest,
+    ) -> Result<SearchJobStatus, SelfHostError> {
+        let prepared =
+            PreparedGrepQuery::compile(&request, self.config.resource_limits.max_page_size)
+                .map_err(|error| SelfHostError::ReadMode(error.to_string()))?;
+        if !prepared.requires_async_search_job() {
+            return Err(SelfHostError::ReadMode(
+                "safe literal search must use the synchronous exact/literal path".to_owned(),
+            ));
+        }
+        let job_id = format!("search-job:{}", uuid::Uuid::now_v7());
+        {
+            let mut jobs = self
+                .search_jobs
+                .lock()
+                .map_err(|_| SelfHostError::LockPoisoned)?;
+            jobs.insert(
+                job_id.clone(),
+                SearchJobRecord {
+                    status: "queued".to_owned(),
+                    result: None,
+                    error: None,
+                },
+            );
+        }
+        let worker_service = self.clone();
+        let worker_job_id = job_id.clone();
+        std::thread::spawn(move || {
+            let run = || -> Result<(), SelfHostError> {
+                {
+                    let mut jobs = worker_service
+                        .search_jobs
+                        .lock()
+                        .map_err(|_| SelfHostError::LockPoisoned)?;
+                    let job = jobs.get_mut(&worker_job_id).ok_or_else(|| {
+                        SelfHostError::NotFound(format!("search job {worker_job_id}"))
+                    })?;
+                    job.status = "running".to_owned();
+                }
+                let response = worker_service.corpus_grep_job_response(&request)?;
+                let result = serde_json::to_value(response)?;
+                let mut jobs = worker_service
+                    .search_jobs
+                    .lock()
+                    .map_err(|_| SelfHostError::LockPoisoned)?;
+                let job = jobs.get_mut(&worker_job_id).ok_or_else(|| {
+                    SelfHostError::NotFound(format!("search job {worker_job_id}"))
+                })?;
+                job.status = "completed".to_owned();
+                job.result = Some(result);
+                Ok(())
+            };
+            if let Err(error) = run()
+                && let Ok(mut jobs) = worker_service.search_jobs.lock()
+                && let Some(job) = jobs.get_mut(&worker_job_id)
+            {
+                job.status = "failed".to_owned();
+                job.error = Some(error.to_string());
+            }
+        });
+        Ok(SearchJobStatus {
+            job_id,
+            status: "queued".to_owned(),
+            result: None,
+            error: None,
+        })
+    }
+
+    pub fn search_job_status(&self, job_id: &str) -> Result<SearchJobStatus, SelfHostError> {
+        let jobs = self
+            .search_jobs
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?;
+        let job = jobs
+            .get(job_id)
+            .ok_or_else(|| SelfHostError::NotFound(format!("search job {job_id}")))?;
+        Ok(SearchJobStatus {
+            job_id: job_id.to_owned(),
+            status: job.status.clone(),
+            result: job.result.clone(),
+            error: job.error.clone(),
         })
     }
 
@@ -790,6 +1251,200 @@ impl AppService {
         })
     }
 
+    pub fn claim_queue_keyset_response(
+        &self,
+        state: Option<ClaimState>,
+        backfill: Option<bool>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ResponseEnvelope<ClaimQueueKeysetPage>, SelfHostError> {
+        self.validate_page_limit(limit, "claim queue")?;
+        let core = self.core_snapshot();
+        self.ensure_projection_fresh(&core.catalog, "proj:claim-queue")?;
+        let mode = self.resolve_read_mode(&core.catalog, "proj:claim-queue", None, None)?;
+        let scope = "v2:claim-queue";
+        let after = decode_keyset_after(cursor, scope)?;
+        if state.is_none() && backfill.is_none() {
+            let items = self.persistence_read_lock()?.projection_items_page(
+                &ProjectionRef::new("proj:person-page"),
+                &[CLAIM_QUEUE_ITEM_OWNER.to_owned()],
+                Some("claim-group:"),
+                after.as_deref(),
+                limit,
+            )?;
+            let next_cursor = keyset_next_cursor(scope, &items, limit)?;
+            let groups = items
+                .into_iter()
+                .map(|item| serde_json::from_value(item.value))
+                .collect::<Result<Vec<ClaimGroup>, _>>()?;
+            let lineage = build_supplemental_projection_lineage(
+                "proj:claim-queue",
+                &core.supplemental.list(),
+                core.snapshot.claim_queue.claims.len() + core.snapshot.claim_queue.decisions.len(),
+                core.snapshot.built_at,
+            );
+            return Ok(ResponseEnvelope {
+                data: ClaimQueueKeysetPage {
+                    groups,
+                    next_cursor,
+                    audit_log: core.snapshot.claim_queue.audit_log.clone(),
+                },
+                projection_metadata: self.projection_metadata(
+                    &core.catalog,
+                    "proj:claim-queue",
+                    mode,
+                    core.snapshot.built_at,
+                    &lineage,
+                )?,
+            });
+        }
+        let mut page_after = after;
+        let mut groups = Vec::with_capacity(limit);
+        let mut source_items = Vec::with_capacity(limit);
+        loop {
+            let items = self.persistence_read_lock()?.projection_items_page(
+                &ProjectionRef::new("proj:person-page"),
+                &[CLAIM_QUEUE_ITEM_OWNER.to_owned()],
+                Some("claim-group:"),
+                page_after.as_deref(),
+                limit,
+            )?;
+            if items.is_empty() {
+                break;
+            }
+            let page_len = items.len();
+            let last_item = items.last().cloned().ok_or_else(|| {
+                SelfHostError::Ingestion("claim queue page unexpectedly empty".to_owned())
+            })?;
+            for item in items {
+                let group: ClaimGroup = serde_json::from_value(item.value.clone())?;
+                let members = group
+                    .members
+                    .into_iter()
+                    .filter(|claim| state.is_none_or(|state| claim.state == state))
+                    .filter(|claim| backfill.is_none_or(|backfill| claim.backfill == backfill))
+                    .collect::<Vec<_>>();
+                if members.is_empty() {
+                    continue;
+                }
+                source_items.push(ProjectionItem {
+                    value: serde_json::to_value(ClaimGroup {
+                        group_id: group.group_id.clone(),
+                        source_refs: group.source_refs.clone(),
+                        members: members.clone(),
+                    })?,
+                    ..item
+                });
+                groups.push(ClaimGroup {
+                    group_id: group.group_id,
+                    source_refs: group.source_refs,
+                    members,
+                });
+                if groups.len() == limit {
+                    break;
+                }
+            }
+            if groups.len() == limit {
+                break;
+            }
+            if page_len < limit {
+                break;
+            }
+            page_after = Some(projection_item_cursor_boundary(&last_item));
+        }
+        let next_cursor = if groups.len() == limit {
+            source_items
+                .last()
+                .map(projection_item_cursor_boundary)
+                .map(|boundary| encode_keyset_cursor(scope, &boundary))
+                .transpose()
+                .map_err(|_| {
+                    SelfHostError::Ingestion("claim queue cursor could not be encoded".to_owned())
+                })?
+        } else {
+            None
+        };
+        let lineage = build_supplemental_projection_lineage(
+            "proj:claim-queue",
+            &core.supplemental.list(),
+            core.snapshot.claim_queue.claims.len() + core.snapshot.claim_queue.decisions.len(),
+            core.snapshot.built_at,
+        );
+        Ok(ResponseEnvelope {
+            data: ClaimQueueKeysetPage {
+                groups,
+                next_cursor,
+                audit_log: core.snapshot.claim_queue.audit_log.clone(),
+            },
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:claim-queue",
+                mode,
+                core.snapshot.built_at,
+                &lineage,
+            )?,
+        })
+    }
+
+    pub fn reply_slo_keyset_response(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ResponseEnvelope<serde_json::Value>, SelfHostError> {
+        self.validate_page_limit(limit, "reply SLO")?;
+        let core = self.core_snapshot();
+        self.ensure_projection_fresh(&core.catalog, "proj:reply-slo")?;
+        let mode = self.resolve_read_mode(&core.catalog, "proj:reply-slo", None, None)?;
+        let scope = "v2:reply-slo";
+        let after = decode_keyset_after(cursor, scope)?;
+        let items = self.persistence_read_lock()?.projection_items_page(
+            &ProjectionRef::new("proj:person-page"),
+            &[REPLY_SLO_ITEM_OWNER.to_owned()],
+            None,
+            after.as_deref(),
+            limit,
+        )?;
+        let next_cursor = keyset_next_cursor(scope, &items, limit)?;
+        let mut rows = Vec::with_capacity(items.len());
+        let now = Utc::now();
+        for item in &items {
+            let mut row = reply_slo_from_projection_item(item)?;
+            if row.sent_at.is_none() && row.due_at < now {
+                row.status = ReplySloStatus::Overdue;
+            }
+            rows.push(row);
+        }
+        let overdue: Vec<_> = rows
+            .iter()
+            .filter(|row| row.status == ReplySloStatus::Overdue)
+            .cloned()
+            .collect();
+        let lineage = build_mixed_projection_lineage(
+            "proj:reply-slo",
+            &core.snapshot.lineage.build_id,
+            core.observation_stats,
+            &core.supplemental.list(),
+            usize::try_from(core.reply_slo_count).map_err(|_| {
+                SelfHostError::Ingestion("reply SLO count does not fit usize".to_owned())
+            })?,
+            core.snapshot.built_at,
+        );
+        Ok(ResponseEnvelope {
+            data: serde_json::json!({
+                "rows": rows,
+                "overdue": overdue,
+                "next_cursor": next_cursor,
+            }),
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:reply-slo",
+                mode,
+                core.snapshot.built_at,
+                &lineage,
+            )?,
+        })
+    }
+
     pub fn break_glass_response(
         &self,
     ) -> Result<ResponseEnvelope<BreakGlassProjection>, SelfHostError> {
@@ -918,6 +1573,196 @@ impl AppService {
             )?,
         })
     }
+
+    pub fn card_queue_keyset_response(
+        &self,
+        state: Option<CardState>,
+        channel: Option<&str>,
+        automatic: Option<bool>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ResponseEnvelope<CardQueueKeysetPage>, SelfHostError> {
+        self.validate_page_limit(limit, "card queue")?;
+        let core = self.core_snapshot();
+        self.ensure_projection_fresh(&core.catalog, "proj:card-queue")?;
+        let mode = self.resolve_read_mode(&core.catalog, "proj:card-queue", None, None)?;
+        let scope = "v2:card-queue";
+        let after = decode_keyset_after(cursor, scope)?;
+        if state.is_none() && channel.is_none() && automatic.is_none() {
+            let items = self.persistence_read_lock()?.projection_items_page(
+                &ProjectionRef::new("proj:person-page"),
+                &[CARD_QUEUE_ITEM_OWNER.to_owned()],
+                Some("card:"),
+                after.as_deref(),
+                limit,
+            )?;
+            let next_cursor = keyset_next_cursor(scope, &items, limit)?;
+            let cards = items
+                .into_iter()
+                .map(|item| serde_json::from_value(item.value))
+                .collect::<Result<Vec<ReplyCard>, _>>()?;
+            let lineage = build_supplemental_projection_lineage(
+                "proj:card-queue",
+                &core.supplemental.list(),
+                core.snapshot.card_queue.cards.len(),
+                core.snapshot.built_at,
+            );
+            return Ok(ResponseEnvelope {
+                data: CardQueueKeysetPage {
+                    cards,
+                    next_cursor,
+                    audit_log: core.snapshot.card_queue.audit_log.clone(),
+                },
+                projection_metadata: self.projection_metadata(
+                    &core.catalog,
+                    "proj:card-queue",
+                    mode,
+                    core.snapshot.built_at,
+                    &lineage,
+                )?,
+            });
+        }
+        let mut page_after = after;
+        let mut cards = Vec::with_capacity(limit);
+        let mut source_items = Vec::with_capacity(limit);
+        loop {
+            let items = self.persistence_read_lock()?.projection_items_page(
+                &ProjectionRef::new("proj:person-page"),
+                &[CARD_QUEUE_ITEM_OWNER.to_owned()],
+                Some("card:"),
+                page_after.as_deref(),
+                limit,
+            )?;
+            if items.is_empty() {
+                break;
+            }
+            let page_len = items.len();
+            let last_item = items.last().cloned().ok_or_else(|| {
+                SelfHostError::Ingestion("card queue page unexpectedly empty".to_owned())
+            })?;
+            for item in items {
+                let card: ReplyCard = serde_json::from_value(item.value.clone())?;
+                if state.is_some_and(|expected| card.state != expected)
+                    || channel.is_some_and(|expected| card.channel != expected)
+                    || automatic.is_some_and(|expected| card.automatic_send != expected)
+                {
+                    continue;
+                }
+                source_items.push(item);
+                cards.push(card);
+                if cards.len() == limit {
+                    break;
+                }
+            }
+            if cards.len() == limit {
+                break;
+            }
+            if page_len < limit {
+                break;
+            }
+            page_after = Some(projection_item_cursor_boundary(&last_item));
+        }
+        let next_cursor = if cards.len() == limit {
+            source_items
+                .last()
+                .map(projection_item_cursor_boundary)
+                .map(|boundary| encode_keyset_cursor(scope, &boundary))
+                .transpose()
+                .map_err(|_| {
+                    SelfHostError::Ingestion("card queue cursor could not be encoded".to_owned())
+                })?
+        } else {
+            None
+        };
+        let lineage = build_supplemental_projection_lineage(
+            "proj:card-queue",
+            &core.supplemental.list(),
+            core.snapshot.card_queue.cards.len(),
+            core.snapshot.built_at,
+        );
+        Ok(ResponseEnvelope {
+            data: CardQueueKeysetPage {
+                cards,
+                next_cursor,
+                audit_log: core.snapshot.card_queue.audit_log.clone(),
+            },
+            projection_metadata: self.projection_metadata(
+                &core.catalog,
+                "proj:card-queue",
+                mode,
+                core.snapshot.built_at,
+                &lineage,
+            )?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClaimQueueKeysetPage {
+    pub groups: Vec<ClaimGroup>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub audit_log: Vec<ProjectionAuditEvent>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CardQueueKeysetPage {
+    pub cards: Vec<ReplyCard>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub audit_log: Vec<ProjectionAuditEvent>,
+}
+
+fn decode_keyset_after(cursor: Option<&str>, scope: &str) -> Result<Option<String>, SelfHostError> {
+    cursor
+        .map(|cursor| {
+            decode_keyset_cursor(cursor, scope)
+                .map(|decoded| decoded.sort_key)
+                .map_err(|error| {
+                    let detail = match error {
+                        KeysetCursorError::Invalid => "cursor is invalid",
+                        KeysetCursorError::WrongScope => "cursor scope does not match this API",
+                    };
+                    SelfHostError::ReadMode(format!("{scope}: {detail}"))
+                })
+        })
+        .transpose()
+}
+
+fn keyset_next_cursor(
+    scope: &str,
+    items: &[ProjectionItem],
+    limit: usize,
+) -> Result<Option<String>, SelfHostError> {
+    if items.len() < limit {
+        return Ok(None);
+    }
+    let item = items
+        .last()
+        .ok_or_else(|| SelfHostError::Ingestion("non-empty keyset page expected".to_owned()))?;
+    let sort_key = projection_item_cursor_boundary(item);
+    Ok(Some(encode_keyset_cursor(scope, &sort_key).map_err(
+        |_| SelfHostError::Ingestion("projection keyset cursor could not be encoded".to_owned()),
+    )?))
+}
+
+fn projection_item_cursor_boundary(item: &ProjectionItem) -> String {
+    format!(
+        "{}{}{}",
+        item.sort_key, PROJECTION_CURSOR_SEPARATOR, item.item_key
+    )
+}
+
+fn person_identity_owners(core: &AppCore, person_id: &str) -> Result<Vec<String>, SelfHostError> {
+    let members = core
+        .compact_state
+        .identity
+        .component_members_for_person(person_id)
+        .ok_or_else(|| SelfHostError::NotFound(person_id.to_owned()))?;
+    Ok(members
+        .iter()
+        .map(|node_id| identity_node_owner(*node_id))
+        .collect())
 }
 
 fn validate_verification_mode_filter(value: Option<&str>) -> Result<(), SelfHostError> {

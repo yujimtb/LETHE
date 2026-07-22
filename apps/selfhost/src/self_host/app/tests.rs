@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
@@ -13,6 +14,7 @@ use lethe_adapter_api::traits::ObservationDraft;
 use lethe_adapter_gslides::gslides::client::{PresentationNative, SlideNative, SlideRevision};
 use lethe_adapter_slack::slack::client::{FixtureSlackClient, SlackMessage, SlackMessageType};
 use lethe_adapter_slack::slack::mapper::SlackAdapter;
+use lethe_api::api::grep::GrepRequest;
 use lethe_core::domain::supplemental::InputAnchorSet;
 
 use super::{
@@ -463,6 +465,7 @@ fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppSe
         derived_projection_lane: Arc::new(Mutex::new(())),
         bulk_import_operation: Arc::new(Mutex::new(())),
         search_index,
+        search_jobs: Arc::new(Mutex::new(BTreeMap::new())),
         config: Arc::new(config.clone()),
         slack_sources: vec![SlackSourceRuntime {
             config: config.slack_sources[0].clone(),
@@ -501,6 +504,47 @@ fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppSe
         .set_state("append_consumer:person-page", "0")
         .unwrap();
     service
+}
+
+#[test]
+fn regex_search_job_lifecycle_reaches_a_terminal_state() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-self-host-search-job-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let config = test_config(db.clone(), blobs.clone());
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let service = test_service(config, persistence);
+    wait_for_search_index_ready(&service);
+
+    let queued = service
+        .submit_corpus_search_job(GrepRequest {
+            pattern: "[a-z]+".to_owned(),
+            ..GrepRequest::default()
+        })
+        .unwrap();
+    assert_eq!(queued.status, "queued");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let terminal = loop {
+        let status = service.search_job_status(&queued.job_id).unwrap();
+        if status.status == "completed" || status.status == "failed" {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "search job did not reach a terminal state"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert_eq!(terminal.status, "completed");
+    assert!(terminal.result.is_some());
+    assert!(terminal.error.is_none());
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 fn wait_for_search_index_ready(service: &AppService) {

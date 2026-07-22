@@ -171,6 +171,33 @@ pub struct PriorQaSearchResponse<T> {
     pub is_primary_source: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExactSearchField {
+    RecordId,
+    SourceObjectId,
+    ThreadKey,
+    SessionId,
+    SourceType,
+    Container,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExactSearchRequest {
+    pub field: ExactSearchField,
+    pub value: String,
+    pub limit: usize,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExactSearchResponse {
+    pub matches: Vec<GrepRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GrepError {
     #[error("invalid regex pattern: {0}")]
@@ -295,6 +322,12 @@ impl PreparedGrepQuery {
     /// candidate constraint.
     pub fn required_literal_ngrams(&self) -> &[String] {
         &self.required_literal_ngrams
+    }
+
+    /// True when the request cannot be narrowed by the persistent literal
+    /// index and therefore belongs to the asynchronous search-job class.
+    pub fn requires_async_search_job(&self) -> bool {
+        self.required_literal_ngrams.is_empty()
     }
 
     /// Returns safe n-gram candidates grouped by independently required query

@@ -39,6 +39,9 @@ impl SqlitePersistence {
                 stream_version INTEGER NOT NULL CHECK (stream_version > 0),
                 idempotency_key TEXT NOT NULL CHECK (length(trim(idempotency_key)) > 0),
                 event_type TEXT NOT NULL CHECK (length(trim(event_type)) > 0),
+                actor_id TEXT,
+                causation_id TEXT,
+                correlation_id TEXT,
                 occurred_at TEXT NOT NULL,
                 observation_id TEXT NOT NULL UNIQUE,
                 event_sha256 TEXT NOT NULL CHECK (length(event_sha256) = 64),
@@ -50,6 +53,21 @@ impl SqlitePersistence {
 
             CREATE INDEX IF NOT EXISTS operational_events_stream
                 ON operational_events(data_space_id, stream_id, stream_version);
+            CREATE INDEX IF NOT EXISTS operational_events_stream_cursor
+                ON operational_events(data_space_id, stream_id, cursor);
+
+            CREATE INDEX IF NOT EXISTS operational_events_correlation_cursor
+                ON operational_events(data_space_id, correlation_id, cursor);
+            CREATE INDEX IF NOT EXISTS operational_events_causation_cursor
+                ON operational_events(data_space_id, causation_id, cursor);
+            CREATE INDEX IF NOT EXISTS operational_events_type_cursor
+                ON operational_events(data_space_id, event_type, cursor);
+            CREATE INDEX IF NOT EXISTS operational_events_actor_cursor
+                ON operational_events(data_space_id, actor_id, cursor);
+            CREATE INDEX IF NOT EXISTS operational_events_occurred_cursor
+                ON operational_events(data_space_id, occurred_at, cursor);
+            CREATE INDEX IF NOT EXISTS operational_events_stream_occurred_cursor
+                ON operational_events(data_space_id, stream_id, occurred_at, cursor);
 
             CREATE TRIGGER IF NOT EXISTS operational_events_no_update
             BEFORE UPDATE ON operational_events
@@ -128,6 +146,18 @@ impl SqlitePersistence {
                     item_key
                 );
 
+            CREATE TABLE IF NOT EXISTS projection_visible_blob_refs (
+                projection_id TEXT NOT NULL,
+                item_key TEXT NOT NULL,
+                blob_ref TEXT NOT NULL,
+                owner_key TEXT NOT NULL,
+                consent_scope TEXT NOT NULL,
+                PRIMARY KEY (projection_id, item_key, blob_ref)
+            );
+
+            CREATE INDEX IF NOT EXISTS projection_visible_blob_refs_lookup
+                ON projection_visible_blob_refs (projection_id, blob_ref);
+
             CREATE TABLE IF NOT EXISTS projection_leaf_watermarks (
                 projection_id TEXT NOT NULL,
                 leaf_id TEXT NOT NULL CHECK (leaf_id LIKE 'lake:%'),
@@ -161,6 +191,7 @@ impl SqlitePersistence {
                 failed INTEGER NOT NULL,
                 quarantined INTEGER NOT NULL,
                 latency_ms INTEGER NOT NULL,
+                last_error TEXT,
                 updated_at TEXT NOT NULL
             );
 
@@ -276,11 +307,18 @@ impl SqlitePersistence {
     fn apply_schema_migrations(&self) -> Result<(), PersistenceError> {
         let identity_lookup_recorded =
             self.schema_migration_recorded(SCHEMA_VERSION_IDENTITY_LOOKUP_INDEX)?;
-        let lock_split_recorded = self.schema_migration_recorded(CURRENT_SCHEMA_VERSION)?;
+        let lock_split_recorded =
+            self.schema_migration_recorded(SCHEMA_VERSION_LOCK_SPLIT_SCALARS)?;
+        let keyset_reads_recorded = self.schema_migration_recorded(CURRENT_SCHEMA_VERSION)?;
 
         if lock_split_recorded && !identity_lookup_recorded {
             return Err(PersistenceError::SchemaInvariant(
                 "schema migration v10 is recorded without prerequisite v9".to_owned(),
+            ));
+        }
+        if keyset_reads_recorded && !lock_split_recorded {
+            return Err(PersistenceError::SchemaInvariant(
+                "schema migration v11 is recorded without prerequisite v10".to_owned(),
             ));
         }
 
@@ -296,12 +334,19 @@ impl SqlitePersistence {
 
         if lock_split_recorded {
             self.require_schema_migration_name(
-                CURRENT_SCHEMA_VERSION,
+                SCHEMA_VERSION_LOCK_SPLIT_SCALARS,
                 "append_commit_lock_split_scalars",
             )?;
             self.require_lock_split_schema_objects()?;
         } else {
             self.apply_lock_split_scalars_migration()?;
+        }
+
+        if keyset_reads_recorded {
+            self.require_schema_migration_name(CURRENT_SCHEMA_VERSION, "indexed_keyset_reads")?;
+            self.require_keyset_read_schema_objects()?;
+        } else {
+            self.apply_keyset_reads_migration()?;
         }
 
         Ok(())
@@ -370,9 +415,93 @@ impl SqlitePersistence {
         self.backfill_projection_manifest_fields(&transaction)?;
         record_schema_migration(
             &transaction,
-            CURRENT_SCHEMA_VERSION,
+            SCHEMA_VERSION_LOCK_SPLIT_SCALARS,
             "append_commit_lock_split_scalars",
         )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn apply_keyset_reads_migration(&self) -> Result<(), PersistenceError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let columns = table_columns(&transaction, "operational_events")?;
+        for (column, definition) in [
+            ("actor_id", "TEXT"),
+            ("causation_id", "TEXT"),
+            ("correlation_id", "TEXT"),
+        ] {
+            if !columns.contains(column) {
+                transaction.execute(
+                    &format!("ALTER TABLE operational_events ADD COLUMN {column} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        transaction.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS projection_visible_blob_refs (
+                projection_id TEXT NOT NULL,
+                item_key TEXT NOT NULL,
+                blob_ref TEXT NOT NULL,
+                owner_key TEXT NOT NULL,
+                consent_scope TEXT NOT NULL,
+                PRIMARY KEY (projection_id, item_key, blob_ref)
+            );
+            CREATE INDEX IF NOT EXISTS projection_visible_blob_refs_lookup
+                ON projection_visible_blob_refs (projection_id, blob_ref);
+
+            CREATE INDEX IF NOT EXISTS projection_materialization_items_owner_order
+                ON projection_materialization_items (
+                    projection_id, owner_key, sort_key, item_key
+                );
+
+            CREATE INDEX IF NOT EXISTS operational_events_correlation_cursor
+                ON operational_events(data_space_id, correlation_id, cursor);
+            CREATE INDEX IF NOT EXISTS operational_events_stream_cursor
+                ON operational_events(data_space_id, stream_id, cursor);
+            CREATE INDEX IF NOT EXISTS operational_events_causation_cursor
+                ON operational_events(data_space_id, causation_id, cursor);
+            CREATE INDEX IF NOT EXISTS operational_events_type_cursor
+                ON operational_events(data_space_id, event_type, cursor);
+            CREATE INDEX IF NOT EXISTS operational_events_actor_cursor
+                ON operational_events(data_space_id, actor_id, cursor);
+            CREATE INDEX IF NOT EXISTS operational_events_occurred_cursor
+                ON operational_events(data_space_id, occurred_at, cursor);
+            CREATE INDEX IF NOT EXISTS operational_events_stream_occurred_cursor
+                ON operational_events(data_space_id, stream_id, occurred_at, cursor);
+
+            ",
+        )?;
+        let sync_columns = table_columns(&transaction, "sync_metrics")?;
+        if !sync_columns.contains("last_error") {
+            transaction.execute("ALTER TABLE sync_metrics ADD COLUMN last_error TEXT", [])?;
+        }
+
+        let mut statement = transaction.prepare(
+            "SELECT cursor, event_json FROM operational_events
+             WHERE actor_id IS NULL OR causation_id IS NULL OR correlation_id IS NULL",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for (cursor, event_json) in rows {
+            let event: lethe_storage_api::OperationalEvent = serde_json::from_str(&event_json)?;
+            transaction.execute(
+                "UPDATE operational_events
+                 SET actor_id = ?1, causation_id = ?2, correlation_id = ?3
+                 WHERE cursor = ?4",
+                rusqlite::params![
+                    event.actor_id,
+                    event.causation_id.map(|id| id.as_str().to_owned()),
+                    event.correlation_id,
+                    cursor,
+                ],
+            )?;
+        }
+        record_schema_migration(&transaction, CURRENT_SCHEMA_VERSION, "indexed_keyset_reads")?;
         transaction.commit()?;
         Ok(())
     }
@@ -464,6 +593,45 @@ impl SqlitePersistence {
             ("table", "operational_event_stats"),
         ] {
             self.require_schema_object(object_type, object_name)?;
+        }
+        Ok(())
+    }
+
+    fn require_keyset_read_schema_objects(&self) -> Result<(), PersistenceError> {
+        for (object_type, object_name) in [
+            ("index", "operational_events_correlation_cursor"),
+            ("index", "operational_events_stream_cursor"),
+            ("index", "operational_events_causation_cursor"),
+            ("index", "operational_events_type_cursor"),
+            ("index", "operational_events_actor_cursor"),
+            ("index", "operational_events_occurred_cursor"),
+            ("index", "operational_events_stream_occurred_cursor"),
+            ("table", "projection_visible_blob_refs"),
+            ("index", "projection_visible_blob_refs_lookup"),
+        ] {
+            self.require_schema_object(object_type, object_name)?;
+        }
+        let columns = self
+            .conn
+            .prepare("PRAGMA table_info(operational_events)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+        for column in ["actor_id", "causation_id", "correlation_id"] {
+            if !columns.contains(column) {
+                return Err(PersistenceError::SchemaInvariant(format!(
+                    "operational_events column is missing: {column}"
+                )));
+            }
+        }
+        let sync_columns = self
+            .conn
+            .prepare("PRAGMA table_info(sync_metrics)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+        if !sync_columns.contains("last_error") {
+            return Err(PersistenceError::SchemaInvariant(
+                "sync_metrics column is missing: last_error".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -787,4 +955,15 @@ fn record_schema_migration(
         params![version, name, chrono::Utc::now().to_rfc3339()],
     )?;
     Ok(())
+}
+
+fn table_columns(
+    transaction: &rusqlite::Transaction<'_>,
+    table: &str,
+) -> Result<std::collections::BTreeSet<String>, PersistenceError> {
+    let mut statement = transaction.prepare(&format!("PRAGMA table_info({table})"))?;
+    statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()
+        .map_err(PersistenceError::from)
 }

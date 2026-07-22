@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::ops::Bound;
 
-use lethe_api::api::grep::{GrepOrder, GrepRecord};
+use lethe_api::api::grep::{ExactSearchField, GrepOrder, GrepRecord};
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::{BooleanQuery, Query, RangeQuery, TermQuery, TermSetQuery};
 use tantivy::schema::{Field, IndexRecordOption, TantivyDocument, Value};
@@ -10,6 +10,7 @@ use tantivy::{DocAddress, Order, Searcher, Term};
 use crate::index::{IndexError, PersistentCorpusIndex};
 
 const READ_CANDIDATE_PAGE_SIZE: usize = 128;
+type ExactRecordMatcher = Box<dyn Fn(&GrepRecord) -> bool>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodingSessionEdge {
@@ -177,6 +178,105 @@ impl PersistentCorpusIndex {
             )));
         }
         Ok((self.load_records(&searcher, addresses)?, total))
+    }
+
+    pub fn records_keyset_page(
+        &self,
+        after_sort_key: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<GrepRecord>, Option<String>), IndexError> {
+        validate_limit(limit)?;
+        let fields = self.fields();
+        let (searcher, _) = self.search_snapshot()?;
+        let (addresses, next_sort_key) =
+            query_addresses_keyset(&searcher, after_sort_key, limit, "sort_desc", |after| {
+                query_with_after(Vec::new(), fields.sort_desc, after)
+            })?;
+        Ok((self.load_records(&searcher, addresses)?, next_sort_key))
+    }
+
+    pub fn exact_records_page(
+        &self,
+        field: ExactSearchField,
+        value: &str,
+        after_sort_key: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<GrepRecord>, Option<String>), IndexError> {
+        validate_limit(limit)?;
+        if value.trim().is_empty() {
+            return Err(IndexError::InvalidReadRequest(
+                "exact search value must not be blank".to_owned(),
+            ));
+        }
+        let fields = self.fields();
+        let expected_value = value.to_owned();
+        let (field, matches): (Field, ExactRecordMatcher) = match field {
+            ExactSearchField::RecordId => (
+                fields.record_id,
+                Box::new({
+                    let expected_value = expected_value.clone();
+                    move |record| record.record_id == expected_value
+                }),
+            ),
+            ExactSearchField::SourceObjectId => (
+                fields.source_object_id,
+                Box::new({
+                    let expected_value = expected_value.clone();
+                    move |record| {
+                        metadata_str(record, "source_object_id") == Some(expected_value.as_str())
+                    }
+                }),
+            ),
+            ExactSearchField::ThreadKey => (
+                fields.thread_key,
+                Box::new({
+                    let expected_value = expected_value.clone();
+                    move |record| {
+                        metadata_str(record, "thread_key") == Some(expected_value.as_str())
+                    }
+                }),
+            ),
+            ExactSearchField::SessionId => (
+                fields.session_id,
+                Box::new({
+                    let expected_value = expected_value.clone();
+                    move |record| {
+                        metadata_str(record, "session_id") == Some(expected_value.as_str())
+                    }
+                }),
+            ),
+            ExactSearchField::SourceType => (
+                fields.source_type,
+                Box::new({
+                    let expected_value = expected_value.clone();
+                    move |record| record.source_type == expected_value
+                }),
+            ),
+            ExactSearchField::Container => (
+                fields.container,
+                Box::new({
+                    let expected_value = expected_value.clone();
+                    move |record| record.container.as_deref() == Some(expected_value.as_str())
+                }),
+            ),
+        };
+        let (searcher, _) = self.search_snapshot()?;
+        let query_value = expected_value;
+        let query = move |after: Option<&str>| -> Box<dyn Query> {
+            query_with_after(
+                vec![exact_term_query(field, &query_value)],
+                fields.sort_desc,
+                after,
+            )
+        };
+        let (addresses, candidate_next) =
+            query_addresses_keyset(&searcher, after_sort_key, limit, "sort_desc", query)?;
+        let records = self
+            .load_records(&searcher, addresses)?
+            .into_iter()
+            .filter(|record| matches(record))
+            .collect::<Vec<_>>();
+        Ok((records, candidate_next))
     }
 
     pub fn source_type_counts(&self) -> Result<BTreeMap<String, u64>, IndexError> {
@@ -704,6 +804,37 @@ fn query_addresses_page(
     Ok((addresses, total))
 }
 
+fn query_addresses_keyset(
+    searcher: &Searcher,
+    after: Option<&str>,
+    limit: usize,
+    sort_field_name: &'static str,
+    query: impl for<'a> Fn(Option<&'a str>) -> Box<dyn Query>,
+) -> Result<(Vec<DocAddress>, Option<String>), IndexError> {
+    validate_limit(limit)?;
+    let collector = TopDocs::with_limit(limit.saturating_add(1))
+        .order_by_string_fast_field(sort_field_name, Order::Asc);
+    let page = searcher.search(query(after).as_ref(), &collector)?;
+    let mut previous = None;
+    let mut addresses = Vec::with_capacity(page.len().min(limit));
+    let mut sort_keys = Vec::with_capacity(page.len());
+    for (sort_key, address) in &page {
+        let sort_key = validate_sort_key(
+            sort_key.as_deref(),
+            after,
+            previous.as_deref(),
+            sort_field_name,
+        )?;
+        previous = Some(sort_key.to_owned());
+        sort_keys.push(sort_key.to_owned());
+        if addresses.len() < limit {
+            addresses.push(*address);
+        }
+    }
+    let next_cursor = (page.len() > limit).then(|| sort_keys[limit - 1].clone());
+    Ok((addresses, next_cursor))
+}
+
 fn visit_query_addresses(
     searcher: &Searcher,
     sort_field_name: &'static str,
@@ -740,7 +871,7 @@ fn query_with_after(
     mut clauses: Vec<Box<dyn Query>>,
     sort_field: Field,
     after: Option<&str>,
-) -> Box<dyn Query> {
+) -> Box<dyn Query + 'static> {
     if let Some(after) = after {
         clauses.push(Box::new(RangeQuery::new(
             Bound::Excluded(Term::from_field_text(sort_field, after)),
@@ -754,7 +885,7 @@ fn query_with_after(
     }
 }
 
-fn exact_term_query(field: Field, value: &str) -> Box<dyn Query> {
+fn exact_term_query(field: Field, value: &str) -> Box<dyn Query + 'static> {
     Box::new(TermQuery::new(
         Term::from_field_text(field, value),
         IndexRecordOption::Basic,
@@ -902,6 +1033,84 @@ mod tests {
             index.records_page(0, 0),
             Err(IndexError::InvalidReadRequest(_))
         ));
+
+        drop(index);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn records_keyset_page_crosses_same_sort_timestamp_without_duplicates() {
+        let records = (0..5)
+            .map(|index| {
+                record(
+                    &format!("same-{index}"),
+                    2,
+                    "slack",
+                    None,
+                    None,
+                    None,
+                    None,
+                    &format!("https://example.test/{index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (path, index) = create_index(&records);
+
+        let (first, first_cursor) = index.records_keyset_page(None, 2).unwrap();
+        let first_cursor = first_cursor.expect("first page must expose a cursor");
+        let (second, second_cursor) = index.records_keyset_page(Some(&first_cursor), 2).unwrap();
+        let second_cursor = second_cursor.expect("second page must expose a cursor");
+        let (third, no_cursor) = index.records_keyset_page(Some(&second_cursor), 2).unwrap();
+
+        let ids = first
+            .into_iter()
+            .chain(second)
+            .chain(third)
+            .map(|record| record.record_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 5);
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            5
+        );
+        assert!(no_cursor.is_none());
+
+        drop(index);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn exact_source_object_id_reads_the_dedicated_index_path() {
+        let mut indexed = record(
+            "indexed",
+            1,
+            "slack",
+            None,
+            None,
+            None,
+            None,
+            "https://example.test/indexed",
+        );
+        indexed.metadata = serde_json::json!({"source_object_id": "object-42"});
+        let mut other = record(
+            "other",
+            2,
+            "slack",
+            None,
+            None,
+            None,
+            None,
+            "https://example.test/other",
+        );
+        other.metadata = serde_json::json!({"source_object_id": "object-99"});
+        let (path, index) = create_index(&[indexed, other]);
+
+        let (matches, next_cursor) = index
+            .exact_records_page(ExactSearchField::SourceObjectId, "object-42", None, 10)
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].record_id, "indexed");
+        assert!(next_cursor.is_none());
 
         drop(index);
         fs::remove_dir_all(path).unwrap();

@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::ops::Bound;
+use std::time::Duration;
 use std::time::Instant;
 
 use lethe_api::api::grep::{GrepError, GrepOrder, GrepRequest, GrepResponse, PreparedGrepQuery};
@@ -30,6 +31,19 @@ impl PersistentCorpusIndex {
         max_limit: usize,
     ) -> Result<(GrepResponse, IndexCommitMetadata), IndexError> {
         let prepared = PreparedGrepQuery::compile(request, max_limit)?;
+        self.search_with_candidate_page_size(&prepared, CANDIDATE_PAGE_SIZE)
+    }
+
+    /// Executes the isolated asynchronous-search cost class with a job-sized
+    /// timeout.  The index and catch-up state machine are unchanged; callers
+    /// must invoke this only from the search-job worker.
+    pub fn search_with_metadata_async(
+        &self,
+        request: &GrepRequest,
+        max_limit: usize,
+    ) -> Result<(GrepResponse, IndexCommitMetadata), IndexError> {
+        let prepared =
+            PreparedGrepQuery::compile(request, max_limit)?.with_timeout(Duration::from_secs(30));
         self.search_with_candidate_page_size(&prepared, CANDIDATE_PAGE_SIZE)
     }
 
