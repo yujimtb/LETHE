@@ -645,7 +645,7 @@ fn migration_ledger_records_current_schema_version() {
 }
 
 #[test]
-fn schema_v10_converges_from_fresh_v9_and_v8_upgrade_paths() {
+fn schema_v11_converges_from_fresh_v9_and_v10_upgrade_paths() {
     let fresh_tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let fresh = SqlitePersistence::open(
         &fresh_tmp.join("test.sqlite3"),
@@ -660,9 +660,10 @@ fn schema_v10_converges_from_fresh_v9_and_v8_upgrade_paths() {
             "observation_identity_lookup_index".to_owned(),
         ),
         (
-            CURRENT_SCHEMA_VERSION,
+            SCHEMA_VERSION_LOCK_SPLIT_SCALARS,
             "append_commit_lock_split_scalars".to_owned(),
         ),
+        (CURRENT_SCHEMA_VERSION, "indexed_keyset_reads".to_owned()),
     ];
     assert_eq!(migration_ledger(&fresh), current_ledger.clone());
     drop(fresh);
@@ -684,7 +685,7 @@ fn schema_v10_converges_from_fresh_v9_and_v8_upgrade_paths() {
                 DROP INDEX audit_events_timestamp_id;
                 DROP TABLE projection_manifest_fields;
                 DROP TABLE observation_stats;
-                DELETE FROM schema_migrations WHERE version = 10;
+                DELETE FROM schema_migrations WHERE version >= 10;
                 ",
             )
             .unwrap();
@@ -741,9 +742,10 @@ fn schema_v10_converges_from_fresh_v9_and_v8_upgrade_paths() {
                 "observation_identity_lookup_index".to_owned(),
             ),
             (
-                CURRENT_SCHEMA_VERSION,
+                SCHEMA_VERSION_LOCK_SPLIT_SCALARS,
                 "append_commit_lock_split_scalars".to_owned(),
             ),
+            (CURRENT_SCHEMA_VERSION, "indexed_keyset_reads".to_owned()),
         ]
     );
     assert_eq!(v8.observation_stats().unwrap().count, 1);
@@ -751,6 +753,114 @@ fn schema_v10_converges_from_fresh_v9_and_v8_upgrade_paths() {
     let _ = fs::remove_dir_all(fresh_tmp);
     let _ = fs::remove_dir_all(v9_tmp);
     let _ = fs::remove_dir_all(v8_tmp);
+}
+
+#[test]
+fn schema_v11_upgrades_true_v10_operational_event_shape() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let database_path = tmp.join("operational.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let data_space = lethe_core::domain::DataSpaceId::new("space:v10-upgrade");
+    {
+        let seed = SqliteOperationalEventStore::open(
+            data_space.clone(),
+            &database_path,
+            &blob_dir,
+            &[7; 32],
+        )
+        .unwrap();
+        let mut event = lethe_storage_api::conformance::sample_operational_event(
+            &data_space,
+            "event:v10-upgrade",
+            "stream:v10-upgrade",
+            1,
+            "idempotency:v10-upgrade",
+        );
+        event.actor_id = Some("actor:v10".to_owned());
+        event.causation_id = Some(lethe_core::domain::OperationalEventId::new(
+            "event:caused-by-v10",
+        ));
+        event.correlation_id = Some("correlation:v10".to_owned());
+        seed.append_operational_event(&OperationalAppendRequest {
+            expected_stream_version: 0,
+            event,
+        })
+        .unwrap();
+
+        seed.persistence()
+            .conn
+            .execute_batch(
+                "
+                DROP INDEX operational_events_correlation_cursor;
+                DROP INDEX operational_events_causation_cursor;
+                DROP INDEX operational_events_actor_cursor;
+                ALTER TABLE operational_events DROP COLUMN correlation_id;
+                ALTER TABLE operational_events DROP COLUMN causation_id;
+                ALTER TABLE operational_events DROP COLUMN actor_id;
+                DELETE FROM schema_migrations WHERE version = 11;
+                ",
+            )
+            .unwrap();
+        let columns = connection_table_columns(seed.persistence());
+        assert!(!columns.contains("correlation_id"));
+        assert!(!columns.contains("causation_id"));
+        assert!(!columns.contains("actor_id"));
+    }
+
+    let upgraded =
+        SqliteOperationalEventStore::open(data_space, &database_path, &blob_dir, &[7; 32]).unwrap();
+    let columns = connection_table_columns(upgraded.persistence());
+    assert!(columns.contains("correlation_id"));
+    assert!(columns.contains("causation_id"));
+    assert!(columns.contains("actor_id"));
+    let scalar_values: (Option<String>, Option<String>, Option<String>) = upgraded
+        .persistence()
+        .conn
+        .query_row(
+            "SELECT correlation_id, causation_id, actor_id
+             FROM operational_events WHERE event_id = 'event:v10-upgrade'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        scalar_values,
+        (
+            Some("correlation:v10".to_owned()),
+            Some("event:caused-by-v10".to_owned()),
+            Some("actor:v10".to_owned()),
+        )
+    );
+    for index in [
+        "operational_events_correlation_cursor",
+        "operational_events_causation_cursor",
+        "operational_events_actor_cursor",
+    ] {
+        let exists: Option<i64> = upgraded
+            .persistence()
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [index],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(exists, Some(1), "missing migrated index {index}");
+    }
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+fn connection_table_columns(store: &SqlitePersistence) -> std::collections::BTreeSet<String> {
+    store
+        .conn
+        .prepare("PRAGMA table_info(operational_events)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
 }
 
 fn migration_ledger(store: &SqlitePersistence) -> Vec<(i64, String)> {
@@ -1138,6 +1248,173 @@ fn projection_item_replace_reopens_with_owner_isolation_and_stable_order() {
         "owner lookup must use exact equality"
     );
     drop(reopened);
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn persisted_sync_state_round_trip_is_strict_and_restart_safe() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let completed_at = "2026-07-23T12:34:56Z".parse().unwrap();
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    store
+        .record_sync_state(
+            "all",
+            &PersistedSyncState {
+                metrics: SyncMetricRecord {
+                    fetched: 11,
+                    ingested: 7,
+                    skipped: 2,
+                    failed: 1,
+                    quarantined: 1,
+                    latency_ms: 321,
+                },
+                completed_at,
+                error: Some("one source failed".to_owned()),
+            },
+        )
+        .unwrap();
+    drop(store);
+
+    let reopened = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    assert_eq!(
+        reopened.load_sync_state("all").unwrap(),
+        Some(PersistedSyncState {
+            metrics: SyncMetricRecord {
+                fetched: 11,
+                ingested: 7,
+                skipped: 2,
+                failed: 1,
+                quarantined: 1,
+                latency_ms: 321,
+            },
+            completed_at,
+            error: Some("one source failed".to_owned()),
+        })
+    );
+    assert!(reopened.load_sync_state("missing").unwrap().is_none());
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn visible_blob_reference_index_tracks_projection_item_commit_atomically() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let projection = lethe_core::domain::ProjectionRef::new("proj:blob-test");
+    let blob_ref = lethe_core::domain::BlobRef::new(format!("blob:sha256:{}", "a".repeat(64)));
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+
+    store
+        .commit_projection_items(
+            &projection,
+            &serde_json::json!({"generation": 1}),
+            &ProjectionItemCommit::Replace {
+                items: vec![ProjectionItem {
+                    item_key: "person-component:person-1".to_owned(),
+                    owner_key: "__person_components__".to_owned(),
+                    sort_key: "person-1".to_owned(),
+                    value: serde_json::json!({"image": blob_ref.as_str()}),
+                }],
+            },
+        )
+        .unwrap();
+    assert!(
+        store
+            .projection_blob_ref_visible(&projection, &blob_ref)
+            .unwrap()
+    );
+
+    store
+        .commit_projection_items(
+            &projection,
+            &serde_json::json!({"generation": 2}),
+            &ProjectionItemCommit::Delta {
+                inserts: Vec::new(),
+                updates: vec![ProjectionItem {
+                    item_key: "person-component:person-1".to_owned(),
+                    owner_key: "__person_components__".to_owned(),
+                    sort_key: "person-1".to_owned(),
+                    value: serde_json::json!({"image": "redacted"}),
+                }],
+                deletes: Vec::new(),
+            },
+        )
+        .unwrap();
+    assert!(
+        !store
+            .projection_blob_ref_visible(&projection, &blob_ref)
+            .unwrap()
+    );
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn projection_item_keyset_boundary_keeps_same_sort_key_and_uses_owner_index() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let store =
+        SqlitePersistence::open(&tmp.join("test.sqlite3"), &tmp.join("blobs"), &[7; 32]).unwrap();
+    let projection = lethe_core::domain::ProjectionRef::new("proj:keyset-test");
+    store
+        .commit_projection_items(
+            &projection,
+            &serde_json::json!({"generation": 1}),
+            &ProjectionItemCommit::Replace {
+                items: vec![
+                    projection_item("item-a", "owner", "001"),
+                    projection_item("item-b", "owner", "001"),
+                    projection_item("item-c", "owner", "002"),
+                ],
+            },
+        )
+        .unwrap();
+    let first = store
+        .projection_items_page(&projection, &["owner".to_owned()], None, None, 2)
+        .unwrap();
+    assert_eq!(
+        first
+            .iter()
+            .map(|item| item.item_key.as_str())
+            .collect::<Vec<_>>(),
+        ["item-a", "item-b"]
+    );
+    let after = format!("{}\u{001f}{}", first[1].sort_key, first[1].item_key);
+    let second = store
+        .projection_items_page(&projection, &["owner".to_owned()], None, Some(&after), 2)
+        .unwrap();
+    assert_eq!(
+        second
+            .iter()
+            .map(|item| item.item_key.as_str())
+            .collect::<Vec<_>>(),
+        ["item-c"]
+    );
+
+    let mut statement = store
+        .conn
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT item_key FROM projection_materialization_items
+             WHERE projection_id = ?1 AND owner_key = ?2 AND sort_key > ?3
+             ORDER BY sort_key, item_key LIMIT ?4",
+        )
+        .unwrap();
+    let plan = statement
+        .query_map(
+            rusqlite::params!["proj:keyset-test", "owner", "000", 2],
+            |row| row.get::<_, String>(3),
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|detail| detail.contains("projection_materialization_items_owner_order")),
+        "keyset page did not use the owner/sort index: {plan:?}"
+    );
     let _ = fs::remove_dir_all(tmp);
 }
 
@@ -2337,6 +2614,101 @@ fn operational_event_store_conforms_and_pins_data_space() {
         Err(PersistenceError::SchemaInvariant(message))
             if message.contains("space:personal")
     ));
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn operational_filter_keyset_uses_correlation_index() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let data_space = lethe_core::domain::DataSpaceId::new("space:indexed");
+    let store = SqliteOperationalEventStore::open(
+        data_space.clone(),
+        &tmp.join("operational.sqlite3"),
+        &tmp.join("blobs"),
+        &[7; 32],
+    )
+    .unwrap();
+    let mut event = lethe_storage_api::conformance::sample_operational_event(
+        &data_space,
+        "event:indexed",
+        "stream:indexed",
+        1,
+        "idempotency:indexed",
+    );
+    event.causation_id = Some(lethe_core::domain::OperationalEventId::new(
+        "event:caused-by",
+    ));
+    let occurred_at = event.occurred_at;
+    store
+        .append_operational_event(&OperationalAppendRequest {
+            expected_stream_version: 0,
+            event,
+        })
+        .unwrap();
+    let rows = store
+        .operational_events_by_filter(
+            &OperationalEventFilter {
+                correlation_id: Some("correlation:conformance".to_owned()),
+                ..Default::default()
+            },
+            0,
+            10,
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    for filter in [
+        OperationalEventFilter {
+            causation_id: Some(lethe_core::domain::OperationalEventId::new(
+                "event:caused-by",
+            )),
+            ..Default::default()
+        },
+        OperationalEventFilter {
+            event_type: Some("work_item_created".to_owned()),
+            ..Default::default()
+        },
+        OperationalEventFilter {
+            stream_id: Some("stream:indexed".to_owned()),
+            ..Default::default()
+        },
+        OperationalEventFilter {
+            actor_id: Some("owner".to_owned()),
+            occurred_at_from: Some(occurred_at - chrono::TimeDelta::seconds(1)),
+            occurred_at_to: Some(occurred_at + chrono::TimeDelta::seconds(1)),
+            ..Default::default()
+        },
+    ] {
+        assert_eq!(
+            store
+                .operational_events_by_filter(&filter, 0, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    let mut statement = store
+        .persistence()
+        .conn
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT cursor FROM operational_events
+             WHERE data_space_id = ?1 AND correlation_id = ?2 AND cursor > ?3
+             ORDER BY cursor LIMIT ?4",
+        )
+        .unwrap();
+    let plan = statement
+        .query_map(
+            rusqlite::params!["space:indexed", "correlation:conformance", 0, 10],
+            |row| row.get::<_, String>(3),
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|detail| detail.contains("operational_events_correlation_cursor")),
+        "operational filter did not use correlation index: {plan:?}"
+    );
     let _ = fs::remove_dir_all(tmp);
 }
 

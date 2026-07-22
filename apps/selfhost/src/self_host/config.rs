@@ -121,6 +121,7 @@ pub struct ResourceLimits {
     pub max_payload_bytes: usize,
     pub max_sync_items: usize,
     pub max_page_size: usize,
+    pub max_search_job_workers: usize,
     pub max_leaf_observations: usize,
     pub retention_days: u32,
 }
@@ -281,6 +282,7 @@ struct LimitsFileConfig {
     max_payload_bytes: usize,
     max_sync_items: usize,
     max_page_size: usize,
+    max_search_job_workers: usize,
     max_leaf_observations: usize,
     retention_days: u32,
 }
@@ -525,6 +527,7 @@ impl SelfHostConfig {
                 max_payload_bytes: raw.limits.max_payload_bytes,
                 max_sync_items: raw.limits.max_sync_items,
                 max_page_size: raw.limits.max_page_size,
+                max_search_job_workers: raw.limits.max_search_job_workers,
                 max_leaf_observations: raw.limits.max_leaf_observations,
                 retention_days: raw.limits.retention_days,
             },
@@ -584,6 +587,10 @@ impl FileConfig {
         require_positive("limits.max_payload_bytes", self.limits.max_payload_bytes)?;
         require_positive("limits.max_sync_items", self.limits.max_sync_items)?;
         require_positive("limits.max_page_size", self.limits.max_page_size)?;
+        require_positive(
+            "limits.max_search_job_workers",
+            self.limits.max_search_job_workers,
+        )?;
         require_positive(
             "limits.max_leaf_observations",
             self.limits.max_leaf_observations,
@@ -1089,6 +1096,7 @@ mod tests {
             max_payload_bytes = 1
             max_sync_items = 1
             max_page_size = 1
+            max_search_job_workers = 2
             max_leaf_observations = 1
             retention_days = 30
             [corpus]
@@ -1160,6 +1168,7 @@ mod tests {
             max_payload_bytes = 1
             max_sync_items = 1
             max_page_size = 1
+            max_search_job_workers = 2
             max_leaf_observations = 1
             retention_days = 3650
             [corpus]
@@ -1219,6 +1228,7 @@ mod tests {
             max_payload_bytes = 1
             max_sync_items = 1
             max_page_size = 1
+            max_search_job_workers = 2
             max_leaf_observations = 1
             retention_days = 3650
             [corpus]
@@ -1279,6 +1289,7 @@ mod tests {
             max_payload_bytes = 1
             max_sync_items = 1
             max_page_size = 1
+            max_search_job_workers = 2
             max_leaf_observations = 1
             retention_days = 30
             [corpus]

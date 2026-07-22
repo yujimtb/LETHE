@@ -1,5 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{
+    Arc, Mutex,
+    mpsc::{self, Receiver, SyncSender, TrySendError},
+};
 
 use arc_swap::ArcSwap;
 use std::time::{Duration, Instant};
@@ -27,9 +31,12 @@ use lethe_adapter_gslides::gslides::mapper::GoogleSlidesAdapter;
 use lethe_adapter_slack::slack::client::SlackClient;
 use lethe_adapter_slack::slack::mapper::SlackAdapter;
 use lethe_api::api::envelope::{ProjectionMetadata, ResponseEnvelope};
-use lethe_api::api::grep::GrepRecord;
+use lethe_api::api::grep::{GrepRecord, GrepRequest, PreparedGrepQuery};
 use lethe_api::api::health::{DependencyHealthInfo, HealthResponse, LastSyncHealth, SyncMetrics};
-use lethe_api::api::pagination::{PaginatedResponse, PaginationParams, paginate};
+use lethe_api::api::pagination::{
+    KeysetCursorError, KeysetPage, PaginatedResponse, PaginationParams, decode_keyset_cursor,
+    encode_keyset_cursor, paginate,
+};
 use lethe_api::api::read_mode::{ReadModeError, ReadModeResolver};
 use lethe_core::domain::{
     ActorRef, AuthorityModel, BlobRef, CaptureModel, EntityRef, FailureClass, IngestResult,
@@ -78,9 +85,10 @@ use lethe_projection_person::person_page::types::{
 };
 use lethe_storage_api::{
     AppendOutcome as DurableAppendOutcome, AuditEventRecord, DiscoveredSlackThread,
-    ObservationStats, OperationalAppendOutcome, OperationalAppendRequest, OperationalEventStats,
-    OperationalStoragePorts, ProjectionItem, ProjectionItemCommit, SlackThreadCatalogEntry,
-    SlackThreadKey, StorageError, StoragePorts, StoredObservation, StoredOperationalEvent,
+    ObservationStats, OperationalAppendOutcome, OperationalAppendRequest, OperationalEventFilter,
+    OperationalEventStats, OperationalStoragePorts, PersistedSyncState, ProjectionItem,
+    ProjectionItemCommit, SlackThreadCatalogEntry, SlackThreadKey, StorageError, StoragePorts,
+    StoredObservation, StoredOperationalEvent,
 };
 use lethe_storage_postgres::PostgresOperationalEventStore;
 use lethe_storage_sqlite::persistence::{
@@ -513,6 +521,8 @@ pub struct ProjectionSnapshot {
 // serialized snapshots so existing cards receive the attribution.
 const NON_CORPUS_MATERIALIZATION_VERSION: u32 = 9;
 const REPLY_SLO_ITEM_OWNER: &str = "__reply_slo__";
+const CLAIM_QUEUE_ITEM_OWNER: &str = "__claim_queue__";
+const CARD_QUEUE_ITEM_OWNER: &str = "__card_queue__";
 const IDENTITY_EVENT_ITEM_OWNER: &str = "__identity_events__";
 const PERSON_COMPONENT_ITEM_OWNER: &str = "__person_components__";
 const NON_CORPUS_REBUILD_STAGING_PROJECTION_ID: &str = "proj:person-page:rebuild-staging";
@@ -1366,12 +1376,31 @@ impl AppCore {
         })?)
     }
 
+    #[cfg(test)]
     fn from_materialized(
+        materialized: MaterializedProjectionSnapshot,
+        persisted_blobs: Vec<Vec<u8>>,
+        persisted_supplementals: Vec<lethe_core::domain::SupplementalRecord>,
+        freshness_thresholds: Vec<FreshnessThreshold>,
+        channels: Vec<lethe_registry::registry::ChannelRecord>,
+    ) -> Result<Self, SelfHostError> {
+        Self::from_materialized_with_sync_state(
+            materialized,
+            persisted_blobs,
+            persisted_supplementals,
+            freshness_thresholds,
+            channels,
+            None,
+        )
+    }
+
+    fn from_materialized_with_sync_state(
         mut materialized: MaterializedProjectionSnapshot,
         persisted_blobs: Vec<Vec<u8>>,
         persisted_supplementals: Vec<lethe_core::domain::SupplementalRecord>,
         freshness_thresholds: Vec<FreshnessThreshold>,
         channels: Vec<lethe_registry::registry::ChannelRecord>,
+        persisted_sync_state: Option<PersistedSyncState>,
     ) -> Result<Self, SelfHostError> {
         materialized.validate()?;
         let supplemental_projection_cache =
@@ -1452,6 +1481,25 @@ impl AppCore {
         let supplemental_count = supplemental_projection_cache.count();
         materialized.snapshot.identity = IdentityResolutionOutput::default();
         materialized.snapshot.person_page = PersonPageOutput::default();
+        let (last_sync_at, last_sync_error, sync_metrics) = match persisted_sync_state {
+            Some(state) => (
+                Some(state.completed_at),
+                state.error,
+                SyncMetrics {
+                    fetched: state.metrics.fetched,
+                    ingested: state.metrics.ingested,
+                    skipped: state.metrics.skipped,
+                    failed: state.metrics.failed,
+                    quarantined: state.metrics.quarantined,
+                    latency_ms: state.metrics.latency_ms,
+                },
+            ),
+            None => (
+                None,
+                Some("persisted sync_metrics row for source all is missing".to_owned()),
+                SyncMetrics::default(),
+            ),
+        };
         let mut core = Self {
             registry,
             catalog: seed_projection_catalog(),
@@ -1474,9 +1522,9 @@ impl AppCore {
             reply_slo_count: materialized.reply_slo_count,
             communication_projection: materialized.communication_projection,
             snapshot: materialized.snapshot,
-            last_sync_at: None,
-            last_sync_error: None,
-            sync_metrics: SyncMetrics::default(),
+            last_sync_at,
+            last_sync_error,
+            sync_metrics,
         };
         core.activate_projections();
         Ok(core)
@@ -1758,6 +1806,8 @@ pub struct AppService {
     derived_projection_lane: Arc<Mutex<()>>,
     bulk_import_operation: Arc<Mutex<()>>,
     search_index: search_index::SearchIndexManager,
+    search_jobs: Arc<Mutex<BTreeMap<String, SearchJobRecord>>>,
+    search_job_queue: Arc<SearchJobQueue>,
     config: Arc<SelfHostConfig>,
     slack_sources: Vec<SlackSourceRuntime>,
     google_sources: Vec<GoogleSourceRuntime>,
@@ -1770,6 +1820,113 @@ pub struct AppService {
     non_corpus_rebuild_error: Arc<Mutex<Option<String>>>,
     #[cfg(test)]
     non_corpus_rebuild_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    search_job_test_gate: Option<Arc<std::sync::Barrier>>,
+    #[cfg(test)]
+    search_job_test_fault: Option<SearchJobTestFault>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchJobStatus {
+    pub job_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SearchJobRecord {
+    status: String,
+    result: Option<serde_json::Value>,
+    error: Option<String>,
+}
+
+struct SearchJobWork {
+    service: AppService,
+    job_id: String,
+    request: GrepRequest,
+}
+
+struct SearchJobQueue {
+    sender: SyncSender<SearchJobWork>,
+}
+
+impl SearchJobQueue {
+    fn try_submit(&self, work: SearchJobWork) -> Result<(), ()> {
+        match self.sender.try_send(work) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => Err(()),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+enum SearchJobTestFault {
+    Error,
+    Panic,
+}
+
+fn start_search_job_workers(worker_count: usize) -> Result<Arc<SearchJobQueue>, SelfHostError> {
+    if worker_count == 0 {
+        return Err(SelfHostError::ReadMode(
+            "limits.max_search_job_workers must be positive".to_owned(),
+        ));
+    }
+    let (sender, receiver) = mpsc::sync_channel(worker_count);
+    let queue = Arc::new(SearchJobQueue { sender });
+    let receiver = Arc::new(Mutex::new(receiver));
+    for worker_index in 0..worker_count {
+        let receiver = Arc::clone(&receiver);
+        std::thread::Builder::new()
+            .name(format!("lethe-search-job-{worker_index}"))
+            .spawn(move || search_job_worker(receiver))
+            .map_err(|error| {
+                SelfHostError::ReadMode(format!(
+                    "failed to spawn search job worker {worker_index}: {error}"
+                ))
+            })?;
+    }
+    Ok(queue)
+}
+
+fn search_job_worker(receiver: Arc<Mutex<Receiver<SearchJobWork>>>) {
+    loop {
+        let next = match receiver.lock() {
+            Ok(receiver) => receiver.recv(),
+            Err(error) => {
+                tracing::error!(error = %error, "search job queue receiver lock poisoned");
+                return;
+            }
+        };
+        let work = match next {
+            Ok(work) => work,
+            Err(_) => return,
+        };
+        let service = work.service.clone();
+        let job_id = work.job_id.clone();
+        let outcome = catch_unwind(AssertUnwindSafe(|| service.run_search_job(work)));
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => service.mark_search_job_failed(&job_id, error.to_string()),
+            Err(panic) => service.mark_search_job_failed(
+                &job_id,
+                format!("search job worker panicked: {}", panic_message(panic)),
+            ),
+        }
+    }
+}
+
+fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_owned()
+    }
 }
 
 #[cfg(test)]
@@ -3899,6 +4056,47 @@ pub(super) fn reply_slo_from_projection_item(
     Ok(canonical)
 }
 
+fn queue_projection_items(
+    claim_queue: &ClaimQueueProjection,
+    card_queue: &CardQueueProjection,
+) -> Result<Vec<ProjectionItem>, SelfHostError> {
+    let mut items = Vec::with_capacity(claim_queue.groups.len() + card_queue.cards.len());
+    for group in &claim_queue.groups {
+        let item = ProjectionItem {
+            item_key: format!("claim-group:{}", group.group_id),
+            owner_key: CLAIM_QUEUE_ITEM_OWNER.to_owned(),
+            sort_key: group.group_id.clone(),
+            value: serde_json::to_value(group)?,
+        };
+        item.validate()?;
+        items.push(item);
+    }
+    for card in &card_queue.cards {
+        let timestamp_nanos = card.created_at.timestamp_nanos_opt().ok_or_else(|| {
+            SelfHostError::Ingestion(format!(
+                "reply card created_at is outside nanosecond range for {}",
+                card.draft_id
+            ))
+        })?;
+        let sortable_timestamp = u64::try_from(i128::from(timestamp_nanos) - i128::from(i64::MIN))
+            .map_err(|_| {
+                SelfHostError::Ingestion(format!(
+                    "reply card created_at sort key overflow for {}",
+                    card.draft_id
+                ))
+            })?;
+        let item = ProjectionItem {
+            item_key: format!("card:{}", card.draft_id),
+            owner_key: CARD_QUEUE_ITEM_OWNER.to_owned(),
+            sort_key: format!("{sortable_timestamp:020}:{}", card.draft_id),
+            value: serde_json::to_value(card)?,
+        };
+        item.validate()?;
+        items.push(item);
+    }
+    Ok(items)
+}
+
 #[cfg(test)]
 fn detach_projection_items(
     snapshot: &mut ProjectionSnapshot,
@@ -4827,6 +5025,9 @@ fn rebuild_materialized_snapshot_paged(
             .map(person_component_projection_item)
             .collect::<Result<Vec<_>, _>>()?,
     );
+    let claim_queue = ClaimQueueProjector.project_records(supplementals);
+    let card_queue = CardQueueProjector::new(built_at).project_records(supplementals);
+    keyed_state_items.extend(queue_projection_items(&claim_queue, &card_queue)?);
     if !keyed_state_items.is_empty() {
         persistence.commit_projection_items(
             &staging_projection,
@@ -4842,7 +5043,6 @@ fn rebuild_materialized_snapshot_paged(
 
     let canonical_observation_fingerprint = hex::encode(canonical_fingerprint);
     let supplemental_fingerprint = supplemental_fingerprint(supplementals)?;
-    let claim_queue = ClaimQueueProjector.project_records(supplementals);
     let cognition_projector = CognitionStateProjector::new(built_at);
     let (resume_snapshot, plan_state) =
         cognition_projector.project_with_claim_queue(supplementals, &claim_queue);
@@ -4876,7 +5076,7 @@ fn rebuild_materialized_snapshot_paged(
             freshness,
             resume_snapshot,
             plan_state,
-            card_queue: CardQueueProjector::new(built_at).project_records(supplementals),
+            card_queue,
             reply_slo: ReplySloProjection::default(),
             break_glass: BreakGlassProjection::from_channels(channels),
             built_at,
@@ -4892,6 +5092,12 @@ fn rebuild_materialized_snapshot_paged(
         .and_then(|count| count.checked_add(identity_event_count))
         .and_then(|count| {
             count.checked_add(u64::try_from(materialized.person_components.len()).ok()?)
+        })
+        .and_then(|count| {
+            count.checked_add(u64::try_from(materialized.snapshot.claim_queue.groups.len()).ok()?)
+        })
+        .and_then(|count| {
+            count.checked_add(u64::try_from(materialized.snapshot.card_queue.cards.len()).ok()?)
         })
         .ok_or_else(|| {
             SelfHostError::Ingestion(
@@ -5002,7 +5208,9 @@ fn apply_supplemental_delta(
         .card_queue
         .projection(built_at);
 
+    let mut inserts = Vec::new();
     let mut updates = Vec::new();
+    let mut deletes = Vec::new();
     if let Some((person_id, created_at, frontend_profile)) =
         frontend_profile_from_supplemental_delta(
             persistence,
@@ -5106,6 +5314,31 @@ fn apply_supplemental_delta(
         }
     }
 
+    let queue_items =
+        queue_projection_items(&core.snapshot.claim_queue, &core.snapshot.card_queue)?;
+    let queue_keys = queue_items
+        .iter()
+        .map(|item| item.item_key.clone())
+        .collect::<HashSet<_>>();
+    for item in queue_items {
+        match persistence
+            .projection_item_by_key(&ProjectionRef::new("proj:person-page"), &item.item_key)?
+        {
+            Some(existing) if existing == item => {}
+            Some(_) => updates.push(item),
+            None => inserts.push(item),
+        }
+    }
+    for owner in [CLAIM_QUEUE_ITEM_OWNER, CARD_QUEUE_ITEM_OWNER] {
+        for item in
+            persistence.projection_items_by_owner(&ProjectionRef::new("proj:person-page"), owner)?
+        {
+            if !queue_keys.contains(&item.item_key) {
+                deletes.push(item.item_key);
+            }
+        }
+    }
+
     core.snapshot.identity = IdentityResolutionOutput::default();
     core.snapshot.person_page = PersonPageOutput::default();
     core.snapshot.built_at = built_at;
@@ -5120,9 +5353,9 @@ fn apply_supplemental_delta(
     core.supplemental_fingerprint = next_supplemental_fingerprint;
     core.claim_queue_dirty = false;
     let item_commit = ProjectionItemCommit::Delta {
-        inserts: Vec::new(),
+        inserts,
         updates,
-        deletes: Vec::new(),
+        deletes,
     };
     item_commit.validate()?;
     Ok(item_commit)
@@ -5248,7 +5481,7 @@ fn current_materialized_snapshot(
     {
         return Ok(None);
     }
-    let expected_projection_item_count = manifest
+    let base_projection_item_count = manifest
         .person_message_count
         .checked_add(manifest.reply_slo_count)
         .and_then(|count| count.checked_add(manifest.person_slide_count))
@@ -5259,6 +5492,30 @@ fn current_materialized_snapshot(
                 "proj:person-page manifest projection item count overflow".to_owned(),
             )
         })?;
+    let queue_projection_item_count = manifest
+        .snapshot
+        .claim_queue
+        .groups
+        .len()
+        .checked_add(manifest.snapshot.card_queue.cards.len())
+        .and_then(|count| u64::try_from(count).ok())
+        .ok_or_else(|| {
+            SelfHostError::Ingestion(
+                "proj:person-page queue projection item count overflow".to_owned(),
+            )
+        })?;
+    let expected_projection_item_count =
+        if persisted_projection_item_count == base_projection_item_count {
+            base_projection_item_count
+        } else {
+            base_projection_item_count
+                .checked_add(queue_projection_item_count)
+                .ok_or_else(|| {
+                    SelfHostError::Ingestion(
+                        "proj:person-page projection item count overflow".to_owned(),
+                    )
+                })?
+        };
     if expected_projection_item_count != persisted_projection_item_count {
         return Err(SelfHostError::Ingestion(format!(
             "proj:person-page manifest expects {expected_projection_item_count} projection item rows, but storage contains {persisted_projection_item_count}"
@@ -5552,20 +5809,39 @@ impl AppService {
             )?,
             None => None,
         };
+        let persisted_queue_item_count = persistence
+            .projection_item_count_by_owner(&person_page_ref, CLAIM_QUEUE_ITEM_OWNER)?
+            .checked_add(
+                persistence
+                    .projection_item_count_by_owner(&person_page_ref, CARD_QUEUE_ITEM_OWNER)?,
+            )
+            .ok_or_else(|| {
+                SelfHostError::Ingestion("queue projection item count overflow".to_owned())
+            })?;
+        let queue_index_missing = persisted_materialized.as_ref().is_some_and(|materialized| {
+            let expected = materialized.snapshot.claim_queue.groups.len()
+                + materialized.snapshot.card_queue.cards.len();
+            u64::try_from(expected).is_ok_and(|expected| persisted_queue_item_count < expected)
+        });
         let requires_background_rebuild = match persisted_materialized.as_ref() {
-            Some(materialized) => materialized.format_version < NON_CORPUS_MATERIALIZATION_VERSION,
+            Some(materialized) => {
+                materialized.format_version < NON_CORPUS_MATERIALIZATION_VERSION
+                    || queue_index_missing
+            }
             None => true,
         };
         let materialized = match persisted_materialized {
             Some(materialized) => materialized,
             None => bootstrap_materialized_placeholder(stats, &supplementals, &config.channels)?,
         };
-        let core = AppCore::from_materialized(
+        let persisted_sync_state = persistence.load_sync_state("all")?;
+        let core = AppCore::from_materialized_with_sync_state(
             materialized,
             Vec::new(),
             supplementals,
             freshness_thresholds(&config),
             config.channels.clone(),
+            persisted_sync_state,
         )?;
         let mut persistence_read_pool = Vec::with_capacity(4);
         persistence_read_pool.push(Arc::new(Mutex::new(
@@ -5605,6 +5881,8 @@ impl AppService {
             config.corpus.rebuild_page_size,
             Arc::clone(&persistence_read_pool[0]),
         );
+        let search_job_queue =
+            start_search_job_workers(config.resource_limits.max_search_job_workers)?;
         let slack_sources = config
             .slack_sources
             .iter()
@@ -5648,6 +5926,8 @@ impl AppService {
             derived_projection_lane: Arc::new(Mutex::new(())),
             bulk_import_operation: Arc::new(Mutex::new(())),
             search_index,
+            search_jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            search_job_queue,
             config: Arc::new(config),
             slack_sources,
             google_sources,
@@ -5663,6 +5943,10 @@ impl AppService {
             non_corpus_rebuild_error: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             non_corpus_rebuild_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            search_job_test_gate: None,
+            #[cfg(test)]
+            search_job_test_fault: None,
         };
         if requires_background_rebuild {
             if !had_persisted_manifest {
@@ -5728,6 +6012,17 @@ impl AppService {
             .map_err(Into::into)
     }
 
+    pub fn operational_events_by_filter(
+        &self,
+        filter: &OperationalEventFilter,
+        after_cursor: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredOperationalEvent>, SelfHostError> {
+        self.operational_ledger_read_lock()?
+            .operational_events_by_filter(filter, after_cursor, limit)
+            .map_err(Into::into)
+    }
+
     pub fn validate_page_limit(&self, limit: usize, resource: &str) -> Result<(), SelfHostError> {
         if limit == 0 || limit > self.config.resource_limits.max_page_size {
             return Err(SelfHostError::IngestionRequest {
@@ -5744,6 +6039,10 @@ impl AppService {
             });
         }
         Ok(())
+    }
+
+    pub fn max_page_size(&self) -> usize {
+        self.config.resource_limits.max_page_size
     }
 
     pub fn validate_operational_page_limit(&self, limit: usize) -> Result<(), SelfHostError> {

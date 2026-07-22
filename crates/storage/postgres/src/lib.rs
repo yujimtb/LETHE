@@ -3,10 +3,11 @@ use std::sync::{Mutex, MutexGuard};
 
 use lethe_core::domain::{BlobRef, DataSpaceId, OperationalEventId};
 use lethe_storage_api::{
-    BlobStore, OperationalAppendOutcome, OperationalAppendRequest, OperationalEventStats,
-    OperationalEventStore, StorageError, StorageResult, StoredOperationalEvent,
+    BlobStore, OperationalAppendOutcome, OperationalAppendRequest, OperationalEventFilter,
+    OperationalEventStats, OperationalEventStore, StorageError, StorageResult,
+    StoredOperationalEvent,
 };
-use postgres::{Client, NoTls, Transaction};
+use postgres::{Client, NoTls, Transaction, types::ToSql};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, thiserror::Error)]
@@ -84,6 +85,9 @@ impl PostgresOperationalEventStore {
                 stream_version BIGINT NOT NULL CHECK (stream_version > 0),
                 idempotency_key TEXT NOT NULL CHECK (length(btrim(idempotency_key)) > 0),
                 event_type TEXT NOT NULL CHECK (length(btrim(event_type)) > 0),
+                actor_id TEXT,
+                causation_id TEXT,
+                correlation_id TEXT,
                 occurred_at TEXT NOT NULL,
                 observation_id TEXT NOT NULL UNIQUE
                     REFERENCES operational_observations(observation_id),
@@ -95,6 +99,33 @@ impl PostgresOperationalEventStore {
 
             CREATE INDEX IF NOT EXISTS operational_events_stream
                 ON operational_events(data_space_id, stream_id, stream_version);
+            CREATE INDEX IF NOT EXISTS operational_events_stream_cursor
+                ON operational_events(data_space_id, stream_id, cursor);
+
+            ALTER TABLE operational_events ADD COLUMN IF NOT EXISTS actor_id TEXT;
+            ALTER TABLE operational_events ADD COLUMN IF NOT EXISTS causation_id TEXT;
+            ALTER TABLE operational_events ADD COLUMN IF NOT EXISTS correlation_id TEXT;
+            UPDATE operational_events
+            SET actor_id = NULLIF(event_json::jsonb ->> 'actor_id', '')
+            WHERE actor_id IS NULL;
+            UPDATE operational_events
+            SET causation_id = NULLIF(event_json::jsonb ->> 'causation_id', '')
+            WHERE causation_id IS NULL;
+            UPDATE operational_events
+            SET correlation_id = NULLIF(event_json::jsonb ->> 'correlation_id', '')
+            WHERE correlation_id IS NULL;
+            CREATE INDEX IF NOT EXISTS operational_events_correlation_cursor
+                ON operational_events(data_space_id, correlation_id, cursor);
+            CREATE INDEX IF NOT EXISTS operational_events_causation_cursor
+                ON operational_events(data_space_id, causation_id, cursor);
+            CREATE INDEX IF NOT EXISTS operational_events_type_cursor
+                ON operational_events(data_space_id, event_type, cursor);
+            CREATE INDEX IF NOT EXISTS operational_events_actor_cursor
+                ON operational_events(data_space_id, actor_id, cursor);
+            CREATE INDEX IF NOT EXISTS operational_events_occurred_cursor
+                ON operational_events(data_space_id, occurred_at, cursor);
+            CREATE INDEX IF NOT EXISTS operational_events_stream_occurred_cursor
+                ON operational_events(data_space_id, stream_id, occurred_at, cursor);
 
             CREATE TABLE IF NOT EXISTS operational_event_stats (
                 data_space_id TEXT PRIMARY KEY,
@@ -259,6 +290,70 @@ impl OperationalEventStore for PostgresOperationalEventStore {
                 &[&self.data_space_id.as_str(), &after, &limit],
             )
             .map_err(Self::backend)?;
+        stored_rows(rows)
+    }
+
+    fn operational_events_by_filter(
+        &self,
+        filter: &OperationalEventFilter,
+        after_cursor: u64,
+        limit: usize,
+    ) -> StorageResult<Vec<StoredOperationalEvent>> {
+        if limit == 0 {
+            return Err(StorageError::Invariant(
+                "operational event page limit must be positive".to_owned(),
+            ));
+        }
+        if filter
+            .occurred_at_from
+            .zip(filter.occurred_at_to)
+            .is_some_and(|(from, to)| from > to)
+        {
+            return Err(StorageError::Invariant(
+                "occurred_at_from must not be later than occurred_at_to".to_owned(),
+            ));
+        }
+        let mut values: Vec<Box<dyn ToSql + Sync>> = vec![
+            Box::new(self.data_space_id.as_str().to_owned()),
+            Box::new(to_i64("after_cursor", after_cursor)?),
+        ];
+        let mut predicates = vec!["data_space_id = $1".to_owned(), "cursor > $2".to_owned()];
+        let mut add_text = |column: &str, value: Option<&str>| -> StorageResult<()> {
+            if let Some(value) = value {
+                require_filter_value(column, value)?;
+                values.push(Box::new(value.to_owned()));
+                predicates.push(format!("{column} = ${}", values.len()));
+            }
+            Ok(())
+        };
+        add_text("correlation_id", filter.correlation_id.as_deref())?;
+        add_text(
+            "causation_id",
+            filter.causation_id.as_ref().map(OperationalEventId::as_str),
+        )?;
+        add_text("event_type", filter.event_type.as_deref())?;
+        add_text("stream_id", filter.stream_id.as_deref())?;
+        add_text("actor_id", filter.actor_id.as_deref())?;
+        if let Some(from) = filter.occurred_at_from {
+            values.push(Box::new(from.to_rfc3339()));
+            predicates.push(format!("occurred_at >= ${}", values.len()));
+        }
+        if let Some(to) = filter.occurred_at_to {
+            values.push(Box::new(to.to_rfc3339()));
+            predicates.push(format!("occurred_at <= ${}", values.len()));
+        }
+        let limit_position = values.len() + 1;
+        values.push(Box::new(to_i64("limit", limit as u64)?));
+        let query = format!(
+            "SELECT cursor, event_json FROM operational_events WHERE {} ORDER BY cursor LIMIT ${limit_position}",
+            predicates.join(" AND ")
+        );
+        let params = values
+            .iter()
+            .map(|value| value.as_ref() as &(dyn ToSql + Sync))
+            .collect::<Vec<_>>();
+        let mut client = self.read_client()?;
+        let rows = client.query(&query, &params).map_err(Self::backend)?;
         stored_rows(rows)
     }
 
@@ -492,9 +587,10 @@ fn append_one(
         .query_one(
             "INSERT INTO operational_events (
                 event_id, data_space_id, stream_id, stream_version,
-                idempotency_key, event_type, occurred_at, observation_id,
-                event_sha256, event_json
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                idempotency_key, event_type, actor_id, causation_id,
+                correlation_id, occurred_at, observation_id, event_sha256,
+                event_json
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
              RETURNING cursor",
             &[
                 &request.event.event_id.as_str(),
@@ -503,6 +599,13 @@ fn append_one(
                 &stream_version,
                 &idempotency_key,
                 &request.event.event_type,
+                &request.event.actor_id,
+                &request
+                    .event
+                    .causation_id
+                    .as_ref()
+                    .map(OperationalEventId::as_str),
+                &request.event.correlation_id,
                 &request.event.occurred_at.to_rfc3339(),
                 &request.event.observation.id.as_str(),
                 &event_sha256,
@@ -537,6 +640,15 @@ fn stored_row(row: postgres::Row) -> StorageResult<StoredOperationalEvent> {
     let event =
         serde_json::from_str(&event_json).map_err(PostgresOperationalEventStore::backend)?;
     Ok(StoredOperationalEvent { cursor, event })
+}
+
+fn require_filter_value(field: &str, value: &str) -> StorageResult<()> {
+    if value.trim().is_empty() {
+        return Err(StorageError::Invariant(format!(
+            "operational event filter {field} must not be blank"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_non_blank(field: &str, value: &str) -> Result<(), PostgresOperationalStoreError> {

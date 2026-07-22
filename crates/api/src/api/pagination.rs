@@ -2,6 +2,69 @@
 
 use serde::{Deserialize, Serialize};
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+/// Versioned, API-independent cursor envelope.  The payload is opaque on the
+/// wire; the scope prevents accidentally reusing a cursor from another read.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct KeysetCursorPayload {
+    scope: String,
+    sort_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeysetCursor {
+    pub scope: String,
+    pub sort_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KeysetPage<T> {
+    pub data: Vec<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeysetCursorError {
+    Invalid,
+    WrongScope,
+}
+
+pub fn encode_keyset_cursor(scope: &str, sort_key: &str) -> Result<String, KeysetCursorError> {
+    if scope.trim().is_empty() || sort_key.is_empty() {
+        return Err(KeysetCursorError::Invalid);
+    }
+    let payload = KeysetCursorPayload {
+        scope: scope.to_owned(),
+        sort_key: sort_key.to_owned(),
+    };
+    let bytes = serde_json::to_vec(&payload).map_err(|_| KeysetCursorError::Invalid)?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+pub fn decode_keyset_cursor(
+    cursor: &str,
+    expected_scope: &str,
+) -> Result<KeysetCursor, KeysetCursorError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| KeysetCursorError::Invalid)?;
+    let payload: KeysetCursorPayload =
+        serde_json::from_slice(&bytes).map_err(|_| KeysetCursorError::Invalid)?;
+    if payload.scope != expected_scope {
+        return Err(KeysetCursorError::WrongScope);
+    }
+    if payload.sort_key.is_empty() {
+        return Err(KeysetCursorError::Invalid);
+    }
+    Ok(KeysetCursor {
+        scope: payload.scope,
+        sort_key: payload.sort_key,
+    })
+}
+
 /// Pagination parameters from query string (M14 §9).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaginationParams {

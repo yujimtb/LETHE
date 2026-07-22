@@ -26,8 +26,9 @@ use lethe_runtime::runtime::partition::{
 use lethe_storage_api::{
     AppendOutcome as PortAppendOutcome, BlobStore as BlobStorePort, DiscoveredSlackThread,
     LeafPosition, ObservationStats, ObservationStore as ObservationStorePort,
-    OperationalAppendOutcome, OperationalAppendRequest, OperationalEventStats,
-    OperationalEventStore, ProjectionItem, ProjectionItemCommit, ProjectionLeafWatermark,
+    OperationalAppendOutcome, OperationalAppendRequest, OperationalEventFilter,
+    OperationalEventStats, OperationalEventStore, PersistedSyncState, ProjectionItem,
+    ProjectionItemCommit, ProjectionLeafWatermark,
     ProjectionMaterializer as ProjectionMaterializerPort,
     ProjectionWatermarkStore as ProjectionWatermarkStorePort, RehomeMode as PortRehomeMode,
     RuntimeStateStore as RuntimeStateStorePort, SlackThreadCatalogEntry,
@@ -63,7 +64,8 @@ pub struct SqliteOperationalEventStore {
 }
 
 const SCHEMA_VERSION_IDENTITY_LOOKUP_INDEX: i64 = 9;
-const CURRENT_SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION_LOCK_SPLIT_SCALARS: i64 = 10;
+const CURRENT_SCHEMA_VERSION: i64 = 11;
 const CANONICAL_JSON_META_KEY: &str = "canonical_json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1514,6 +1516,10 @@ impl SqlitePersistence {
             "DELETE FROM projection_materialization_items WHERE projection_id = ?1",
             [target.as_str()],
         )?;
+        transaction.execute(
+            "DELETE FROM projection_visible_blob_refs WHERE projection_id = ?1",
+            [target.as_str()],
+        )?;
         let inserted = transaction.execute(
             "INSERT INTO projection_materialization_items (
                 projection_id, item_key, owner_key, sort_key, value_json
@@ -1529,6 +1535,15 @@ impl SqlitePersistence {
             )));
         }
         transaction.execute(
+            "INSERT INTO projection_visible_blob_refs (
+                projection_id, item_key, blob_ref, owner_key, consent_scope
+             )
+             SELECT ?1, item_key, blob_ref, owner_key, consent_scope
+             FROM projection_visible_blob_refs
+             WHERE projection_id = ?2",
+            params![target.as_str(), staging.as_str()],
+        )?;
+        transaction.execute(
             "INSERT INTO projection_materializations (
                 projection_id, records_json, materialized_at
              ) VALUES (?1, ?2, ?3)
@@ -1540,6 +1555,10 @@ impl SqlitePersistence {
         upsert_manifest_fields(&transaction, target, manifest)?;
         let deleted_staging_items = transaction.execute(
             "DELETE FROM projection_materialization_items WHERE projection_id = ?1",
+            [staging.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM projection_visible_blob_refs WHERE projection_id = ?1",
             [staging.as_str()],
         )?;
         if deleted_staging_items != expected_insert_count {
@@ -1632,6 +1651,97 @@ impl SqlitePersistence {
             });
         }
         Ok(items)
+    }
+
+    pub fn projection_items_page(
+        &self,
+        projection: &lethe_core::domain::ProjectionRef,
+        owner_keys: &[String],
+        item_key_prefix: Option<&str>,
+        after_sort_key: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ProjectionItem>, PersistenceError> {
+        validate_projection_key(projection)?;
+        if owner_keys.is_empty() || limit == 0 {
+            return Err(PersistenceError::SchemaInvariant(
+                "projection item page requires owners and a positive limit".to_owned(),
+            ));
+        }
+        for owner_key in owner_keys {
+            validate_owner_key(owner_key)?;
+        }
+        let placeholders = (0..owner_keys.len())
+            .map(|index| format!("?{}", index + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut sql = format!(
+            "SELECT item_key, owner_key, sort_key, value_json
+             FROM projection_materialization_items
+             WHERE projection_id = ?1 AND owner_key IN ({placeholders})"
+        );
+        let mut values = vec![rusqlite::types::Value::Text(projection.as_str().to_owned())];
+        values.extend(owner_keys.iter().cloned().map(rusqlite::types::Value::Text));
+        if let Some(prefix) = item_key_prefix {
+            sql.push_str(" AND item_key LIKE ?");
+            values.push(rusqlite::types::Value::Text(format!("{prefix}%")));
+        }
+        if let Some(after_sort_key) = after_sort_key {
+            if let Some((sort_key, item_key)) = after_sort_key.rsplit_once('\u{001f}') {
+                if sort_key.is_empty() || item_key.is_empty() {
+                    return Err(PersistenceError::SchemaInvariant(
+                        "projection item cursor boundary is invalid".to_owned(),
+                    ));
+                }
+                sql.push_str(" AND (sort_key > ? OR (sort_key = ? AND item_key > ?))");
+                values.push(rusqlite::types::Value::Text(sort_key.to_owned()));
+                values.push(rusqlite::types::Value::Text(sort_key.to_owned()));
+                values.push(rusqlite::types::Value::Text(item_key.to_owned()));
+            } else {
+                sql.push_str(" AND sort_key > ?");
+                values.push(rusqlite::types::Value::Text(after_sort_key.to_owned()));
+            }
+        }
+        sql.push_str(" ORDER BY sort_key ASC, item_key ASC LIMIT ?");
+        values.push(rusqlite::types::Value::Integer(
+            i64::try_from(limit).map_err(|_| {
+                PersistenceError::SchemaInvariant("projection item limit overflow".to_owned())
+            })?,
+        ));
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (item_key, owner_key, sort_key, value_json) = row?;
+            Ok(ProjectionItem {
+                item_key,
+                owner_key,
+                sort_key,
+                value: serde_json::from_str(&value_json)?,
+            })
+        })
+        .collect()
+    }
+
+    pub fn projection_blob_ref_visible(
+        &self,
+        projection: &lethe_core::domain::ProjectionRef,
+        blob_ref: &BlobRef,
+    ) -> Result<bool, PersistenceError> {
+        validate_projection_key(projection)?;
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM projection_visible_blob_refs
+                 WHERE projection_id = ?1 AND blob_ref = ?2
+             )",
+            params![projection.as_str(), blob_ref.as_str()],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn projection_item_count_by_owner(
@@ -1856,11 +1966,26 @@ impl SqlitePersistence {
         source: &str,
         metrics: &SyncMetricRecord,
     ) -> Result<(), PersistenceError> {
+        self.record_sync_state(
+            source,
+            &PersistedSyncState {
+                metrics: metrics.clone(),
+                completed_at: chrono::Utc::now(),
+                error: None,
+            },
+        )
+    }
+
+    pub fn record_sync_state(
+        &self,
+        source: &str,
+        state: &PersistedSyncState,
+    ) -> Result<(), PersistenceError> {
         self.conn.execute(
             "INSERT INTO sync_metrics (
                 source_instance, fetched, ingested, skipped, failed,
-                quarantined, latency_ms, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                quarantined, latency_ms, last_error, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(source_instance) DO UPDATE SET
                 fetched = excluded.fetched,
                 ingested = excluded.ingested,
@@ -1868,19 +1993,65 @@ impl SqlitePersistence {
                 failed = excluded.failed,
                 quarantined = excluded.quarantined,
                 latency_ms = excluded.latency_ms,
+                last_error = excluded.last_error,
                 updated_at = excluded.updated_at",
             params![
                 source,
-                metrics.fetched,
-                metrics.ingested,
-                metrics.skipped,
-                metrics.failed,
-                metrics.quarantined,
-                metrics.latency_ms,
-                chrono::Utc::now().to_rfc3339(),
+                state.metrics.fetched,
+                state.metrics.ingested,
+                state.metrics.skipped,
+                state.metrics.failed,
+                state.metrics.quarantined,
+                state.metrics.latency_ms,
+                state.error,
+                state.completed_at.to_rfc3339(),
             ],
         )?;
         Ok(())
+    }
+
+    pub fn load_sync_state(
+        &self,
+        source: &str,
+    ) -> Result<Option<PersistedSyncState>, PersistenceError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT fetched, ingested, skipped, failed, quarantined,
+                        latency_ms, last_error, updated_at
+                 FROM sync_metrics WHERE source_instance = ?1",
+                [source],
+                |row| {
+                    Ok((
+                        SyncMetricRecord {
+                            fetched: row.get(0)?,
+                            ingested: row.get(1)?,
+                            skipped: row.get(2)?,
+                            failed: row.get(3)?,
+                            quarantined: row.get(4)?,
+                            latency_ms: row.get(5)?,
+                        },
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(metrics, error, completed_at)| {
+            let completed_at = completed_at
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .map_err(|parse_error| {
+                    PersistenceError::SchemaInvariant(format!(
+                        "sync_metrics updated_at is invalid: {parse_error}"
+                    ))
+                })?;
+            Ok(PersistedSyncState {
+                metrics,
+                completed_at,
+                error,
+            })
+        })
+        .transpose()
     }
 
     pub fn apply_retention(&self, retention_days: u32) -> Result<usize, PersistenceError> {
@@ -2103,9 +2274,10 @@ impl OperationalEventStore for SqliteOperationalEventStore {
                 .execute(
                     "INSERT INTO operational_events (
                         event_id, data_space_id, stream_id, stream_version,
-                        idempotency_key, event_type, occurred_at, observation_id,
+                        idempotency_key, event_type, actor_id, causation_id,
+                        correlation_id, occurred_at, observation_id,
                         event_sha256, event_json
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     params![
                         request.event.event_id.as_str(),
                         self.data_space_id.as_str(),
@@ -2113,6 +2285,9 @@ impl OperationalEventStore for SqliteOperationalEventStore {
                         request.event.stream_version,
                         idempotency_key,
                         request.event.event_type,
+                        request.event.actor_id.as_deref(),
+                        request.event.causation_id.as_ref().map(|id| id.as_str()),
+                        request.event.correlation_id.as_deref(),
                         request.event.occurred_at.to_rfc3339(),
                         request.event.observation.id.as_str(),
                         event_sha256,
@@ -2180,6 +2355,93 @@ impl OperationalEventStore for SqliteOperationalEventStore {
                 params![self.data_space_id.as_str(), after_cursor, limit as u64],
                 |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
             )
+            .map_err(Self::storage_error)?;
+        rows.map(|row| {
+            let (cursor, event_json) = row.map_err(Self::storage_error)?;
+            let event = serde_json::from_str(&event_json).map_err(Self::storage_error)?;
+            Ok(StoredOperationalEvent { cursor, event })
+        })
+        .collect()
+    }
+
+    fn operational_events_by_filter(
+        &self,
+        filter: &OperationalEventFilter,
+        after_cursor: u64,
+        limit: usize,
+    ) -> StorageResult<Vec<StoredOperationalEvent>> {
+        if limit == 0 {
+            return Err(StorageError::Invariant(
+                "operational event page limit must be positive".to_owned(),
+            ));
+        }
+        if filter
+            .occurred_at_from
+            .zip(filter.occurred_at_to)
+            .is_some_and(|(from, to)| from > to)
+        {
+            return Err(StorageError::Invariant(
+                "operational event occurred_at range is inverted".to_owned(),
+            ));
+        }
+        let mut sql = String::from(
+            "SELECT cursor, event_json FROM operational_events
+             WHERE data_space_id = ? AND cursor > ?",
+        );
+        let mut values = vec![
+            rusqlite::types::Value::Text(self.data_space_id.as_str().to_owned()),
+            rusqlite::types::Value::Integer(i64::try_from(after_cursor).map_err(|_| {
+                StorageError::Invariant("after_cursor does not fit SQLite INTEGER".to_owned())
+            })?),
+        ];
+        if let Some(value) = &filter.correlation_id {
+            require_operational_filter_value("correlation_id", value)?;
+            sql.push_str(" AND correlation_id = ?");
+            values.push(rusqlite::types::Value::Text(value.clone()));
+        }
+        if let Some(value) = &filter.causation_id {
+            sql.push_str(" AND causation_id = ?");
+            values.push(rusqlite::types::Value::Text(value.as_str().to_owned()));
+        }
+        if let Some(value) = &filter.event_type {
+            require_operational_filter_value("event_type", value)?;
+            sql.push_str(" AND event_type = ?");
+            values.push(rusqlite::types::Value::Text(value.clone()));
+        }
+        if let Some(value) = &filter.stream_id {
+            require_operational_filter_value("stream_id", value)?;
+            sql.push_str(" AND stream_id = ?");
+            values.push(rusqlite::types::Value::Text(value.clone()));
+        }
+        if let Some(value) = &filter.actor_id {
+            require_operational_filter_value("actor_id", value)?;
+            sql.push_str(" AND actor_id = ?");
+            values.push(rusqlite::types::Value::Text(value.clone()));
+        }
+        if let Some(value) = filter.occurred_at_from {
+            sql.push_str(" AND occurred_at >= ?");
+            values.push(rusqlite::types::Value::Text(value.to_rfc3339()));
+        }
+        if let Some(value) = filter.occurred_at_to {
+            sql.push_str(" AND occurred_at <= ?");
+            values.push(rusqlite::types::Value::Text(value.to_rfc3339()));
+        }
+        sql.push_str(" ORDER BY cursor LIMIT ?");
+        values.push(rusqlite::types::Value::Integer(
+            i64::try_from(limit).map_err(|_| {
+                StorageError::Invariant("limit does not fit SQLite INTEGER".to_owned())
+            })?,
+        ));
+
+        let mut statement = self
+            .persistence
+            .conn
+            .prepare(&sql)
+            .map_err(Self::storage_error)?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(values), |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(Self::storage_error)?;
         rows.map(|row| {
             let (cursor, event_json) = row.map_err(Self::storage_error)?;
@@ -2484,6 +2746,15 @@ fn insert_audit_event_connection(
     Ok(())
 }
 
+fn require_operational_filter_value(field: &str, value: &str) -> StorageResult<()> {
+    if value.trim().is_empty() {
+        return Err(StorageError::Invariant(format!(
+            "operational event {field} filter must not be blank"
+        )));
+    }
+    Ok(())
+}
+
 fn manifest_fields(
     manifest: &serde_json::Value,
 ) -> Result<&serde_json::Map<String, serde_json::Value>, PersistenceError> {
@@ -2643,6 +2914,7 @@ fn insert_projection_item(
             serde_json::to_string(&item.value)?,
         ],
     )?;
+    replace_visible_blob_refs(transaction, projection, item)?;
     Ok(())
 }
 
@@ -2671,6 +2943,7 @@ fn insert_new_projection_item(
             projection.as_str()
         )));
     }
+    replace_visible_blob_refs(transaction, projection, item)?;
     Ok(())
 }
 
@@ -2698,6 +2971,7 @@ fn update_projection_item(
             projection.as_str()
         )));
     }
+    replace_visible_blob_refs(transaction, projection, item)?;
     Ok(())
 }
 
@@ -2717,7 +2991,65 @@ fn delete_projection_item(
             projection.as_str()
         )));
     }
+    transaction.execute(
+        "DELETE FROM projection_visible_blob_refs
+         WHERE projection_id = ?1 AND item_key = ?2",
+        params![projection.as_str(), item_key],
+    )?;
     Ok(())
+}
+
+fn replace_visible_blob_refs(
+    transaction: &rusqlite::Transaction<'_>,
+    projection: &lethe_core::domain::ProjectionRef,
+    item: &ProjectionItem,
+) -> Result<(), PersistenceError> {
+    transaction.execute(
+        "DELETE FROM projection_visible_blob_refs
+         WHERE projection_id = ?1 AND item_key = ?2",
+        params![projection.as_str(), item.item_key],
+    )?;
+    let consent_scope = format!(
+        "projection:{}:owner:{}",
+        projection.as_str(),
+        item.owner_key
+    );
+    let mut refs = std::collections::BTreeSet::new();
+    collect_blob_refs(&item.value, &mut refs);
+    for blob_ref in refs {
+        transaction.execute(
+            "INSERT INTO projection_visible_blob_refs (
+                projection_id, item_key, blob_ref, owner_key, consent_scope
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                projection.as_str(),
+                item.item_key,
+                blob_ref,
+                item.owner_key,
+                consent_scope,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn collect_blob_refs(value: &serde_json::Value, refs: &mut std::collections::BTreeSet<String>) {
+    match value {
+        serde_json::Value::String(value) if value.starts_with("blob:sha256:") => {
+            refs.insert(value.clone());
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_blob_refs(value, refs);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values() {
+                collect_blob_refs(value, refs);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn storage_error(error: PersistenceError) -> StorageError {
@@ -2966,6 +3298,34 @@ impl ProjectionMaterializerPort for SqlitePersistence {
             .map_err(storage_error)
     }
 
+    fn projection_items_page(
+        &self,
+        projection: &lethe_core::domain::ProjectionRef,
+        owner_keys: &[String],
+        item_key_prefix: Option<&str>,
+        after_sort_key: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<Vec<ProjectionItem>> {
+        SqlitePersistence::projection_items_page(
+            self,
+            projection,
+            owner_keys,
+            item_key_prefix,
+            after_sort_key,
+            limit,
+        )
+        .map_err(storage_error)
+    }
+
+    fn projection_blob_ref_visible(
+        &self,
+        projection: &lethe_core::domain::ProjectionRef,
+        blob_ref: &BlobRef,
+    ) -> StorageResult<bool> {
+        SqlitePersistence::projection_blob_ref_visible(self, projection, blob_ref)
+            .map_err(storage_error)
+    }
+
     fn projection_item_count_by_owner(
         &self,
         projection: &lethe_core::domain::ProjectionRef,
@@ -3017,6 +3377,14 @@ impl RuntimeStateStorePort for SqlitePersistence {
 
     fn record_sync_metrics(&self, source: &str, metrics: &SyncMetricRecord) -> StorageResult<()> {
         SqlitePersistence::record_sync_metrics(self, source, metrics).map_err(storage_error)
+    }
+
+    fn record_sync_state(&self, source: &str, state: &PersistedSyncState) -> StorageResult<()> {
+        SqlitePersistence::record_sync_state(self, source, state).map_err(storage_error)
+    }
+
+    fn load_sync_state(&self, source: &str) -> StorageResult<Option<PersistedSyncState>> {
+        SqlitePersistence::load_sync_state(self, source).map_err(storage_error)
     }
 
     fn apply_retention(&self, retention_days: u32) -> StorageResult<usize> {

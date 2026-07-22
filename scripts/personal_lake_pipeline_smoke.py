@@ -289,6 +289,7 @@ max_blob_bytes = 10485760
 max_payload_bytes = 1048576
 max_sync_items = 10000
 max_page_size = 100
+max_search_job_workers = 2
 max_leaf_observations = 100000
 retention_days = 3650
 

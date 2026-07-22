@@ -119,6 +119,22 @@ pub struct StoredOperationalEvent {
     pub event: OperationalEvent,
 }
 
+/// Indexed predicates supported by the operational-event read path.
+///
+/// The cursor remains the canonical append sequence.  Each predicate is backed
+/// by a composite `(data_space_id, predicate, cursor)` index in the storage
+/// backends, so filtering never requires a cursor-zero client scan.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperationalEventFilter {
+    pub correlation_id: Option<String>,
+    pub causation_id: Option<OperationalEventId>,
+    pub event_type: Option<String>,
+    pub stream_id: Option<String>,
+    pub actor_id: Option<String>,
+    pub occurred_at_from: Option<DateTime<Utc>>,
+    pub occurred_at_to: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationalEventStats {
     pub count: u64,
@@ -147,6 +163,13 @@ pub trait OperationalEventStore: Send {
 
     fn operational_event_page(
         &self,
+        after_cursor: u64,
+        limit: usize,
+    ) -> StorageResult<Vec<StoredOperationalEvent>>;
+
+    fn operational_events_by_filter(
+        &self,
+        filter: &OperationalEventFilter,
         after_cursor: u64,
         limit: usize,
     ) -> StorageResult<Vec<StoredOperationalEvent>>;
@@ -479,6 +502,13 @@ pub struct SyncMetricRecord {
     pub latency_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedSyncState {
+    pub metrics: SyncMetricRecord,
+    pub completed_at: DateTime<Utc>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SlackThreadKey {
     pub source_instance: String,
@@ -680,6 +710,19 @@ pub trait ProjectionMaterializer: Send {
         projection: &ProjectionRef,
         owner_key: &str,
     ) -> StorageResult<Vec<ProjectionItem>>;
+    fn projection_items_page(
+        &self,
+        projection: &ProjectionRef,
+        owner_keys: &[String],
+        item_key_prefix: Option<&str>,
+        after_sort_key: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<Vec<ProjectionItem>>;
+    fn projection_blob_ref_visible(
+        &self,
+        projection: &ProjectionRef,
+        blob_ref: &BlobRef,
+    ) -> StorageResult<bool>;
     fn projection_item_count_by_owner(
         &self,
         projection: &ProjectionRef,
@@ -723,6 +766,8 @@ pub trait RuntimeStateStore: Send {
         limit: usize,
     ) -> StorageResult<Vec<AuditEventRecord>>;
     fn record_sync_metrics(&self, source: &str, metrics: &SyncMetricRecord) -> StorageResult<()>;
+    fn record_sync_state(&self, source: &str, state: &PersistedSyncState) -> StorageResult<()>;
+    fn load_sync_state(&self, source: &str) -> StorageResult<Option<PersistedSyncState>>;
     fn apply_retention(&self, retention_days: u32) -> StorageResult<usize>;
     fn garbage_collect_orphan_blobs(&self) -> StorageResult<usize>;
     fn deep_check(&self) -> StorageResult<()>;

@@ -6,6 +6,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::self_host::app::{
@@ -14,8 +15,11 @@ use crate::self_host::app::{
 };
 use lethe_adapter_api::traits::ObservationDraft;
 use lethe_api::api::envelope::{ErrorResponse, ResponseEnvelope};
+use lethe_api::api::grep::PreparedGrepQuery;
 use lethe_api::api::health::HealthResponse;
-use lethe_api::api::pagination::PaginationParams;
+use lethe_api::api::pagination::{
+    KeysetCursorError, PaginationParams, decode_keyset_cursor, encode_keyset_cursor,
+};
 use lethe_core::domain::BlobRef;
 use lethe_core::domain::OperationalEventId;
 use lethe_history::{
@@ -25,8 +29,8 @@ use lethe_history::{
 use lethe_projection_claim_queue::ClaimState;
 use lethe_projection_cognition::CardState;
 use lethe_storage_api::{
-    OperationalAppendOutcome, OperationalAppendRequest, OperationalEventStats,
-    StoredOperationalEvent,
+    OperationalAppendOutcome, OperationalAppendRequest, OperationalEventFilter,
+    OperationalEventStats, StoredOperationalEvent,
 };
 
 const IMPORT_REQUEST_BODY_LIMIT_BYTES: usize = 128 * 1024 * 1024;
@@ -67,6 +71,42 @@ pub fn build_router(service: AppService) -> Router {
             "/api/operational-events",
             get(operational_event_page).post(append_operational_events),
         )
+        .route(
+            "/api/v2/operational-events",
+            get(operational_event_filter_page),
+        )
+        .route(
+            "/api/v2/projections/{projection_id}/records",
+            get(projection_records_v2),
+        )
+        .route(
+            "/api/v2/projections/{projection_id}/records/{record_id}",
+            get(projection_record_detail_v2),
+        )
+        .route(
+            "/api/v2/projections/{projection_id}/records/{record_id}/slides",
+            get(projection_record_slides_v2),
+        )
+        .route(
+            "/api/v2/projections/{projection_id}/records/{record_id}/messages",
+            get(projection_record_messages_v2),
+        )
+        .route(
+            "/api/v2/projections/{projection_id}/records/{record_id}/timeline",
+            get(projection_record_timeline_v2),
+        )
+        .route(
+            "/api/v2/projections/{projection_id}/exact",
+            post(projection_exact_v2),
+        )
+        .route(
+            "/api/v2/projections/{projection_id}/grep",
+            post(projection_grep_v2),
+        )
+        .route("/api/v2/search-jobs/{job_id}", get(search_job_v2))
+        .route("/api/v2/projections/claim-queue", get(claim_queue_v2))
+        .route("/api/v2/projections/card-queue", get(card_queue_v2))
+        .route("/api/v2/projections/reply-slo", get(reply_slo_v2))
         .route(
             "/api/operational-events/stats",
             get(operational_event_stats),
@@ -178,6 +218,103 @@ struct OperationalEventPageResponse {
 struct OperationalStreamPageResponse {
     events: Vec<StoredOperationalEvent>,
     next_stream_version: u64,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OperationalEventFilterQuery {
+    cursor: Option<String>,
+    #[serde(default = "default_keyset_limit")]
+    limit: usize,
+    correlation_id: Option<String>,
+    causation_id: Option<String>,
+    event_type: Option<String>,
+    stream_id: Option<String>,
+    actor_id: Option<String>,
+    occurred_at_from: Option<DateTime<Utc>>,
+    occurred_at_to: Option<DateTime<Utc>>,
+}
+
+fn default_keyset_limit() -> usize {
+    20
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct KeysetReadQuery {
+    mode: Option<String>,
+    pin: Option<String>,
+    cursor: Option<String>,
+    #[serde(default = "default_keyset_limit")]
+    limit: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct OperationalEventFilterPageResponse {
+    events: Vec<StoredOperationalEvent>,
+    next_cursor: Option<String>,
+}
+
+async fn operational_event_filter_page(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Query(query): Query<OperationalEventFilterQuery>,
+) -> Result<Json<OperationalEventFilterPageResponse>, ApiError> {
+    authorize_headers_blocking(service.clone(), headers, "read:operational").await?;
+    service.validate_operational_page_limit(query.limit)?;
+    let after_cursor = query
+        .cursor
+        .as_deref()
+        .map(|cursor| {
+            decode_keyset_cursor(cursor, "v2:operational-events")
+                .map_err(|error| keyset_cursor_error(error, "operational event"))?
+                .sort_key
+                .parse::<u64>()
+                .map_err(|_| {
+                    ApiError::bad_request_with_details(
+                        "invalid_cursor",
+                        "operational event cursor sort key is invalid".to_owned(),
+                        serde_json::json!({"resource": "operational event"}),
+                    )
+                })
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let filter = OperationalEventFilter {
+        correlation_id: query.correlation_id,
+        causation_id: query.causation_id.map(OperationalEventId::new),
+        event_type: query.event_type,
+        stream_id: query.stream_id,
+        actor_id: query.actor_id,
+        occurred_at_from: query.occurred_at_from,
+        occurred_at_to: query.occurred_at_to,
+    };
+    let limit = query.limit;
+    let events = tokio::task::spawn_blocking(move || {
+        service.operational_events_by_filter(&filter, after_cursor, limit)
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))??;
+    let next_cursor = (events.len() == limit)
+        .then(|| events.last().map(|event| event.cursor.to_string()))
+        .flatten()
+        .map(|sort_key| encode_keyset_cursor("v2:operational-events", &sort_key))
+        .transpose()
+        .map_err(|_| ApiError::internal("failed to encode operational event cursor".to_owned()))?;
+    Ok(Json(OperationalEventFilterPageResponse {
+        events,
+        next_cursor,
+    }))
+}
+
+fn keyset_cursor_error(error: KeysetCursorError, resource: &str) -> ApiError {
+    let detail = match error {
+        KeysetCursorError::Invalid => format!("{resource} cursor is invalid"),
+        KeysetCursorError::WrongScope => format!("{resource} cursor has the wrong scope"),
+    };
+    ApiError::bad_request_with_details(
+        "invalid_cursor",
+        detail,
+        serde_json::json!({"resource": resource}),
+    )
 }
 
 async fn append_operational_events(
@@ -666,6 +803,197 @@ async fn projection_records(
         }
         _ => Err(ApiError::not_found()),
     }
+}
+
+async fn claim_queue_v2(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Query(query): Query<ClaimQueueQuery>,
+) -> Result<
+    Json<ResponseEnvelope<crate::self_host::app::projection_api::ClaimQueueKeysetPage>>,
+    ApiError,
+> {
+    service.authorize_headers(&headers, "read:corpus")?;
+    Ok(Json(service.claim_queue_keyset_response(
+        query.state,
+        query.backfill,
+        query.limit.unwrap_or_else(default_keyset_limit),
+        query.cursor.as_deref(),
+    )?))
+}
+
+async fn card_queue_v2(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Query(query): Query<CardQueueQuery>,
+) -> Result<
+    Json<ResponseEnvelope<crate::self_host::app::projection_api::CardQueueKeysetPage>>,
+    ApiError,
+> {
+    service.authorize_headers(&headers, "read:corpus")?;
+    Ok(Json(service.card_queue_keyset_response(
+        query.state,
+        query.channel.as_deref(),
+        query.automatic,
+        query.limit.unwrap_or_else(default_keyset_limit),
+        query.cursor.as_deref(),
+    )?))
+}
+
+async fn reply_slo_v2(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Query(query): Query<KeysetReadQuery>,
+) -> Result<Json<ResponseEnvelope<serde_json::Value>>, ApiError> {
+    service.authorize_headers(&headers, "read:corpus")?;
+    Ok(Json(service.reply_slo_keyset_response(
+        query.limit,
+        query.cursor.as_deref(),
+    )?))
+}
+
+async fn projection_records_v2(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Path(projection_id): Path<String>,
+    Query(query): Query<KeysetReadQuery>,
+) -> Result<Json<ResponseEnvelope<serde_json::Value>>, ApiError> {
+    match projection_id.as_str() {
+        "proj:person-page" => {
+            service.authorize_headers(&headers, "read:persons")?;
+            Ok(Json(service.persons_keyset_response(
+                query.mode.as_deref(),
+                query.pin.as_deref(),
+                query.limit,
+                query.cursor.as_deref(),
+            )?))
+        }
+        "proj:corpus" => {
+            service.authorize_headers(&headers, "read:corpus")?;
+            Ok(Json(service.corpus_records_keyset_response(
+                query.mode.as_deref(),
+                query.pin.as_deref(),
+                query.limit,
+                query.cursor.as_deref(),
+            )?))
+        }
+        _ => Err(ApiError::not_found()),
+    }
+}
+
+async fn projection_record_detail_v2(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Path((projection_id, record_id)): Path<(String, String)>,
+    Query(query): Query<KeysetReadQuery>,
+) -> Result<Json<ResponseEnvelope<serde_json::Value>>, ApiError> {
+    match projection_id.as_str() {
+        "proj:person-page" => {
+            service.authorize_headers_all(&headers, &["read:persons", "read:timeline"])?;
+            Ok(Json(service.person_detail_keyset_response(
+                &record_id,
+                query.mode.as_deref(),
+                query.pin.as_deref(),
+                query.limit,
+                query.cursor.as_deref(),
+            )?))
+        }
+        _ => Err(ApiError::not_found()),
+    }
+}
+
+async fn projection_record_slides_v2(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Path((projection_id, record_id)): Path<(String, String)>,
+    Query(query): Query<KeysetReadQuery>,
+) -> Result<Json<ResponseEnvelope<serde_json::Value>>, ApiError> {
+    service.authorize_headers(&headers, "read:timeline")?;
+    ensure_projection_person_page(&projection_id)?;
+    Ok(Json(service.person_slides_keyset_response(
+        &record_id,
+        query.mode.as_deref(),
+        query.pin.as_deref(),
+        query.limit,
+        query.cursor.as_deref(),
+    )?))
+}
+
+async fn projection_record_messages_v2(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Path((projection_id, record_id)): Path<(String, String)>,
+    Query(query): Query<KeysetReadQuery>,
+) -> Result<Json<ResponseEnvelope<serde_json::Value>>, ApiError> {
+    service.authorize_headers(&headers, "read:timeline")?;
+    ensure_projection_person_page(&projection_id)?;
+    Ok(Json(service.person_messages_keyset_response(
+        &record_id,
+        query.mode.as_deref(),
+        query.pin.as_deref(),
+        query.limit,
+        query.cursor.as_deref(),
+    )?))
+}
+
+async fn projection_record_timeline_v2(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Path((projection_id, record_id)): Path<(String, String)>,
+    Query(query): Query<KeysetReadQuery>,
+) -> Result<Json<ResponseEnvelope<serde_json::Value>>, ApiError> {
+    service.authorize_headers(&headers, "read:timeline")?;
+    ensure_projection_person_page(&projection_id)?;
+    Ok(Json(service.person_timeline_keyset_response(
+        &record_id,
+        query.mode.as_deref(),
+        query.pin.as_deref(),
+        query.limit,
+        query.cursor.as_deref(),
+    )?))
+}
+
+async fn projection_exact_v2(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Path(projection_id): Path<String>,
+    Json(request): Json<lethe_api::api::grep::ExactSearchRequest>,
+) -> Result<Json<ResponseEnvelope<lethe_api::api::grep::ExactSearchResponse>>, ApiError> {
+    service.authorize_headers(&headers, "read:corpus")?;
+    ensure_projection_corpus(&projection_id)?;
+    Ok(Json(service.corpus_exact_response(&request)?))
+}
+
+async fn projection_grep_v2(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Path(projection_id): Path<String>,
+    Json(request): Json<lethe_api::api::grep::GrepRequest>,
+) -> Result<Response, ApiError> {
+    service.authorize_headers(&headers, "read:corpus")?;
+    ensure_projection_corpus(&projection_id)?;
+    let prepared =
+        PreparedGrepQuery::compile(&request, service.max_page_size()).map_err(|error| {
+            ApiError::bad_request_with_details(
+                "invalid_search_request",
+                error.to_string(),
+                serde_json::json!({}),
+            )
+        })?;
+    if prepared.requires_async_search_job() {
+        let status = service.submit_corpus_search_job(request)?;
+        return Ok((StatusCode::ACCEPTED, Json(status)).into_response());
+    }
+    Ok(Json(service.corpus_grep_response(&request)?).into_response())
+}
+
+async fn search_job_v2(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+) -> Result<Json<crate::self_host::app::SearchJobStatus>, ApiError> {
+    service.authorize_headers(&headers, "read:corpus")?;
+    Ok(Json(service.search_job_status(&job_id)?))
 }
 
 async fn projection_grep(
