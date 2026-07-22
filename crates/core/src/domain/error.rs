@@ -25,7 +25,16 @@ pub enum IngestResult {
 #[derive(Debug, Clone)]
 pub struct QuarantineTicket {
     pub id: String,
+    pub kind: QuarantineKind,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuarantineKind {
+    Policy,
+    ClockSkewFuture,
+    CanonicalCollision,
+    Channel,
 }
 
 /// Domain-level error — used internally; not an HTTP error.

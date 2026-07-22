@@ -2,6 +2,9 @@ use std::path::PathBuf;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use chrono::{DateTime, Utc};
+use lethe_adapter_api::idempotency::identity_key;
+use lethe_adapter_api::traits::ObservationDraft;
 use lethe_adapter_coding_agent::codex::CodexImporter;
 use lethe_core::domain::supplemental::InputAnchorSet;
 use lethe_core::domain::{
@@ -9,7 +12,7 @@ use lethe_core::domain::{
     ObserverRef, SchemaRef, SemVer, SourceSystemRef, SupplementalId, SupplementalRecord,
 };
 use lethe_projection_corpus::CorpusMode;
-use lethe_runtime::runtime::partition::RoutingKeyOrder;
+use lethe_runtime::runtime::partition::{RoutingKeyOrder, routing_key_from_observation_for_order};
 use lethe_selfhost::self_host::app::AppService;
 use lethe_selfhost::self_host::config::{
     ApiTokenConfig, CorpusProjectionConfig, FreshnessConfig, GoogleConfig, JsonWebKey,
@@ -69,6 +72,93 @@ fn slack_observation(
             "source_container": format!("slack-test:{channel}"),
         }),
     }
+}
+
+fn v2_slack_draft(
+    object_id: &str,
+    text: &str,
+    event_time: &str,
+    published: DateTime<Utc>,
+    authority_model: AuthorityModel,
+) -> ObservationDraft {
+    let canonical_json = serde_json::json!({
+        "sender": "U-V2",
+        "body": text,
+        "event_time": event_time,
+    })
+    .to_string();
+    ObservationDraft {
+        schema: SchemaRef::new("schema:slack-message"),
+        schema_version: SemVer::new("1.0.0"),
+        observer: ObserverRef::new("obs:slack-crawler"),
+        source_system: Some(SourceSystemRef::new("sys:slack")),
+        authority_model,
+        capture_model: CaptureModel::Event,
+        subject: EntityRef::new(format!("message:slack:{object_id}")),
+        target: None,
+        payload: serde_json::json!({
+            "channel_id": "C01ABC",
+            "channel_name": "general",
+            "ts": event_time,
+            "thread_ts": event_time,
+            "user_id": "U-V2",
+            "user_name": "V2 User",
+            "email": "v2@example.test",
+            "text": text,
+        }),
+        attachments: vec![],
+        published,
+        idempotency_key: identity_key("slack-test", object_id, &canonical_json),
+        client_ref: Some(object_id.to_owned()),
+        meta: serde_json::json!({
+            "object_id": object_id,
+            "canonical_json": canonical_json,
+            "source_container": "C01ABC",
+            "communication_channel_kind": "slack",
+            "communication_channel_external_id": "C01ABC",
+            "communication_sender_id": "U-V2",
+            "communication_thread_ref": format!("slack:thread:{event_time}"),
+        }),
+    }
+}
+
+fn persisted_v2_observation(draft: &ObservationDraft) -> Observation {
+    let mut meta = draft.meta.as_object().cloned().unwrap();
+    meta.insert(
+        "source_instance".to_owned(),
+        serde_json::Value::String("slack-test".to_owned()),
+    );
+    meta.insert(
+        "source_container".to_owned(),
+        serde_json::Value::String("slack-test:C01ABC".to_owned()),
+    );
+    Observation {
+        id: Observation::new_id(),
+        schema: draft.schema.clone(),
+        schema_version: draft.schema_version.clone(),
+        observer: draft.observer.clone(),
+        source_system: draft.source_system.clone(),
+        actor: None,
+        authority_model: draft.authority_model,
+        capture_model: draft.capture_model,
+        subject: draft.subject.clone(),
+        target: draft.target.clone(),
+        payload: draft.payload.clone(),
+        attachments: draft.attachments.clone(),
+        published: draft.published,
+        recorded_at: Utc::now(),
+        consent: None,
+        idempotency_key: draft.idempotency_key.clone(),
+        meta: serde_json::Value::Object(meta),
+    }
+}
+
+fn ingestion_test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
+    let mut config = test_config(db, blobs);
+    config.api_tokens[0]
+        .scopes
+        .push("write:observations".into());
+    config
 }
 
 fn gslides_observation(editors: &[&str], owner: &str, title: &str, key: &str) -> Observation {
@@ -232,6 +322,255 @@ fn test_config_with_corpus(db: PathBuf, blobs: PathBuf, corpus_mode: CorpusMode)
 
 fn wait_for_search_index_ready(service: &AppService) {
     wait_for_search_index_status(service, "ok");
+}
+
+#[test]
+fn v2_http_retry_crossing_partitions_is_a_global_duplicate() {
+    let (root, db, blobs) = temp_paths();
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let first_draft = v2_slack_draft(
+        "channel:C01ABC:ts:cross-leaf-1",
+        "stable body",
+        "100.000001",
+        DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .to_utc(),
+        AuthorityModel::LakeAuthoritative,
+    );
+    let second_draft = v2_slack_draft(
+        "channel:C01ABC:ts:cross-leaf-2",
+        "other body",
+        "200.000001",
+        DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
+            .unwrap()
+            .to_utc(),
+        AuthorityModel::LakeAuthoritative,
+    );
+    let first = persisted_v2_observation(&first_draft);
+    let second = persisted_v2_observation(&second_draft);
+    persistence.append_observation_idempotent(&first).unwrap();
+    persistence.append_observation_idempotent(&second).unwrap();
+    assert!(persistence.split_leaf_if_capacity(2).unwrap());
+
+    let tree = persistence.load_partition_tree().unwrap();
+    let first_key = routing_key_from_observation_for_order(
+        RoutingKeyOrder::MonthYearSourceContainerPublished,
+        &first,
+    )
+    .unwrap();
+    let second_key = routing_key_from_observation_for_order(
+        RoutingKeyOrder::MonthYearSourceContainerPublished,
+        &second,
+    )
+    .unwrap();
+    let first_leaf = tree.route(&first_key).to_owned();
+    assert_ne!(first_leaf, tree.route(&second_key));
+
+    let retry_published = [
+        "2026-02-01T00:00:00Z",
+        "2026-04-01T00:00:00Z",
+        "2026-07-01T00:00:00Z",
+        "2027-01-01T00:00:00Z",
+    ]
+    .into_iter()
+    .map(|value| DateTime::parse_from_rfc3339(value).unwrap().to_utc())
+    .find(|published| {
+        let candidate = persisted_v2_observation(&v2_slack_draft(
+            "channel:C01ABC:ts:cross-leaf-1",
+            "stable body",
+            "100.000001",
+            *published,
+            AuthorityModel::LakeAuthoritative,
+        ));
+        let key = routing_key_from_observation_for_order(
+            RoutingKeyOrder::MonthYearSourceContainerPublished,
+            &candidate,
+        )
+        .unwrap();
+        tree.route(&key) != first_leaf
+    })
+    .expect("retry candidate must route to the other leaf");
+    let retry = v2_slack_draft(
+        "channel:C01ABC:ts:cross-leaf-1",
+        "stable body",
+        "100.000001",
+        retry_published,
+        AuthorityModel::LakeAuthoritative,
+    );
+    drop(persistence);
+
+    let service = bootstrap_ready(ingestion_test_config(db.clone(), blobs.clone()));
+    let app = build_router(service);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let response = runtime
+        .block_on(async {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v2/import/observation-drafts")
+                    .header("authorization", "Bearer test-api-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "source_instance_id": "slack-test",
+                            "drafts": [serde_json::to_value(retry).unwrap()],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+        })
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = runtime
+        .block_on(async { axum::body::to_bytes(response.into_body(), usize::MAX).await })
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["results"][0]["outcome"], "duplicate");
+    assert_eq!(json["results"][0]["existing_id"], first.id.as_str());
+    assert_eq!(json["summary"]["duplicates"], 1);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn v2_http_canonical_collision_returns_quarantine_ticket_and_existing_id() {
+    let (root, db, blobs) = temp_paths();
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let incoming = v2_slack_draft(
+        "channel:C01ABC:ts:collision",
+        "new canonical body",
+        "300.000001",
+        Utc::now() - chrono::Duration::minutes(1),
+        AuthorityModel::LakeAuthoritative,
+    );
+    let mut existing = persisted_v2_observation(&incoming);
+    let old_canonical = serde_json::json!({
+        "sender": "U-V2",
+        "body": "old canonical body",
+        "event_time": "300.000001",
+    })
+    .to_string();
+    existing.meta["canonical_json"] = serde_json::Value::String(old_canonical);
+    persistence
+        .append_observation_idempotent(&existing)
+        .unwrap();
+    drop(persistence);
+
+    let service = bootstrap_ready(ingestion_test_config(db.clone(), blobs.clone()));
+    let app = build_router(service);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let response = runtime
+        .block_on(async {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v2/import/observation-drafts")
+                    .header("authorization", "Bearer test-api-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "source_instance_id": "slack-test",
+                            "drafts": [serde_json::to_value(incoming).unwrap()],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+        })
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = runtime
+        .block_on(async { axum::body::to_bytes(response.into_body(), usize::MAX).await })
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let result = &json["results"][0];
+    assert_eq!(result["outcome"], "quarantined");
+    assert_eq!(result["existing_id"], existing.id.as_str());
+    assert_eq!(result["error_code"], "canonical_collision");
+    assert_eq!(result["failure_class"], "quarantine");
+    assert!(
+        result["ticket"]["id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
+    assert!(
+        result["ticket"]["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty())
+    );
+    assert_eq!(json["summary"]["quarantined"], 1);
+
+    let reopened = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    assert_eq!(reopened.observation_stats().unwrap().count, 1);
+    assert_eq!(reopened.load_observations().unwrap()[0].id, existing.id);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn v2_http_quarantine_error_codes_cover_clock_skew_and_policy() {
+    let (root, db, blobs) = temp_paths();
+    let service = bootstrap_ready(ingestion_test_config(db, blobs));
+    let app = build_router(service);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let future = v2_slack_draft(
+        "channel:C01ABC:ts:future",
+        "future body",
+        "400.000001",
+        Utc::now() + chrono::Duration::minutes(11),
+        AuthorityModel::LakeAuthoritative,
+    );
+    let policy = v2_slack_draft(
+        "channel:C01ABC:ts:policy",
+        "policy body",
+        "500.000001",
+        Utc::now() - chrono::Duration::minutes(1),
+        AuthorityModel::DualReference,
+    );
+    let response = runtime
+        .block_on(async {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v2/import/observation-drafts")
+                    .header("authorization", "Bearer test-api-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "source_instance_id": "slack-test",
+                            "drafts": [
+                                serde_json::to_value(future).unwrap(),
+                                serde_json::to_value(policy).unwrap(),
+                            ],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+        })
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = runtime
+        .block_on(async { axum::body::to_bytes(response.into_body(), usize::MAX).await })
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["results"].as_array().unwrap().len(), 2);
+    assert_eq!(json["results"][0]["outcome"], "quarantined");
+    assert_eq!(json["results"][0]["error_code"], "clock_skew_future");
+    assert_eq!(json["results"][0]["failure_class"], "quarantine");
+    assert_eq!(json["results"][1]["outcome"], "quarantined");
+    assert_eq!(json["results"][1]["error_code"], "policy_quarantine");
+    assert_eq!(json["results"][1]["failure_class"], "quarantine");
+    assert!(json["results"].as_array().unwrap().iter().all(|result| {
+        result["ticket"]["id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    }));
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 fn wait_for_search_index_status(service: &AppService, expected: &str) {

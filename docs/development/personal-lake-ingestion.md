@@ -135,6 +135,18 @@ as a retry identity or routing uniqueness key. The request body limit is
 page limit defaults to 500 for the personal lake. Limit errors include both
 the actual value and the applied maximum.
 
+Quarantine error codes are classified from the typed quarantine cause, not
+from the display text in `ticket.reason`: future timestamps use
+`clock_skew_future`, policy denial or review uses `policy_quarantine`, and
+other quarantine causes use `quarantine_required`. The ticket reason remains
+human-readable and may change without changing the wire taxonomy.
+
+The acceptance regression suite covers schema-v8 backfill of duplicate
+identity rows across leaves (the smallest `append_seq` wins), v2 retry
+deduplication after an event-time routing change across leaves, v2 canonical
+collision responses (`quarantined` + ticket + `existing_id`), and HTTP-level
+clock-skew/policy quarantine classification.
+
 The 2026-07-06 production rebuild used:
 
 ```powershell

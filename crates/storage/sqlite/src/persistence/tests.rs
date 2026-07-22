@@ -570,6 +570,99 @@ fn open_migrates_legacy_canonical_json_column_and_keeps_bulk_dedupe_idempotent()
 }
 
 #[test]
+fn schema_v8_backfill_keeps_oldest_cross_leaf_identity_duplicate() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    let oldest = sample_observation_with_identity("legacy-cross-leaf", "stable");
+    let mut newer = oldest.clone();
+    newer.id = Observation::new_id();
+
+    store
+        .conn
+        .execute_batch(
+            "
+            DROP INDEX IF EXISTS observations_leaf_append;
+            DROP TABLE observations;
+            DROP TABLE observation_identity_registry;
+            CREATE TABLE observations (
+                append_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL UNIQUE,
+                leaf_id TEXT NOT NULL CHECK (leaf_id LIKE 'lake:%'),
+                routing_key TEXT NOT NULL,
+                identity_key TEXT NOT NULL,
+                canonical_json_sha256 TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                observation_json TEXT NOT NULL,
+                UNIQUE (leaf_id, identity_key)
+            );
+            ",
+        )
+        .unwrap();
+    for (append_seq, leaf_id, observation) in [
+        (2_i64, "lake:newer", &newer),
+        (1_i64, "lake:oldest", &oldest),
+    ] {
+        let canonical_json = observation
+            .meta
+            .get(CANONICAL_JSON_META_KEY)
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO observations (
+                    append_seq, id, leaf_id, routing_key, identity_key,
+                    canonical_json_sha256, recorded_at, observation_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    append_seq,
+                    observation.id.as_str(),
+                    leaf_id,
+                    format!("routing:{leaf_id}"),
+                    observation.idempotency_key.as_str(),
+                    canonical_json_sha256(canonical_json),
+                    observation.recorded_at.to_rfc3339(),
+                    serde_json::to_string(observation).unwrap(),
+                ],
+            )
+            .unwrap();
+    }
+    drop(store);
+
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    let (winner_id, registry_count): (String, i64) = store
+        .conn
+        .query_row(
+            "SELECT (
+                 SELECT observation_id
+                 FROM observation_identity_registry
+                 WHERE identity_key = ?1
+             ), (
+                 SELECT COUNT(*)
+                 FROM observation_identity_registry
+                 WHERE identity_key = ?1
+             )",
+            [oldest.idempotency_key.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(winner_id, oldest.id.as_str());
+    assert_eq!(registry_count, 1);
+
+    let mut retry = oldest.clone();
+    retry.id = Observation::new_id();
+    assert_eq!(
+        store.append_observation_idempotent(&retry).unwrap(),
+        DurableAppendOutcome::Duplicate(oldest.id.clone())
+    );
+    assert_eq!(store.load_observations().unwrap().len(), 2);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
 fn slack_thread_append_catalog_and_due_queue_are_durable() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let db = tmp.join("test.sqlite3");
