@@ -3265,6 +3265,26 @@ fn v2_payload_limit_is_an_item_error_with_actual_and_maximum() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[test]
+fn v2_transient_failures_are_machine_classified() {
+    let result = super::transient_item(
+        "client-transient".to_owned(),
+        "storage temporarily unavailable".to_owned(),
+        serde_json::json!({"stage": "durable_append"}),
+    );
+
+    assert_eq!(result.outcome, ImportOutcome::Rejected);
+    assert_eq!(
+        result.failure_class,
+        Some(super::ImportFailureClass::Transient)
+    );
+    assert_eq!(result.error_code.as_deref(), Some("transient_failure"));
+    assert_eq!(
+        super::error_code_for_failure(lethe_core::domain::FailureClass::RetryableEffectFailure),
+        "transient_failure"
+    );
+}
+
 fn normalized_non_corpus_manifest(mut value: serde_json::Value) -> serde_json::Value {
     value
         .pointer_mut("/snapshot")
