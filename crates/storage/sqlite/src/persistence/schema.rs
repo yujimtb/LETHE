@@ -510,12 +510,17 @@ impl SqlitePersistence {
 
     fn backfill_global_identity_registry(&self) -> Result<(), PersistenceError> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO observation_identity_registry (
+            "INSERT INTO observation_identity_registry (
                 identity_key, observation_id, canonical_json_sha256
              )
-             SELECT identity_key, id, canonical_json_sha256
-             FROM observations
-             ORDER BY append_seq",
+             SELECT observation.identity_key, observation.id, observation.canonical_json_sha256
+             FROM observations observation
+             WHERE observation.append_seq = (
+                 SELECT MIN(candidate.append_seq)
+                 FROM observations candidate
+                 WHERE candidate.identity_key = observation.identity_key
+             )
+             ON CONFLICT(identity_key) DO NOTHING",
             [],
         )?;
         Ok(())

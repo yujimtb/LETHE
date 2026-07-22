@@ -315,13 +315,7 @@ fn item_result_from_ingest_result(client_ref: String, result: IngestResult) -> I
             details: None,
         },
         IngestResult::Quarantined { ticket } => {
-            let error_code = if ticket.reason.contains("too far in the future") {
-                "clock_skew_future"
-            } else if ticket.reason.starts_with("policy denied:") {
-                "policy_quarantine"
-            } else {
-                "quarantine_required"
-            };
+            let error_code = error_code_for_quarantine(ticket.kind);
             ImportItemResult {
                 client_ref,
                 outcome: ImportOutcome::Quarantined,
@@ -334,13 +328,26 @@ fn item_result_from_ingest_result(client_ref: String, result: IngestResult) -> I
                 error_code: Some(error_code.to_owned()),
                 failure_class: Some(ImportFailureClass::Quarantine),
                 reason: Some(ticket.reason),
-                details: (error_code == "clock_skew_future").then(|| {
+                details: matches!(
+                    ticket.kind,
+                    lethe_core::domain::QuarantineKind::ClockSkewFuture
+                )
+                .then(|| {
                     serde_json::json!({
                         "max_clock_skew_seconds": MAX_CLOCK_SKEW.num_seconds(),
                     })
                 }),
             }
         }
+    }
+}
+
+fn error_code_for_quarantine(kind: lethe_core::domain::QuarantineKind) -> &'static str {
+    match kind {
+        lethe_core::domain::QuarantineKind::Policy => "policy_quarantine",
+        lethe_core::domain::QuarantineKind::ClockSkewFuture => "clock_skew_future",
+        lethe_core::domain::QuarantineKind::CanonicalCollision => "canonical_collision",
+        lethe_core::domain::QuarantineKind::Channel => "quarantine_required",
     }
 }
 

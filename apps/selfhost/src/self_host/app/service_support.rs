@@ -478,6 +478,7 @@ impl AppService {
             DurableAppendOutcome::CanonicalCollision(existing_id) => IngestResult::Quarantined {
                 ticket: lethe_core::domain::QuarantineTicket {
                     id: uuid::Uuid::now_v7().to_string(),
+                    kind: lethe_core::domain::QuarantineKind::CanonicalCollision,
                     reason: format!(
                         "sha256-collision: existing observation {existing_id} has different canonical_json"
                     ),
@@ -509,6 +510,7 @@ impl AppService {
             DurableAppendOutcome::CanonicalCollision(existing_id) => IngestResult::Quarantined {
                 ticket: lethe_core::domain::QuarantineTicket {
                     id: uuid::Uuid::now_v7().to_string(),
+                    kind: lethe_core::domain::QuarantineKind::CanonicalCollision,
                     reason: format!(
                         "sha256-collision: existing observation {existing_id} has different canonical_json"
                     ),

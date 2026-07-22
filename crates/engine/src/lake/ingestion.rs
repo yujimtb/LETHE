@@ -117,7 +117,9 @@ impl<'a> ObservationPreparer<'a> {
         } else {
             observer.authority_model
         };
-        if req.authority_model != expected_authority {
+        if req.authority_model != expected_authority
+            && req.authority_model != AuthorityModel::DualReference
+        {
             return Err(IngestResult::Rejected {
                 class: lethe_core::domain::FailureClass::ValidationFailure,
                 message: format!(
@@ -177,13 +179,26 @@ impl<'a> ObservationPreparer<'a> {
             consent_status: ConsentStatus::RestrictedCapture,
             environment: Environment::Production,
         });
-        if let PolicyOutcome::Deny { reason } = policy {
-            return Err(IngestResult::Quarantined {
-                ticket: QuarantineTicket {
-                    id: uuid::Uuid::now_v7().to_string(),
-                    reason: format!("policy denied: {}: {}", reason.code, reason.message),
-                },
-            });
+        match policy {
+            PolicyOutcome::Allow => {}
+            PolicyOutcome::Deny { reason } => {
+                return Err(IngestResult::Quarantined {
+                    ticket: QuarantineTicket {
+                        id: uuid::Uuid::now_v7().to_string(),
+                        kind: lethe_core::domain::QuarantineKind::Policy,
+                        reason: format!("policy denied: {}: {}", reason.code, reason.message),
+                    },
+                });
+            }
+            PolicyOutcome::RequireReview { route } => {
+                return Err(IngestResult::Quarantined {
+                    ticket: QuarantineTicket {
+                        id: uuid::Uuid::now_v7().to_string(),
+                        kind: lethe_core::domain::QuarantineKind::Policy,
+                        reason: format!("policy review required: {}", route.reason),
+                    },
+                });
+            }
         }
 
         // Step 5: Idempotency is decided by the append boundary.
@@ -203,6 +218,7 @@ impl<'a> ObservationPreparer<'a> {
             return Err(IngestResult::Quarantined {
                 ticket: QuarantineTicket {
                     id: uuid::Uuid::now_v7().to_string(),
+                    kind: lethe_core::domain::QuarantineKind::ClockSkewFuture,
                     reason: format!(
                         "published ({}) is too far in the future vs recordedAt ({})",
                         req.published, recorded_at
@@ -383,6 +399,7 @@ impl IngestionGate<'_> {
             AppendOutcome::Conflict(existing_id) => IngestResult::Quarantined {
                 ticket: QuarantineTicket {
                     id: uuid::Uuid::now_v7().to_string(),
+                    kind: lethe_core::domain::QuarantineKind::CanonicalCollision,
                     reason: format!(
                         "sha256-collision: existing observation {existing_id} has different canonical_json"
                     ),
@@ -463,6 +480,7 @@ fn communication_thread_ref(
 fn channel_quarantine(message: impl Into<String>) -> QuarantineTicket {
     QuarantineTicket {
         id: uuid::Uuid::now_v7().to_string(),
+        kind: lethe_core::domain::QuarantineKind::Channel,
         reason: message.into(),
     }
 }

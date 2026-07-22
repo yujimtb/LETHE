@@ -206,3 +206,18 @@ idempotency_key を固定する。published / event time は identity tuple と
 routing uniqueness の根拠にしない。SQLite には leaf routing とは別の
 observation_identity_registry(identity_key PRIMARY KEY, ...) を追加し、
 既存 rows を backfill して全 leaf 共通の判定境界にする。
+
+## 受入レビュー回帰カバレッジ
+
+受入レビューで指摘された未検証境界を、次のテストで固定する。
+
+- schema v8 移行前の複数 leaf に同一 `identity_key` が存在する場合、registry
+  backfill はクラッシュせず、最小 `append_seq` の Observation を勝者にする。
+- v2 HTTP 取り込みは、実際に split 済みの別 leaf を跨いで event time を変えた
+  retry を単一の `duplicate` へ収束させる。
+- v2 の canonical collision は HTTP 200 の item 結果として
+  `quarantined`、ticket、`existing_id`、`error_code=canonical_collision` を返し、
+  既存 Observation を変更しない。
+- `clock_skew_future` と `policy_quarantine` は、ticket の表示文言ではなく
+  `QuarantineKind` から導出する。同一 HTTP e2e で両方の wire code と ticket を
+  検証する。
