@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::http::HeaderMap;
 use chrono::{DateTime, Utc};
@@ -229,12 +230,256 @@ const CANONICAL_OBSERVATION_FINGERPRINT_DOMAIN: &[u8] =
     b"lethe:canonical-observation-fingerprint:v1\0";
 const SUPPLEMENTAL_FINGERPRINT_DOMAIN: &[u8] = b"lethe:supplemental-fingerprint:v2\0";
 const IMPORT_PROCESS_BATCH_SIZE: usize = 512;
+const OBSERVATION_IMPORT_SLOW_THRESHOLD_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NonCorpusDeltaKind {
     FreshnessOnly,
     SlackMessage,
     FullRebuild,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NonCorpusDeltaReason {
+    EmptyAppend,
+    SlackUserIdMissing,
+    ReplySloRequired,
+    UnsupportedSchema,
+}
+
+impl NonCorpusDeltaReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::EmptyAppend => "empty_append",
+            Self::SlackUserIdMissing => "slack_user_id_missing",
+            Self::ReplySloRequired => "reply_slo_required",
+            Self::UnsupportedSchema => "unsupported_schema",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NonCorpusDeltaClassification {
+    kind: NonCorpusDeltaKind,
+    reason: Option<NonCorpusDeltaReason>,
+}
+
+impl NonCorpusDeltaClassification {
+    fn materialization_mode(self) -> &'static str {
+        match self.kind {
+            NonCorpusDeltaKind::FreshnessOnly | NonCorpusDeltaKind::SlackMessage => "incremental",
+            NonCorpusDeltaKind::FullRebuild => "full_rebuild",
+        }
+    }
+
+    fn kind_as_str(self) -> &'static str {
+        match self.kind {
+            NonCorpusDeltaKind::FreshnessOnly => "freshness_only",
+            NonCorpusDeltaKind::SlackMessage => "slack_message",
+            NonCorpusDeltaKind::FullRebuild => "full_rebuild",
+        }
+    }
+
+    fn full_rebuild_reason(self) -> &'static str {
+        self.reason
+            .map_or("not_applicable", NonCorpusDeltaReason::as_str)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportTimingStage {
+    LedgerAppend,
+    NonCorpusMaterialize,
+    SearchIndexCatchUp,
+    Audit,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ObservationImportTiming {
+    ledger_append_ms: u64,
+    non_corpus_materialize_ms: u64,
+    search_index_catch_up_ms: u64,
+    audit_ms: u64,
+    total_ms: u64,
+}
+
+#[derive(Debug)]
+struct ObservationImportTimer {
+    started_at: Instant,
+    timing: ObservationImportTiming,
+}
+
+impl ObservationImportTimer {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            timing: ObservationImportTiming::default(),
+        }
+    }
+
+    fn record_stage(&mut self, stage: ImportTimingStage, elapsed: Duration) {
+        let elapsed_ms = u64::try_from(elapsed.as_millis())
+            .expect("observation import stage duration does not fit u64 milliseconds");
+        match stage {
+            ImportTimingStage::LedgerAppend => self.timing.ledger_append_ms = elapsed_ms,
+            ImportTimingStage::NonCorpusMaterialize => {
+                self.timing.non_corpus_materialize_ms = elapsed_ms;
+            }
+            ImportTimingStage::SearchIndexCatchUp => {
+                self.timing.search_index_catch_up_ms = elapsed_ms;
+            }
+            ImportTimingStage::Audit => self.timing.audit_ms = elapsed_ms,
+        }
+    }
+
+    fn finish(mut self) -> ObservationImportTiming {
+        self.timing.total_ms = u64::try_from(self.started_at.elapsed().as_millis())
+            .expect("observation import total duration does not fit u64 milliseconds");
+        self.timing
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservationImportContext {
+    schema_names: Vec<String>,
+    subject_kinds: Vec<String>,
+}
+
+impl ObservationImportContext {
+    fn from_drafts(drafts: &[ObservationDraft]) -> Self {
+        let schema_names = drafts
+            .iter()
+            .map(|draft| draft.schema.as_str().to_owned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let subject_kinds = drafts
+            .iter()
+            .map(|draft| {
+                draft
+                    .subject
+                    .as_str()
+                    .split_once(':')
+                    .map_or("<invalid>", |(kind, _)| kind)
+                    .to_owned()
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        Self {
+            schema_names,
+            subject_kinds,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportMaterializationState {
+    NotRun,
+    Deferred,
+    Classified(NonCorpusDeltaClassification),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservationImportTimingLog {
+    context: ObservationImportContext,
+    source_instance_id: String,
+    timing: ObservationImportTiming,
+    materialization_state: ImportMaterializationState,
+    bulk_session_requested: bool,
+    result: &'static str,
+    ingested: usize,
+    duplicates: usize,
+    quarantined: usize,
+}
+
+impl ObservationImportTimingLog {
+    #[cfg(test)]
+    fn field_names() -> &'static [&'static str] {
+        &[
+            "import_timing",
+            "source_instance_id",
+            "schema_names",
+            "subject_kinds",
+            "ledger_append_ms",
+            "non_corpus_materialize_ms",
+            "non_corpus_materialize_mode",
+            "non_corpus_classification",
+            "full_rebuild_reason",
+            "search_index_catch_up_ms",
+            "audit_ms",
+            "total_ms",
+            "slow_threshold_ms",
+            "bulk_session_requested",
+            "ingested",
+            "duplicates",
+            "quarantined",
+            "result",
+        ]
+    }
+
+    fn emit(self) {
+        let (materialization_mode, classification, full_rebuild_reason) =
+            match self.materialization_state {
+                ImportMaterializationState::NotRun => ("not_run", "not_run", "not_applicable"),
+                ImportMaterializationState::Deferred => {
+                    ("deferred", "deferred_bulk_session", "bulk_session_deferred")
+                }
+                ImportMaterializationState::Classified(classification) => (
+                    classification.materialization_mode(),
+                    classification.kind_as_str(),
+                    classification.full_rebuild_reason(),
+                ),
+            };
+        let slow = self.timing.total_ms > OBSERVATION_IMPORT_SLOW_THRESHOLD_MS;
+        let schema_names = self.context.schema_names.join(",");
+        let subject_kinds = self.context.subject_kinds.join(",");
+        if slow {
+            tracing::warn!(
+                import_timing = true,
+                source_instance_id = %self.source_instance_id,
+                schema_names = %schema_names,
+                subject_kinds = %subject_kinds,
+                ledger_append_ms = self.timing.ledger_append_ms,
+                non_corpus_materialize_ms = self.timing.non_corpus_materialize_ms,
+                non_corpus_materialize_mode = materialization_mode,
+                non_corpus_classification = classification,
+                full_rebuild_reason,
+                search_index_catch_up_ms = self.timing.search_index_catch_up_ms,
+                audit_ms = self.timing.audit_ms,
+                total_ms = self.timing.total_ms,
+                slow_threshold_ms = OBSERVATION_IMPORT_SLOW_THRESHOLD_MS,
+                bulk_session_requested = self.bulk_session_requested,
+                ingested = self.ingested,
+                duplicates = self.duplicates,
+                quarantined = self.quarantined,
+                result = self.result,
+                "observation import timing exceeded threshold"
+            );
+        } else {
+            tracing::info!(
+                import_timing = true,
+                source_instance_id = %self.source_instance_id,
+                schema_names = %schema_names,
+                subject_kinds = %subject_kinds,
+                ledger_append_ms = self.timing.ledger_append_ms,
+                non_corpus_materialize_ms = self.timing.non_corpus_materialize_ms,
+                non_corpus_materialize_mode = materialization_mode,
+                non_corpus_classification = classification,
+                full_rebuild_reason,
+                search_index_catch_up_ms = self.timing.search_index_catch_up_ms,
+                audit_ms = self.timing.audit_ms,
+                total_ms = self.timing.total_ms,
+                slow_threshold_ms = OBSERVATION_IMPORT_SLOW_THRESHOLD_MS,
+                bulk_session_requested = self.bulk_session_requested,
+                ingested = self.ingested,
+                duplicates = self.duplicates,
+                quarantined = self.quarantined,
+                result = self.result,
+                "observation import timing"
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2465,7 +2710,9 @@ fn slack_identity_node_for_observation(
         })
 }
 
-fn classify_non_corpus_delta(observations: &[Observation]) -> NonCorpusDeltaKind {
+fn classify_non_corpus_delta_with_reason(
+    observations: &[Observation],
+) -> NonCorpusDeltaClassification {
     const FRESHNESS_ONLY_SCHEMAS: &[&str] = &[
         "schema:claude-message",
         "schema:chatgpt-message",
@@ -2476,7 +2723,10 @@ fn classify_non_corpus_delta(observations: &[Observation]) -> NonCorpusDeltaKind
     ];
 
     if observations.is_empty() {
-        return NonCorpusDeltaKind::FullRebuild;
+        return NonCorpusDeltaClassification {
+            kind: NonCorpusDeltaKind::FullRebuild,
+            reason: Some(NonCorpusDeltaReason::EmptyAppend),
+        };
     }
     let mut saw_slack_message = false;
     for observation in observations {
@@ -2490,16 +2740,39 @@ fn classify_non_corpus_delta(observations: &[Observation]) -> NonCorpusDeltaKind
             {
                 saw_slack_message = true;
             }
+            "schema:slack-message" => {
+                return NonCorpusDeltaClassification {
+                    kind: NonCorpusDeltaKind::FullRebuild,
+                    reason: Some(NonCorpusDeltaReason::SlackUserIdMissing),
+                };
+            }
             schema
                 if FRESHNESS_ONLY_SCHEMAS.contains(&schema)
                     && !contributes_to_reply_slo(observation) => {}
-            _ => return NonCorpusDeltaKind::FullRebuild,
+            schema if FRESHNESS_ONLY_SCHEMAS.contains(&schema) => {
+                return NonCorpusDeltaClassification {
+                    kind: NonCorpusDeltaKind::FullRebuild,
+                    reason: Some(NonCorpusDeltaReason::ReplySloRequired),
+                };
+            }
+            _ => {
+                return NonCorpusDeltaClassification {
+                    kind: NonCorpusDeltaKind::FullRebuild,
+                    reason: Some(NonCorpusDeltaReason::UnsupportedSchema),
+                };
+            }
         }
     }
     if saw_slack_message {
-        NonCorpusDeltaKind::SlackMessage
+        NonCorpusDeltaClassification {
+            kind: NonCorpusDeltaKind::SlackMessage,
+            reason: None,
+        }
     } else {
-        NonCorpusDeltaKind::FreshnessOnly
+        NonCorpusDeltaClassification {
+            kind: NonCorpusDeltaKind::FreshnessOnly,
+            reason: None,
+        }
     }
 }
 
@@ -5158,102 +5431,149 @@ impl AppService {
         source_instance_id: &str,
         bulk_session_id: Option<&str>,
     ) -> Result<ImportReport, SelfHostError> {
-        if source_instance_id.trim().is_empty() {
-            return Err(SelfHostError::Ingestion(
-                "source_instance_id must not be blank".to_owned(),
-            ));
-        }
-
-        let _operation = self.bulk_import_operation_lock()?;
-        let mut core = self.core_lock()?;
-        let bulk_session = self.bulk_import_session_for_append(bulk_session_id)?;
-
-        let mut report = ImportReport {
-            ingested: 0,
-            duplicates: 0,
-            quarantined: 0,
-        };
-
-        let mut prepared_observations = Vec::new();
-        let mut remaining = drafts.into_iter();
-        loop {
-            let batch = remaining
-                .by_ref()
-                .take(IMPORT_PROCESS_BATCH_SIZE)
-                .collect::<Vec<_>>();
-            if batch.is_empty() {
-                break;
+        let context = ObservationImportContext::from_drafts(&drafts);
+        let bulk_session_requested = bulk_session_id.is_some();
+        let mut timer = ObservationImportTimer::new();
+        let mut materialization_state = ImportMaterializationState::NotRun;
+        let result = (|| {
+            if source_instance_id.trim().is_empty() {
+                return Err(SelfHostError::Ingestion(
+                    "source_instance_id must not be blank".to_owned(),
+                ));
             }
-            self.prepare_observation_draft_batch(
-                &mut core,
-                batch,
-                source_instance_id,
-                &mut prepared_observations,
-            )?;
-        }
 
-        let outcomes = if prepared_observations.is_empty() {
-            Vec::new()
-        } else {
-            self.persistence_lock()?
-                .append_observations(&prepared_observations)
-                .map_err(SelfHostError::Storage)?
-        };
-        if outcomes.len() != prepared_observations.len() {
-            return Err(SelfHostError::Ingestion(format!(
-                "bulk append returned {} outcomes for {} observations",
-                outcomes.len(),
-                prepared_observations.len()
-            )));
-        }
+            let _operation = self.bulk_import_operation_lock()?;
+            let mut core = self.core_lock()?;
+            let bulk_session = self.bulk_import_session_for_append(bulk_session_id)?;
 
-        let mut request_appended_observations = Vec::new();
-        for (observation, outcome) in prepared_observations.into_iter().zip(outcomes) {
-            match outcome {
-                DurableAppendOutcome::Appended(id) => {
-                    if id != observation.id {
-                        return Err(SelfHostError::Ingestion(format!(
-                            "bulk append returned observation id {id}, expected {}",
-                            observation.id
-                        )));
-                    }
-                    report.ingested += 1;
-                    request_appended_observations.push(observation);
+            let mut report = ImportReport {
+                ingested: 0,
+                duplicates: 0,
+                quarantined: 0,
+            };
+
+            let mut prepared_observations = Vec::new();
+            let mut remaining = drafts.into_iter();
+            loop {
+                let batch = remaining
+                    .by_ref()
+                    .take(IMPORT_PROCESS_BATCH_SIZE)
+                    .collect::<Vec<_>>();
+                if batch.is_empty() {
+                    break;
                 }
-                DurableAppendOutcome::Duplicate(_) => report.duplicates += 1,
-                DurableAppendOutcome::CanonicalCollision(_) => report.quarantined += 1,
-            }
-        }
-
-        if !request_appended_observations.is_empty() {
-            if let Some(session) = bulk_session.clone() {
-                self.record_deferred_bulk_import_append(session)?;
-                core.mark_non_corpus_materializations_stale();
-            } else {
-                self.materialize_after_observation_append(
+                self.prepare_observation_draft_batch(
                     &mut core,
-                    &request_appended_observations,
+                    batch,
+                    source_instance_id,
+                    &mut prepared_observations,
                 )?;
             }
-        }
 
-        if report.ingested > 0 {
-            self.emit_audit(
-                "actor:self-host",
-                AuditEventKind::WriteExecution,
-                serde_json::json!({
-                    "mode": "bulk_observation_import",
-                    "source_instance_id": source_instance_id,
-                    "ingested": report.ingested,
-                    "duplicates": report.duplicates,
-                    "quarantined": report.quarantined,
-                    "bulk_session_id": bulk_session_id,
-                }),
-            );
-            self.search_index.catch_up_after_append()?;
-        }
+            let outcomes = if prepared_observations.is_empty() {
+                Vec::new()
+            } else {
+                let stage_started_at = Instant::now();
+                let append_result = self
+                    .persistence_lock()?
+                    .append_observations(&prepared_observations)
+                    .map_err(SelfHostError::Storage);
+                timer.record_stage(ImportTimingStage::LedgerAppend, stage_started_at.elapsed());
+                append_result?
+            };
+            if outcomes.len() != prepared_observations.len() {
+                return Err(SelfHostError::Ingestion(format!(
+                    "bulk append returned {} outcomes for {} observations",
+                    outcomes.len(),
+                    prepared_observations.len()
+                )));
+            }
 
-        Ok(report)
+            let mut request_appended_observations = Vec::new();
+            for (observation, outcome) in prepared_observations.into_iter().zip(outcomes) {
+                match outcome {
+                    DurableAppendOutcome::Appended(id) => {
+                        if id != observation.id {
+                            return Err(SelfHostError::Ingestion(format!(
+                                "bulk append returned observation id {id}, expected {}",
+                                observation.id
+                            )));
+                        }
+                        report.ingested += 1;
+                        request_appended_observations.push(observation);
+                    }
+                    DurableAppendOutcome::Duplicate(_) => report.duplicates += 1,
+                    DurableAppendOutcome::CanonicalCollision(_) => report.quarantined += 1,
+                }
+            }
+
+            if !request_appended_observations.is_empty() {
+                if let Some(session) = bulk_session.clone() {
+                    self.record_deferred_bulk_import_append(session)?;
+                    core.mark_non_corpus_materializations_stale();
+                    materialization_state = ImportMaterializationState::Deferred;
+                } else {
+                    let classification =
+                        classify_non_corpus_delta_with_reason(&request_appended_observations);
+                    materialization_state = ImportMaterializationState::Classified(classification);
+                    let stage_started_at = Instant::now();
+                    let materialize_result = self.materialize_after_observation_append(
+                        &mut core,
+                        &request_appended_observations,
+                    );
+                    timer.record_stage(
+                        ImportTimingStage::NonCorpusMaterialize,
+                        stage_started_at.elapsed(),
+                    );
+                    materialize_result?;
+                }
+            }
+
+            if report.ingested > 0 {
+                let stage_started_at = Instant::now();
+                self.emit_audit(
+                    "actor:self-host",
+                    AuditEventKind::WriteExecution,
+                    serde_json::json!({
+                        "mode": "bulk_observation_import",
+                        "source_instance_id": source_instance_id,
+                        "ingested": report.ingested,
+                        "duplicates": report.duplicates,
+                        "quarantined": report.quarantined,
+                        "bulk_session_id": bulk_session_id,
+                    }),
+                );
+                timer.record_stage(ImportTimingStage::Audit, stage_started_at.elapsed());
+
+                let stage_started_at = Instant::now();
+                let search_index_result = self.search_index.catch_up_after_append();
+                timer.record_stage(
+                    ImportTimingStage::SearchIndexCatchUp,
+                    stage_started_at.elapsed(),
+                );
+                search_index_result?;
+            }
+
+            Ok(report)
+        })();
+        let timing = timer.finish();
+        let (result_name, ingested, duplicates, quarantined) = match &result {
+            Ok(report) => ("ok", report.ingested, report.duplicates, report.quarantined),
+            Err(_) => ("error", 0, 0, 0),
+        };
+        ObservationImportTimingLog {
+            context,
+            source_instance_id: source_instance_id.to_owned(),
+            timing,
+            materialization_state,
+            bulk_session_requested,
+            result: result_name,
+            ingested,
+            duplicates,
+            quarantined,
+        }
+        .emit();
+        result
     }
 
     fn prepare_observation_draft_batch(

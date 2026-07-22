@@ -247,7 +247,7 @@ impl AppService {
         core: &mut AppCore,
         appended_observations: &[Observation],
     ) -> Result<(), SelfHostError> {
-        let result = (|| match classify_non_corpus_delta(appended_observations) {
+        let result = (|| match classify_non_corpus_delta_with_reason(appended_observations).kind {
             NonCorpusDeltaKind::FreshnessOnly | NonCorpusDeltaKind::SlackMessage => {
                 let persistence = self.persistence_lock()?;
                 let stats = persistence.observation_stats()?;

@@ -1656,7 +1656,7 @@ fn non_corpus_delta_classification_is_an_explicit_closed_whitelist() {
     ] {
         let observation = freshness_only_observation(schema, "sys:claude-ai", schema, published);
         assert_eq!(
-            super::classify_non_corpus_delta(&[observation]),
+            super::classify_non_corpus_delta_with_reason(&[observation]).kind,
             super::NonCorpusDeltaKind::FreshnessOnly
         );
     }
@@ -1667,9 +1667,14 @@ fn non_corpus_delta_classification_is_an_explicit_closed_whitelist() {
         "unknown",
         published,
     );
+    let unknown_classification = super::classify_non_corpus_delta_with_reason(&[unknown]);
     assert_eq!(
-        super::classify_non_corpus_delta(&[unknown]),
+        unknown_classification.kind,
         super::NonCorpusDeltaKind::FullRebuild
+    );
+    assert_eq!(
+        unknown_classification.reason,
+        Some(super::NonCorpusDeltaReason::UnsupportedSchema)
     );
 
     let mut reply_relevant = freshness_only_observation(
@@ -1680,7 +1685,7 @@ fn non_corpus_delta_classification_is_an_explicit_closed_whitelist() {
     );
     reply_relevant.meta["communication_sender_id"] = serde_json::json!("sender@example.test");
     assert_eq!(
-        super::classify_non_corpus_delta(&[reply_relevant.clone()]),
+        super::classify_non_corpus_delta_with_reason(&[reply_relevant.clone()]).kind,
         super::NonCorpusDeltaKind::FreshnessOnly
     );
     reply_relevant.meta["communication_channel_id"] = serde_json::json!("chan:gmail");
@@ -1688,10 +1693,78 @@ fn non_corpus_delta_classification_is_an_explicit_closed_whitelist() {
     reply_relevant.meta["communication"] = serde_json::json!({
         "reply_due_at": "2026-07-13T01:00:00Z"
     });
+    let reply_slo_classification = super::classify_non_corpus_delta_with_reason(&[reply_relevant]);
     assert_eq!(
-        super::classify_non_corpus_delta(&[reply_relevant]),
+        reply_slo_classification.kind,
         super::NonCorpusDeltaKind::FullRebuild
     );
+    assert_eq!(
+        reply_slo_classification.reason,
+        Some(super::NonCorpusDeltaReason::ReplySloRequired)
+    );
+
+    let missing_slack_user_id = freshness_only_observation(
+        "schema:slack-message",
+        "sys:slack",
+        "missing-user-id",
+        published,
+    );
+    let slack_classification =
+        super::classify_non_corpus_delta_with_reason(&[missing_slack_user_id]);
+    assert_eq!(
+        slack_classification.kind,
+        super::NonCorpusDeltaKind::FullRebuild
+    );
+    assert_eq!(
+        slack_classification.reason,
+        Some(super::NonCorpusDeltaReason::SlackUserIdMissing)
+    );
+}
+
+#[test]
+fn observation_import_timer_records_each_stage_duration() {
+    let mut timer = super::ObservationImportTimer::new();
+    timer.record_stage(
+        super::ImportTimingStage::LedgerAppend,
+        std::time::Duration::from_millis(11),
+    );
+    timer.record_stage(
+        super::ImportTimingStage::NonCorpusMaterialize,
+        std::time::Duration::from_millis(22),
+    );
+    timer.record_stage(
+        super::ImportTimingStage::SearchIndexCatchUp,
+        std::time::Duration::from_millis(33),
+    );
+    timer.record_stage(
+        super::ImportTimingStage::Audit,
+        std::time::Duration::from_millis(44),
+    );
+
+    let timing = timer.finish();
+    assert_eq!(timing.ledger_append_ms, 11);
+    assert_eq!(timing.non_corpus_materialize_ms, 22);
+    assert_eq!(timing.search_index_catch_up_ms, 33);
+    assert_eq!(timing.audit_ms, 44);
+}
+
+#[test]
+fn observation_import_timing_log_declares_required_fields() {
+    let fields = super::ObservationImportTimingLog::field_names();
+    for required in [
+        "schema_names",
+        "subject_kinds",
+        "ledger_append_ms",
+        "non_corpus_materialize_ms",
+        "non_corpus_materialize_mode",
+        "non_corpus_classification",
+        "full_rebuild_reason",
+        "search_index_catch_up_ms",
+        "audit_ms",
+        "total_ms",
+    ] {
+        assert!(fields.contains(&required), "missing log field {required}");
+    }
 }
 
 fn apply_projection_item_commit(
@@ -2833,7 +2906,7 @@ fn wave2_slack_incremental_materialization_matches_normalized_full_rebuild() {
         ),
     ];
     assert_eq!(
-        super::classify_non_corpus_delta(&appended),
+        super::classify_non_corpus_delta_with_reason(&appended).kind,
         super::NonCorpusDeltaKind::SlackMessage
     );
     let initial_materialized = super::MaterializedProjectionSnapshot::build_at(

@@ -644,6 +644,38 @@ reintroduce per-observation materialization, per-observation audit writes, a
 normal Slack topology fallback to full non-corpus rebuild, or a full corpus-index
 rebuild on normal import.
 
+#### Import timing instrumentation
+
+Every `POST /api/import/observation-drafts` request emits one structured
+`tracing` event with `import_timing=true`. Successful requests are logged at
+`info`; requests whose total duration exceeds the explicit
+`OBSERVATION_IMPORT_SLOW_THRESHOLD_MS = 5000` constant are logged at `warn`.
+The event contains these fields:
+
+- `source_instance_id`, `schema_names`, `subject_kinds`
+- `ledger_append_ms`, `non_corpus_materialize_ms`,
+  `search_index_catch_up_ms`, `audit_ms`, `total_ms`
+- `non_corpus_materialize_mode`, `non_corpus_classification`,
+  `full_rebuild_reason`
+- `slow_threshold_ms`, `bulk_session_requested`, `ingested`, `duplicates`,
+  `quarantined`, and `result`
+
+`source_instance_id`, `schema_names`, and `subject_kinds` are derived from the
+request contract and subject kind prefix; the event never includes payload,
+message text, or a subject identifier. A normal non-bulk request reports
+`incremental` for the
+freshness-only and Slack-message paths, or `full_rebuild` with one of
+`unsupported_schema`, `reply_slo_required`, `slack_user_id_missing`, or
+`empty_append` as the reason. A request bound to a bulk session reports
+`deferred` because materialization is intentionally performed at finalization.
+
+The current classifier treats `schema:discord-message` as incremental when it
+does not contribute to reply SLO, but as `full_rebuild` when the complete
+reply-SLO metadata is present. `schema:slack-message` is incremental only when
+its payload contains a non-blank `user_id`; a missing or blank value causes
+`full_rebuild`. Any other schema is outside the closed incremental whitelist
+and causes `full_rebuild` with `unsupported_schema`.
+
 ### Bulk import session
 
 Use one explicit session around every multi-request archive load:
