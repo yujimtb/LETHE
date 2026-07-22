@@ -36,3 +36,8 @@ canonical 書き込み lane の排他ロックは短時間 SHALL とし、blob I
 #### Scenario: 両バックエンドで read pool を分離する
 - **WHEN** SQLite バックエンドまたは PostgreSQL バックエンドで読み取りが実行される
 - **THEN** いずれのバックエンドでも読み取り connection は書き込みと分離された pool から供給される
+
+#### Scenario: stale 公開と consumer の全置換を同一 lane で直列化する
+- **WHEN** bulk import の開始／deferred append または派生 consumer の失敗が非 corpus projection を stale として公開する
+- **THEN** その stale 更新は派生 consumer の全置換 writeback と同じ `derived_projection_lane` を保持して実行される
+- **AND** stale フラグが consumer の snapshot 全置換によって取りこぼされない

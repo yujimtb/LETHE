@@ -27,7 +27,7 @@ pub struct UpsertRollback {
 }
 
 /// In-memory supplemental store with mutability enforcement.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SupplementalStore {
     records: HashMap<String, VersionedRecord>,
     /// All historical versions for ManagedCache records.

@@ -71,6 +71,9 @@ fn replace_with_legacy_canonical_json_observations_table(
             "
             DROP INDEX IF EXISTS observations_leaf_append;
             DROP TABLE observations;
+            DELETE FROM schema_migrations WHERE version >= 9;
+            INSERT INTO schema_migrations (version, name, applied_at)
+            VALUES (8, 'global_observation_identity_registry', '2026-07-22T00:00:00Z');
             CREATE TABLE observations (
                 append_seq INTEGER PRIMARY KEY AUTOINCREMENT,
                 id TEXT NOT NULL UNIQUE,
@@ -139,6 +142,90 @@ fn observation_stats_report_empty_and_appended_high_water() {
             count: 1,
             max_append_seq: 1,
         }
+    );
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn durable_append_and_audit_enqueue_commit_or_rollback_as_one_transaction() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    let first = sample_observation();
+    let audit = lethe_storage_api::AuditEventRecord {
+        id: "audit:append-1".to_owned(),
+        timestamp: "2026-07-23T00:00:00Z".to_owned(),
+        actor: "actor:test".to_owned(),
+        event_json: serde_json::json!({"kind": "write_execution"}).to_string(),
+    };
+
+    store
+        .append_observations_idempotent_with_audit(
+            std::slice::from_ref(&first),
+            std::slice::from_ref(&audit),
+        )
+        .unwrap();
+    assert_eq!(store.observation_stats().unwrap().count, 1);
+    assert_eq!(
+        store.audit_event_page(None, 10).unwrap(),
+        vec![audit.clone()]
+    );
+
+    let second = sample_observation_with_identity("append-2", "second");
+    assert!(
+        store
+            .append_observations_idempotent_with_audit(
+                std::slice::from_ref(&second),
+                std::slice::from_ref(&audit),
+            )
+            .is_err()
+    );
+    assert_eq!(store.observation_stats().unwrap().count, 1);
+    assert!(store.observation_by_id(&second.id).unwrap().is_none());
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn audit_event_page_uses_timestamp_and_id_keyset_at_boundary() {
+    let tmp = std::env::temp_dir().join(format!("lethe-audit-page-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    let timestamp = "2026-07-23T00:00:00Z";
+
+    for id in ["audit:1", "audit:2", "audit:3"] {
+        store
+            .record_audit_event(
+                id,
+                timestamp,
+                "actor:test",
+                &serde_json::json!({"id": id}).to_string(),
+            )
+            .unwrap();
+    }
+
+    let first_page = store.audit_event_page(None, 2).unwrap();
+    assert_eq!(
+        first_page
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["audit:1", "audit:2"]
+    );
+    let cursor = lethe_storage_api::AuditEventCursor {
+        timestamp: first_page.last().unwrap().timestamp.clone(),
+        id: first_page.last().unwrap().id.clone(),
+    };
+    let second_page = store.audit_event_page(Some(&cursor), 2).unwrap();
+    assert_eq!(
+        second_page
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["audit:3"]
     );
 
     let _ = fs::remove_dir_all(tmp);
@@ -558,6 +645,144 @@ fn migration_ledger_records_current_schema_version() {
 }
 
 #[test]
+fn schema_v10_converges_from_fresh_v9_and_v8_upgrade_paths() {
+    let fresh_tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let fresh = SqlitePersistence::open(
+        &fresh_tmp.join("test.sqlite3"),
+        &fresh_tmp.join("blobs"),
+        &[7; 32],
+    )
+    .unwrap();
+    let fresh_signature = schema_object_signature(&fresh);
+    let current_ledger = vec![
+        (
+            SCHEMA_VERSION_IDENTITY_LOOKUP_INDEX,
+            "observation_identity_lookup_index".to_owned(),
+        ),
+        (
+            CURRENT_SCHEMA_VERSION,
+            "append_commit_lock_split_scalars".to_owned(),
+        ),
+    ];
+    assert_eq!(migration_ledger(&fresh), current_ledger.clone());
+    drop(fresh);
+
+    let v9_tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    {
+        let seed = SqlitePersistence::open(
+            &v9_tmp.join("test.sqlite3"),
+            &v9_tmp.join("blobs"),
+            &[7; 32],
+        )
+        .unwrap();
+        seed.append_observation_idempotent(&sample_observation())
+            .unwrap();
+        seed.conn
+            .execute_batch(
+                "
+                DROP TABLE operational_event_stats;
+                DROP INDEX audit_events_timestamp_id;
+                DROP TABLE projection_manifest_fields;
+                DROP TABLE observation_stats;
+                DELETE FROM schema_migrations WHERE version = 10;
+                ",
+            )
+            .unwrap();
+    }
+    let v9 = SqlitePersistence::open(
+        &v9_tmp.join("test.sqlite3"),
+        &v9_tmp.join("blobs"),
+        &[7; 32],
+    )
+    .unwrap();
+    assert_eq!(schema_object_signature(&v9), fresh_signature);
+    assert_eq!(migration_ledger(&v9), current_ledger);
+    assert_eq!(v9.observation_stats().unwrap().count, 1);
+    drop(v9);
+
+    let v8_tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    {
+        let seed = SqlitePersistence::open(
+            &v8_tmp.join("test.sqlite3"),
+            &v8_tmp.join("blobs"),
+            &[7; 32],
+        )
+        .unwrap();
+        seed.append_observation_idempotent(&sample_observation())
+            .unwrap();
+        seed.conn
+            .execute_batch(
+                "
+                DROP INDEX observations_identity_append;
+                DROP TABLE operational_event_stats;
+                DROP INDEX audit_events_timestamp_id;
+                DROP TABLE projection_manifest_fields;
+                DROP TABLE observation_stats;
+                DELETE FROM schema_migrations WHERE version >= 9;
+                INSERT INTO schema_migrations (version, name, applied_at)
+                VALUES (8, 'global_observation_identity_registry', '2026-07-22T00:00:00Z');
+                ",
+            )
+            .unwrap();
+    }
+    let v8 = SqlitePersistence::open(
+        &v8_tmp.join("test.sqlite3"),
+        &v8_tmp.join("blobs"),
+        &[7; 32],
+    )
+    .unwrap();
+    assert_eq!(schema_object_signature(&v8), fresh_signature);
+    assert_eq!(
+        migration_ledger(&v8),
+        vec![
+            (8, "global_observation_identity_registry".to_owned()),
+            (
+                SCHEMA_VERSION_IDENTITY_LOOKUP_INDEX,
+                "observation_identity_lookup_index".to_owned(),
+            ),
+            (
+                CURRENT_SCHEMA_VERSION,
+                "append_commit_lock_split_scalars".to_owned(),
+            ),
+        ]
+    );
+    assert_eq!(v8.observation_stats().unwrap().count, 1);
+
+    let _ = fs::remove_dir_all(fresh_tmp);
+    let _ = fs::remove_dir_all(v9_tmp);
+    let _ = fs::remove_dir_all(v8_tmp);
+}
+
+fn migration_ledger(store: &SqlitePersistence) -> Vec<(i64, String)> {
+    let mut statement = store
+        .conn
+        .prepare("SELECT version, name FROM schema_migrations ORDER BY version")
+        .unwrap();
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn schema_object_signature(store: &SqlitePersistence) -> Vec<(String, String, String)> {
+    let mut statement = store
+        .conn
+        .prepare(
+            "SELECT type, name, sql
+             FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_%'
+             ORDER BY type, name",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+#[test]
 fn open_migrates_legacy_canonical_json_column_and_keeps_bulk_dedupe_idempotent() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let db = tmp.join("test.sqlite3");
@@ -643,6 +868,9 @@ fn schema_v8_backfill_keeps_oldest_cross_leaf_identity_duplicate() {
             DROP INDEX IF EXISTS observations_leaf_append;
             DROP TABLE observations;
             DROP TABLE observation_identity_registry;
+            DELETE FROM schema_migrations WHERE version >= 9;
+            INSERT INTO schema_migrations (version, name, applied_at)
+            VALUES (8, 'global_observation_identity_registry', '2026-07-22T00:00:00Z');
             CREATE TABLE observations (
                 append_seq INTEGER PRIMARY KEY AUTOINCREMENT,
                 id TEXT NOT NULL UNIQUE,

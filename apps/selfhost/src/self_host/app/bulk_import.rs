@@ -191,7 +191,7 @@ impl AppService {
 
     pub fn begin_bulk_import_session(&self) -> Result<BulkImportSessionReport, SelfHostError> {
         let _operation = self.bulk_import_operation_lock()?;
-        let mut core = self.core_lock()?;
+        let core = self.core_snapshot();
         self.ensure_projection_fresh(&core.catalog, "proj:person-page")?;
         let session = {
             let persistence = self.persistence_lock()?;
@@ -211,9 +211,15 @@ impl AppService {
             persist_bulk_import_session(persistence.as_ref(), &session)?;
             session
         };
-        core.mark_non_corpus_materializations_stale();
+        let _derived_lane = self
+            .derived_projection_lane
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?;
+        let mut live_core = self.core_lock()?;
+        live_core.mark_non_corpus_materializations_stale();
+        self.publish_core_snapshot(&live_core);
         let report = session.report();
-        drop(core);
+        drop(live_core);
         self.emit_audit(
             "actor:self-host",
             AuditEventKind::WriteExecution,
@@ -222,7 +228,7 @@ impl AppService {
                 "session_id": report.session_id,
                 "base_append_seq": report.base_append_seq,
             }),
-        );
+        )?;
         Ok(report)
     }
 
@@ -237,7 +243,7 @@ impl AppService {
             });
         }
         let _operation = self.bulk_import_operation_lock()?;
-        let mut core = self.core_lock()?;
+        let mut core = (*self.core_snapshot()).clone();
         let mut session = {
             let persistence = self.persistence_lock()?;
             let Some(mut session) = load_persisted_bulk_import_session(persistence.as_ref())?
@@ -280,7 +286,12 @@ impl AppService {
             session
         };
 
+        let _derived_lane = self
+            .derived_projection_lane
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?;
         core.mark_non_corpus_materializations_stale();
+        drop(_derived_lane);
         self.search_index.catch_up_after_append()?;
         let person_page_ref = ProjectionRef::new("proj:person-page");
         let non_corpus_ready = core.catalog.get(&person_page_ref).is_some_and(|entry| {
@@ -295,7 +306,7 @@ impl AppService {
             self.refresh_materialized_snapshot(&mut core)?;
             drop(core);
             self.wait_for_non_corpus_rebuild()?;
-            core = self.core_lock()?;
+            core = (*self.core_snapshot()).clone();
         }
 
         let ready_result = (|| {
@@ -312,14 +323,28 @@ impl AppService {
             persist_bulk_import_session(self.persistence_lock()?.as_ref(), &session)
         })();
         if let Err(error) = ready_result {
+            let _derived_lane = self
+                .derived_projection_lane
+                .lock()
+                .map_err(|_| SelfHostError::LockPoisoned)?;
             core.mark_non_corpus_materializations_stale();
+            let mut live_core = self.core_lock()?;
+            *live_core = core;
+            self.publish_core_snapshot(&live_core);
             return Err(error);
         }
         if target_already_materialized {
             core.activate_non_corpus_projections();
         }
+        let _derived_lane = self
+            .derived_projection_lane
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?;
+        let mut live_core = self.core_lock()?;
+        *live_core = core;
+        self.publish_core_snapshot(&live_core);
         let report = session.report();
-        drop(core);
+        drop(live_core);
         self.emit_audit(
             "actor:self-host",
             AuditEventKind::WriteExecution,
@@ -329,7 +354,7 @@ impl AppService {
                 "target_append_seq": report.target_append_seq,
                 "target_observation_count": report.target_observation_count,
             }),
-        );
+        )?;
         Ok(report)
     }
 

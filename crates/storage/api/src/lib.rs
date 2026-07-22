@@ -432,6 +432,20 @@ pub struct ObservationStats {
     pub max_append_seq: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditEventRecord {
+    pub id: String,
+    pub timestamp: String,
+    pub actor: String,
+    pub event_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditEventCursor {
+    pub timestamp: String,
+    pub id: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum RehomeMode {
     StoredIdentity,
@@ -588,6 +602,11 @@ pub trait ObservationStore: Send {
             .map(|observation| self.append_observation(observation))
             .collect()
     }
+    fn append_observations_with_audit(
+        &self,
+        observations: &[Observation],
+        audit_events: &[AuditEventRecord],
+    ) -> StorageResult<Vec<AppendOutcome>>;
     fn load_observations(&self) -> StorageResult<Vec<Observation>>;
     fn observation_stats(&self) -> StorageResult<ObservationStats>;
     fn rehome_observation(
@@ -677,6 +696,14 @@ pub trait SupplementalProjectionCommitter: Send {
         manifest: &serde_json::Value,
         item_delta: &ProjectionItemCommit,
     ) -> StorageResult<()>;
+    fn commit_supplemental_and_projection_with_audit(
+        &self,
+        record: &SupplementalRecord,
+        projection: &ProjectionRef,
+        manifest: &serde_json::Value,
+        item_delta: &ProjectionItemCommit,
+        audit_event: &AuditEventRecord,
+    ) -> StorageResult<()>;
 }
 
 pub trait RuntimeStateStore: Send {
@@ -690,6 +717,11 @@ pub trait RuntimeStateStore: Send {
         actor: &str,
         event_json: &str,
     ) -> StorageResult<()>;
+    fn audit_event_page(
+        &self,
+        after: Option<&AuditEventCursor>,
+        limit: usize,
+    ) -> StorageResult<Vec<AuditEventRecord>>;
     fn record_sync_metrics(&self, source: &str, metrics: &SyncMetricRecord) -> StorageResult<()>;
     fn apply_retention(&self, retention_days: u32) -> StorageResult<usize>;
     fn garbage_collect_orphan_blobs(&self) -> StorageResult<usize>;
@@ -701,6 +733,12 @@ pub trait SlackThreadCatalogStore: Send {
         &self,
         observation: &Observation,
         thread: &SlackThreadKey,
+    ) -> StorageResult<AppendOutcome>;
+    fn append_slack_observation_with_audit(
+        &self,
+        observation: &Observation,
+        thread: &SlackThreadKey,
+        audit_events: &[AuditEventRecord],
     ) -> StorageResult<AppendOutcome>;
     fn slack_thread_discovery_high_water(&self) -> StorageResult<u64>;
     fn commit_slack_thread_discovery(

@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use lethe_core::domain::{BlobRef, DataSpaceId, OperationalEventId};
@@ -17,7 +18,9 @@ pub enum PostgresOperationalStoreError {
 }
 
 pub struct PostgresOperationalEventStore {
-    client: Mutex<Client>,
+    write_client: Mutex<Client>,
+    read_clients: Vec<Mutex<Client>>,
+    next_read_client: AtomicUsize,
     data_space_id: DataSpaceId,
     schema: String,
     role: String,
@@ -93,6 +96,12 @@ impl PostgresOperationalEventStore {
             CREATE INDEX IF NOT EXISTS operational_events_stream
                 ON operational_events(data_space_id, stream_id, stream_version);
 
+            CREATE TABLE IF NOT EXISTS operational_event_stats (
+                data_space_id TEXT PRIMARY KEY,
+                event_count BIGINT NOT NULL CHECK (event_count >= 0),
+                max_cursor BIGINT NOT NULL CHECK (max_cursor >= 0)
+            );
+
             CREATE TABLE IF NOT EXISTS operational_blobs (
                 blob_ref TEXT PRIMARY KEY,
                 bytes BIGINT NOT NULL CHECK (bytes >= 0),
@@ -129,8 +138,23 @@ impl PostgresOperationalEventStore {
                 "postgres schema {schema} is pinned to data space {pinned}, not {data_space_id}"
             )));
         }
+        let mut read_clients = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let mut read_client = Client::connect(dsn, NoTls)?;
+            read_client.batch_execute(&search_path)?;
+            read_clients.push(Mutex::new(read_client));
+        }
+        client.execute(
+            "INSERT INTO operational_event_stats (data_space_id, event_count, max_cursor)
+             SELECT $1, COUNT(*), COALESCE(MAX(cursor), 0)
+             FROM operational_events WHERE data_space_id = $1
+             ON CONFLICT (data_space_id) DO NOTHING",
+            &[&data_space_id.as_str()],
+        )?;
         Ok(Self {
-            client: Mutex::new(client),
+            write_client: Mutex::new(client),
+            read_clients,
+            next_read_client: AtomicUsize::new(0),
             data_space_id,
             schema: schema.to_owned(),
             role: expected_role.to_owned(),
@@ -146,9 +170,16 @@ impl PostgresOperationalEventStore {
     }
 
     fn client(&self) -> StorageResult<MutexGuard<'_, Client>> {
-        self.client
+        self.write_client
             .lock()
             .map_err(|_| StorageError::Backend("postgres client mutex is poisoned".to_owned()))
+    }
+
+    fn read_client(&self) -> StorageResult<MutexGuard<'_, Client>> {
+        let index = self.next_read_client.fetch_add(1, Ordering::Relaxed) % self.read_clients.len();
+        self.read_clients[index]
+            .lock()
+            .map_err(|_| StorageError::Backend("postgres read client mutex is poisoned".to_owned()))
     }
 
     fn backend(error: impl std::fmt::Display) -> StorageError {
@@ -193,11 +224,11 @@ impl OperationalEventStore for PostgresOperationalEventStore {
     }
 
     fn operational_event_stats(&self) -> StorageResult<OperationalEventStats> {
-        let mut client = self.client()?;
+        let mut client = self.read_client()?;
         let row = client
             .query_one(
-                "SELECT COUNT(*), COALESCE(MAX(cursor), 0)
-                 FROM operational_events WHERE data_space_id = $1",
+                "SELECT event_count, max_cursor
+                 FROM operational_event_stats WHERE data_space_id = $1",
                 &[&self.data_space_id.as_str()],
             )
             .map_err(Self::backend)?;
@@ -219,7 +250,7 @@ impl OperationalEventStore for PostgresOperationalEventStore {
         }
         let after = to_i64("after_cursor", after_cursor)?;
         let limit = to_i64("limit", limit as u64)?;
-        let mut client = self.client()?;
+        let mut client = self.read_client()?;
         let rows = client
             .query(
                 "SELECT cursor, event_json FROM operational_events
@@ -244,7 +275,7 @@ impl OperationalEventStore for PostgresOperationalEventStore {
         }
         let after = to_i64("after_stream_version", after_stream_version)?;
         let limit = to_i64("limit", limit as u64)?;
-        let mut client = self.client()?;
+        let mut client = self.read_client()?;
         let rows = client
             .query(
                 "SELECT cursor, event_json FROM operational_events
@@ -260,7 +291,7 @@ impl OperationalEventStore for PostgresOperationalEventStore {
         &self,
         event_id: &OperationalEventId,
     ) -> StorageResult<Option<StoredOperationalEvent>> {
-        let mut client = self.client()?;
+        let mut client = self.read_client()?;
         let row = client
             .query_opt(
                 "SELECT cursor, event_json FROM operational_events
@@ -277,7 +308,7 @@ impl OperationalEventStore for PostgresOperationalEventStore {
                 "stream_id must not be blank".to_owned(),
             ));
         }
-        let mut client = self.client()?;
+        let mut client = self.read_client()?;
         let value: i64 = client
             .query_one(
                 "SELECT COALESCE(MAX(stream_version), 0)
@@ -356,7 +387,7 @@ impl BlobStore for PostgresOperationalEventStore {
     }
 
     fn get_blob(&self, blob_ref: &BlobRef) -> StorageResult<Option<Vec<u8>>> {
-        let mut client = self.client()?;
+        let mut client = self.read_client()?;
         client
             .query_opt(
                 "SELECT content FROM operational_blobs WHERE blob_ref = $1",
@@ -479,8 +510,19 @@ fn append_one(
             ],
         )
         .map_err(PostgresOperationalEventStore::backend)?;
+    let cursor = from_i64("cursor", row.get(0))?;
+    let cursor_value = to_i64("cursor", cursor)?;
+    transaction
+        .execute(
+            "UPDATE operational_event_stats
+             SET event_count = event_count + 1,
+                 max_cursor = GREATEST(max_cursor, $2)
+             WHERE data_space_id = $1",
+            &[&data_space_id.as_str(), &cursor_value],
+        )
+        .map_err(PostgresOperationalEventStore::backend)?;
     Ok(OperationalAppendOutcome::Appended {
-        cursor: from_i64("cursor", row.get(0))?,
+        cursor,
         stream_version: request.event.stream_version,
     })
 }

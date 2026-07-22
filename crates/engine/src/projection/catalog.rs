@@ -15,7 +15,7 @@ pub struct CatalogEntry {
 }
 
 /// Projection Catalog: manages registration, deduplication, and DAG validation.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ProjectionCatalog {
     entries: HashMap<String, CatalogEntry>,
 }

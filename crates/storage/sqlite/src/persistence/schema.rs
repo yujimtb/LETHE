@@ -257,6 +257,7 @@ impl SqlitePersistence {
         }
         self.ensure_partition_initialize()?;
         self.migrate_existing_schema()?;
+        self.apply_schema_migrations()?;
         self.conn.execute_batch(
             "
             CREATE INDEX IF NOT EXISTS observations_leaf_append
@@ -269,14 +270,201 @@ impl SqlitePersistence {
              ) VALUES (1, 0, 0)",
             [],
         )?;
-        self.conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
-            params![
-                CURRENT_SCHEMA_VERSION,
+        Ok(())
+    }
+
+    fn apply_schema_migrations(&self) -> Result<(), PersistenceError> {
+        let identity_lookup_recorded =
+            self.schema_migration_recorded(SCHEMA_VERSION_IDENTITY_LOOKUP_INDEX)?;
+        let lock_split_recorded = self.schema_migration_recorded(CURRENT_SCHEMA_VERSION)?;
+
+        if lock_split_recorded && !identity_lookup_recorded {
+            return Err(PersistenceError::SchemaInvariant(
+                "schema migration v10 is recorded without prerequisite v9".to_owned(),
+            ));
+        }
+
+        if identity_lookup_recorded {
+            self.require_schema_migration_name(
+                SCHEMA_VERSION_IDENTITY_LOOKUP_INDEX,
                 "observation_identity_lookup_index",
-                chrono::Utc::now().to_rfc3339(),
-            ],
+            )?;
+            self.require_schema_object("index", "observations_identity_append")?;
+        } else {
+            self.apply_identity_lookup_index_migration()?;
+        }
+
+        if lock_split_recorded {
+            self.require_schema_migration_name(
+                CURRENT_SCHEMA_VERSION,
+                "append_commit_lock_split_scalars",
+            )?;
+            self.require_lock_split_schema_objects()?;
+        } else {
+            self.apply_lock_split_scalars_migration()?;
+        }
+
+        Ok(())
+    }
+
+    fn apply_identity_lookup_index_migration(&self) -> Result<(), PersistenceError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute(
+            "CREATE INDEX IF NOT EXISTS observations_identity_append
+             ON observations(identity_key, append_seq)",
+            [],
         )?;
+        self.backfill_global_identity_registry(&transaction)?;
+        record_schema_migration(
+            &transaction,
+            SCHEMA_VERSION_IDENTITY_LOOKUP_INDEX,
+            "observation_identity_lookup_index",
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn apply_lock_split_scalars_migration(&self) -> Result<(), PersistenceError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS observation_stats (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                observation_count INTEGER NOT NULL CHECK (observation_count >= 0),
+                max_append_seq INTEGER NOT NULL CHECK (max_append_seq >= 0)
+            );
+
+            CREATE TABLE IF NOT EXISTS projection_manifest_fields (
+                projection_id TEXT NOT NULL,
+                field_key TEXT NOT NULL CHECK (length(trim(field_key)) > 0),
+                value_json TEXT NOT NULL,
+                PRIMARY KEY (projection_id, field_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS audit_events_timestamp_id
+                ON audit_events(timestamp, id);
+
+            CREATE TABLE IF NOT EXISTS operational_event_stats (
+                data_space_id TEXT PRIMARY KEY CHECK (length(trim(data_space_id)) > 0),
+                event_count INTEGER NOT NULL CHECK (event_count >= 0),
+                max_cursor INTEGER NOT NULL CHECK (max_cursor >= 0)
+            );
+            ",
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO observation_stats (
+                singleton, observation_count, max_append_seq
+             )
+             SELECT 1, COUNT(*), COALESCE(MAX(append_seq), 0) FROM observations",
+            [],
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO operational_event_stats (
+                data_space_id, event_count, max_cursor
+             )
+             SELECT data_space_id, COUNT(*), COALESCE(MAX(cursor), 0)
+             FROM operational_events
+             GROUP BY data_space_id",
+            [],
+        )?;
+        self.backfill_projection_manifest_fields(&transaction)?;
+        record_schema_migration(
+            &transaction,
+            CURRENT_SCHEMA_VERSION,
+            "append_commit_lock_split_scalars",
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn backfill_projection_manifest_fields(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+    ) -> Result<(), PersistenceError> {
+        let mut statement = transaction.prepare(
+            "SELECT projection_id, records_json
+             FROM projection_materializations
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM projection_manifest_fields fields
+                 WHERE fields.projection_id = projection_materializations.projection_id
+             )",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let pending = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for (projection_id, records_json) in pending {
+            let value: serde_json::Value = serde_json::from_str(&records_json)?;
+            let object = value.as_object().ok_or_else(|| {
+                PersistenceError::SchemaInvariant(format!(
+                    "projection {projection_id} manifest must be a JSON object"
+                ))
+            })?;
+            for (field_key, field_value) in object {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO projection_manifest_fields (
+                        projection_id, field_key, value_json
+                     ) VALUES (?1, ?2, ?3)",
+                    params![
+                        projection_id,
+                        field_key,
+                        serde_json::to_string(field_value)?
+                    ],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn require_schema_migration_name(
+        &self,
+        version: i64,
+        expected_name: &str,
+    ) -> Result<(), PersistenceError> {
+        let actual_name = self.conn.query_row(
+            "SELECT name FROM schema_migrations WHERE version = ?1",
+            [version],
+            |row| row.get::<_, String>(0),
+        )?;
+        if actual_name != expected_name {
+            return Err(PersistenceError::SchemaInvariant(format!(
+                "schema migration v{version} is named {actual_name:?}, expected {expected_name:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn require_schema_object(
+        &self,
+        object_type: &str,
+        object_name: &str,
+    ) -> Result<(), PersistenceError> {
+        let exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2",
+                params![object_type, object_name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(PersistenceError::SchemaInvariant(format!(
+                "schema migration object is missing: {object_type} {object_name}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn require_lock_split_schema_objects(&self) -> Result<(), PersistenceError> {
+        for (object_type, object_name) in [
+            ("table", "observation_stats"),
+            ("table", "projection_manifest_fields"),
+            ("index", "audit_events_timestamp_id"),
+            ("table", "operational_event_stats"),
+        ] {
+            self.require_schema_object(object_type, object_name)?;
+        }
         Ok(())
     }
 
@@ -323,13 +511,6 @@ impl SqlitePersistence {
             self.rebuild_observations_with_current_columns()?;
             columns = self.observation_columns()?;
         }
-
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS observations_identity_append
-             ON observations(identity_key, append_seq)",
-            [],
-        )?;
-        self.backfill_global_identity_registry()?;
 
         self.require_observation_columns(&columns)
     }
@@ -513,8 +694,11 @@ impl SqlitePersistence {
         Ok(())
     }
 
-    fn backfill_global_identity_registry(&self) -> Result<(), PersistenceError> {
-        self.conn.execute(
+    fn backfill_global_identity_registry(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+    ) -> Result<(), PersistenceError> {
+        transaction.execute(
             "INSERT INTO observation_identity_registry (
                 identity_key, observation_id, canonical_json_sha256
              )
@@ -590,4 +774,17 @@ impl SqlitePersistence {
         )?;
         Ok(())
     }
+}
+
+fn record_schema_migration(
+    transaction: &rusqlite::Transaction<'_>,
+    version: i64,
+    name: &str,
+) -> Result<(), PersistenceError> {
+    transaction.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at)
+         VALUES (?1, ?2, ?3)",
+        params![version, name, chrono::Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
 }

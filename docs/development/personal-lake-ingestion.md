@@ -151,12 +151,20 @@ The schema-v9 SQLite migration adds `observations_identity_append` on
 `(identity_key, append_seq)`. The v8 identity-registry lookup is backed by the
 registry primary-key index; the legacy observation fallback and the registry
 backfill both use this observation index, so identity lookup does not scan the
-corpus. `/health` and `/health/deep` execute their synchronous health and
-SQLite checks on Tokio's blocking pool, preserving the existing response and
-error contracts while preventing a health request from blocking an async worker
-behind an in-progress import or sync. Operational-event authorization and its
-audit write use the same blocking boundary before the operational read/append,
-so a primary-storage lock held by an import cannot block the async worker.
+corpus. Schema-v10 then adds the persisted observation and operational-event
+high-water scalars, per-field projection manifest table, and audit page index
+used by append-commit/lock-split. Fresh databases apply v9 then v10; a
+production v9 database applies only v10; a v8 database applies v9 then v10.
+All three paths are covered by a schema-signature convergence test.
+
+`/health` and `/health/deep` execute their synchronous health and SQLite checks
+on Tokio's blocking pool, preserving the existing response and error contracts
+while preventing a health request from blocking an async worker behind an
+in-progress import or sync. Operational-event authorization and its durable,
+fail-closed audit enqueue use the same blocking boundary before the
+operational read/append, so a primary-storage lock held by an import cannot
+block the async worker. Audit reads use the persistent page query; they do not
+use an unbounded in-memory mirror.
 
 The 2026-07-06 production rebuild used:
 

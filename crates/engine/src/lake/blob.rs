@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use lethe_core::domain::BlobRef;
 /// A simple content-addressable store for binary attachments.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct BlobStore {
     blobs: HashMap<String, Vec<u8>>,
 }

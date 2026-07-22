@@ -22,7 +22,7 @@ use super::{
 };
 
 /// In-memory registry that enforces all M02 invariants.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct RegistryStore {
     entity_types: HashMap<String, EntityType>,
     schemas: HashMap<String, ObservationSchema>,

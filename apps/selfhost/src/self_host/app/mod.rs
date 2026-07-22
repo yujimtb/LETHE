@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+
+use arc_swap::ArcSwap;
 use std::time::{Duration, Instant};
 
 use axum::http::HeaderMap;
@@ -51,7 +53,6 @@ use lethe_history::{
     HistoryError, HistoryImportCommand, HistoryImportResult, HistoryInventoryReport,
     HistoryInventoryRequest, HistoryProjection, HistoryQueryRequest, HistoryQueryResponse,
 };
-use lethe_policy::governance::audit::{AuditLog, InMemoryAuditLog};
 use lethe_policy::governance::engine::PolicyEngine;
 use lethe_policy::governance::filter::FilteringGate;
 use lethe_policy::governance::types::{
@@ -76,8 +77,8 @@ use lethe_projection_person::person_page::types::{
     PersonMessage, PersonPageOutput, PersonProfile, PersonSlide, TimelineEvent,
 };
 use lethe_storage_api::{
-    AppendOutcome as DurableAppendOutcome, DiscoveredSlackThread, ObservationStats,
-    OperationalAppendOutcome, OperationalAppendRequest, OperationalEventStats,
+    AppendOutcome as DurableAppendOutcome, AuditEventRecord, DiscoveredSlackThread,
+    ObservationStats, OperationalAppendOutcome, OperationalAppendRequest, OperationalEventStats,
     OperationalStoragePorts, ProjectionItem, ProjectionItemCommit, SlackThreadCatalogEntry,
     SlackThreadKey, StorageError, StoragePorts, StoredObservation, StoredOperationalEvent,
 };
@@ -654,9 +655,6 @@ fn validate_projection_fold_declarations(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ImportTimingStage {
     LedgerAppend,
-    NonCorpusMaterialize,
-    SearchIndexCatchUp,
-    Audit,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -687,13 +685,6 @@ impl ObservationImportTimer {
             .expect("observation import stage duration does not fit u64 milliseconds");
         match stage {
             ImportTimingStage::LedgerAppend => self.timing.ledger_append_ms = elapsed_ms,
-            ImportTimingStage::NonCorpusMaterialize => {
-                self.timing.non_corpus_materialize_ms = elapsed_ms;
-            }
-            ImportTimingStage::SearchIndexCatchUp => {
-                self.timing.search_index_catch_up_ms = elapsed_ms;
-            }
-            ImportTimingStage::Audit => self.timing.audit_ms = elapsed_ms,
         }
     }
 
@@ -1316,7 +1307,7 @@ impl Default for ProjectionSnapshot {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AppCore {
     pub registry: lethe_registry::registry::RegistryStore,
     pub catalog: ProjectionCatalog,
@@ -1756,9 +1747,15 @@ fn prepare_draft(core: &AppCore, draft: ObservationDraft) -> Result<Observation,
 #[derive(Clone)]
 pub struct AppService {
     core: Arc<Mutex<AppCore>>,
+    core_snapshot: Arc<ArcSwap<AppCore>>,
     persistence: Arc<Mutex<Box<dyn StoragePorts>>>,
+    persistence_read_pool: Vec<Arc<Mutex<Box<dyn StoragePorts>>>>,
+    persistence_read_next: Arc<std::sync::atomic::AtomicUsize>,
     operational_ledger: Arc<Mutex<Box<dyn OperationalStoragePorts>>>,
+    operational_ledger_read_pool: Vec<Arc<Mutex<Box<dyn OperationalStoragePorts>>>>,
+    operational_ledger_read_next: Arc<std::sync::atomic::AtomicUsize>,
     history_projection: Arc<Mutex<HistoryProjection>>,
+    derived_projection_lane: Arc<Mutex<()>>,
     bulk_import_operation: Arc<Mutex<()>>,
     search_index: search_index::SearchIndexManager,
     config: Arc<SelfHostConfig>,
@@ -1766,7 +1763,9 @@ pub struct AppService {
     google_sources: Vec<GoogleSourceRuntime>,
     slide_analyzer: Option<GeminiSlideAnalyzer>,
     resilient_executor: Arc<ResilientExecutor>,
-    audit_log: Arc<InMemoryAuditLog>,
+    append_consumer_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    append_consumer_error: Arc<Mutex<Option<String>>>,
+    search_index_catch_up_in_flight: Arc<std::sync::atomic::AtomicBool>,
     non_corpus_rebuild_in_flight: Arc<std::sync::atomic::AtomicBool>,
     non_corpus_rebuild_error: Arc<Mutex<Option<String>>>,
     #[cfg(test)]
@@ -2568,6 +2567,34 @@ fn apply_compact_incremental_delta(
     built_at: DateTime<Utc>,
     lookup: &dyn ComponentProjectionLookup,
 ) -> Result<ProjectionItemCommit, SelfHostError> {
+    let fact_observations = appended_observations
+        .iter()
+        .filter(|observation| {
+            observation.schema.as_str() == "schema:slack-message"
+                || identity_replay_event(observation, 1).is_some()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let appended_fact_sequences =
+        stored_observation_append_sequences(lookup, &fact_observations, stats.max_append_seq)?;
+    apply_compact_incremental_delta_with_sequences(
+        core,
+        appended_observations,
+        stats,
+        built_at,
+        &appended_fact_sequences,
+        lookup,
+    )
+}
+
+fn apply_compact_incremental_delta_with_sequences(
+    core: &mut AppCore,
+    appended_observations: &[Observation],
+    stats: ObservationStats,
+    built_at: DateTime<Utc>,
+    appended_fact_sequences: &BTreeMap<String, u64>,
+    lookup: &dyn ComponentProjectionLookup,
+) -> Result<ProjectionItemCommit, SelfHostError> {
     if appended_observations.is_empty() {
         return Err(SelfHostError::Ingestion(
             "compact materialization delta must contain an appended observation".to_owned(),
@@ -2615,17 +2642,6 @@ fn apply_compact_incremental_delta(
         &core.canonical_observation_fingerprint,
         appended_observations,
     )?;
-    let fact_observations = appended_observations
-        .iter()
-        .filter(|observation| {
-            observation.schema.as_str() == "schema:slack-message"
-                || identity_replay_event(observation, 1).is_some()
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let appended_fact_sequences =
-        stored_observation_append_sequences(lookup, &fact_observations, stats.max_append_seq)?;
-
     let compact_apply = core
         .compact_state
         .apply_observation_page(appended_observations)?;
@@ -5470,37 +5486,40 @@ fn bootstrap_materialized_placeholder(
 
 impl AppService {
     pub fn bootstrap(config: SelfHostConfig) -> Result<Self, SelfHostError> {
-        let operational_ledger: Box<dyn OperationalStoragePorts> = match &config.operational_ledger
-        {
-            OperationalLedgerConfig::Sqlite {
-                data_space_id,
-                database_path,
-                blob_dir,
-                secret_encryption_key,
-            } => Box::new(
-                SqliteOperationalEventStore::open(
-                    data_space_id.clone(),
-                    database_path,
-                    blob_dir,
-                    secret_encryption_key,
-                )
-                .map_err(|error| SelfHostError::OperationalLedger(error.to_string()))?,
-            ),
-            OperationalLedgerConfig::Postgres {
-                data_space_id,
-                dsn,
-                schema,
-                role,
-            } => Box::new(
-                PostgresOperationalEventStore::connect_no_tls(
-                    data_space_id.clone(),
-                    dsn.expose(),
-                    schema,
-                    role,
-                )
-                .map_err(|error| SelfHostError::OperationalLedger(error.to_string()))?,
-            ),
-        };
+        let open_operational_ledger =
+            || -> Result<Box<dyn OperationalStoragePorts>, SelfHostError> {
+                match &config.operational_ledger {
+                    OperationalLedgerConfig::Sqlite {
+                        data_space_id,
+                        database_path,
+                        blob_dir,
+                        secret_encryption_key,
+                    } => Ok(Box::new(
+                        SqliteOperationalEventStore::open(
+                            data_space_id.clone(),
+                            database_path,
+                            blob_dir,
+                            secret_encryption_key,
+                        )
+                        .map_err(|error| SelfHostError::OperationalLedger(error.to_string()))?,
+                    )),
+                    OperationalLedgerConfig::Postgres {
+                        data_space_id,
+                        dsn,
+                        schema,
+                        role,
+                    } => Ok(Box::new(
+                        PostgresOperationalEventStore::connect_no_tls(
+                            data_space_id.clone(),
+                            dsn.expose(),
+                            schema,
+                            role,
+                        )
+                        .map_err(|error| SelfHostError::OperationalLedger(error.to_string()))?,
+                    )),
+                }
+            };
+        let operational_ledger = open_operational_ledger()?;
         // The history read API is a projection API.  Build its immutable snapshot before
         // accepting requests so a first owner query cannot hold the operational-ledger mutex
         // while scanning every historical event.
@@ -5548,8 +5567,33 @@ impl AppService {
             freshness_thresholds(&config),
             config.channels.clone(),
         )?;
-        let persistence: Arc<Mutex<Box<dyn StoragePorts>>> =
-            Arc::new(Mutex::new(Box::new(persistence)));
+        let mut persistence_read_pool = Vec::with_capacity(4);
+        persistence_read_pool.push(Arc::new(Mutex::new(
+            Box::new(persistence) as Box<dyn StoragePorts>
+        )));
+        for _ in 1..4 {
+            persistence_read_pool.push(Arc::new(Mutex::new(Box::new(
+                SqlitePersistence::open_with_routing_key_order(
+                    &config.database_path,
+                    &config.blob_dir,
+                    &config.secret_encryption_key,
+                    config.routing_key_order,
+                )?,
+            )
+                as Box<dyn StoragePorts>)));
+        }
+        let persistence: Arc<Mutex<Box<dyn StoragePorts>>> = Arc::new(Mutex::new(Box::new(
+            SqlitePersistence::open_with_routing_key_order(
+                &config.database_path,
+                &config.blob_dir,
+                &config.secret_encryption_key,
+                config.routing_key_order,
+            )?,
+        )));
+        let mut operational_ledger_read_pool = Vec::with_capacity(4);
+        for _ in 0..4 {
+            operational_ledger_read_pool.push(Arc::new(Mutex::new(open_operational_ledger()?)));
+        }
         let corpus_config = config.corpus.projector_config();
         let search_index = search_index::SearchIndexManager::bootstrap(
             lethe_search_index::IndexRoot::new(
@@ -5559,7 +5603,7 @@ impl AppService {
             )?,
             CorpusProjector::new(corpus_config),
             config.corpus.rebuild_page_size,
-            Arc::clone(&persistence),
+            Arc::clone(&persistence_read_pool[0]),
         );
         let slack_sources = config
             .slack_sources
@@ -5590,11 +5634,18 @@ impl AppService {
             .map(|slide_ai| GeminiSlideAnalyzer::new(slide_ai.api_key.expose(), &slide_ai.model))
             .transpose()?;
 
+        let core_snapshot = Arc::new(ArcSwap::from_pointee(core.clone()));
         let service = Self {
             core: Arc::new(Mutex::new(core)),
+            core_snapshot,
             persistence,
+            persistence_read_pool,
+            persistence_read_next: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             operational_ledger: Arc::new(Mutex::new(operational_ledger)),
+            operational_ledger_read_pool,
+            operational_ledger_read_next: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             history_projection: Arc::new(Mutex::new(history_projection)),
+            derived_projection_lane: Arc::new(Mutex::new(())),
             bulk_import_operation: Arc::new(Mutex::new(())),
             search_index,
             config: Arc::new(config),
@@ -5605,17 +5656,25 @@ impl AppService {
                 3,
                 std::time::Duration::from_secs(60),
             )),
-            audit_log: Arc::new(InMemoryAuditLog::new()),
+            append_consumer_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            append_consumer_error: Arc::new(Mutex::new(None)),
+            search_index_catch_up_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             non_corpus_rebuild_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             non_corpus_rebuild_error: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             non_corpus_rebuild_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         if requires_background_rebuild {
-            let mut core = service.core_lock()?;
             if !had_persisted_manifest {
+                let _derived_lane = service
+                    .derived_projection_lane
+                    .lock()
+                    .map_err(|_| SelfHostError::LockPoisoned)?;
+                let mut core = service.core_lock()?;
                 core.mark_non_corpus_materializations_stale();
+                service.publish_core_snapshot(&core);
             }
+            let mut core = service.core_lock()?;
             service.refresh_materialized_snapshot_with_reason(
                 &mut core,
                 if had_persisted_manifest {
@@ -5623,6 +5682,20 @@ impl AppService {
                 } else {
                     "bootstrap"
                 },
+            )?;
+        }
+        let cursor_initialized = service
+            .persistence_read_lock()?
+            .get_state("append_consumer:person-page")?
+            .is_some();
+        if !cursor_initialized {
+            let current_high_water = service
+                .persistence_read_lock()?
+                .observation_stats()?
+                .max_append_seq;
+            service.persistence_lock()?.set_state(
+                "append_consumer:person-page",
+                &current_high_water.to_string(),
             )?;
         }
         Ok(service)
@@ -5640,9 +5713,7 @@ impl AppService {
     }
 
     pub fn operational_event_stats(&self) -> Result<OperationalEventStats, SelfHostError> {
-        self.operational_ledger
-            .lock()
-            .map_err(|_| SelfHostError::LockPoisoned)?
+        self.operational_ledger_read_lock()?
             .operational_event_stats()
             .map_err(Into::into)
     }
@@ -5652,9 +5723,7 @@ impl AppService {
         after_cursor: u64,
         limit: usize,
     ) -> Result<Vec<StoredOperationalEvent>, SelfHostError> {
-        self.operational_ledger
-            .lock()
-            .map_err(|_| SelfHostError::LockPoisoned)?
+        self.operational_ledger_read_lock()?
             .operational_event_page(after_cursor, limit)
             .map_err(Into::into)
     }
@@ -5687,9 +5756,7 @@ impl AppService {
         after_stream_version: u64,
         limit: usize,
     ) -> Result<Vec<StoredOperationalEvent>, SelfHostError> {
-        self.operational_ledger
-            .lock()
-            .map_err(|_| SelfHostError::LockPoisoned)?
+        self.operational_ledger_read_lock()?
             .operational_events_for_stream(stream_id, after_stream_version, limit)
             .map_err(Into::into)
     }
@@ -5698,9 +5765,7 @@ impl AppService {
         &self,
         event_id: &lethe_core::domain::OperationalEventId,
     ) -> Result<Option<StoredOperationalEvent>, SelfHostError> {
-        self.operational_ledger
-            .lock()
-            .map_err(|_| SelfHostError::LockPoisoned)?
+        self.operational_ledger_read_lock()?
             .operational_event_by_id(event_id)
             .map_err(Into::into)
     }
@@ -5721,9 +5786,7 @@ impl AppService {
         &self,
         blob_ref: &BlobRef,
     ) -> Result<Option<Vec<u8>>, SelfHostError> {
-        self.operational_ledger
-            .lock()
-            .map_err(|_| SelfHostError::LockPoisoned)?
+        self.operational_ledger_read_lock()?
             .get_blob(blob_ref)
             .map_err(Into::into)
     }
@@ -5762,10 +5825,7 @@ impl AppService {
                 self.config.resource_limits.max_payload_bytes
             )));
         }
-        let ledger = self
-            .operational_ledger
-            .lock()
-            .map_err(|_| SelfHostError::LockPoisoned)?;
+        let ledger = self.operational_ledger_read_lock()?;
         let mut projection = self
             .history_projection
             .lock()
@@ -5816,21 +5876,60 @@ impl AppService {
                 "actor:anonymous",
                 AuditEventKind::PolicyDenial,
                 serde_json::json!({ "required_scopes": required_scopes, "reason": "missing bearer token" }),
-            );
+            )?;
             return Err(SelfHostError::Auth("missing bearer token".to_string()));
         };
-        let raw = header
-            .to_str()
-            .map_err(|_| SelfHostError::Auth("invalid authorization header".to_string()))?;
-        let token = raw.strip_prefix("Bearer ").ok_or_else(|| {
-            SelfHostError::Auth("authorization must use Bearer token".to_string())
-        })?;
-        let matched = self
+        let raw = match header.to_str() {
+            Ok(raw) => raw,
+            Err(_) => {
+                self.emit_audit(
+                    "actor:anonymous",
+                    AuditEventKind::PolicyDenial,
+                    serde_json::json!({
+                        "required_scopes": required_scopes,
+                        "reason": "invalid authorization header"
+                    }),
+                )?;
+                return Err(SelfHostError::Auth(
+                    "invalid authorization header".to_string(),
+                ));
+            }
+        };
+        let token = match raw.strip_prefix("Bearer ") {
+            Some(token) => token,
+            None => {
+                self.emit_audit(
+                    "actor:anonymous",
+                    AuditEventKind::PolicyDenial,
+                    serde_json::json!({
+                        "required_scopes": required_scopes,
+                        "reason": "authorization must use Bearer token"
+                    }),
+                )?;
+                return Err(SelfHostError::Auth(
+                    "authorization must use Bearer token".to_string(),
+                ));
+            }
+        };
+        let matched = match self
             .config
             .api_tokens
             .iter()
             .find(|candidate| candidate.token.expose() == token)
-            .ok_or_else(|| SelfHostError::Auth("token rejected".to_string()))?;
+        {
+            Some(matched) => matched,
+            None => {
+                self.emit_audit(
+                    "actor:anonymous",
+                    AuditEventKind::PolicyDenial,
+                    serde_json::json!({
+                        "required_scopes": required_scopes,
+                        "reason": "token rejected"
+                    }),
+                )?;
+                return Err(SelfHostError::Auth("token rejected".to_string()));
+            }
+        };
         if required_scopes.iter().all(|required_scope| {
             matched
                 .scopes
@@ -5841,14 +5940,14 @@ impl AppService {
                 "actor:api-token",
                 audit_kind_for_scope(required_scopes[0]),
                 serde_json::json!({ "required_scopes": required_scopes }),
-            );
+            )?;
             Ok(())
         } else {
             self.emit_audit(
                 "actor:api-token",
                 AuditEventKind::PolicyDenial,
                 serde_json::json!({ "required_scopes": required_scopes, "reason": "scope denied" }),
-            );
+            )?;
             Err(SelfHostError::Policy(format!(
                 "token lacks required scopes {}",
                 required_scopes.join(",")
@@ -5856,36 +5955,56 @@ impl AppService {
         }
     }
 
-    fn emit_audit(&self, actor: &str, kind: AuditEventKind, detail: serde_json::Value) {
-        let event = AuditEvent {
+    fn emit_audit(
+        &self,
+        actor: &str,
+        kind: AuditEventKind,
+        detail: serde_json::Value,
+    ) -> Result<(), SelfHostError> {
+        let event = self.build_audit_event(actor, kind, detail)?;
+        let audit = AuditEventRecord {
+            id: event.id.clone(),
+            timestamp: event.timestamp.to_rfc3339(),
+            actor: event.actor.as_str().to_owned(),
+            event_json: serde_json::to_string(&event)?,
+        };
+        self.persistence_lock()?.record_audit_event(
+            &audit.id,
+            &audit.timestamp,
+            &audit.actor,
+            &audit.event_json,
+        )?;
+        Ok(())
+    }
+
+    pub(super) fn build_audit_event(
+        &self,
+        actor: &str,
+        kind: AuditEventKind,
+        detail: serde_json::Value,
+    ) -> Result<AuditEvent, SelfHostError> {
+        Ok(AuditEvent {
             id: format!("audit:{}", uuid::Uuid::now_v7()),
             timestamp: Utc::now(),
             actor: ActorRef::new(actor),
             kind,
             detail,
-        };
-        match serde_json::to_string(&event) {
-            Ok(json) => {
-                if let Ok(store) = self.persistence.lock()
-                    && let Err(error) = store.record_audit_event(
-                        &event.id,
-                        &event.timestamp.to_rfc3339(),
-                        event.actor.as_str(),
-                        &json,
-                    )
-                {
-                    tracing::error!(error = %error, "failed to persist audit event");
-                }
-            }
-            Err(error) => tracing::error!(error = %error, "failed to serialize audit event"),
-        }
-        self.audit_log.emit(event);
+        })
+    }
+
+    pub(super) fn audit_record(event: &AuditEvent) -> Result<AuditEventRecord, SelfHostError> {
+        Ok(AuditEventRecord {
+            id: event.id.clone(),
+            timestamp: event.timestamp.to_rfc3339(),
+            actor: event.actor.as_str().to_owned(),
+            event_json: serde_json::to_string(event)?,
+        })
     }
 
     pub fn attribute_inventory_documents(
         &self,
     ) -> Result<Vec<AttributeInventoryDocument>, SelfHostError> {
-        let core = self.core_lock()?;
+        let core = self.core_snapshot();
         self.ensure_projection_fresh(&core.catalog, "proj:person-page")?;
         Ok(build_inventory_documents(&core.snapshot))
     }
@@ -5916,7 +6035,7 @@ impl AppService {
             }
 
             let _operation = self.bulk_import_operation_lock()?;
-            let mut core = self.core_lock()?;
+            let mut core = (*self.core_snapshot()).clone();
             let bulk_session = self.bulk_import_session_for_append(bulk_session_id)?;
 
             let mut report = ImportReport {
@@ -5946,13 +6065,28 @@ impl AppService {
                 )?;
             }
 
+            let audit_events = if prepared_observations.is_empty() {
+                Vec::new()
+            } else {
+                let event = self.build_audit_event(
+                    "actor:self-host",
+                    AuditEventKind::WriteExecution,
+                    serde_json::json!({
+                        "mode": "bulk_observation_import",
+                        "source_instance_id": source_instance_id,
+                        "requested": prepared_observations.len(),
+                        "bulk_session_id": bulk_session_id,
+                    }),
+                )?;
+                vec![AppService::audit_record(&event)?]
+            };
             let outcomes = if prepared_observations.is_empty() {
                 Vec::new()
             } else {
                 let stage_started_at = Instant::now();
                 let append_result = self
                     .persistence_lock()?
-                    .append_observations(&prepared_observations)
+                    .append_observations_with_audit(&prepared_observations, &audit_events)
                     .map_err(SelfHostError::Storage);
                 timer.record_stage(ImportTimingStage::LedgerAppend, stage_started_at.elapsed());
                 append_result?
@@ -6026,51 +6160,25 @@ impl AppService {
                 }
             }
 
-            if !request_appended_observations.is_empty() {
+            let request_had_canonical_attempt = !audit_events.is_empty();
+            if request_had_canonical_attempt {
                 if let Some(session) = bulk_session.clone() {
                     self.record_deferred_bulk_import_append(session)?;
+                    let _derived_lane = self
+                        .derived_projection_lane
+                        .lock()
+                        .map_err(|_| SelfHostError::LockPoisoned)?;
+                    let mut core = self.core_lock()?;
                     core.mark_non_corpus_materializations_stale();
+                    self.publish_core_snapshot(&core);
                     materialization_state = ImportMaterializationState::Deferred;
+                    self.trigger_search_index_catch_up();
                 } else {
                     let classification =
                         classify_non_corpus_delta_with_reason(&request_appended_observations);
                     materialization_state = ImportMaterializationState::Classified(classification);
-                    let stage_started_at = Instant::now();
-                    let materialize_result = self.materialize_after_observation_append(
-                        &mut core,
-                        &request_appended_observations,
-                    );
-                    timer.record_stage(
-                        ImportTimingStage::NonCorpusMaterialize,
-                        stage_started_at.elapsed(),
-                    );
-                    materialize_result?;
+                    self.trigger_append_consumer();
                 }
-            }
-
-            if report.ingested > 0 {
-                let stage_started_at = Instant::now();
-                self.emit_audit(
-                    "actor:self-host",
-                    AuditEventKind::WriteExecution,
-                    serde_json::json!({
-                        "mode": "bulk_observation_import",
-                        "source_instance_id": source_instance_id,
-                        "ingested": report.ingested,
-                        "duplicates": report.duplicates,
-                        "quarantined": report.quarantined,
-                        "bulk_session_id": bulk_session_id,
-                    }),
-                );
-                timer.record_stage(ImportTimingStage::Audit, stage_started_at.elapsed());
-
-                let stage_started_at = Instant::now();
-                let search_index_result = self.search_index.catch_up_after_append();
-                timer.record_stage(
-                    ImportTimingStage::SearchIndexCatchUp,
-                    stage_started_at.elapsed(),
-                );
-                search_index_result?;
             }
 
             report.refresh_summary();
@@ -6142,7 +6250,7 @@ impl AppService {
             }
 
             let _operation = self.bulk_import_operation_lock()?;
-            let mut core = self.core_lock()?;
+            let core = (*self.core_snapshot()).clone();
             let bulk_session = self.bulk_import_session_for_append(bulk_session_id)?;
             let mut report = ImportReport {
                 ingested: 0,
@@ -6218,11 +6326,28 @@ impl AppService {
                 .iter()
                 .map(|item| item.observation.clone())
                 .collect::<Vec<_>>();
+            let audit_events = if append_input.is_empty() {
+                Vec::new()
+            } else {
+                let event = self.build_audit_event(
+                    "actor:self-host",
+                    AuditEventKind::WriteExecution,
+                    serde_json::json!({
+                        "mode": "v2_bulk_observation_import",
+                        "source_instance_id": source_instance_id,
+                        "requested": append_input.len(),
+                        "bulk_session_id": bulk_session_id,
+                    }),
+                )?;
+                vec![AppService::audit_record(&event)?]
+            };
             let outcomes = if append_input.is_empty() {
                 Vec::new()
             } else {
                 let stage_started_at = Instant::now();
-                let append_result = self.persistence_lock()?.append_observations(&append_input);
+                let append_result = self
+                    .persistence_lock()?
+                    .append_observations_with_audit(&append_input, &audit_events);
                 timer.record_stage(ImportTimingStage::LedgerAppend, stage_started_at.elapsed());
                 match append_result {
                     Ok(outcomes) => outcomes,
@@ -6321,7 +6446,8 @@ impl AppService {
                 .filter(|result| result.outcome == ImportOutcome::Rejected)
                 .count();
 
-            if !request_appended_observations.is_empty() {
+            let request_had_canonical_attempt = !audit_events.is_empty();
+            if request_had_canonical_attempt {
                 if let Some(session) = bulk_session {
                     if let Err(error) = self.record_deferred_bulk_import_append(session) {
                         tracing::error!(
@@ -6329,52 +6455,21 @@ impl AppService {
                             "v2 import deferred-materialization bookkeeping failed after durable append"
                         );
                     }
+                    let _derived_lane = self
+                        .derived_projection_lane
+                        .lock()
+                        .map_err(|_| SelfHostError::LockPoisoned)?;
+                    let mut core = self.core_lock()?;
                     core.mark_non_corpus_materializations_stale();
+                    self.publish_core_snapshot(&core);
                     materialization_state = ImportMaterializationState::Deferred;
+                    self.trigger_search_index_catch_up();
                 } else {
                     let classification =
                         classify_non_corpus_delta_with_reason(&request_appended_observations);
                     materialization_state = ImportMaterializationState::Classified(classification);
-                    let stage_started_at = Instant::now();
-                    if let Err(error) = self.materialize_after_observation_append(
-                        &mut core,
-                        &request_appended_observations,
-                    ) {
-                        core.mark_non_corpus_materializations_stale();
-                        tracing::error!(error = %error, "v2 import materialization failed after durable append");
-                    }
-                    timer.record_stage(
-                        ImportTimingStage::NonCorpusMaterialize,
-                        stage_started_at.elapsed(),
-                    );
+                    self.trigger_append_consumer();
                 }
-            }
-
-            if report.ingested > 0 {
-                let stage_started_at = Instant::now();
-                self.emit_audit(
-                    "actor:self-host",
-                    AuditEventKind::WriteExecution,
-                    serde_json::json!({
-                        "mode": "v2_bulk_observation_import",
-                        "source_instance_id": source_instance_id,
-                        "ingested": report.ingested,
-                        "duplicates": report.duplicates,
-                        "quarantined": report.quarantined,
-                        "rejected": report.rejected,
-                        "bulk_session_id": bulk_session_id,
-                    }),
-                );
-                timer.record_stage(ImportTimingStage::Audit, stage_started_at.elapsed());
-
-                let stage_started_at = Instant::now();
-                if let Err(error) = self.search_index.catch_up_after_append() {
-                    tracing::error!(error = %error, "v2 import search index catch-up failed after durable append");
-                }
-                timer.record_stage(
-                    ImportTimingStage::SearchIndexCatchUp,
-                    stage_started_at.elapsed(),
-                );
             }
 
             report.refresh_summary();

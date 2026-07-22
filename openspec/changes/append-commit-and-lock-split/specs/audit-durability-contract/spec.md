@@ -38,3 +38,8 @@
 - **WHEN** audit 履歴が読まれる
 - **THEN** LETHE は永続台帳を page query して供給する
 - **AND** 全履歴を無制限 in-memory `Vec` に保持しない
+
+#### Scenario: audit page は timestamp と id の複合 keyset を使う
+- **WHEN** 同一 timestamp の audit event が page 境界を跨いで存在する
+- **THEN** 次ページの cursor は `(timestamp, id)` を使って後続行を返す
+- **AND** timestamp 単独の境界判定で event をスキップしない

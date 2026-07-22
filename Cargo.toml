@@ -51,6 +51,7 @@ edition = "2024"
 
 [workspace.dependencies]
 aes-gcm = "0.10"
+arc-swap = "1.9"
 axum = "0.8"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
