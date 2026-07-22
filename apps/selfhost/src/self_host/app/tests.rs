@@ -1,6 +1,11 @@
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
+use axum::body::Body;
+use axum::http::Request;
 use chrono::Utc;
 use lethe_adapter_api::idempotency::identity_key;
 use lethe_adapter_api::retry::ResilientExecutor;
@@ -35,6 +40,7 @@ use lethe_storage_api::{
     OperationalAppendOutcome, OperationalAppendRequest, SlackThreadKey, StoredObservation,
 };
 use lethe_storage_sqlite::persistence::{SqliteOperationalEventStore, SqlitePersistence};
+use tower::ServiceExt;
 
 #[test]
 fn non_empty_state_filters_blank_values() {
@@ -287,6 +293,89 @@ fn operational_ledger_survives_interface_service_restart() {
             .len(),
         1
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn health_and_operational_read_do_not_occupy_async_worker_while_storage_is_locked() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-self-host-health-concurrency-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let (service, root) = tokio::task::spawn_blocking(move || {
+        let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+        (test_service(test_config(db, blobs), persistence), root)
+    })
+    .await
+    .unwrap();
+    let router = crate::self_host::server::build_router(service.clone());
+
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let release = Arc::new(AtomicBool::new(false));
+    let locker_release = Arc::clone(&release);
+    let locker_service = service.clone();
+    let locker = tokio::task::spawn_blocking(move || {
+        let _core = locker_service.core_lock().unwrap();
+        let _persistence = locker_service.persistence_lock().unwrap();
+        locked_tx.send(()).unwrap();
+        while !locker_release.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    });
+    locked_rx.recv().unwrap();
+
+    let health_task = tokio::spawn(
+        router.clone().oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    );
+    let operational_page_task = tokio::spawn(
+        router.oneshot(
+            Request::builder()
+                .uri("/api/operational-events?after_cursor=0&limit=100")
+                .header("authorization", "Bearer test-api-token")
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    );
+    let releaser = std::thread::spawn({
+        let release = Arc::clone(&release);
+        move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            release.store(true, Ordering::Release);
+        }
+    });
+
+    let worker_remained_available = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        tokio::time::sleep(std::time::Duration::from_millis(20)),
+    )
+    .await
+    .is_ok();
+    assert!(
+        worker_remained_available,
+        "health and operational authorization lock waits must not block the single Tokio worker"
+    );
+
+    let health_response = health_task.await.unwrap().unwrap();
+    let operational_page_response = operational_page_task.await.unwrap().unwrap();
+    assert_eq!(health_response.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        operational_page_response.status(),
+        axum::http::StatusCode::OK
+    );
+    releaser.join().unwrap();
+    locker.await.unwrap();
+    tokio::task::spawn_blocking(move || {
+        drop(service);
+        let _ = std::fs::remove_dir_all(root);
+    })
+    .await
+    .unwrap();
 }
 
 fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppService {

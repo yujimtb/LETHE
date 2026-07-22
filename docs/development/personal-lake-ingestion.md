@@ -147,6 +147,17 @@ deduplication after an event-time routing change across leaves, v2 canonical
 collision responses (`quarantined` + ticket + `existing_id`), and HTTP-level
 clock-skew/policy quarantine classification.
 
+The schema-v9 SQLite migration adds `observations_identity_append` on
+`(identity_key, append_seq)`. The v8 identity-registry lookup is backed by the
+registry primary-key index; the legacy observation fallback and the registry
+backfill both use this observation index, so identity lookup does not scan the
+corpus. `/health` and `/health/deep` execute their synchronous health and
+SQLite checks on Tokio's blocking pool, preserving the existing response and
+error contracts while preventing a health request from blocking an async worker
+behind an in-progress import or sync. Operational-event authorization and its
+audit write use the same blocking boundary before the operational read/append,
+so a primary-storage lock held by an import cannot block the async worker.
+
 The 2026-07-06 production rebuild used:
 
 ```powershell

@@ -273,7 +273,7 @@ impl SqlitePersistence {
             "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
             params![
                 CURRENT_SCHEMA_VERSION,
-                "global_observation_identity_registry",
+                "observation_identity_lookup_index",
                 chrono::Utc::now().to_rfc3339(),
             ],
         )?;
@@ -324,6 +324,11 @@ impl SqlitePersistence {
             columns = self.observation_columns()?;
         }
 
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS observations_identity_append
+             ON observations(identity_key, append_seq)",
+            [],
+        )?;
         self.backfill_global_identity_registry()?;
 
         self.require_observation_columns(&columns)
