@@ -627,8 +627,8 @@ Import performance note: `AppService::ingest_observation_drafts` prepares the
 batch once, appends observations through the storage bulk API inside one SQLite
 transaction, and emits one summary audit event. For each non-empty batch, the
 persistent corpus index consumes only the new canonical tail and upserts each
-`record_id` once. Normal imports continue to materialize non-corpus projections
-after each request. Multi-request backfills must use the explicit bulk import
+`record_id` once. Normal imports continue to fold non-corpus projections
+incrementally after each request. Multi-request backfills must use the explicit bulk import
 session described below so that the non-corpus full rebuild runs once at the
 final high-water instead of once per request. A reference non-corpus rebuild
 fixes one canonical high-water, performs two bounded page passes, writes message
@@ -663,18 +663,20 @@ The event contains these fields:
 `source_instance_id`, `schema_names`, and `subject_kinds` are derived from the
 request contract and subject kind prefix; the event never includes payload,
 message text, or a subject identifier. A normal non-bulk request reports
-`incremental` for the
-freshness-only and Slack-message paths, or `full_rebuild` with one of
-`unsupported_schema`, `reply_slo_required`, `slack_user_id_missing`, or
-`empty_append` as the reason. A request bound to a bulk session reports
-`deferred` because materialization is intentionally performed at finalization.
+`incremental` for freshness-only, Slack-message, and communication folds;
+communication metadata is folded into the resident reply-SLO projection in
+the same append path. An empty append is `not_applicable`/`no_op`. A declared
+schema drift encountered after startup is `incremental`/`declared_schema_skip`
+and emits a warning; it never triggers a full rebuild. A request bound to a
+bulk session reports `deferred` because materialization is intentionally
+performed at finalization.
 
-The current classifier treats `schema:discord-message` as incremental when it
-does not contribute to reply SLO, but as `full_rebuild` when the complete
-reply-SLO metadata is present. `schema:slack-message` is incremental only when
-its payload contains a non-blank `user_id`; a missing or blank value causes
-`full_rebuild`. Any other schema is outside the closed incremental whitelist
-and causes `full_rebuild` with `unsupported_schema`.
+The reply-SLO projection stores incoming communication facts keyed by
+`(channel_id, thread_ref)` and evaluates `Pending` versus `Overdue` at read
+time. Its freshness contract is: normally append-to-read propagation is
+within 5 seconds; while a migration, recovery, or bootstrap rebuild runs in
+the background, the last atomically published snapshot may be up to 60
+seconds old. Reads never use an empty or partially rebuilt snapshot.
 
 ### Bulk import session
 
@@ -759,8 +761,10 @@ Slack adapter maps them to `schema:slack-message`.
 Communication projection surfaces:
 
 - `GET /projections/freshness` reports channel freshness using channel ids.
-- `GET /projections/reply-slo` folds incoming observations, `reply-draft@1`, and
-  `send-record@1` supplementals to show pending, overdue, and sent replies.
+- `GET /projections/reply-slo` reads the resident communication projection,
+  which incrementally folds incoming observations and the existing
+  `reply-draft@1`/`send-record@1` join to show pending, overdue, and sent
+  replies.
 - `GET /projections/break-glass` exposes channel and sender allowlists for the
   runtime mode logic. LETHE exposes the declarations only; it does not decide or
   execute interruptions.
