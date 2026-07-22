@@ -10,19 +10,19 @@
 
 ## What Changes
 
-- 各 observation schema に実 payload JSON Schema を持たせ、取り込み時に supplemental と同水準の厳格検証をする。過去レイクデータは再検証せず、version-gated で新 version から厳格化する。
+- 各 observation schema に宣言フィールドの実 payload JSON Schema を持たせる。宣言必須の欠落・型違反は item エラー、宣言外の余剰フィールドは受理・保存し projection が宣言フィールドのみ読む(厳格性を取り込みゲートから projection 契約へ移す)。過去レイクデータは再検証せず version-gated・API バージョニングで新 version から適用する。
 - append 前 consent gate を定数評価から実 consent-decision 記録(既存 supplemental kind)評価へ置き換え、consent 変更の反映鮮度を契約する。
 - `meta.retracts` を typed metadata(Observation ID / object ID 逆 index)にし、retraction を corpus/検索/通信 projection へ増分反映(物理削除でなく遮蔽)し、遮蔽の完全性を検証する。
 - 可視性モデルを **consent scope 単位**で本 change が正として定義し(indexed-keyset-reads C2Q5 の委譲を解決)、可視 blob 表のキーとする。
 - consent/retraction/blob 認可判定の監査証跡**内容**を規定し、durability は append-commit の ADC に委譲する。
 
-各設計判断の原理導出は design.md に明記する。原理から導出できない自由選択は同 Open Questions に列挙する。
+各設計判断の原理導出は design.md に明記する。原理から導出できず運用選択に委ねた項はオーナー確定済み(design.md「確定事項」、2026-07-23)。
 
 ## Capabilities
 
 ### New Capabilities
 
-- `observation-schema-strictness`: schema/version ごとの strict payload 検証と version-gated 移行(B-09)。
+- `observation-schema-strictness`: 宣言フィールド検証(欠落・型違反は item エラー)+ 宣言外余剰フィールドの受理・保存 + version-gated 移行(B-09)。
 - `consent-gate-evaluation`: 実 consent-decision 評価と反映鮮度契約(B-10)。
 - `retraction-projection-shielding`: typed retraction の projection 増分遮蔽と完全性検証(B-11 / C-13)。
 - `consent-scoped-blob-visibility`: consent scope 単位の可視性モデルを正として定義(C-13 / indexed-keyset C2Q5)。

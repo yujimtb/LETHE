@@ -19,12 +19,13 @@ append 前 consent gate は subject / channel の実 consent-decision(`schema:co
 
 ### Requirement: CGE-02 consent 変更の反映鮮度契約
 
-consent 変更の反映は 2 境界で契約 SHALL する。capture gate は評価時点で解決済みの最新 consent-decision を使用 SHALL する(A-9、correctness 境界)。公開 projection への consent delta 反映は watermark 増分 fold で行 SHALL う(A-3)。projection 反映の許容 staleness bound は運用確定事項(design Q2)とし、gate の「評価時最新」性はそれに依存 SHALL NOT する。
+consent 変更の反映は 2 境界で契約 SHALL する。capture gate は評価時点で解決済みの最新 consent-decision を使用 SHALL する(A-9、correctness 境界)。公開 projection への consent delta 反映は watermark 増分 fold で行 SHALL い(A-3)、通常時の反映遅延は communication-projection IM-05 の鮮度契約と統一して **5 秒以内** SHALL とする。capture gate の「評価時最新」性はこの projection 鮮度に依存 SHALL NOT する。
 
 #### Scenario: capture gate は評価時点の最新 consent
 - **WHEN** consent-decision が変更された後に Observation が取り込まれる
 - **THEN** capture gate は評価時点で解決済みの最新 decision を使う
 
-#### Scenario: 公開 projection への consent 反映は増分
+#### Scenario: 公開 projection への consent 反映は増分かつ 5 秒以内
 - **WHEN** consent delta が公開 projection に反映される
 - **THEN** watermark 増分 fold で差分反映され全量再計算しない
+- **AND** 通常時の反映は 5 秒以内に projection 読みへ現れる
