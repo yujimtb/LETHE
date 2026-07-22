@@ -697,6 +697,246 @@ pub struct ReplySloProjection {
     pub overdue: Vec<ReplyLatency>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct CommunicationThreadKey {
+    pub channel_id: String,
+    pub thread_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommunicationFact {
+    pub incoming_observation_id: ObservationId,
+    pub channel_id: String,
+    pub sender_id: String,
+    pub thread_ref: String,
+    pub published: DateTime<Utc>,
+    pub due_at: DateTime<Utc>,
+    pub sent_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommunicationProjectionState {
+    facts_by_thread: BTreeMap<String, BTreeMap<String, CommunicationFact>>,
+    observation_keys: BTreeMap<String, CommunicationThreadKey>,
+}
+
+impl CommunicationProjectionState {
+    pub fn from_observations(observations: &[Observation], join_index: &ReplySloJoinIndex) -> Self {
+        let mut state = Self::default();
+        state.fold_observations(observations, join_index);
+        state
+    }
+
+    pub fn from_reply_latencies(rows: &[ReplyLatency]) -> Self {
+        let mut state = Self::default();
+        for row in rows {
+            let fact = CommunicationFact {
+                incoming_observation_id: row.incoming_observation_id.clone(),
+                channel_id: row.channel_id.clone(),
+                sender_id: row.sender_id.clone(),
+                thread_ref: row.thread_ref.clone(),
+                published: row.published,
+                due_at: row.due_at,
+                sent_at: row.sent_at,
+            };
+            let observation_id = fact.incoming_observation_id.as_str().to_owned();
+            let key = CommunicationThreadKey {
+                channel_id: fact.channel_id.clone(),
+                thread_ref: fact.thread_ref.clone(),
+            };
+            state
+                .observation_keys
+                .insert(observation_id.clone(), key.clone());
+            state
+                .facts_by_thread
+                .entry(communication_thread_storage_key(&key))
+                .or_default()
+                .insert(observation_id, fact);
+        }
+        state
+    }
+
+    pub fn fold_observations(
+        &mut self,
+        observations: &[Observation],
+        join_index: &ReplySloJoinIndex,
+    ) -> ReplySloProjection {
+        let mut delta = Vec::new();
+        for observation in observations {
+            let Some(fact) = communication_fact(observation, join_index) else {
+                continue;
+            };
+            let observation_id = fact.incoming_observation_id.as_str().to_owned();
+            let key = CommunicationThreadKey {
+                channel_id: fact.channel_id.clone(),
+                thread_ref: fact.thread_ref.clone(),
+            };
+            let storage_key = communication_thread_storage_key(&key);
+            if let Some(previous_key) = self
+                .observation_keys
+                .insert(observation_id.clone(), key.clone())
+                && previous_key != key
+                && let Some(facts) = self
+                    .facts_by_thread
+                    .get_mut(&communication_thread_storage_key(&previous_key))
+            {
+                facts.remove(&observation_id);
+                if facts.is_empty() {
+                    self.facts_by_thread
+                        .remove(&communication_thread_storage_key(&previous_key));
+                }
+            }
+            self.facts_by_thread
+                .entry(storage_key)
+                .or_default()
+                .insert(observation_id, fact.clone());
+            delta.push(reply_latency_from_fact(&fact, Utc::now()));
+        }
+        sort_reply_slo_rows(&mut delta);
+        let overdue = delta
+            .iter()
+            .filter(|row| is_overdue_reply(row.status))
+            .cloned()
+            .collect();
+        ReplySloProjection {
+            rows: delta,
+            overdue,
+        }
+    }
+
+    pub fn refresh_sent_at(
+        &mut self,
+        observation_id: &ObservationId,
+        sent_at: Option<DateTime<Utc>>,
+    ) {
+        let Some(key) = self.observation_keys.get(observation_id.as_str()) else {
+            return;
+        };
+        if let Some(fact) = self
+            .facts_by_thread
+            .get_mut(&communication_thread_storage_key(key))
+            .and_then(|facts| facts.get_mut(observation_id.as_str()))
+        {
+            fact.sent_at = sent_at;
+        }
+    }
+
+    pub fn project(&self, now: DateTime<Utc>) -> ReplySloProjection {
+        let mut rows = self
+            .facts_by_thread
+            .values()
+            .flat_map(|facts| facts.values())
+            .map(|fact| reply_latency_from_fact(fact, now))
+            .collect::<Vec<_>>();
+        sort_reply_slo_rows(&mut rows);
+        let overdue = rows
+            .iter()
+            .filter(|row| is_overdue_reply(row.status))
+            .cloned()
+            .collect();
+        ReplySloProjection { rows, overdue }
+    }
+
+    pub fn project_observations(
+        &self,
+        observations: &[Observation],
+        now: DateTime<Utc>,
+    ) -> ReplySloProjection {
+        let mut rows = observations
+            .iter()
+            .filter_map(|observation| {
+                let key = self.observation_keys.get(observation.id.as_str())?;
+                self.facts_by_thread
+                    .get(&communication_thread_storage_key(key))?
+                    .get(observation.id.as_str())
+                    .map(|fact| reply_latency_from_fact(fact, now))
+            })
+            .collect::<Vec<_>>();
+        sort_reply_slo_rows(&mut rows);
+        let overdue = rows
+            .iter()
+            .filter(|row| is_overdue_reply(row.status))
+            .cloned()
+            .collect();
+        ReplySloProjection { rows, overdue }
+    }
+
+    pub fn len(&self) -> usize {
+        self.observation_keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.observation_keys.is_empty()
+    }
+}
+
+fn communication_thread_storage_key(key: &CommunicationThreadKey) -> String {
+    serde_json::to_string(&(key.channel_id.as_str(), key.thread_ref.as_str()))
+        .expect("communication thread key serialization must not fail")
+}
+
+fn communication_fact(
+    observation: &Observation,
+    join_index: &ReplySloJoinIndex,
+) -> Option<CommunicationFact> {
+    let channel_id = communication_meta(observation, "communication_channel_id")?;
+    let sender_id = communication_meta(observation, "communication_sender_id")?;
+    let thread_ref = communication_meta(observation, "communication_thread_ref")?;
+    let due_at = observation
+        .meta
+        .pointer("/communication/reply_due_at")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_datetime)?;
+    Some(CommunicationFact {
+        incoming_observation_id: observation.id.clone(),
+        channel_id: channel_id.to_owned(),
+        sender_id: sender_id.to_owned(),
+        thread_ref: thread_ref.to_owned(),
+        published: observation.published,
+        due_at,
+        sent_at: join_index.sent_at_for_observation(&observation.id),
+    })
+}
+
+fn reply_latency_from_fact(fact: &CommunicationFact, now: DateTime<Utc>) -> ReplyLatency {
+    let latency_seconds = fact
+        .sent_at
+        .map(|sent_at| (sent_at - fact.published).num_seconds());
+    let status = match fact.sent_at {
+        Some(sent_at) if sent_at <= fact.due_at => ReplySloStatus::SentOnTime,
+        Some(_) => ReplySloStatus::SentLate,
+        None if now > fact.due_at => ReplySloStatus::Overdue,
+        None => ReplySloStatus::Pending,
+    };
+    ReplyLatency {
+        incoming_observation_id: fact.incoming_observation_id.clone(),
+        channel_id: fact.channel_id.clone(),
+        sender_id: fact.sender_id.clone(),
+        thread_ref: fact.thread_ref.clone(),
+        published: fact.published,
+        due_at: fact.due_at,
+        sent_at: fact.sent_at,
+        latency_seconds,
+        status,
+    }
+}
+
+fn sort_reply_slo_rows(rows: &mut [ReplyLatency]) {
+    rows.sort_by(|left, right| {
+        left.due_at.cmp(&right.due_at).then_with(|| {
+            left.incoming_observation_id
+                .as_str()
+                .cmp(right.incoming_observation_id.as_str())
+        })
+    });
+}
+
+fn is_overdue_reply(status: ReplySloStatus) -> bool {
+    matches!(status, ReplySloStatus::Overdue | ReplySloStatus::SentLate)
+}
+
 #[derive(Debug, Clone)]
 pub struct ReplySloProjector {
     now: DateTime<Utc>,
@@ -845,6 +1085,21 @@ impl ReplySloJoinIndex {
                     .or_insert(sent_at);
             }
             _ => unreachable!("reply SLO kind routing is exhaustive"),
+        }
+    }
+
+    pub fn sent_at_for_observation(&self, observation_id: &ObservationId) -> Option<DateTime<Utc>> {
+        self.sent_by_observation
+            .get(observation_id.as_str())
+            .copied()
+    }
+
+    pub fn observation_id_for_record(&self, record: &SupplementalRecord) -> Option<ObservationId> {
+        match record.kind.as_str() {
+            "reply-draft@1" => record.derived_from.observations.first().cloned(),
+            "send-record@1" => single_draft_anchor(record)
+                .and_then(|draft_id| self.draft_to_observation.get(draft_id.as_str()).cloned()),
+            _ => None,
         }
     }
 
@@ -1803,6 +2058,142 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&after_remove).unwrap(),
             serde_json::to_value(&indexed).unwrap()
+        );
+    }
+
+    #[test]
+    fn communication_projection_rebuild_is_deterministic_cp01() {
+        let first = communication_observation("obs:first", "chan:mail", at(1), at(8));
+        let second = communication_observation("obs:second", "chan:mail", at(2), at(9));
+        let records = vec![supplemental(
+            "sup:draft",
+            "reply-draft@1",
+            serde_json::json!({"drafted_at": at(3)}),
+            obs_anchor("obs:first"),
+            at(3),
+        )];
+        let join_index = ReplySloJoinIndex::from_records(&records);
+        let forward = CommunicationProjectionState::from_observations(
+            &[first.clone(), second.clone()],
+            &join_index,
+        );
+        let reverse =
+            CommunicationProjectionState::from_observations(&[second, first], &join_index);
+        assert_eq!(
+            serde_json::to_value(forward).unwrap(),
+            serde_json::to_value(reverse).unwrap()
+        );
+    }
+
+    #[test]
+    fn communication_projection_fold_is_o1_and_evaluates_time_on_read_cp03() {
+        let pending = communication_observation("obs:pending", "chan:mail", at(1), at(8));
+        let overdue = communication_observation("obs:overdue", "chan:mail", at(2), at(3));
+        let join_index = ReplySloJoinIndex::default();
+        let mut state = CommunicationProjectionState::default();
+        state.fold_observations(std::slice::from_ref(&pending), &join_index);
+        assert_eq!(state.len(), 1);
+        state.fold_observations(&[overdue], &join_index);
+        assert_eq!(state.len(), 2);
+        assert_eq!(
+            state
+                .project(at(7))
+                .rows
+                .iter()
+                .find(|row| row.incoming_observation_id.as_str() == "obs:pending")
+                .unwrap()
+                .status,
+            ReplySloStatus::Pending
+        );
+        assert_eq!(
+            state
+                .project(at(9))
+                .rows
+                .iter()
+                .find(|row| row.incoming_observation_id.as_str() == "obs:overdue")
+                .unwrap()
+                .status,
+            ReplySloStatus::Overdue
+        );
+    }
+
+    #[test]
+    fn communication_projection_matches_full_recalculation_at_fixed_times_cp02() {
+        let observations = vec![
+            communication_observation("obs:on-time", "chan:mail", at(0), at(30)),
+            communication_observation("obs:late", "chan:mail", at(1), at(31)),
+            communication_observation("obs:overdue", "chan:mail", at(2), at(3)),
+            communication_observation("obs:pending", "chan:mail", at(3), at(50)),
+            communication_observation("obs:tie", "chan:mail", at(4), at(30)),
+        ];
+        let records = vec![
+            supplemental(
+                "sup:draft-on-time",
+                "reply-draft@1",
+                serde_json::json!({}),
+                obs_anchor("obs:on-time"),
+                at(5),
+            ),
+            supplemental(
+                "sup:draft-late",
+                "reply-draft@1",
+                serde_json::json!({}),
+                obs_anchor("obs:late"),
+                at(6),
+            ),
+            supplemental(
+                "sup:draft-tie",
+                "reply-draft@1",
+                serde_json::json!({}),
+                obs_anchor("obs:tie"),
+                at(7),
+            ),
+            supplemental(
+                "sup:send-on-time-late",
+                "send-record@1",
+                serde_json::json!({"sent_at": at(20)}),
+                sup_anchor("sup:draft-on-time"),
+                at(20),
+            ),
+            supplemental(
+                "sup:send-on-time-early",
+                "send-record@1",
+                serde_json::json!({"sent_at": at(10)}),
+                sup_anchor("sup:draft-on-time"),
+                at(21),
+            ),
+            supplemental(
+                "sup:send-late",
+                "send-record@1",
+                serde_json::json!({"sent_at": at(40)}),
+                sup_anchor("sup:draft-late"),
+                at(22),
+            ),
+        ];
+        let join_index = ReplySloJoinIndex::from_records(&records);
+        let state = CommunicationProjectionState::from_observations(&observations, &join_index);
+        for now in [at(2), at(4), at(50), at(55)] {
+            let expected = ReplySloProjector::new(now).project_records(&observations, &records);
+            assert_eq!(
+                serde_json::to_value(expected).unwrap(),
+                serde_json::to_value(state.project(now)).unwrap()
+            );
+        }
+        let projected = state.project(at(50));
+        let row = |id: &str| {
+            projected
+                .rows
+                .iter()
+                .find(|row| row.incoming_observation_id.as_str() == id)
+                .unwrap()
+        };
+        assert_eq!(row("obs:on-time").status, ReplySloStatus::SentOnTime);
+        assert_eq!(row("obs:late").status, ReplySloStatus::SentLate);
+        assert_eq!(row("obs:overdue").status, ReplySloStatus::Overdue);
+        assert_eq!(row("obs:on-time").latency_seconds, Some(10));
+        assert_eq!(
+            projected.overdue[0].incoming_observation_id.as_str(),
+            "obs:overdue"
         );
     }
 }
