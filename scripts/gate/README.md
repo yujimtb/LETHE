@@ -168,6 +168,43 @@ Every test's report entry includes a `transient_events` (or, for test 1b,
 time, HTTP status (if any), and message, so a run that passed despite some
 retries is still visible in `--report`.
 
+#### The timeout → 429 orphan chain (and why raising `--probe-timeout-seconds` is correct, not lowering it)
+
+Observed in a real 568k run: the ACK-convergence probe hit its client-side
+timeout, but **the server kept processing that import after the client
+gave up** — it doesn't cancel work just because the caller stopped
+waiting. That orphaned request went on holding one of the server's bounded
+import-permit slots (`config.limits.max_concurrent_imports`, commonly 2)
+until it actually finished. The *next* probe then got HTTP 429
+`import_concurrency_limit` because the permit pool was full — and, before
+this fix, the gate treated any non-2xx/non-5xx status as a hard failure
+and died immediately on that 429, even though nothing was actually broken.
+
+The fix:
+
+- HTTP 429 `import_concurrency_limit` is now its own transient subtype
+  (`gate_common.ImportConcurrencyLimitError`), always retried honoring the
+  server's `retry_after` hint (mirrors
+  `apps/selfhost/src/self_host/import_client.rs`'s own 429 handling) —
+  never a hard 4xx failure.
+- It is counted **separately** from timeouts/connection-errors/5xx: a run
+  of 429s does not consume the `--max-consecutive-timeouts` budget, and a
+  timeout does not consume the 429 budget. In the ACK-convergence loop,
+  429s are retried for as long as `--ack-timeout-seconds` allows (no
+  separate cap); in test batches, `--max-consecutive-concurrency-retries`
+  (default 60) caps a consecutive 429 run before the gate aborts.
+- While the ACK-convergence loop is draining a 429 streak, it **does not**
+  advance to a new probe (new index) — it re-polls the *same* logical
+  probe at the `retry_after` cadence, so the gate itself never adds more
+  orphans on top of the one it's waiting to clear.
+
+**Because the server keeps working on an import regardless of whether the
+client is still waiting, a shorter `--probe-timeout-seconds` does not make
+convergence faster — it only orphans more in-flight requests, each of
+which can starve the next probe with 429 until it finishes server-side.**
+`--probe-timeout-seconds` defaults to 900 (15 min) for this reason; prefer
+raising it over lowering it if you suspect probes are giving up too eagerly.
+
 ## Threshold arguments (all overridable)
 
 | Argument | Default | Meaning |
@@ -177,8 +214,9 @@ retries is still visible in `--report`.
 | `--bulk-residual-threshold-mib` | 768 | test 2: `(RSS 3min after the 1000-item send) − baseline` must be ≤ this, for both sub-tests |
 | `--slope-threshold-mib-per-batch` | 8 | test 3: the linear-regression slope of (batch number → post-settle RSS) across 8 batches must be ≤ this MiB/batch |
 | `--bulk-session-end-latency-threshold-seconds` | 10 | test 1b: max acceptable `.../bulk-sessions/{id}/end` duration per batch |
-| `--max-consecutive-timeouts` | 3 | tests 1/1b/2/2b/3: consecutive transient failures (timeout/connection-error/5xx) on the same batch before the gate aborts |
-| `--probe-timeout-seconds` | 300 | per-request HTTP timeout for the ACK-convergence probe (not the test batches — those use their own per-call timeouts, see source) |
+| `--max-consecutive-timeouts` | 3 | tests 1/1b/2/2b/3: consecutive transient failures (timeout/connection-error/5xx, NOT counting HTTP 429) on the same batch before the gate aborts |
+| `--max-consecutive-concurrency-retries` | 60 | tests 1/1b/2/2b/3: consecutive HTTP 429 `import_concurrency_limit` responses (retried honoring `retry_after`, counted separately from timeouts) on the same batch before the gate aborts. The ACK probe also retries 429s but is bounded only by `--ack-timeout-seconds`, not this count |
+| `--probe-timeout-seconds` | 900 | per-request HTTP timeout for the ACK-convergence probe (not the test batches — those use their own per-call timeouts, see source). Raising this reduces orphaned server-side work, not the other way around — see "The timeout → 429 orphan chain" above |
 | `--health-timeout-seconds` | 900 (15 min) | max wait for `/health` to return 200 |
 | `--ack-timeout-seconds` | 1800 (30 min) | max wait for single-item import ACK latency to converge |
 | `--ack-latency-threshold-seconds` | 2.0 | the ACK latency convergence target |

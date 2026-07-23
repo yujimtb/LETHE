@@ -353,6 +353,44 @@ class TransientImportError(GateError):
         self.status_code = status_code
 
 
+class ImportConcurrencyLimitError(TransientImportError):
+    """HTTP 429 ``import_concurrency_limit`` — the server's bounded import
+    permit pool (config ``limits.max_concurrent_imports``) is currently
+    full.
+
+    This commonly shows up as a *chain*: a client gives up on a slow import
+    (timeout) while the server keeps processing it and holding a permit;
+    the next probe/batch then gets 429 until that orphaned request finally
+    finishes server-side and releases the permit — which has nothing to do
+    with how long *this* request waits. Must be retried after
+    ``retry_after_seconds`` (from the response body, matching
+    apps/selfhost/src/self_host/import_client.rs's own 429 handling), never
+    treated as a hard 4xx failure.
+    """
+
+    def __init__(
+        self, message: str, *, elapsed_seconds: float, retry_after_seconds: float
+    ) -> None:
+        super().__init__(message, elapsed_seconds=elapsed_seconds, status_code=429)
+        self.retry_after_seconds = retry_after_seconds
+
+
+def _parse_retry_after_seconds(body_text: str, default_seconds: float = 1.0) -> float:
+    """Read ``retry_after`` (seconds) from a 429 response body, matching the
+    server's ErrorResponse shape ({"error", "detail", "details",
+    "retry_after"}). Falls back to ``default_seconds`` if absent/unparsable
+    — mirrors import_client.rs::IMPORT_CONCURRENCY_DEFAULT_RETRY_AFTER_SECS.
+    """
+    try:
+        payload = json.loads(body_text)
+        value = payload.get("retry_after") if isinstance(payload, dict) else None
+        if isinstance(value, (int, float)) and value >= 0:
+            return float(value)
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return default_seconds
+
+
 def _is_transient_network_error(error: BaseException) -> bool:
     """True for timeouts/connection-level failures from whichever HTTP
     backend is active (never for a clean non-2xx HTTP response, which is
@@ -461,6 +499,15 @@ class ImportClient:
                 ) from error
             raise
         elapsed = time.monotonic() - started
+        if status_code == 429:
+            body_text = getattr(response, "text", "")
+            retry_after = _parse_retry_after_seconds(body_text)
+            raise ImportConcurrencyLimitError(
+                f"HTTP 429 import_concurrency_limit after {elapsed:.1f}s "
+                f"(retry_after={retry_after:.1f}s): {body_text[:300]}",
+                elapsed_seconds=elapsed,
+                retry_after_seconds=retry_after,
+            )
         if status_code >= 500:
             body_text = getattr(response, "text", "<no body>")
             raise TransientImportError(
@@ -521,11 +568,13 @@ class ImportClient:
 @dataclass
 class RetryOutcome:
     """Result of send_drafts_with_retry: the eventual success, plus a record
-    of any transient (timeout/connection/5xx) attempts that preceded it."""
+    of any transient (timeout/connection/5xx) and 429 concurrency-limit
+    attempts that preceded it."""
 
     result: ImportBatchResult
     attempts: int
     transient_events: list[dict[str, Any]]
+    concurrency_events: list[dict[str, Any]] = field(default_factory=list)
 
 
 def send_drafts_with_retry(
@@ -536,19 +585,36 @@ def send_drafts_with_retry(
     bulk_session_id: str | None = None,
     timeout: float | None = None,
     max_consecutive_timeouts: int = 3,
+    max_consecutive_concurrency_retries: int = 60,
     context: str,
     on_transient: Any = None,
+    on_concurrency_limit: Any = None,
 ) -> RetryOutcome:
     """Send one import batch, retrying on transient network failures.
 
-    A timeout / connection error / 5xx is recorded as a latency spike for
-    that batch (not an unhandled crash) and the same batch is retried.
-    ``max_consecutive_timeouts`` consecutive transient failures on this one
-    batch raise a GateError explaining the abort — a real request to
-    ``on_transient(event)`` (if given) is invoked once per transient
-    attempt, e.g. to log a single line before retrying.
+    Two independent, separately-counted failure streaks, each reset by any
+    event of the *other* kind (or by success):
+
+    - timeout / connection-error / 5xx: recorded as a latency spike for
+      that batch (not an unhandled crash) and the batch is retried
+      immediately. ``max_consecutive_timeouts`` in a row raises a
+      GateError explaining the abort.
+    - HTTP 429 ``import_concurrency_limit``: the server's bounded import
+      permit pool is full, commonly because an earlier request whose
+      *client* gave up via timeout is still being processed server-side
+      and holding a permit. This is not counted against
+      ``max_consecutive_timeouts`` — it is retried after the server's
+      ``retry_after`` hint, up to ``max_consecutive_concurrency_retries``
+      times (default 60), which raises a GateError if the permit never
+      clears.
+
+    ``on_transient`` / ``on_concurrency_limit`` (if given) are each called
+    once per matching attempt, e.g. to log a single line before retrying.
     """
     transient_events: list[dict[str, Any]] = []
+    concurrency_events: list[dict[str, Any]] = []
+    timeout_streak = 0
+    concurrency_streak = 0
     attempt = 0
     while True:
         attempt += 1
@@ -560,9 +626,34 @@ def send_drafts_with_retry(
                 timeout=timeout,
             )
             return RetryOutcome(
-                result=result, attempts=attempt, transient_events=transient_events
+                result=result,
+                attempts=attempt,
+                transient_events=transient_events,
+                concurrency_events=concurrency_events,
             )
+        except ImportConcurrencyLimitError as error:
+            concurrency_streak += 1
+            timeout_streak = 0
+            event = {
+                "attempt": attempt,
+                "elapsed_seconds": error.elapsed_seconds,
+                "retry_after_seconds": error.retry_after_seconds,
+                "message": str(error),
+            }
+            concurrency_events.append(event)
+            if on_concurrency_limit is not None:
+                on_concurrency_limit(event)
+            if concurrency_streak >= max_consecutive_concurrency_retries:
+                raise GateError(
+                    f"{context}: {concurrency_streak} consecutive HTTP 429 "
+                    f"import_concurrency_limit responses, aborting (an orphaned "
+                    f"import request is likely holding a concurrency permit and "
+                    f"never clearing): {error}"
+                ) from error
+            time.sleep(max(error.retry_after_seconds, 0.1))
         except TransientImportError as error:
+            timeout_streak += 1
+            concurrency_streak = 0
             event = {
                 "attempt": attempt,
                 "elapsed_seconds": error.elapsed_seconds,
@@ -572,10 +663,10 @@ def send_drafts_with_retry(
             transient_events.append(event)
             if on_transient is not None:
                 on_transient(event)
-            if attempt >= max_consecutive_timeouts:
+            if timeout_streak >= max_consecutive_timeouts:
                 raise GateError(
-                    f"{context}: {attempt} consecutive transient import failures "
-                    f"(timeout/connection-error/5xx), aborting: {error}"
+                    f"{context}: {timeout_streak} consecutive transient import "
+                    f"failures (timeout/connection-error/5xx), aborting: {error}"
                 ) from error
 
 
