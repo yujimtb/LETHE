@@ -104,12 +104,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--probe-timeout-seconds",
         type=float,
-        default=300.0,
+        default=900.0,
         help=(
             "per-request HTTP timeout for the ACK-convergence probe. A fresh "
             "container can take well over a minute per import during backlog "
             "catch-up; a probe that times out is treated as 'not converged "
-            "yet', not a failure, as long as --ack-timeout-seconds budget remains"
+            "yet', not a failure, as long as --ack-timeout-seconds budget "
+            "remains. IMPORTANT: the server keeps processing an import after "
+            "the client gives up on it — a shorter timeout here does not make "
+            "convergence faster, it only orphans more in-flight requests that "
+            "go on holding a concurrency permit (limits.max_concurrent_imports, "
+            "commonly 2) until they finish server-side, which can starve the "
+            "next probe with HTTP 429 import_concurrency_limit. Prefer raising "
+            "this over lowering it"
         ),
     )
     parser.add_argument(
@@ -118,8 +125,23 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help=(
             "test 1/1b/2/2b/3: number of consecutive transient failures "
-            "(timeout/connection-error/5xx) on the same batch before the gate "
-            "aborts with an explicit reason"
+            "(timeout/connection-error/5xx, NOT counting HTTP 429 — see "
+            "--max-consecutive-concurrency-retries) on the same batch before "
+            "the gate aborts with an explicit reason"
+        ),
+    )
+    parser.add_argument(
+        "--max-consecutive-concurrency-retries",
+        type=int,
+        default=60,
+        help=(
+            "test 1/1b/2/2b/3: number of consecutive HTTP 429 "
+            "import_concurrency_limit responses on the same batch (retried "
+            "honoring the server's retry_after hint, counted separately from "
+            "--max-consecutive-timeouts) before the gate aborts — signals a "
+            "permit that is never clearing. The ACK-convergence probe also "
+            "retries 429s honoring retry_after, but is only bounded by the "
+            "overall --ack-timeout-seconds budget, not this count"
         ),
     )
     parser.add_argument("--baseline-settle-seconds", type=float, default=60.0)
@@ -261,21 +283,56 @@ def wait_for_ack_latency(
     attempt = 0
     samples: list[float] = []
     transient_events: list[dict[str, Any]] = []
+    concurrency_events: list[dict[str, Any]] = []
+    # Reused across HTTP 429 retries of the *same* logical probe so that
+    # draining an orphaned permit doesn't itself pile on new orphans; only
+    # advanced to a fresh index once we get a non-429 outcome (success or a
+    # genuine timeout).
+    probe_index: int | None = None
+    draft: dict[str, Any] | None = None
+    advance_probe = True
     while time.monotonic() < deadline:
         gc.assert_container_alive(container_name)
-        attempt += 1
-        # Disjoint, effectively unbounded index space so ack probes never
-        # collide with corpus or bulk-test indices.
-        probe_index = 900_000_000 + attempt
-        draft = gc.build_corpus_draft(
-            tag=f"{tag}-ackprobe",
-            source_instance_id=source_instance_id,
-            index=probe_index,
-        )
+        if advance_probe:
+            attempt += 1
+            # Disjoint, effectively unbounded index space so ack probes
+            # never collide with corpus or bulk-test indices.
+            probe_index = 900_000_000 + attempt
+            draft = gc.build_corpus_draft(
+                tag=f"{tag}-ackprobe",
+                source_instance_id=source_instance_id,
+                index=probe_index,
+            )
         try:
             result = client.send_drafts(
                 source_instance_id, [draft], timeout=probe_timeout_seconds
             )
+        except gc.ImportConcurrencyLimitError as error:
+            # The bounded import-permit pool is full — commonly because an
+            # earlier probe's *client* gave up (timeout) while the server
+            # kept processing it and holding a permit. Retrying our own
+            # probe faster than that orphan can finish would just add more
+            # load; wait the server's retry_after hint and re-poll the same
+            # (not a new) probe until the permit clears, still bounded by
+            # the overall --ack-timeout-seconds budget.
+            wait_seconds = max(error.retry_after_seconds, 0.1)
+            waited_so_far = time.monotonic() - started
+            concurrency_events.append(
+                {
+                    "attempt": attempt,
+                    "elapsed_seconds": error.elapsed_seconds,
+                    "retry_after_seconds": error.retry_after_seconds,
+                    "message": str(error),
+                }
+            )
+            log(
+                f"ack probe #{attempt}: HTTP 429 import_concurrency_limit; "
+                f"waiting retry_after={wait_seconds:.1f}s for an orphaned import "
+                f"permit to clear (waited {waited_so_far:.0f}s of {timeout_seconds:.0f}s budget)"
+            )
+            time.sleep(wait_seconds)
+            advance_probe = False
+            continue
         except gc.TransientImportError as error:
             # A fresh container doing backlog catch-up can take well over a
             # minute (observed: 90s+) to ACK a single import. That is "not
@@ -296,6 +353,7 @@ def wait_for_ack_latency(
                 f"continuing (waited {waited_so_far:.0f}s of {timeout_seconds:.0f}s budget)"
             )
             time.sleep(poll_interval_seconds)
+            advance_probe = True
             continue
         gc.assert_no_failures(result.counts, context=f"ack probe #{attempt}")
         samples.append(result.elapsed_seconds)
@@ -306,12 +364,15 @@ def wait_for_ack_latency(
                 "final_latency_seconds": result.elapsed_seconds,
                 "samples": samples,
                 "transient_events": transient_events,
+                "concurrency_limit_events": concurrency_events,
             }
         time.sleep(poll_interval_seconds)
+        advance_probe = True
     raise gc.GateError(
         f"single-item ACK latency did not drop below {threshold_seconds:.1f}s "
         f"within {timeout_seconds:.0f}s (last successful sample="
-        f"{samples[-1] if samples else 'n/a'}, transient failures={len(transient_events)})"
+        f"{samples[-1] if samples else 'n/a'}, transient failures={len(transient_events)}, "
+        f"HTTP 429 import_concurrency_limit responses={len(concurrency_events)})"
     )
 
 
@@ -319,6 +380,15 @@ def log_transient_event(context: str, event: dict[str, Any]) -> None:
     log(
         f"{context}: transient failure on attempt {event['attempt']} after "
         f"{event['elapsed_seconds']:.1f}s (status={event['status_code']}): {event['message']}"
+    )
+
+
+def log_concurrency_event(context: str, event: dict[str, Any]) -> None:
+    log(
+        f"{context}: HTTP 429 import_concurrency_limit on attempt {event['attempt']} "
+        f"after {event['elapsed_seconds']:.1f}s; waiting "
+        f"retry_after={event['retry_after_seconds']:.1f}s for an orphaned import "
+        f"permit to clear"
     )
 
 
@@ -337,9 +407,11 @@ def run_dup_only_batches(
     batch_size: int,
     container_name: str,
     max_consecutive_timeouts: int,
-) -> tuple[list[float], list[dict[str, Any]]]:
+    max_consecutive_concurrency_retries: int,
+) -> tuple[list[float], list[dict[str, Any]], list[dict[str, Any]]]:
     latencies: list[float] = []
     all_transient_events: list[dict[str, Any]] = []
+    all_concurrency_events: list[dict[str, Any]] = []
     for batch_num in range(batches):
         gc.assert_container_alive(container_name)
         lo = start_index + batch_num * batch_size
@@ -355,18 +427,21 @@ def run_dup_only_batches(
             drafts,
             timeout=120.0,
             max_consecutive_timeouts=max_consecutive_timeouts,
+            max_consecutive_concurrency_retries=max_consecutive_concurrency_retries,
             context=context,
             on_transient=lambda event, context=context: log_transient_event(context, event),
+            on_concurrency_limit=lambda event, context=context: log_concurrency_event(context, event),
         )
         result = outcome.result
         all_transient_events.extend(outcome.transient_events)
+        all_concurrency_events.extend(outcome.concurrency_events)
         gc.assert_all_duplicate(result.counts, batch_size, context=context)
         latencies.append(result.elapsed_seconds)
         log(
             f"dup batch {batch_num + 1}/{batches}: {result.elapsed_seconds:.3f}s "
             f"(duplicate={result.counts.duplicates}, attempts={outcome.attempts})"
         )
-    return latencies, all_transient_events
+    return latencies, all_transient_events, all_concurrency_events
 
 
 def run_test1_dup_only(
@@ -381,9 +456,10 @@ def run_test1_dup_only(
     rss_average_window_seconds: float,
     residual_threshold_mib: float,
     max_consecutive_timeouts: int,
+    max_consecutive_concurrency_retries: int,
 ) -> dict[str, Any]:
     log("=== test 1: dup-only replay (100 x 8 batches) ===")
-    latencies, transient_events = run_dup_only_batches(
+    latencies, transient_events, concurrency_events = run_dup_only_batches(
         client,
         source_instance_id=source_instance_id,
         tag=tag,
@@ -392,6 +468,7 @@ def run_test1_dup_only(
         batch_size=100,
         container_name=container_name,
         max_consecutive_timeouts=max_consecutive_timeouts,
+        max_consecutive_concurrency_retries=max_consecutive_concurrency_retries,
     )
     log(f"test 1 sending done; settling {post_batch_wait_seconds:.0f}s before residual RSS sample ...")
     time.sleep(post_batch_wait_seconds)
@@ -409,6 +486,7 @@ def run_test1_dup_only(
         "passed": passed,
         "batch_latencies_seconds": latencies,
         "transient_events": transient_events,
+        "concurrency_limit_events": concurrency_events,
         "baseline_mib": baseline_mib,
         "after_mib": after_mib,
         "residual_mib": residual_mib,
@@ -444,6 +522,7 @@ def run_test1b_bulk_session_dup_only(
     residual_threshold_mib: float,
     end_latency_threshold_seconds: float,
     max_consecutive_timeouts: int,
+    max_consecutive_concurrency_retries: int,
 ) -> dict[str, Any]:
     log("=== test 1b: bulk session dup-only (begin -> 100 dup -> end, x4) ===")
 
@@ -462,6 +541,7 @@ def run_test1b_bulk_session_dup_only(
 
     import_latencies: list[float] = []
     import_transient_events: list[dict[str, Any]] = []
+    import_concurrency_events: list[dict[str, Any]] = []
     end_durations: list[float] = []
     end_latency_violations: list[dict[str, Any]] = []
     session_states: list[str] = []
@@ -482,11 +562,14 @@ def run_test1b_bulk_session_dup_only(
             bulk_session_id=session_id,
             timeout=120.0,
             max_consecutive_timeouts=max_consecutive_timeouts,
+            max_consecutive_concurrency_retries=max_consecutive_concurrency_retries,
             context=context,
             on_transient=lambda event, context=context: log_transient_event(context, event),
+            on_concurrency_limit=lambda event, context=context: log_concurrency_event(context, event),
         )
         import_result = outcome.result
         import_transient_events.extend(outcome.transient_events)
+        import_concurrency_events.extend(outcome.concurrency_events)
         gc.assert_all_duplicate(import_result.counts, 100, context=context)
         import_latencies.append(import_result.elapsed_seconds)
 
@@ -531,6 +614,7 @@ def run_test1b_bulk_session_dup_only(
         "skipped": False,
         "import_batch_latencies_seconds": import_latencies,
         "import_transient_events": import_transient_events,
+        "import_concurrency_limit_events": import_concurrency_events,
         "end_duration_seconds": end_durations,
         "session_states_after_end": session_states,
         "end_latency_threshold_seconds": end_latency_threshold_seconds,
@@ -564,12 +648,14 @@ def run_bulk_subtest(
     peak_threshold_mib: float,
     residual_threshold_mib: float,
     max_consecutive_timeouts: int,
+    max_consecutive_concurrency_retries: int,
 ) -> dict[str, Any]:
     log(f"=== test 2 ({label}): {count} new drafts, batch={batch_size} ===")
     marker = sampler.mark()
     total = gc.OutcomeCounts()
     latencies: list[float] = []
     transient_events: list[dict[str, Any]] = []
+    concurrency_events: list[dict[str, Any]] = []
     index = start_index
     end = start_index + count
     while index < end:
@@ -586,11 +672,14 @@ def run_bulk_subtest(
             drafts,
             timeout=180.0,
             max_consecutive_timeouts=max_consecutive_timeouts,
+            max_consecutive_concurrency_retries=max_consecutive_concurrency_retries,
             context=context,
             on_transient=lambda event, context=context: log_transient_event(context, event),
+            on_concurrency_limit=lambda event, context=context: log_concurrency_event(context, event),
         )
         result = outcome.result
         transient_events.extend(outcome.transient_events)
+        concurrency_events.extend(outcome.concurrency_events)
         gc.assert_all_ingested(result.counts, len(drafts), context=context)
         total = total + result.counts
         latencies.append(result.elapsed_seconds)
@@ -626,6 +715,7 @@ def run_bulk_subtest(
         "duplicates": total.duplicates,
         "batch_latencies_seconds": latencies,
         "transient_events": transient_events,
+        "concurrency_limit_events": concurrency_events,
         "peak_mib": peak_mib,
         "peak_over_baseline_mib": peak_over_baseline_mib,
         "peak_threshold_mib": peak_threshold_mib,
@@ -657,6 +747,7 @@ def run_test2b_bulk_session_new(
     peak_threshold_mib: float,
     residual_threshold_mib: float,
     max_consecutive_timeouts: int,
+    max_consecutive_concurrency_retries: int,
 ) -> dict[str, Any]:
     log(f"=== test 2b: bulk session new import ({count} drafts, batch={batch_size}, session-wrapped) ===")
 
@@ -678,6 +769,7 @@ def run_test2b_bulk_session_new(
     total = gc.OutcomeCounts()
     latencies: list[float] = []
     transient_events: list[dict[str, Any]] = []
+    concurrency_events: list[dict[str, Any]] = []
     index = start_index
     end_index = start_index + count
     while index < end_index:
@@ -695,11 +787,14 @@ def run_test2b_bulk_session_new(
             bulk_session_id=session_id,
             timeout=180.0,
             max_consecutive_timeouts=max_consecutive_timeouts,
+            max_consecutive_concurrency_retries=max_consecutive_concurrency_retries,
             context=context,
             on_transient=lambda event, context=context: log_transient_event(context, event),
+            on_concurrency_limit=lambda event, context=context: log_concurrency_event(context, event),
         )
         result = outcome.result
         transient_events.extend(outcome.transient_events)
+        concurrency_events.extend(outcome.concurrency_events)
         gc.assert_all_ingested(result.counts, len(drafts), context=context)
         total = total + result.counts
         latencies.append(result.elapsed_seconds)
@@ -737,6 +832,7 @@ def run_test2b_bulk_session_new(
         "duplicates": total.duplicates,
         "batch_latencies_seconds": latencies,
         "transient_events": transient_events,
+        "concurrency_limit_events": concurrency_events,
         "peak_mib": peak_mib,
         "peak_over_baseline_mib": peak_over_baseline_mib,
         "peak_threshold_mib": peak_threshold_mib,
@@ -770,12 +866,14 @@ def run_test3_slope(
     rss_average_window_seconds: float,
     slope_threshold_mib_per_batch: float,
     max_consecutive_timeouts: int,
+    max_consecutive_concurrency_retries: int,
 ) -> dict[str, Any]:
     log("=== test 3: slope detection (100 x 8 dup batches, per-batch settle) ===")
     batch_numbers: list[float] = []
     rss_after_points: list[float] = []
     latencies: list[float] = []
     transient_events: list[dict[str, Any]] = []
+    concurrency_events: list[dict[str, Any]] = []
     for batch_num in range(8):
         gc.assert_container_alive(container_name)
         lo = start_index + batch_num * 100
@@ -791,11 +889,14 @@ def run_test3_slope(
             drafts,
             timeout=120.0,
             max_consecutive_timeouts=max_consecutive_timeouts,
+            max_consecutive_concurrency_retries=max_consecutive_concurrency_retries,
             context=context,
             on_transient=lambda event, context=context: log_transient_event(context, event),
+            on_concurrency_limit=lambda event, context=context: log_concurrency_event(context, event),
         )
         result = outcome.result
         transient_events.extend(outcome.transient_events)
+        concurrency_events.extend(outcome.concurrency_events)
         gc.assert_all_duplicate(result.counts, 100, context=context)
         latencies.append(result.elapsed_seconds)
         time.sleep(slope_settle_seconds)
@@ -816,6 +917,7 @@ def run_test3_slope(
         "passed": passed,
         "batch_latencies_seconds": latencies,
         "transient_events": transient_events,
+        "concurrency_limit_events": concurrency_events,
         "batch_numbers": batch_numbers,
         "rss_after_mib": rss_after_points,
         "baseline_mib": baseline_mib,
@@ -863,6 +965,7 @@ def main() -> int:
             "bulk_session_end_latency_threshold_seconds": args.bulk_session_end_latency_threshold_seconds,
             "probe_timeout_seconds": args.probe_timeout_seconds,
             "max_consecutive_timeouts": args.max_consecutive_timeouts,
+            "max_consecutive_concurrency_retries": args.max_consecutive_concurrency_retries,
         },
         "phases": {},
         "tests": [],
@@ -923,6 +1026,7 @@ def main() -> int:
             rss_average_window_seconds=args.rss_average_window_seconds,
             residual_threshold_mib=args.dup_residual_threshold_mib,
             max_consecutive_timeouts=args.max_consecutive_timeouts,
+            max_consecutive_concurrency_retries=args.max_consecutive_concurrency_retries,
         )
         report["tests"].append(test1)
 
@@ -939,6 +1043,7 @@ def main() -> int:
             residual_threshold_mib=args.dup_residual_threshold_mib,
             end_latency_threshold_seconds=args.bulk_session_end_latency_threshold_seconds,
             max_consecutive_timeouts=args.max_consecutive_timeouts,
+            max_consecutive_concurrency_retries=args.max_consecutive_concurrency_retries,
         )
         report["tests"].append(test1b)
 
@@ -960,6 +1065,7 @@ def main() -> int:
             peak_threshold_mib=args.bulk_peak_threshold_mib,
             residual_threshold_mib=args.bulk_residual_threshold_mib,
             max_consecutive_timeouts=args.max_consecutive_timeouts,
+            max_consecutive_concurrency_retries=args.max_consecutive_concurrency_retries,
         )
         report["tests"].append(test2a)
 
@@ -979,6 +1085,7 @@ def main() -> int:
             peak_threshold_mib=args.bulk_peak_threshold_mib,
             residual_threshold_mib=args.bulk_residual_threshold_mib,
             max_consecutive_timeouts=args.max_consecutive_timeouts,
+            max_consecutive_concurrency_retries=args.max_consecutive_concurrency_retries,
         )
         report["tests"].append(test2b)
 
@@ -998,6 +1105,7 @@ def main() -> int:
             peak_threshold_mib=args.bulk_peak_threshold_mib,
             residual_threshold_mib=args.bulk_residual_threshold_mib,
             max_consecutive_timeouts=args.max_consecutive_timeouts,
+            max_consecutive_concurrency_retries=args.max_consecutive_concurrency_retries,
         )
         report["tests"].append(test2b_session)
 
@@ -1013,6 +1121,7 @@ def main() -> int:
             rss_average_window_seconds=args.rss_average_window_seconds,
             slope_threshold_mib_per_batch=args.slope_threshold_mib_per_batch,
             max_consecutive_timeouts=args.max_consecutive_timeouts,
+            max_consecutive_concurrency_retries=args.max_consecutive_concurrency_retries,
         )
         report["tests"].append(test3)
 
