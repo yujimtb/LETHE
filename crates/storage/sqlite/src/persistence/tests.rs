@@ -670,7 +670,60 @@ fn migration_ledger_records_current_schema_version() {
 }
 
 #[test]
-fn schema_v12_converges_from_fresh_v9_and_v10_upgrade_paths() {
+fn schema_v14_requires_v13_reconsent_prerequisite() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let database_path = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let store = SqlitePersistence::open(&database_path, &blob_dir, &[7; 32]).unwrap();
+    store
+        .conn
+        .execute(
+            "DELETE FROM schema_migrations WHERE version = ?1",
+            [SCHEMA_VERSION_RECONSENT_PRIVACY_INDEX],
+        )
+        .unwrap();
+    drop(store);
+
+    let result = SqlitePersistence::open(&database_path, &blob_dir, &[7; 32]);
+    assert!(matches!(
+        result,
+        Err(PersistenceError::SchemaInvariant(reason))
+            if reason == "schema migration v14 is recorded without prerequisite v13"
+    ));
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn reconsent_privacy_reverse_index_tracks_subject_and_identifier_keys() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    let mut observation = sample_observation();
+    observation.payload["email"] = serde_json::json!("person@example.test");
+    store.append_observation_idempotent(&observation).unwrap();
+
+    assert_eq!(
+        store
+            .observations_for_privacy_key("entity:test")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .observations_for_privacy_key("person@example.test")
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn schema_v14_converges_from_fresh_v12_and_v13_upgrade_paths() {
     let fresh_tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let fresh = SqlitePersistence::open(
         &fresh_tmp.join("test.sqlite3"),
@@ -697,18 +750,22 @@ fn schema_v12_converges_from_fresh_v9_and_v10_upgrade_paths() {
             "privacy_projection_visibility".to_owned(),
         ),
         (
+            SCHEMA_VERSION_RECONSENT_PRIVACY_INDEX,
+            "reconsent_privacy_reverse_index".to_owned(),
+        ),
+        (
             SCHEMA_VERSION_CUTOVER_BRIDGE,
             "v1_v2_cutover_bridge".to_owned(),
         ),
     ];
-    assert_eq!(migration_ledger(&fresh), current_ledger.clone());
+    assert_eq!(migration_ledger(&fresh), current_ledger);
     drop(fresh);
 
-    let v9_tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let v12_tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     {
         let seed = SqlitePersistence::open(
-            &v9_tmp.join("test.sqlite3"),
-            &v9_tmp.join("blobs"),
+            &v12_tmp.join("test.sqlite3"),
+            &v12_tmp.join("blobs"),
             &[7; 32],
         )
         .unwrap();
@@ -717,93 +774,91 @@ fn schema_v12_converges_from_fresh_v9_and_v10_upgrade_paths() {
         seed.conn
             .execute_batch(
                 "
-                DROP TABLE operational_event_stats;
-                DROP INDEX audit_events_timestamp_id;
-                DROP TABLE projection_manifest_fields;
-                DROP TABLE observation_stats;
-                DELETE FROM schema_migrations WHERE version >= 10;
+                DROP TRIGGER cutover_transition_log_no_update;
+                DROP TRIGGER cutover_transition_log_no_delete;
+                DROP INDEX cutover_credentials_active;
+                DROP INDEX cutover_transition_unit_seq;
+                DROP INDEX identity_bridge_gaps_source_append;
+                DROP INDEX identity_bridge_candidates_source_append;
+                DROP INDEX identity_bridge_candidates_key_append;
+                DROP TABLE cutover_unit_metrics;
+                DROP TABLE cutover_credentials;
+                DROP TABLE cutover_transition_log;
+                DROP TABLE identity_bridge_watermark;
+                DROP TABLE identity_bridge_gaps;
+                DROP TABLE identity_bridge_candidates;
+                DROP INDEX observation_privacy_keys_append;
+                DROP TABLE observation_privacy_keys;
+                DELETE FROM schema_migrations WHERE version >= 13;
                 ",
             )
             .unwrap();
     }
-    let v9 = SqlitePersistence::open(
-        &v9_tmp.join("test.sqlite3"),
-        &v9_tmp.join("blobs"),
+    let v12 = SqlitePersistence::open(
+        &v12_tmp.join("test.sqlite3"),
+        &v12_tmp.join("blobs"),
         &[7; 32],
     )
     .unwrap();
-    assert_eq!(schema_object_signature(&v9), fresh_signature);
-    assert_eq!(migration_ledger(&v9), current_ledger);
-    assert_eq!(v9.observation_stats().unwrap().count, 1);
-    drop(v9);
-
-    let v8_tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
-    {
-        let seed = SqlitePersistence::open(
-            &v8_tmp.join("test.sqlite3"),
-            &v8_tmp.join("blobs"),
-            &[7; 32],
-        )
-        .unwrap();
-        seed.append_observation_idempotent(&sample_observation())
-            .unwrap();
-        seed.conn
-            .execute_batch(
-                "
-                DROP INDEX observations_identity_append;
-                DROP TABLE operational_event_stats;
-                DROP INDEX audit_events_timestamp_id;
-                DROP TABLE projection_manifest_fields;
-                DROP TABLE observation_stats;
-                DELETE FROM schema_migrations WHERE version >= 9;
-                INSERT INTO schema_migrations (version, name, applied_at)
-                VALUES (8, 'global_observation_identity_registry', '2026-07-22T00:00:00Z');
-                ",
-            )
-            .unwrap();
-    }
-    let v8 = SqlitePersistence::open(
-        &v8_tmp.join("test.sqlite3"),
-        &v8_tmp.join("blobs"),
-        &[7; 32],
-    )
-    .unwrap();
-    assert_eq!(schema_object_signature(&v8), fresh_signature);
+    assert_eq!(schema_object_signature(&v12), fresh_signature);
+    assert_eq!(migration_ledger(&v12), current_ledger);
+    assert_eq!(v12.observation_stats().unwrap().count, 1);
     assert_eq!(
-        migration_ledger(&v8),
-        vec![
-            (8, "global_observation_identity_registry".to_owned()),
-            (
-                SCHEMA_VERSION_IDENTITY_LOOKUP_INDEX,
-                "observation_identity_lookup_index".to_owned(),
-            ),
-            (
-                SCHEMA_VERSION_LOCK_SPLIT_SCALARS,
-                "append_commit_lock_split_scalars".to_owned(),
-            ),
-            (
-                SCHEMA_VERSION_KEYSET_READS,
-                "indexed_keyset_reads".to_owned()
-            ),
-            (
-                SCHEMA_VERSION_PRIVACY_PROJECTION,
-                "privacy_projection_visibility".to_owned(),
-            ),
-            (
-                SCHEMA_VERSION_CUTOVER_BRIDGE,
-                "v1_v2_cutover_bridge".to_owned(),
-            ),
-        ]
+        v12.observations_for_privacy_key("entity:test")
+            .unwrap()
+            .len(),
+        1
     );
-    assert_eq!(v8.observation_stats().unwrap().count, 1);
+    drop(v12);
+
+    let v13_tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    {
+        let seed = SqlitePersistence::open(
+            &v13_tmp.join("test.sqlite3"),
+            &v13_tmp.join("blobs"),
+            &[7; 32],
+        )
+        .unwrap();
+        seed.append_observation_idempotent(&sample_observation())
+            .unwrap();
+        seed.conn
+            .execute_batch(
+                "
+                DROP TRIGGER cutover_transition_log_no_update;
+                DROP TRIGGER cutover_transition_log_no_delete;
+                DROP INDEX cutover_credentials_active;
+                DROP INDEX cutover_transition_unit_seq;
+                DROP INDEX identity_bridge_gaps_source_append;
+                DROP INDEX identity_bridge_candidates_source_append;
+                DROP INDEX identity_bridge_candidates_key_append;
+                DROP TABLE cutover_unit_metrics;
+                DROP TABLE cutover_credentials;
+                DROP TABLE cutover_transition_log;
+                DROP TABLE identity_bridge_watermark;
+                DROP TABLE identity_bridge_gaps;
+                DROP TABLE identity_bridge_candidates;
+                DELETE FROM schema_migrations WHERE version = 14;
+                ",
+            )
+            .unwrap();
+    }
+    let v13 = SqlitePersistence::open(
+        &v13_tmp.join("test.sqlite3"),
+        &v13_tmp.join("blobs"),
+        &[7; 32],
+    )
+    .unwrap();
+    assert_eq!(schema_object_signature(&v13), fresh_signature);
+    assert_eq!(migration_ledger(&v13), current_ledger);
+    assert_eq!(v13.observation_stats().unwrap().count, 1);
 
     let _ = fs::remove_dir_all(fresh_tmp);
-    let _ = fs::remove_dir_all(v9_tmp);
-    let _ = fs::remove_dir_all(v8_tmp);
+    let _ = fs::remove_dir_all(v12_tmp);
+    let _ = fs::remove_dir_all(v13_tmp);
 }
 
 #[test]
-fn schema_v12_upgrades_true_v11_operational_event_shape() {
+fn schema_v13_upgrades_true_v11_operational_event_shape() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let database_path = tmp.join("operational.sqlite3");
     let blob_dir = tmp.join("blobs");
@@ -2828,7 +2883,7 @@ fn cutover_state_fold_rejects_invalid_transition_log() {
 }
 
 #[test]
-fn schema_v14_upgrades_true_v12_cutover_shape() {
+fn schema_v14_upgrades_true_v13_cutover_shape() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let database_path = tmp.join("test.sqlite3");
     let blob_dir = tmp.join("blobs");
@@ -2857,6 +2912,17 @@ fn schema_v14_upgrades_true_v12_cutover_shape() {
             .unwrap();
     }
     let reopened = SqlitePersistence::open(&database_path, &blob_dir, &[7; 32]).unwrap();
+    assert_eq!(
+        reopened
+            .conn
+            .query_row(
+                "SELECT name FROM schema_migrations WHERE version = 13",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "reconsent_privacy_reverse_index"
+    );
     assert_eq!(
         reopened
             .conn

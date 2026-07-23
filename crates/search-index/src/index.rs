@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -6,8 +6,10 @@ use std::sync::{Mutex, MutexGuard};
 
 use chrono::{DateTime, Utc};
 use lethe_api::api::grep::{GrepError, GrepRecord, normalize};
-use lethe_core::domain::RetractionTarget;
-use lethe_projection_corpus::{CorpusProjector, CorpusRecord, linked_form_sheet_id};
+use lethe_core::domain::{
+    ConsentDecision, RetractionTarget, consent_decision_from_observation, consent_decision_order,
+};
+use lethe_projection_corpus::{CorpusProjector, CorpusRecord, PrivacyFilter, linked_form_sheet_id};
 use lethe_storage_api::ObservationStats;
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::TermQuery;
@@ -26,56 +28,131 @@ const CURRENT_FILE: &str = "CURRENT";
 const CURRENT_TMP_FILE: &str = "CURRENT.tmp";
 pub const MIN_WRITER_HEAP_BYTES: usize = 15_000_000;
 
-fn invalidated_source_object_ids(
-    observations: &[lethe_storage_api::StoredObservation],
-) -> HashSet<String> {
-    let mut invalidated = HashSet::new();
-    for stored in observations {
-        if let Some(value) = stored.observation.meta.get("retracts")
-            && let Ok(target) = RetractionTarget::from_value(value)
-        {
-            if let Some(source_object_id) = target.source_object_id {
-                invalidated.insert(source_object_id);
-            }
-            if let Some(observation_id) = target.observation_id {
-                invalidated.insert(observation_id.as_str().to_owned());
-            }
-        }
-        if stored.observation.schema.as_str() == "schema:consent-decision"
-            && stored
-                .observation
-                .payload
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                == Some("opted_out")
-        {
-            invalidated.insert(stored.observation.subject.as_str().to_owned());
-            if let Some(identifier) = stored
-                .observation
-                .payload
-                .get("identifier")
-                .and_then(serde_json::Value::as_str)
-            {
-                invalidated.insert(identifier.to_owned());
-            }
-        }
-    }
-    invalidated
+#[derive(Debug, Clone, Default)]
+struct PrivacyIndexState {
+    consent_by_subject: BTreeMap<String, ConsentDecision>,
+    consent_by_identifier: BTreeMap<String, ConsentDecision>,
+    retracted_observation_ids: BTreeSet<String>,
+    retracted_source_object_ids: BTreeSet<String>,
 }
 
-fn record_is_invalidated(record: &CorpusRecord, invalidated: &HashSet<String>) -> bool {
-    let mut keys = record
-        .metadata
-        .get("privacy_keys")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flat_map(|values| values.iter().filter_map(serde_json::Value::as_str));
-    record
-        .metadata
-        .get("source_object_id")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|id| invalidated.contains(id))
-        || keys.any(|key| invalidated.contains(key))
+#[derive(Debug, Default)]
+struct PrivacyDelta {
+    invalidated: HashSet<String>,
+    validation_keys: HashSet<String>,
+}
+
+struct DeltaContext<'a> {
+    invalidated_source_object_ids: &'a HashSet<String>,
+    linked_sheet_ids: &'a HashSet<String>,
+    last_append_seq: u64,
+    observation_count: u64,
+    projection_watermark: String,
+    privacy_validation_keys: &'a HashSet<String>,
+    privacy_state: Option<&'a PrivacyIndexState>,
+}
+
+impl PrivacyIndexState {
+    fn from_metadata(metadata: &IndexCommitMetadata) -> Self {
+        Self {
+            consent_by_subject: metadata.consent_by_subject.clone(),
+            consent_by_identifier: metadata.consent_by_identifier.clone(),
+            retracted_observation_ids: metadata.retracted_observation_ids.iter().cloned().collect(),
+            retracted_source_object_ids: metadata
+                .retracted_source_object_ids
+                .iter()
+                .cloned()
+                .collect(),
+        }
+    }
+
+    fn apply(&mut self, observations: &[lethe_storage_api::StoredObservation]) -> PrivacyDelta {
+        let mut delta = PrivacyDelta::default();
+        for stored in observations {
+            let observation = &stored.observation;
+            if let Some(value) = observation.meta.get("retracts")
+                && let Ok(target) = RetractionTarget::from_value(value)
+            {
+                if let Some(source_object_id) = target.source_object_id {
+                    delta.invalidated.insert(source_object_id.clone());
+                    delta.validation_keys.insert(source_object_id.clone());
+                    self.retracted_source_object_ids.insert(source_object_id);
+                }
+                if let Some(observation_id) = target.observation_id {
+                    delta.invalidated.insert(observation_id.as_str().to_owned());
+                    delta
+                        .validation_keys
+                        .insert(observation_id.as_str().to_owned());
+                    self.retracted_observation_ids
+                        .insert(observation_id.as_str().to_owned());
+                }
+            }
+            let Some(decision) = consent_decision_from_observation(observation) else {
+                continue;
+            };
+            if update_latest_consent(
+                &mut self.consent_by_subject,
+                decision.subject.clone(),
+                decision.clone(),
+            ) {
+                delta.invalidated.insert(decision.subject.clone());
+            }
+            if let Some(identifier) = decision.identifier.clone()
+                && update_latest_consent(
+                    &mut self.consent_by_identifier,
+                    identifier.clone(),
+                    decision,
+                )
+            {
+                delta.invalidated.insert(identifier);
+            }
+        }
+        delta
+    }
+
+    fn filter(&self) -> PrivacyFilter {
+        PrivacyFilter::from_materialized_state(
+            &self.consent_by_subject,
+            &self.consent_by_identifier,
+            &self.retracted_observation_ids,
+            &self.retracted_source_object_ids,
+        )
+    }
+
+    fn write_to_metadata(&self, metadata: &mut IndexCommitMetadata) {
+        metadata.consent_by_subject = self.consent_by_subject.clone();
+        metadata.consent_by_identifier = self.consent_by_identifier.clone();
+        metadata.retracted_observation_ids =
+            self.retracted_observation_ids.iter().cloned().collect();
+        metadata.retracted_source_object_ids =
+            self.retracted_source_object_ids.iter().cloned().collect();
+    }
+}
+
+fn update_latest_consent(
+    index: &mut BTreeMap<String, ConsentDecision>,
+    key: String,
+    decision: ConsentDecision,
+) -> bool {
+    match index.get(&key) {
+        Some(current)
+            if consent_decision_order(
+                current.published,
+                current.recorded_at,
+                current.observation_id.as_str(),
+            ) >= consent_decision_order(
+                decision.published,
+                decision.recorded_at,
+                decision.observation_id.as_str(),
+            ) =>
+        {
+            false
+        }
+        _ => {
+            index.insert(key, decision);
+            true
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -226,6 +303,7 @@ impl IndexRoot {
         let (generation, index) = self.create_generation()?;
         cursor = 0;
         let mut observation_count = 0_u64;
+        let mut privacy_state = PrivacyIndexState::default();
         loop {
             let mut page = store.observation_page(cursor, page_size)?;
             validate_observation_page(&page, cursor, page_size)?;
@@ -237,13 +315,26 @@ impl IndexRoot {
             if page.is_empty() {
                 break;
             }
-            let invalidated = invalidated_source_object_ids(&page);
-            let records = page
+            let privacy_delta = privacy_state.apply(&page);
+            let invalidated = privacy_delta.invalidated;
+            let mut candidates = page
                 .iter()
+                .map(|stored| (stored.observation.id.as_str().to_owned(), stored.clone()))
+                .collect::<BTreeMap<_, _>>();
+            for privacy_key in &invalidated {
+                for stored in store.observations_for_privacy_key(privacy_key)? {
+                    candidates
+                        .entry(stored.observation.id.as_str().to_owned())
+                        .or_insert(stored);
+                }
+            }
+            let privacy_filter = privacy_state.filter();
+            let records = candidates
+                .values()
+                .filter(|stored| privacy_filter.visible(&stored.observation))
                 .flat_map(|stored| {
                     projector.project_observation(&stored.observation, &linked_sheet_ids)
                 })
-                .filter(|record| !record_is_invalidated(record, &invalidated))
                 .collect::<Vec<_>>();
             observation_count = observation_count
                 .checked_add(page.len() as u64)
@@ -253,11 +344,15 @@ impl IndexRoot {
             cursor = page.last().expect("non-empty page").append_seq;
             index.apply_delta(
                 &records,
-                &invalidated,
-                &linked_sheet_ids,
-                cursor,
-                observation_count,
-                format!("proj:corpus:{cursor}"),
+                DeltaContext {
+                    invalidated_source_object_ids: &invalidated,
+                    linked_sheet_ids: &linked_sheet_ids,
+                    last_append_seq: cursor,
+                    observation_count,
+                    projection_watermark: format!("proj:corpus:{cursor}"),
+                    privacy_validation_keys: &privacy_delta.validation_keys,
+                    privacy_state: Some(&privacy_state),
+                },
             )?;
             if cursor >= high_water {
                 break;
@@ -598,6 +693,10 @@ impl PersistentCorpusIndex {
             record_count: 0,
             source_type_counts: BTreeMap::new(),
             linked_form_sheet_ids: Vec::new(),
+            consent_by_subject: BTreeMap::new(),
+            consent_by_identifier: BTreeMap::new(),
+            retracted_observation_ids: Vec::new(),
+            retracted_source_object_ids: Vec::new(),
         };
         let this = Self {
             path,
@@ -713,11 +812,15 @@ impl PersistentCorpusIndex {
             .collect::<HashSet<_>>();
         self.apply_delta_locked(
             records,
-            &HashSet::new(),
-            &linked_sheet_ids,
-            last_append_seq,
-            observation_count,
-            projection_watermark,
+            DeltaContext {
+                invalidated_source_object_ids: &HashSet::new(),
+                linked_sheet_ids: &linked_sheet_ids,
+                last_append_seq,
+                observation_count,
+                projection_watermark,
+                privacy_validation_keys: &HashSet::new(),
+                privacy_state: None,
+            },
         )
     }
 
@@ -769,14 +872,29 @@ impl PersistentCorpusIndex {
                     newly_linked.insert(sheet_id);
                 }
             }
-            let mut invalidated = invalidated_source_object_ids(&page);
-            invalidated.extend(newly_linked.iter().cloned());
-            let records = page
+            let mut invalidated = HashSet::new();
+            let mut privacy_state = PrivacyIndexState::from_metadata(&metadata);
+            let privacy_delta = privacy_state.apply(&page);
+            invalidated.extend(privacy_delta.invalidated);
+            let mut candidates = page
                 .iter()
+                .map(|stored| (stored.observation.id.as_str().to_owned(), stored.clone()))
+                .collect::<BTreeMap<_, _>>();
+            for privacy_key in &invalidated {
+                for stored in store.observations_for_privacy_key(privacy_key)? {
+                    candidates
+                        .entry(stored.observation.id.as_str().to_owned())
+                        .or_insert(stored);
+                }
+            }
+            let privacy_filter = privacy_state.filter();
+            invalidated.extend(newly_linked.iter().cloned());
+            let records = candidates
+                .values()
+                .filter(|stored| privacy_filter.visible(&stored.observation))
                 .flat_map(|stored| {
                     projector.project_observation(&stored.observation, &linked_sheet_ids)
                 })
-                .filter(|record| !record_is_invalidated(record, &invalidated))
                 .collect::<Vec<_>>();
             let last_append_seq = page.last().expect("non-empty page").append_seq;
             let observation_count = metadata
@@ -787,11 +905,15 @@ impl PersistentCorpusIndex {
                 })?;
             self.apply_delta_locked(
                 &records,
-                &invalidated,
-                &linked_sheet_ids,
-                last_append_seq,
-                observation_count,
-                format!("proj:corpus:{last_append_seq}"),
+                DeltaContext {
+                    invalidated_source_object_ids: &invalidated,
+                    linked_sheet_ids: &linked_sheet_ids,
+                    last_append_seq,
+                    observation_count,
+                    projection_watermark: format!("proj:corpus:{last_append_seq}"),
+                    privacy_validation_keys: &privacy_delta.validation_keys,
+                    privacy_state: Some(&privacy_state),
+                },
             )?;
         }
     }
@@ -799,32 +921,26 @@ impl PersistentCorpusIndex {
     fn apply_delta(
         &self,
         records: &[CorpusRecord],
-        invalidated_source_object_ids: &HashSet<String>,
-        linked_sheet_ids: &HashSet<String>,
-        last_append_seq: u64,
-        observation_count: u64,
-        projection_watermark: String,
+        context: DeltaContext<'_>,
     ) -> Result<(), IndexError> {
         let _mutation = self.mutation_lock()?;
-        self.apply_delta_locked(
-            records,
-            invalidated_source_object_ids,
-            linked_sheet_ids,
-            last_append_seq,
-            observation_count,
-            projection_watermark,
-        )
+        self.apply_delta_locked(records, context)
     }
 
     fn apply_delta_locked(
         &self,
         records: &[CorpusRecord],
-        invalidated_source_object_ids: &HashSet<String>,
-        linked_sheet_ids: &HashSet<String>,
-        last_append_seq: u64,
-        observation_count: u64,
-        projection_watermark: String,
+        context: DeltaContext<'_>,
     ) -> Result<(), IndexError> {
+        let DeltaContext {
+            invalidated_source_object_ids,
+            linked_sheet_ids,
+            last_append_seq,
+            observation_count,
+            projection_watermark,
+            privacy_validation_keys,
+            privacy_state,
+        } = context;
         let previous = self.metadata()?;
         if last_append_seq < previous.last_append_seq {
             return Err(IndexError::IncompatibleMetadata(format!(
@@ -893,7 +1009,7 @@ impl PersistentCorpusIndex {
         }
         let mut linked_form_sheet_ids = linked_sheet_ids.iter().cloned().collect::<Vec<_>>();
         linked_form_sheet_ids.sort_unstable();
-        let metadata = IndexCommitMetadata {
+        let mut metadata = IndexCommitMetadata {
             last_append_seq,
             observation_count,
             projection_watermark,
@@ -903,6 +1019,9 @@ impl PersistentCorpusIndex {
             linked_form_sheet_ids,
             ..previous
         };
+        if let Some(privacy_state) = privacy_state {
+            privacy_state.write_to_metadata(&mut metadata);
+        }
         commit_with_metadata(&mut writer, &metadata)?;
         drop(writer);
         let mut published_metadata = self
@@ -913,7 +1032,7 @@ impl PersistentCorpusIndex {
         *published_metadata = metadata;
         drop(published_metadata);
         self.validate_record_count()?;
-        self.validate_incremental_privacy(invalidated_source_object_ids)?;
+        self.validate_incremental_privacy(privacy_validation_keys)?;
         Ok(())
     }
 
@@ -1320,6 +1439,21 @@ mod tests {
             self.active_page_calls.fetch_sub(1, Ordering::SeqCst);
             Ok(page)
         }
+
+        fn observations_for_privacy_key(
+            &self,
+            privacy_key: &str,
+        ) -> StorageResult<Vec<StoredObservation>> {
+            Ok(self
+                .rows
+                .iter()
+                .filter(|row| {
+                    lethe_core::domain::observation_privacy_keys(&row.observation)
+                        .contains(privacy_key)
+                })
+                .cloned()
+                .collect())
+        }
     }
 
     fn temp_root() -> PathBuf {
@@ -1622,6 +1756,46 @@ mod tests {
         index.catch_up(&store, &projector, 10).unwrap();
         assert_eq!(index.record_count().unwrap(), 0);
 
+        let mut reconsent = observation(
+            "reconsent",
+            "schema:consent-decision",
+            serde_json::json!({"status": "unrestricted", "identifier": "person-2"}),
+        );
+        reconsent.subject = EntityRef::new("person:2");
+        reconsent.published = "2026-01-03T00:00:00Z".parse().unwrap();
+        reconsent.recorded_at = "2026-01-03T00:00:01Z".parse().unwrap();
+        store.append_observation_idempotent(&reconsent).unwrap();
+        index.catch_up(&store, &projector, 10).unwrap();
+        assert_eq!(index.record_count().unwrap(), 1);
+
+        let mut late_old_opt_out = observation(
+            "late-old-opt-out",
+            "schema:consent-decision",
+            serde_json::json!({"status": "opted_out", "identifier": "person-2"}),
+        );
+        late_old_opt_out.subject = EntityRef::new("person:2");
+        late_old_opt_out.published = "2026-01-02T00:00:00Z".parse().unwrap();
+        late_old_opt_out.recorded_at = "2026-01-04T00:00:00Z".parse().unwrap();
+        store
+            .append_observation_idempotent(&late_old_opt_out)
+            .unwrap();
+        index.catch_up(&store, &projector, 10).unwrap();
+        assert_eq!(index.record_count().unwrap(), 1);
+
+        let mut reconsent_retracted = observation(
+            "reconsent-retracted",
+            "schema:consent-decision",
+            serde_json::json!({"status": "unrestricted"}),
+        );
+        reconsent_retracted.subject = target.subject.clone();
+        reconsent_retracted.published = "2026-01-05T00:00:00Z".parse().unwrap();
+        reconsent_retracted.recorded_at = "2026-01-05T00:00:01Z".parse().unwrap();
+        store
+            .append_observation_idempotent(&reconsent_retracted)
+            .unwrap();
+        index.catch_up(&store, &projector, 10).unwrap();
+        assert_eq!(index.record_count().unwrap(), 1);
+
         drop(index);
         drop(store);
         fs::remove_dir_all(root_path).unwrap();
@@ -1669,11 +1843,15 @@ mod tests {
         index
             .apply_delta(
                 &[],
-                &HashSet::from(["sheet-many".to_owned()]),
-                &HashSet::new(),
-                301,
-                301,
-                "proj:corpus:301".into(),
+                DeltaContext {
+                    invalidated_source_object_ids: &HashSet::from(["sheet-many".to_owned()]),
+                    linked_sheet_ids: &HashSet::new(),
+                    last_append_seq: 301,
+                    observation_count: 301,
+                    projection_watermark: "proj:corpus:301".into(),
+                    privacy_validation_keys: &HashSet::new(),
+                    privacy_state: None,
+                },
             )
             .unwrap();
         assert_eq!(index.record_count().unwrap(), 0);
@@ -1990,6 +2168,13 @@ mod tests {
                     InvalidPage::Oversized => self.rows.iter().take(limit + 1).cloned().collect(),
                     InvalidPage::NonMonotonic => self.rows.clone(),
                 })
+            }
+
+            fn observations_for_privacy_key(
+                &self,
+                _privacy_key: &str,
+            ) -> StorageResult<Vec<StoredObservation>> {
+                Ok(Vec::new())
             }
         }
 

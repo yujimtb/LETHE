@@ -306,6 +306,8 @@ impl SqlitePersistence {
         let keyset_reads_recorded = self.schema_migration_recorded(SCHEMA_VERSION_KEYSET_READS)?;
         let privacy_projection_recorded =
             self.schema_migration_recorded(SCHEMA_VERSION_PRIVACY_PROJECTION)?;
+        let reconsent_privacy_index_recorded =
+            self.schema_migration_recorded(SCHEMA_VERSION_RECONSENT_PRIVACY_INDEX)?;
         let cutover_bridge_recorded =
             self.schema_migration_recorded(SCHEMA_VERSION_CUTOVER_BRIDGE)?;
 
@@ -324,9 +326,14 @@ impl SqlitePersistence {
                 "schema migration v12 is recorded without prerequisite v11".to_owned(),
             ));
         }
-        if cutover_bridge_recorded && !privacy_projection_recorded {
+        if reconsent_privacy_index_recorded && !privacy_projection_recorded {
             return Err(PersistenceError::SchemaInvariant(
-                "schema migration v14 is recorded without prerequisite v12".to_owned(),
+                "schema migration v13 is recorded without prerequisite v12".to_owned(),
+            ));
+        }
+        if cutover_bridge_recorded && !reconsent_privacy_index_recorded {
+            return Err(PersistenceError::SchemaInvariant(
+                "schema migration v14 is recorded without prerequisite v13".to_owned(),
             ));
         }
 
@@ -368,6 +375,16 @@ impl SqlitePersistence {
             self.require_privacy_projection_schema_objects()?;
         } else {
             self.apply_privacy_projection_migration()?;
+        }
+
+        if reconsent_privacy_index_recorded {
+            self.require_schema_migration_name(
+                SCHEMA_VERSION_RECONSENT_PRIVACY_INDEX,
+                "reconsent_privacy_reverse_index",
+            )?;
+            self.require_reconsent_privacy_index_schema_objects()?;
+        } else {
+            self.apply_reconsent_privacy_index_migration()?;
         }
 
         if cutover_bridge_recorded {
@@ -673,6 +690,62 @@ impl SqlitePersistence {
         Ok(())
     }
 
+    fn apply_reconsent_privacy_index_migration(&self) -> Result<(), PersistenceError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS observation_privacy_keys (
+                privacy_key TEXT NOT NULL,
+                observation_id TEXT NOT NULL,
+                append_seq INTEGER NOT NULL,
+                PRIMARY KEY (privacy_key, observation_id)
+            );
+            CREATE INDEX IF NOT EXISTS observation_privacy_keys_append
+                ON observation_privacy_keys (privacy_key, append_seq);
+            ",
+        )?;
+        let rows = {
+            let mut statement = transaction.prepare(
+                "SELECT id, append_seq, observation_json
+                 FROM observations ORDER BY append_seq",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (observation_id, append_seq, json) in rows {
+            let observation: Observation = serde_json::from_str(&json)?;
+            if observation.id.as_str() != observation_id {
+                return Err(PersistenceError::SchemaInvariant(format!(
+                    "observation {} disagrees with stored payload {}",
+                    observation_id,
+                    observation.id.as_str()
+                )));
+            }
+            for privacy_key in lethe_core::domain::observation_privacy_keys(&observation) {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO observation_privacy_keys (
+                        privacy_key, observation_id, append_seq
+                     ) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![privacy_key, observation_id, append_seq],
+                )?;
+            }
+        }
+        record_schema_migration(
+            &transaction,
+            SCHEMA_VERSION_RECONSENT_PRIVACY_INDEX,
+            "reconsent_privacy_reverse_index",
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn backfill_projection_manifest_fields(
         &self,
         transaction: &rusqlite::Transaction<'_>,
@@ -833,6 +906,16 @@ impl SqlitePersistence {
             ("index", "cutover_credentials_active"),
             ("trigger", "cutover_transition_log_no_update"),
             ("trigger", "cutover_transition_log_no_delete"),
+        ] {
+            self.require_schema_object(object_type, object_name)?;
+        }
+        Ok(())
+    }
+
+    fn require_reconsent_privacy_index_schema_objects(&self) -> Result<(), PersistenceError> {
+        for (object_type, object_name) in [
+            ("table", "observation_privacy_keys"),
+            ("index", "observation_privacy_keys_append"),
         ] {
             self.require_schema_object(object_type, object_name)?;
         }

@@ -18,10 +18,11 @@ use lethe_api::api::grep::GrepRequest;
 use lethe_core::domain::supplemental::InputAnchorSet;
 
 use super::{
-    AppCore, AppService, GoogleSourceRuntime, ImportOutcome, SearchJobStatus, SelfHostError,
-    SlackSourceRuntime, classify_slack_ingress, discovered_slack_threads,
-    extract_slide_text_fragments, infer_profile_name_from_fragments, latest_revision_to_capture,
-    namespace_draft, non_empty_state, ranked_self_intro_slide_indices, thread_root_ts,
+    AppCore, AppService, CompactProjectionState, GoogleSourceRuntime, ImportOutcome,
+    SearchJobStatus, SelfHostError, SlackSourceRuntime, classify_slack_ingress,
+    discovered_slack_threads, extract_slide_text_fragments, infer_profile_name_from_fragments,
+    latest_revision_to_capture, namespace_draft, non_empty_state, ranked_self_intro_slide_indices,
+    thread_root_ts,
 };
 use crate::self_host::config::{
     ApiTokenConfig, CorpusProjectionConfig, FreshnessConfig, GoogleConfig, JsonWebKey,
@@ -32,10 +33,13 @@ use crate::self_host::google::HttpGoogleSlidesClient;
 use crate::self_host::slack::HttpSlackClient;
 use lethe_core::domain::{
     ActorRef, AuthorityModel, CaptureModel, EntityRef, IdempotencyKey, IngestResult, Mutability,
-    Observation, ObserverRef, ProjectionRef, SchemaRef, SemVer, SourceSystemRef, SupplementalId,
-    SupplementalRecord,
+    Observation, ObservationId, ObserverRef, ProjectionRef, SchemaRef, SemVer, SourceSystemRef,
+    SupplementalId, SupplementalRecord,
 };
 use lethe_derivation_gemini::GeminiSlideAnalyzer;
+use lethe_engine::lake::ConsentDecisionResolver;
+use lethe_policy::governance::types::ConsentStatus;
+use lethe_projection_corpus::PrivacyFilter;
 use lethe_runtime::runtime::partition::RoutingKeyOrder;
 use lethe_storage_api::{
     OperationalAppendOutcome, OperationalAppendRequest, SlackThreadKey, StoredObservation,
@@ -52,6 +56,49 @@ fn non_empty_state_filters_blank_values() {
         non_empty_state(Some("1234567890.123456".to_string())).as_deref(),
         Some("1234567890.123456")
     );
+}
+
+#[test]
+fn capture_gate_and_projection_use_identical_latest_consent_ordering() {
+    let target = Observation {
+        id: Observation::new_id(),
+        schema: SchemaRef::new("schema:claude-message"),
+        schema_version: SemVer::new("1.0.0"),
+        observer: ObserverRef::new("obs:test"),
+        source_system: Some(SourceSystemRef::new("sys:claude-ai")),
+        actor: None,
+        authority_model: AuthorityModel::LakeAuthoritative,
+        capture_model: CaptureModel::Event,
+        subject: EntityRef::new("person:1"),
+        target: None,
+        payload: serde_json::json!({"text": "consent parity", "email": "person-1"}),
+        attachments: Vec::new(),
+        published: "2026-01-01T00:00:00Z".parse().unwrap(),
+        recorded_at: "2026-01-01T00:00:01Z".parse().unwrap(),
+        consent: None,
+        idempotency_key: IdempotencyKey::new("parity-target"),
+        meta: serde_json::json!({}),
+    };
+    let decision = |id: &str, status: &str, published: &str| {
+        let mut observation = target.clone();
+        observation.id = ObservationId::new(id);
+        observation.schema = SchemaRef::new("schema:consent-decision");
+        observation.payload = serde_json::json!({
+            "status": status,
+            "identifier": "person-1",
+        });
+        observation.published = published.parse().unwrap();
+        observation.recorded_at = observation.published + chrono::Duration::seconds(1);
+        observation
+    };
+    let newest_unrestricted = decision("consent:new", "unrestricted", "2026-01-03T00:00:00Z");
+    let late_old_opt_out = decision("consent:old", "opted_out", "2026-01-02T00:00:00Z");
+    let observations = vec![target.clone(), newest_unrestricted, late_old_opt_out];
+    let compact = CompactProjectionState::build(&observations).unwrap();
+    let capture_status = compact.resolve(&target.subject, &["person-1".to_owned()], None);
+    let projection = PrivacyFilter::from_observations(&observations);
+    assert_eq!(capture_status, ConsentStatus::Unrestricted);
+    assert!(projection.visible(&target));
 }
 
 #[test]
@@ -295,6 +342,80 @@ fn operational_ledger_survives_interface_service_restart() {
             .len(),
         1
     );
+}
+
+#[test]
+fn v9_manifest_with_legacy_opt_out_fields_rebuilds_on_restart() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-self-host-v9-manifest-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let config = test_config(db.clone(), blobs.clone());
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let target = wave2_slack_observation(
+        "U-V9",
+        "V9 manifest target",
+        Some("v9@example.test"),
+        "1.000001",
+        "2026-07-12T00:00:00Z".parse().unwrap(),
+    );
+    persistence.persist_observation(&target).unwrap();
+    drop(persistence);
+
+    let service = AppService::bootstrap(config.clone()).unwrap();
+    service.wait_for_non_corpus_rebuild().unwrap();
+    let mut legacy_manifest = service
+        .persistence_lock()
+        .unwrap()
+        .projection_records(&ProjectionRef::new("proj:person-page"))
+        .unwrap()
+        .unwrap();
+    legacy_manifest["format_version"] = serde_json::json!(9);
+    let communication = legacy_manifest["communication_projection"]
+        .as_object_mut()
+        .unwrap();
+    communication.remove("consent_by_subject");
+    communication.remove("consent_by_identifier");
+    communication.remove("observation_ids_by_privacy_key");
+    communication.insert(
+        "opted_out_subjects".to_owned(),
+        serde_json::json!(["person:v9-legacy"]),
+    );
+    communication.insert(
+        "opted_out_sender_ids".to_owned(),
+        serde_json::json!(["U-V9"]),
+    );
+    service
+        .persistence_lock()
+        .unwrap()
+        .materialize_projection(&ProjectionRef::new("proj:person-page"), &legacy_manifest)
+        .unwrap();
+    drop(service);
+
+    let restarted = AppService::bootstrap(config).unwrap();
+    restarted.wait_for_non_corpus_rebuild().unwrap();
+    assert_eq!(
+        restarted
+            .non_corpus_rebuild_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    let rebuilt_manifest = restarted
+        .persistence_lock()
+        .unwrap()
+        .projection_records(&ProjectionRef::new("proj:person-page"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rebuilt_manifest["format_version"],
+        super::NON_CORPUS_MATERIALIZATION_VERSION
+    );
+    assert_eq!(restarted.reply_slo_response().unwrap().data.rows.len(), 1);
+
+    drop(restarted);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1631,7 +1752,7 @@ fn materialized_snapshot_selection_is_versioned_strict_and_stats_bound() {
             0
         )
         .unwrap()
-        .is_some()
+        .is_none()
     );
 
     let mut missing_version = value.clone();
@@ -2192,6 +2313,7 @@ struct TestComponentProjectionLookup {
     observations: std::collections::BTreeMap<String, lethe_storage_api::StoredObservation>,
     rows: std::collections::BTreeMap<String, lethe_storage_api::ProjectionItem>,
     requested_observations: std::cell::RefCell<Vec<String>>,
+    requested_privacy_keys: std::cell::RefCell<Vec<String>>,
 }
 
 impl super::ComponentProjectionLookup for TestComponentProjectionLookup {
@@ -2203,6 +2325,24 @@ impl super::ComponentProjectionLookup for TestComponentProjectionLookup {
             .borrow_mut()
             .push(observation_id.as_str().to_owned());
         Ok(self.observations.get(observation_id.as_str()).cloned())
+    }
+
+    fn observations_for_privacy_key(
+        &self,
+        privacy_key: &str,
+    ) -> Result<Vec<lethe_storage_api::StoredObservation>, SelfHostError> {
+        self.requested_privacy_keys
+            .borrow_mut()
+            .push(privacy_key.to_owned());
+        Ok(self
+            .observations
+            .values()
+            .filter(|stored| {
+                lethe_core::domain::observation_privacy_keys(&stored.observation)
+                    .contains(privacy_key)
+            })
+            .cloned()
+            .collect())
     }
 
     fn person_message_items(
@@ -2507,6 +2647,7 @@ fn component_projection_lookup(
             .collect(),
         rows,
         requested_observations: std::cell::RefCell::new(Vec::new()),
+        requested_privacy_keys: std::cell::RefCell::new(Vec::new()),
     }
 }
 
@@ -2747,6 +2888,98 @@ fn slack_identifier_consent_change_reprojects_component_and_matches_full_rebuild
     assert_eq!(
         serde_json::to_value(&core.person_components).unwrap(),
         serde_json::to_value(&full.person_components).unwrap()
+    );
+}
+
+#[test]
+fn communication_incremental_consent_repulls_after_state_restore() {
+    let initial_at = chrono::DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    let target = wave2_slack_observation(
+        "U-A",
+        "Affected",
+        Some("person@example.test"),
+        "1.000001",
+        initial_at,
+    );
+    let initial_stats = lethe_storage_api::ObservationStats {
+        count: 1,
+        max_append_seq: 1,
+    };
+    let mut initial_materialized = super::MaterializedProjectionSnapshot::build_at(
+        vec![target.clone()],
+        vec![],
+        vec![],
+        vec![],
+        initial_stats,
+        initial_at,
+    )
+    .unwrap();
+    initial_materialized.communication_projection = serde_json::from_value(
+        serde_json::to_value(&initial_materialized.communication_projection).unwrap(),
+    )
+    .unwrap();
+    let mut core =
+        AppCore::from_materialized(initial_materialized, vec![], vec![], vec![], vec![]).unwrap();
+    assert_eq!(core.communication_projection.len(), 1);
+
+    let opt_out = component_consent_observation(
+        "person@example.test",
+        "opted_out",
+        "restore-opt-out",
+        initial_at + chrono::Duration::minutes(1),
+    );
+    let all_after_opt_out = vec![target.clone(), opt_out.clone()];
+    let lookup_after_opt_out = component_projection_lookup(&all_after_opt_out, BTreeMap::new());
+    let opt_out_stats = lethe_storage_api::ObservationStats {
+        count: 2,
+        max_append_seq: 2,
+    };
+    super::apply_compact_incremental_delta(
+        &mut core,
+        std::slice::from_ref(&opt_out),
+        opt_out_stats,
+        initial_at + chrono::Duration::minutes(1),
+        &lookup_after_opt_out,
+    )
+    .unwrap();
+    assert!(core.communication_projection.is_empty());
+    assert!(
+        lookup_after_opt_out
+            .requested_privacy_keys
+            .borrow()
+            .iter()
+            .any(|key| key == "person@example.test")
+    );
+
+    let reconsent = component_consent_observation(
+        "person@example.test",
+        "unrestricted",
+        "restore-reconsent",
+        initial_at + chrono::Duration::minutes(2),
+    );
+    let all_after_reconsent = vec![target, opt_out, reconsent.clone()];
+    let lookup_after_reconsent = component_projection_lookup(&all_after_reconsent, BTreeMap::new());
+    let reconsent_stats = lethe_storage_api::ObservationStats {
+        count: 3,
+        max_append_seq: 3,
+    };
+    super::apply_compact_incremental_delta(
+        &mut core,
+        std::slice::from_ref(&reconsent),
+        reconsent_stats,
+        initial_at + chrono::Duration::minutes(2),
+        &lookup_after_reconsent,
+    )
+    .unwrap();
+    assert_eq!(core.communication_projection.len(), 1);
+    assert!(
+        lookup_after_reconsent
+            .requested_privacy_keys
+            .borrow()
+            .iter()
+            .any(|key| key == "person@example.test")
     );
 }
 

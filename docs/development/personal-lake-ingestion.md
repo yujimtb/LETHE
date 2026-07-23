@@ -211,16 +211,23 @@ registry primary-key index; the legacy observation fallback and the registry
 backfill both use this observation index, so identity lookup does not scan the
 corpus. Schema-v10 then adds the persisted observation and operational-event
 high-water scalars, per-field projection manifest table, and audit page index
-used by append-commit/lock-split. Fresh databases apply v9 then v10; a
-production v9 database applies only v10; a v8 database applies v9 then v10.
-All three paths are covered by a schema-signature convergence test.
-Schema v14 adds only the cutover bridge tables, append-only transition log,
-unit/version credential generations, and metrics. Its migration is transactional
-and idempotent; fresh databases and true-shape v12 upgrades are both covered.
-The transition log is replayed deterministically; an invalid phase or generation
-edge fails closed instead of being treated as current state.
-The parallel v13 migration remains outside this change and is not referenced
-by the v14 bridge DDL.
+used by append-commit/lock-split.
+
+The current chain is strictly schema v12 → v13 → v14. Schema v13 owns the
+`observation_privacy_keys` reverse index and backfills it from the append-only
+observation ledger; new appends and partition rebuilds maintain the same index.
+The consent projection uses it for targeted re-evaluation. The same release
+requires non-corpus communication manifests at format 10 and search-index
+metadata at format 3, so stale materializations/index generations are rebuilt
+or rejected by their existing version checks. Schema v14 then adds only the
+cutover bridge tables, append-only transition log, unit/version credential
+generations, and metrics. Its migration is transactional and idempotent, and
+checks v13 as its prerequisite before applying the bridge objects.
+
+Fresh databases, true-shape v12 upgrades, and true-shape v13 upgrades are
+covered by a schema-signature convergence test. The transition log is replayed
+deterministically; an invalid phase or generation edge fails closed instead of
+being treated as current state.
 
 `/health` and `/health/deep` execute their synchronous health and SQLite checks
 on Tokio's blocking pool, preserving the existing response and error contracts
