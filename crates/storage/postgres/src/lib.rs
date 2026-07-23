@@ -218,6 +218,13 @@ impl PostgresOperationalEventStore {
     }
 }
 
+fn unsupported_history_v2_append_error() -> StorageError {
+    StorageError::Backend(
+        "history v2 operational append requires a backend with cutover bridge support; use the SQLite Personal Lake backend"
+            .to_owned(),
+    )
+}
+
 impl OperationalEventStore for PostgresOperationalEventStore {
     fn data_space_id(&self) -> &DataSpaceId {
         &self.data_space_id
@@ -252,6 +259,15 @@ impl OperationalEventStore for PostgresOperationalEventStore {
         }
         transaction.commit().map_err(Self::backend)?;
         Ok(outcomes)
+    }
+
+    fn append_operational_events_v2_with_bridge(
+        &self,
+        _source_instance_id: &str,
+        _generation: Option<u64>,
+        _requests: &[OperationalAppendRequest],
+    ) -> StorageResult<Vec<OperationalAppendOutcome>> {
+        Err(unsupported_history_v2_append_error())
     }
 
     fn operational_event_stats(&self) -> StorageResult<OperationalEventStats> {
@@ -698,6 +714,17 @@ mod tests {
         assert!(validate_identifier("schema", "space_personal").is_ok());
         assert!(validate_identifier("schema", "space-personal").is_err());
         assert!(validate_identifier("schema", "space;drop schema public").is_err());
+    }
+
+    #[test]
+    fn postgres_history_v2_bridge_append_is_explicitly_unsupported() {
+        let error = unsupported_history_v2_append_error();
+        assert!(matches!(
+            error,
+            StorageError::Backend(reason)
+                if reason.contains("history v2 operational append requires a backend with cutover bridge support")
+                    && reason.contains("SQLite Personal Lake backend")
+        ));
     }
 
     #[test]

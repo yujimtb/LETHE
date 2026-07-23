@@ -2,11 +2,12 @@ use super::*;
 use chrono::Utc;
 
 use lethe_core::domain::{
-    ActorRef, AuthorityModel, CaptureModel, EntityRef, IdempotencyKey, Mutability, Observation,
-    ObserverRef, SchemaRef, SemVer, SourceSystemRef, SupplementalId, SupplementalRecord,
-    supplemental::InputAnchorSet,
+    ActorRef, AuthorityModel, CaptureModel, DataSpaceId, EntityRef, IdempotencyKey, Mutability,
+    Observation, ObserverRef, OperationalEventId, SchemaRef, SemVer, SourceSystemRef,
+    SupplementalId, SupplementalRecord, supplemental::InputAnchorSet,
 };
 use lethe_runtime::runtime::partition::{RoutingKeyOrder, routing_keyspec_json_for_order};
+use lethe_storage_api::{OperationalAppendRequest, OperationalEvent, OperationalEventStore};
 
 fn sample_observation() -> Observation {
     let canonical_json = serde_json::json!({
@@ -72,6 +73,59 @@ fn bridge_observation(
         "source_container": format!("{source_instance_id}:test"),
     });
     observation
+}
+
+fn history_identity(source_instance_id: &str, object_id: &str, canonical_json: &str) -> String {
+    bridge_identity(source_instance_id, object_id, canonical_json)
+}
+
+fn legacy_history_observation(
+    source_instance_id: &str,
+    source_session_id: &str,
+    canonical_json: &str,
+    identity_key: &str,
+) -> Observation {
+    let mut observation = sample_observation();
+    observation.schema = SchemaRef::new("schema:history-message");
+    observation.payload = serde_json::from_str(canonical_json).unwrap();
+    observation.idempotency_key = IdempotencyKey::new(identity_key);
+    observation.meta = serde_json::json!({
+        CANONICAL_JSON_META_KEY: canonical_json,
+        "source_container": source_session_id,
+        "source_instance_id": source_instance_id,
+    });
+    observation
+}
+
+fn history_event_request(
+    data_space_id: &DataSpaceId,
+    event_id: &str,
+    stream_id: &str,
+    observation: Observation,
+) -> OperationalAppendRequest {
+    let mut observation = observation;
+    observation
+        .meta
+        .as_object_mut()
+        .unwrap()
+        .insert("event_id".to_owned(), serde_json::json!(event_id));
+    let occurred_at = observation.published;
+    OperationalAppendRequest {
+        expected_stream_version: 0,
+        event: OperationalEvent {
+            event_id: OperationalEventId::new(event_id),
+            data_space_id: data_space_id.clone(),
+            stream_id: stream_id.to_owned(),
+            stream_version: 1,
+            event_type: "history.message_imported".to_owned(),
+            occurred_at,
+            actor_type: "history_source".to_owned(),
+            actor_id: Some("owner".to_owned()),
+            correlation_id: None,
+            causation_id: None,
+            observation,
+        },
+    }
 }
 
 fn bridge_identity(source_instance_id: &str, object_id: &str, canonical_json: &str) -> String {
@@ -2669,6 +2723,256 @@ fn identity_bridge_projection_is_incremental_idempotent_and_resumable() {
     assert_eq!(resolution.winner, Some(v1.id));
     assert_eq!(resolution.multiplicity, 1);
     assert!(!resolution.canonical_collision);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn legacy_history_message_is_resolved_by_v2_operational_append_without_ledger_delta() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let database = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let data_space_id = DataSpaceId::new("space:personal");
+    let store =
+        SqliteOperationalEventStore::open(data_space_id.clone(), &database, &blob_dir, &[7; 32])
+            .unwrap();
+    let source_instance_id = "codex-personal";
+    let source_session_id = "session-1";
+    let source_message_id = "message-1";
+    let object_id = format!("{source_session_id}:{source_message_id}");
+    let canonical_json = serde_json::json!({
+        "source_instance_id": source_instance_id,
+        "source_session_id": source_session_id,
+        "source_message_id": source_message_id,
+        "text": "hello"
+    })
+    .to_string();
+    let legacy = legacy_history_observation(
+        source_instance_id,
+        source_session_id,
+        &canonical_json,
+        "history-message:legacy",
+    );
+    let mut legacy = legacy;
+    legacy.meta.as_object_mut().unwrap().insert(
+        "data_space_id".to_owned(),
+        serde_json::json!("space:personal"),
+    );
+    let event_id = "event:history-message:legacy";
+    let stream_id = "history-message:legacy";
+    store
+        .append_operational_event(&history_event_request(
+            &data_space_id,
+            event_id,
+            stream_id,
+            legacy.clone(),
+        ))
+        .unwrap();
+
+    let mut v2 = legacy.clone();
+    v2.id = Observation::new_id();
+    v2.idempotency_key = IdempotencyKey::new(history_identity(
+        source_instance_id,
+        &object_id,
+        &canonical_json,
+    ));
+    v2.meta = serde_json::json!({
+        "source_instance": source_instance_id,
+        "object_id": object_id,
+        CANONICAL_JSON_META_KEY: canonical_json,
+        "source_container": source_session_id,
+        "data_space_id": "space:personal",
+    });
+    let outcome = store
+        .append_operational_events_v2_with_bridge(
+            source_instance_id,
+            None,
+            &[history_event_request(
+                &data_space_id,
+                event_id,
+                stream_id,
+                v2,
+            )],
+        )
+        .unwrap();
+    assert!(matches!(
+        outcome.as_slice(),
+        [lethe_storage_api::OperationalAppendOutcome::Duplicate { .. }]
+    ));
+    assert_eq!(store.persistence().observation_stats().unwrap().count, 1);
+    assert_eq!(store.operational_event_stats().unwrap().count, 1);
+    assert_eq!(store.persistence().identity_bridge_watermark().unwrap(), 1);
+
+    store
+        .persistence()
+        .cutover_register(source_instance_id, "owner:test", "history admission")
+        .unwrap();
+    store
+        .persistence()
+        .cutover_begin_drain(source_instance_id, "owner:test", "history fence")
+        .unwrap();
+    let fixture = CutoverFixture {
+        object_id: object_id.clone(),
+        canonical_json: canonical_json.clone(),
+        expected_identity_key: history_identity(source_instance_id, &object_id, &canonical_json),
+        expected_observation_id: Some(legacy.id.clone()),
+    };
+    let active = store
+        .persistence()
+        .cutover_activate(
+            source_instance_id,
+            "owner:test",
+            "history activate",
+            &fixture,
+        )
+        .unwrap();
+    let new_object_id = "session-1:message-2";
+    let new_canonical_json = serde_json::json!({
+        "source_instance_id": source_instance_id,
+        "source_session_id": source_session_id,
+        "source_message_id": "message-2",
+        "text": "new"
+    })
+    .to_string();
+    let mut new_v2 = legacy.clone();
+    new_v2.id = Observation::new_id();
+    new_v2.idempotency_key = IdempotencyKey::new(history_identity(
+        source_instance_id,
+        new_object_id,
+        &new_canonical_json,
+    ));
+    new_v2.meta = serde_json::json!({
+        "source_instance": source_instance_id,
+        "object_id": new_object_id,
+        CANONICAL_JSON_META_KEY: new_canonical_json,
+        "source_container": source_session_id,
+        "data_space_id": "space:personal",
+    });
+    let new_request = history_event_request(
+        &data_space_id,
+        "event:history-message:new",
+        "history-message:new",
+        new_v2,
+    );
+    let missing_generation = store.append_operational_events_v2_with_bridge(
+        source_instance_id,
+        None,
+        std::slice::from_ref(&new_request),
+    );
+    assert!(
+        matches!(
+            &missing_generation,
+            Err(lethe_storage_api::StorageError::CutoverAdmissionDenied(_))
+        ),
+        "unexpected missing-generation result: {missing_generation:?}"
+    );
+    let stale_generation = store.append_operational_events_v2_with_bridge(
+        source_instance_id,
+        Some(active.generation + 1),
+        std::slice::from_ref(&new_request),
+    );
+    assert!(matches!(
+        stale_generation,
+        Err(lethe_storage_api::StorageError::CutoverAdmissionDenied(_))
+    ));
+    store
+        .append_operational_events_v2_with_bridge(
+            source_instance_id,
+            Some(active.generation),
+            std::slice::from_ref(&new_request),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .persistence()
+            .cutover_state(source_instance_id)
+            .unwrap()
+            .phase,
+        CutoverPhase::V2Committed
+    );
+    let committed_missing_generation = store.append_operational_events_v2_with_bridge(
+        source_instance_id,
+        None,
+        std::slice::from_ref(&new_request),
+    );
+    assert!(matches!(
+        committed_missing_generation,
+        Err(lethe_storage_api::StorageError::CutoverAdmissionDenied(_))
+    ));
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn v2_operational_append_is_denied_for_v1_active_and_draining_units() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let data_space_id = DataSpaceId::new("space:cutover-admission");
+    let store = SqliteOperationalEventStore::open(
+        data_space_id.clone(),
+        &tmp.join("test.sqlite3"),
+        &tmp.join("blobs"),
+        &[7; 32],
+    )
+    .unwrap();
+    let source_instance_id = "cutover-admission-unit";
+    let canonical_json = serde_json::json!({"body": "must not append"}).to_string();
+    let mut observation = bridge_observation(
+        source_instance_id,
+        "object-1",
+        &canonical_json,
+        &bridge_identity(source_instance_id, "object-1", &canonical_json),
+    );
+    observation.meta.as_object_mut().unwrap().insert(
+        "data_space_id".to_owned(),
+        serde_json::json!(data_space_id.as_str()),
+    );
+    let request = history_event_request(
+        &data_space_id,
+        "event:cutover-admission",
+        "cutover-admission-stream",
+        observation,
+    );
+
+    let registered = store
+        .persistence()
+        .cutover_register(source_instance_id, "owner:test", "register")
+        .unwrap();
+    assert_eq!(registered.phase, lethe_storage_api::CutoverPhase::V1Active);
+    assert_eq!(registered.generation, 1);
+    let v1_active = store.append_operational_events_v2_with_bridge(
+        source_instance_id,
+        Some(registered.generation),
+        std::slice::from_ref(&request),
+    );
+    assert!(
+        matches!(
+            &v1_active,
+            Err(lethe_storage_api::StorageError::CutoverAdmissionDenied(reason))
+                if reason.contains("v1_active") && reason.contains("not admitting v2")
+        ),
+        "unexpected v1_active admission result: {v1_active:?}"
+    );
+
+    let draining = store
+        .persistence()
+        .cutover_begin_drain(source_instance_id, "owner:test", "drain")
+        .unwrap();
+    assert_eq!(draining.phase, lethe_storage_api::CutoverPhase::Draining);
+    assert_eq!(draining.generation, 1);
+    let draining_result = store.append_operational_events_v2_with_bridge(
+        source_instance_id,
+        Some(draining.generation),
+        std::slice::from_ref(&request),
+    );
+    assert!(
+        matches!(
+            &draining_result,
+            Err(lethe_storage_api::StorageError::CutoverAdmissionDenied(reason))
+                if reason.contains("draining") && reason.contains("not admitting v2")
+        ),
+        "unexpected draining admission result: {draining_result:?}"
+    );
+    assert_eq!(store.operational_event_stats().unwrap().count, 0);
 
     let _ = fs::remove_dir_all(tmp);
 }

@@ -155,6 +155,13 @@ pub trait OperationalEventStore: Send {
         requests: &[OperationalAppendRequest],
     ) -> StorageResult<Vec<OperationalAppendOutcome>>;
 
+    fn append_operational_events_v2_with_bridge(
+        &self,
+        source_instance_id: &str,
+        generation: Option<u64>,
+        requests: &[OperationalAppendRequest],
+    ) -> StorageResult<Vec<OperationalAppendOutcome>>;
+
     fn append_operational_event(
         &self,
         request: &OperationalAppendRequest,
