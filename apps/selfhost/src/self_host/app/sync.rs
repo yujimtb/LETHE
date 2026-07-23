@@ -741,6 +741,7 @@ impl AppService {
             let materialize_result = self.refresh_materialized_snapshot(&mut core);
             let index_result = self.search_index.catch_up_after_append();
             if let Err(error) = materialize_result {
+                core.mark_non_corpus_materializations_stale();
                 dead_letters.push(DeadLetter {
                     source: "projection:person-page".to_owned(),
                     reason: error.to_string(),

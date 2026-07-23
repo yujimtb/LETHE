@@ -3789,6 +3789,34 @@ fn v2_slack_draft(index: usize, published: chrono::DateTime<Utc>) -> Observation
     draft
 }
 
+fn consent_decision_draft(key: &str, identifier: &str, status: &str) -> ObservationDraft {
+    ObservationDraft {
+        schema: SchemaRef::new("schema:consent-decision"),
+        schema_version: SemVer::new("1.0.0"),
+        observer: ObserverRef::new("obs:consent-ledger"),
+        source_system: Some(SourceSystemRef::new("sys:lethe-governance")),
+        authority_model: AuthorityModel::LakeAuthoritative,
+        capture_model: CaptureModel::Event,
+        subject: EntityRef::new(format!("person:{key}")),
+        target: None,
+        payload: serde_json::json!({
+            "status": status,
+            "identifier": identifier,
+        }),
+        attachments: vec![],
+        published: Utc::now(),
+        idempotency_key: IdempotencyKey::new(format!("consent:{key}:{status}")),
+        client_ref: None,
+        meta: serde_json::json!({
+            "canonical_json": serde_json::json!({
+                "identifier": identifier,
+                "status": status,
+            }).to_string(),
+            "source_container": "consent-test",
+        }),
+    }
+}
+
 #[test]
 fn v2_import_returns_per_item_results_and_keeps_valid_items_on_quarantine() {
     let root = std::env::temp_dir().join(format!("lethe-v2-import-{}", uuid::Uuid::now_v7()));
@@ -4026,6 +4054,12 @@ fn bulk_duplicate_only_session_is_a_true_no_op() {
     let before_rebuild_count = service
         .non_corpus_rebuild_count
         .load(std::sync::atomic::Ordering::Relaxed);
+    let before_audit_count = service
+        .persistence_lock()
+        .unwrap()
+        .audit_event_page(None, 1_000)
+        .unwrap()
+        .len();
 
     for index in 0..20 {
         let report = if index % 2 == 0 {
@@ -4049,6 +4083,21 @@ fn bulk_duplicate_only_session_is_a_true_no_op() {
         assert_eq!(report.duplicates, 1);
     }
 
+    // Each of the 20 duplicate-only requests still records its own audit
+    // event even though the batch is a true no-op for the projection state;
+    // check this before ending the session, since session-end itself emits
+    // one more audit event of its own.
+    assert_eq!(
+        service
+            .persistence_lock()
+            .unwrap()
+            .audit_event_page(None, 1_000)
+            .unwrap()
+            .len(),
+        before_audit_count + 20,
+        "dup-only bulk requests must each retain an audit event"
+    );
+
     let completed = service
         .end_bulk_import_session(&session.session_id)
         .unwrap();
@@ -4071,6 +4120,87 @@ fn bulk_duplicate_only_session_is_a_true_no_op() {
     );
 
     drop(before_snapshot);
+    drop(service);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn bulk_session_consent_observation_after_first_append_triggers_minimal_publish() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-bulk-consent-minimal-publish-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let service = test_service(test_config(db, blobs), persistence);
+    wait_for_search_index_ready(&service);
+
+    let session = service.begin_bulk_import_session().unwrap();
+
+    // The very first append in a session always publishes (first_append
+    // branch), independent of consent content. Get that out of the way so
+    // the subsequent assertion isolates the `contains_consent` branch.
+    let first_report = service
+        .ingest_observation_drafts_with_session(
+            vec![wave2_slack_draft(0)],
+            "slack-test",
+            Some(&session.session_id),
+        )
+        .unwrap();
+    assert_eq!(first_report.ingested, 1);
+
+    let publish_count_before_consent = service.publish_count();
+    let rebuild_count_before_consent = service
+        .non_corpus_rebuild_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    let subject = EntityRef::new("person:bulk-consent-subject");
+    let identifier = "bulk-consent-identifier";
+    let consent_report = service
+        .ingest_observation_drafts_with_session(
+            vec![consent_decision_draft(
+                "bulk-consent-subject",
+                identifier,
+                "opted_out",
+            )],
+            "slack-test",
+            Some(&session.session_id),
+        )
+        .unwrap();
+    assert_eq!(consent_report.ingested, 1);
+
+    // `materialize_bulk_import_append` takes the `contains_consent` branch
+    // here (first_append is now false), which must still capture the
+    // consent decision and publish a minimal snapshot immediately rather
+    // than deferring it to session end.
+    assert_eq!(
+        service.publish_count(),
+        publish_count_before_consent + 1,
+        "consent observation mid-session must trigger a minimal publish"
+    );
+    assert_eq!(
+        service
+            .non_corpus_rebuild_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        rebuild_count_before_consent,
+        "minimal consent publish must not trigger a background non-corpus rebuild"
+    );
+    assert_eq!(
+        service
+            .core_snapshot()
+            .compact_state
+            .resolve(&subject, &[identifier.to_owned()], None),
+        ConsentStatus::OptedOut,
+        "published snapshot must reflect the captured consent decision"
+    );
+
+    wait_for_search_index_high_water(&service, 2);
+    let completed = service
+        .end_bulk_import_session(&session.session_id)
+        .unwrap();
+    assert_eq!(completed.state, super::BulkImportSessionPhase::Ready);
+
     drop(service);
     let _ = std::fs::remove_dir_all(root);
 }
