@@ -159,6 +159,27 @@ OS`, or any future producer.
 
 Run the local procedure per unit:
 
+**Warning: `cutover_register` is not a neutral, read-only observation.** The
+instant a unit is registered it becomes `v1_active`/generation 1 and is
+subject to fencing: any v1 client submission for that unit that does not
+present the `X-LETHE-Admission-Generation` header is rejected outright with
+401 (`stale_v1_rejection`). Do not register a unit just to inspect its
+inventory or health — an unregistered unit stays fully frozen, i.e. it keeps
+accepting v1 traffic unconditionally, exactly as before cutover work started.
+
+The correct order is therefore: (a) implement and deploy generation
+presentation in every v1 client for the target unit, (b) only then call
+`cutover_register`, and (c) proceed to `/drain` and the remaining steps
+below.
+
+Two related operational notes. First, the bridge's first-boot bootstrap is a
+bounded batch scan proportional to ledger size (16384 records per batch); if
+it is killed mid-run it resumes from the durable watermark on restart, which
+is expected behavior, not a hang. Second, the `/readiness` fixture must
+genuinely select an item keyed under the v1 formula — an item that is already
+reconciled to the v2 key leaves no dry-run winner and blocks activation. That
+is a safe false-negative, not a bridge defect.
+
 1. `POST /api/v2/cutover/units/{source_instance_id}/register` with an
    authority and reason. The response establishes the v1 generation.
 2. Stop new sends for every producer in the unit, allow already authorized v1
