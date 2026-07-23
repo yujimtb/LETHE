@@ -29,6 +29,16 @@ scope, or routing — see gate_common.SESSION_API_UNAVAILABLE_STATUS_CODES),
 those two tests are marked skipped (not failed) with a reason recorded in
 the report, and a warning is printed to stdout.
 
+A fresh container can take well over a minute to ACK a single import while
+it works through backlog catch-up — this is expected, not a fatal error.
+Every import send in this script (the ACK-convergence probe and every test
+batch) treats a request timeout / connection error / 5xx as transient:
+it's logged and, outside the ACK-convergence loop, retried on the same
+batch up to --max-consecutive-timeouts times before the gate aborts with
+an explicit reason. Only a real HTTP 4xx or an unexpected outcome
+(rejected/quarantined counts, wrong ingested/duplicate totals) is a hard
+failure.
+
 Never pushes anywhere and never talks to a non-loopback host: the
 container is published on 127.0.0.1 only, and this script performs no
 outbound network calls other than to that container.
@@ -91,6 +101,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ack-timeout-seconds", type=float, default=1800.0)
     parser.add_argument("--ack-latency-threshold-seconds", type=float, default=2.0)
     parser.add_argument("--ack-poll-interval-seconds", type=float, default=5.0)
+    parser.add_argument(
+        "--probe-timeout-seconds",
+        type=float,
+        default=300.0,
+        help=(
+            "per-request HTTP timeout for the ACK-convergence probe. A fresh "
+            "container can take well over a minute per import during backlog "
+            "catch-up; a probe that times out is treated as 'not converged "
+            "yet', not a failure, as long as --ack-timeout-seconds budget remains"
+        ),
+    )
+    parser.add_argument(
+        "--max-consecutive-timeouts",
+        type=int,
+        default=3,
+        help=(
+            "test 1/1b/2/2b/3: number of consecutive transient failures "
+            "(timeout/connection-error/5xx) on the same batch before the gate "
+            "aborts with an explicit reason"
+        ),
+    )
     parser.add_argument("--baseline-settle-seconds", type=float, default=60.0)
     parser.add_argument("--stats-poll-interval-seconds", type=float, default=1.0)
     parser.add_argument(
@@ -217,15 +248,19 @@ def wait_for_ack_latency(
     threshold_seconds: float,
     timeout_seconds: float,
     poll_interval_seconds: float,
+    probe_timeout_seconds: float,
     container_name: str,
 ) -> dict[str, Any]:
     log(
         f"waiting up to {timeout_seconds:.0f}s for single-item ACK latency "
-        f"< {threshold_seconds:.1f}s (migration/index rebuild convergence) ..."
+        f"< {threshold_seconds:.1f}s (migration/index rebuild convergence); "
+        f"per-probe request timeout is {probe_timeout_seconds:.0f}s ..."
     )
     deadline = time.monotonic() + timeout_seconds
+    started = time.monotonic()
     attempt = 0
     samples: list[float] = []
+    transient_events: list[dict[str, Any]] = []
     while time.monotonic() < deadline:
         gc.assert_container_alive(container_name)
         attempt += 1
@@ -237,16 +272,53 @@ def wait_for_ack_latency(
             source_instance_id=source_instance_id,
             index=probe_index,
         )
-        result = client.send_drafts(source_instance_id, [draft], timeout=30.0)
+        try:
+            result = client.send_drafts(
+                source_instance_id, [draft], timeout=probe_timeout_seconds
+            )
+        except gc.TransientImportError as error:
+            # A fresh container doing backlog catch-up can take well over a
+            # minute (observed: 90s+) to ACK a single import. That is "not
+            # converged yet", not a fatal error — log it and keep polling
+            # against the overall --ack-timeout-seconds budget.
+            waited_so_far = time.monotonic() - started
+            transient_events.append(
+                {
+                    "attempt": attempt,
+                    "elapsed_seconds": error.elapsed_seconds,
+                    "status_code": error.status_code,
+                    "message": str(error),
+                }
+            )
+            log(
+                f"ack probe #{attempt}: transient failure after "
+                f"{error.elapsed_seconds:.1f}s ({error}); not converged yet, "
+                f"continuing (waited {waited_so_far:.0f}s of {timeout_seconds:.0f}s budget)"
+            )
+            time.sleep(poll_interval_seconds)
+            continue
         gc.assert_no_failures(result.counts, context=f"ack probe #{attempt}")
         samples.append(result.elapsed_seconds)
         log(f"ack probe #{attempt}: {result.elapsed_seconds:.3f}s")
         if result.elapsed_seconds < threshold_seconds:
-            return {"attempts": attempt, "final_latency_seconds": result.elapsed_seconds, "samples": samples}
+            return {
+                "attempts": attempt,
+                "final_latency_seconds": result.elapsed_seconds,
+                "samples": samples,
+                "transient_events": transient_events,
+            }
         time.sleep(poll_interval_seconds)
     raise gc.GateError(
         f"single-item ACK latency did not drop below {threshold_seconds:.1f}s "
-        f"within {timeout_seconds:.0f}s (last={samples[-1] if samples else 'n/a'})"
+        f"within {timeout_seconds:.0f}s (last successful sample="
+        f"{samples[-1] if samples else 'n/a'}, transient failures={len(transient_events)})"
+    )
+
+
+def log_transient_event(context: str, event: dict[str, Any]) -> None:
+    log(
+        f"{context}: transient failure on attempt {event['attempt']} after "
+        f"{event['elapsed_seconds']:.1f}s (status={event['status_code']}): {event['message']}"
     )
 
 
@@ -264,8 +336,10 @@ def run_dup_only_batches(
     batches: int,
     batch_size: int,
     container_name: str,
-) -> list[float]:
+    max_consecutive_timeouts: int,
+) -> tuple[list[float], list[dict[str, Any]]]:
     latencies: list[float] = []
+    all_transient_events: list[dict[str, Any]] = []
     for batch_num in range(batches):
         gc.assert_container_alive(container_name)
         lo = start_index + batch_num * batch_size
@@ -274,13 +348,25 @@ def run_dup_only_batches(
             gc.build_corpus_draft(tag=tag, source_instance_id=source_instance_id, index=i)
             for i in range(lo, hi)
         ]
-        result = client.send_drafts(source_instance_id, drafts, timeout=120.0)
-        gc.assert_all_duplicate(
-            result.counts, batch_size, context=f"dup batch {batch_num + 1} [{lo},{hi})"
+        context = f"dup batch {batch_num + 1} [{lo},{hi})"
+        outcome = gc.send_drafts_with_retry(
+            client,
+            source_instance_id,
+            drafts,
+            timeout=120.0,
+            max_consecutive_timeouts=max_consecutive_timeouts,
+            context=context,
+            on_transient=lambda event, context=context: log_transient_event(context, event),
         )
+        result = outcome.result
+        all_transient_events.extend(outcome.transient_events)
+        gc.assert_all_duplicate(result.counts, batch_size, context=context)
         latencies.append(result.elapsed_seconds)
-        log(f"dup batch {batch_num + 1}/{batches}: {result.elapsed_seconds:.3f}s (duplicate={result.counts.duplicates})")
-    return latencies
+        log(
+            f"dup batch {batch_num + 1}/{batches}: {result.elapsed_seconds:.3f}s "
+            f"(duplicate={result.counts.duplicates}, attempts={outcome.attempts})"
+        )
+    return latencies, all_transient_events
 
 
 def run_test1_dup_only(
@@ -294,9 +380,10 @@ def run_test1_dup_only(
     post_batch_wait_seconds: float,
     rss_average_window_seconds: float,
     residual_threshold_mib: float,
+    max_consecutive_timeouts: int,
 ) -> dict[str, Any]:
     log("=== test 1: dup-only replay (100 x 8 batches) ===")
-    latencies = run_dup_only_batches(
+    latencies, transient_events = run_dup_only_batches(
         client,
         source_instance_id=source_instance_id,
         tag=tag,
@@ -304,6 +391,7 @@ def run_test1_dup_only(
         batches=8,
         batch_size=100,
         container_name=container_name,
+        max_consecutive_timeouts=max_consecutive_timeouts,
     )
     log(f"test 1 sending done; settling {post_batch_wait_seconds:.0f}s before residual RSS sample ...")
     time.sleep(post_batch_wait_seconds)
@@ -320,6 +408,7 @@ def run_test1_dup_only(
         "name": "dup_only_replay",
         "passed": passed,
         "batch_latencies_seconds": latencies,
+        "transient_events": transient_events,
         "baseline_mib": baseline_mib,
         "after_mib": after_mib,
         "residual_mib": residual_mib,
@@ -354,6 +443,7 @@ def run_test1b_bulk_session_dup_only(
     rss_average_window_seconds: float,
     residual_threshold_mib: float,
     end_latency_threshold_seconds: float,
+    max_consecutive_timeouts: int,
 ) -> dict[str, Any]:
     log("=== test 1b: bulk session dup-only (begin -> 100 dup -> end, x4) ===")
 
@@ -371,6 +461,7 @@ def run_test1b_bulk_session_dup_only(
         raise
 
     import_latencies: list[float] = []
+    import_transient_events: list[dict[str, Any]] = []
     end_durations: list[float] = []
     end_latency_violations: list[dict[str, Any]] = []
     session_states: list[str] = []
@@ -383,14 +474,20 @@ def run_test1b_bulk_session_dup_only(
             gc.build_corpus_draft(tag=tag, source_instance_id=source_instance_id, index=i)
             for i in range(lo, hi)
         ]
-        import_result = client.send_drafts(
-            source_instance_id, drafts, bulk_session_id=session_id, timeout=120.0
+        context = f"bulk-session dup batch {batch_num + 1} [{lo},{hi})"
+        outcome = gc.send_drafts_with_retry(
+            client,
+            source_instance_id,
+            drafts,
+            bulk_session_id=session_id,
+            timeout=120.0,
+            max_consecutive_timeouts=max_consecutive_timeouts,
+            context=context,
+            on_transient=lambda event, context=context: log_transient_event(context, event),
         )
-        gc.assert_all_duplicate(
-            import_result.counts,
-            100,
-            context=f"bulk-session dup batch {batch_num + 1} [{lo},{hi})",
-        )
+        import_result = outcome.result
+        import_transient_events.extend(outcome.transient_events)
+        gc.assert_all_duplicate(import_result.counts, 100, context=context)
         import_latencies.append(import_result.elapsed_seconds)
 
         end_result = client.end_bulk_session(session_id, timeout=1800.0)
@@ -433,6 +530,7 @@ def run_test1b_bulk_session_dup_only(
         "passed": passed,
         "skipped": False,
         "import_batch_latencies_seconds": import_latencies,
+        "import_transient_events": import_transient_events,
         "end_duration_seconds": end_durations,
         "session_states_after_end": session_states,
         "end_latency_threshold_seconds": end_latency_threshold_seconds,
@@ -465,11 +563,13 @@ def run_bulk_subtest(
     rss_average_window_seconds: float,
     peak_threshold_mib: float,
     residual_threshold_mib: float,
+    max_consecutive_timeouts: int,
 ) -> dict[str, Any]:
     log(f"=== test 2 ({label}): {count} new drafts, batch={batch_size} ===")
     marker = sampler.mark()
     total = gc.OutcomeCounts()
     latencies: list[float] = []
+    transient_events: list[dict[str, Any]] = []
     index = start_index
     end = start_index + count
     while index < end:
@@ -479,10 +579,19 @@ def run_bulk_subtest(
             gc.build_corpus_draft(tag=tag, source_instance_id=source_instance_id, index=i)
             for i in range(index, batch_end)
         ]
-        result = client.send_drafts(source_instance_id, drafts, timeout=180.0)
-        gc.assert_all_ingested(
-            result.counts, len(drafts), context=f"{label} batch [{index},{batch_end})"
+        context = f"{label} batch [{index},{batch_end})"
+        outcome = gc.send_drafts_with_retry(
+            client,
+            source_instance_id,
+            drafts,
+            timeout=180.0,
+            max_consecutive_timeouts=max_consecutive_timeouts,
+            context=context,
+            on_transient=lambda event, context=context: log_transient_event(context, event),
         )
+        result = outcome.result
+        transient_events.extend(outcome.transient_events)
+        gc.assert_all_ingested(result.counts, len(drafts), context=context)
         total = total + result.counts
         latencies.append(result.elapsed_seconds)
         index = batch_end
@@ -516,6 +625,7 @@ def run_bulk_subtest(
         "ingested": total.ingested,
         "duplicates": total.duplicates,
         "batch_latencies_seconds": latencies,
+        "transient_events": transient_events,
         "peak_mib": peak_mib,
         "peak_over_baseline_mib": peak_over_baseline_mib,
         "peak_threshold_mib": peak_threshold_mib,
@@ -546,6 +656,7 @@ def run_test2b_bulk_session_new(
     rss_average_window_seconds: float,
     peak_threshold_mib: float,
     residual_threshold_mib: float,
+    max_consecutive_timeouts: int,
 ) -> dict[str, Any]:
     log(f"=== test 2b: bulk session new import ({count} drafts, batch={batch_size}, session-wrapped) ===")
 
@@ -566,6 +677,7 @@ def run_test2b_bulk_session_new(
     marker = sampler.mark()
     total = gc.OutcomeCounts()
     latencies: list[float] = []
+    transient_events: list[dict[str, Any]] = []
     index = start_index
     end_index = start_index + count
     while index < end_index:
@@ -575,12 +687,20 @@ def run_test2b_bulk_session_new(
             gc.build_corpus_draft(tag=tag, source_instance_id=source_instance_id, index=i)
             for i in range(index, batch_end)
         ]
-        result = client.send_drafts(
-            source_instance_id, drafts, bulk_session_id=session_id, timeout=180.0
+        context = f"bulk-session new batch [{index},{batch_end})"
+        outcome = gc.send_drafts_with_retry(
+            client,
+            source_instance_id,
+            drafts,
+            bulk_session_id=session_id,
+            timeout=180.0,
+            max_consecutive_timeouts=max_consecutive_timeouts,
+            context=context,
+            on_transient=lambda event, context=context: log_transient_event(context, event),
         )
-        gc.assert_all_ingested(
-            result.counts, len(drafts), context=f"bulk-session new batch [{index},{batch_end})"
-        )
+        result = outcome.result
+        transient_events.extend(outcome.transient_events)
+        gc.assert_all_ingested(result.counts, len(drafts), context=context)
         total = total + result.counts
         latencies.append(result.elapsed_seconds)
         index = batch_end
@@ -616,6 +736,7 @@ def run_test2b_bulk_session_new(
         "ingested": total.ingested,
         "duplicates": total.duplicates,
         "batch_latencies_seconds": latencies,
+        "transient_events": transient_events,
         "peak_mib": peak_mib,
         "peak_over_baseline_mib": peak_over_baseline_mib,
         "peak_threshold_mib": peak_threshold_mib,
@@ -648,11 +769,13 @@ def run_test3_slope(
     slope_settle_seconds: float,
     rss_average_window_seconds: float,
     slope_threshold_mib_per_batch: float,
+    max_consecutive_timeouts: int,
 ) -> dict[str, Any]:
     log("=== test 3: slope detection (100 x 8 dup batches, per-batch settle) ===")
     batch_numbers: list[float] = []
     rss_after_points: list[float] = []
     latencies: list[float] = []
+    transient_events: list[dict[str, Any]] = []
     for batch_num in range(8):
         gc.assert_container_alive(container_name)
         lo = start_index + batch_num * 100
@@ -661,10 +784,19 @@ def run_test3_slope(
             gc.build_corpus_draft(tag=tag, source_instance_id=source_instance_id, index=i)
             for i in range(lo, hi)
         ]
-        result = client.send_drafts(source_instance_id, drafts, timeout=120.0)
-        gc.assert_all_duplicate(
-            result.counts, 100, context=f"slope batch {batch_num + 1} [{lo},{hi})"
+        context = f"slope batch {batch_num + 1} [{lo},{hi})"
+        outcome = gc.send_drafts_with_retry(
+            client,
+            source_instance_id,
+            drafts,
+            timeout=120.0,
+            max_consecutive_timeouts=max_consecutive_timeouts,
+            context=context,
+            on_transient=lambda event, context=context: log_transient_event(context, event),
         )
+        result = outcome.result
+        transient_events.extend(outcome.transient_events)
+        gc.assert_all_duplicate(result.counts, 100, context=context)
         latencies.append(result.elapsed_seconds)
         time.sleep(slope_settle_seconds)
         gc.assert_container_alive(container_name)
@@ -683,6 +815,7 @@ def run_test3_slope(
         "name": "slope_detection",
         "passed": passed,
         "batch_latencies_seconds": latencies,
+        "transient_events": transient_events,
         "batch_numbers": batch_numbers,
         "rss_after_mib": rss_after_points,
         "baseline_mib": baseline_mib,
@@ -728,6 +861,8 @@ def main() -> int:
             "bulk_residual_threshold_mib": args.bulk_residual_threshold_mib,
             "slope_threshold_mib_per_batch": args.slope_threshold_mib_per_batch,
             "bulk_session_end_latency_threshold_seconds": args.bulk_session_end_latency_threshold_seconds,
+            "probe_timeout_seconds": args.probe_timeout_seconds,
+            "max_consecutive_timeouts": args.max_consecutive_timeouts,
         },
         "phases": {},
         "tests": [],
@@ -762,6 +897,7 @@ def main() -> int:
             threshold_seconds=args.ack_latency_threshold_seconds,
             timeout_seconds=args.ack_timeout_seconds,
             poll_interval_seconds=args.ack_poll_interval_seconds,
+            probe_timeout_seconds=args.probe_timeout_seconds,
             container_name=container_name,
         )
         report["phases"]["ack_convergence"] = ack_info
@@ -786,6 +922,7 @@ def main() -> int:
             post_batch_wait_seconds=args.post_batch_wait_seconds,
             rss_average_window_seconds=args.rss_average_window_seconds,
             residual_threshold_mib=args.dup_residual_threshold_mib,
+            max_consecutive_timeouts=args.max_consecutive_timeouts,
         )
         report["tests"].append(test1)
 
@@ -801,6 +938,7 @@ def main() -> int:
             rss_average_window_seconds=args.rss_average_window_seconds,
             residual_threshold_mib=args.dup_residual_threshold_mib,
             end_latency_threshold_seconds=args.bulk_session_end_latency_threshold_seconds,
+            max_consecutive_timeouts=args.max_consecutive_timeouts,
         )
         report["tests"].append(test1b)
 
@@ -821,6 +959,7 @@ def main() -> int:
             rss_average_window_seconds=args.rss_average_window_seconds,
             peak_threshold_mib=args.bulk_peak_threshold_mib,
             residual_threshold_mib=args.bulk_residual_threshold_mib,
+            max_consecutive_timeouts=args.max_consecutive_timeouts,
         )
         report["tests"].append(test2a)
 
@@ -839,6 +978,7 @@ def main() -> int:
             rss_average_window_seconds=args.rss_average_window_seconds,
             peak_threshold_mib=args.bulk_peak_threshold_mib,
             residual_threshold_mib=args.bulk_residual_threshold_mib,
+            max_consecutive_timeouts=args.max_consecutive_timeouts,
         )
         report["tests"].append(test2b)
 
@@ -857,6 +997,7 @@ def main() -> int:
             rss_average_window_seconds=args.rss_average_window_seconds,
             peak_threshold_mib=args.bulk_peak_threshold_mib,
             residual_threshold_mib=args.bulk_residual_threshold_mib,
+            max_consecutive_timeouts=args.max_consecutive_timeouts,
         )
         report["tests"].append(test2b_session)
 
@@ -871,6 +1012,7 @@ def main() -> int:
             slope_settle_seconds=args.slope_settle_seconds,
             rss_average_window_seconds=args.rss_average_window_seconds,
             slope_threshold_mib_per_batch=args.slope_threshold_mib_per_batch,
+            max_consecutive_timeouts=args.max_consecutive_timeouts,
         )
         report["tests"].append(test3)
 

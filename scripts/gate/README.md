@@ -143,6 +143,31 @@ report and a warning is printed to stdout — this does **not** fail the
 gate. Any other failure (e.g. a business-logic conflict such as a stray
 already-active session) is treated as a real test failure, not a skip.
 
+### Network resilience (timeouts are not crashes)
+
+Observed in practice: a freshly booted container doing backlog catch-up can
+take 90s+ to ACK a single import. Every import send in this script — the
+ACK-convergence probe and every test batch (1, 1b, 2, 2b, 3) — treats a
+request timeout, connection error, or HTTP 5xx as *transient*, never as an
+unhandled crash:
+
+- In the ACK-convergence wait, a transient failure is logged
+  (`gate_common.TransientImportError`, one line, no traceback) and treated
+  as "not converged yet" — polling continues against the
+  `--ack-timeout-seconds` budget. Only exhausting that budget is a failure.
+- In test batches, a transient failure is retried on the *same* batch
+  (its latency is recorded as the spike it was) up to
+  `--max-consecutive-timeouts` times; if it never comes back clean, the
+  gate aborts with an explicit "N consecutive transient import failures"
+  reason. A clean non-2xx response other than 5xx (e.g. 400/401/403) is
+  still an immediate hard failure, as is any wrong outcome (unexpected
+  rejected/quarantined counts, wrong ingested/duplicate totals).
+
+Every test's report entry includes a `transient_events` (or, for test 1b,
+`import_transient_events`) list recording each transient attempt's elapsed
+time, HTTP status (if any), and message, so a run that passed despite some
+retries is still visible in `--report`.
+
 ## Threshold arguments (all overridable)
 
 | Argument | Default | Meaning |
@@ -152,6 +177,8 @@ already-active session) is treated as a real test failure, not a skip.
 | `--bulk-residual-threshold-mib` | 768 | test 2: `(RSS 3min after the 1000-item send) − baseline` must be ≤ this, for both sub-tests |
 | `--slope-threshold-mib-per-batch` | 8 | test 3: the linear-regression slope of (batch number → post-settle RSS) across 8 batches must be ≤ this MiB/batch |
 | `--bulk-session-end-latency-threshold-seconds` | 10 | test 1b: max acceptable `.../bulk-sessions/{id}/end` duration per batch |
+| `--max-consecutive-timeouts` | 3 | tests 1/1b/2/2b/3: consecutive transient failures (timeout/connection-error/5xx) on the same batch before the gate aborts |
+| `--probe-timeout-seconds` | 300 | per-request HTTP timeout for the ACK-convergence probe (not the test batches — those use their own per-call timeouts, see source) |
 | `--health-timeout-seconds` | 900 (15 min) | max wait for `/health` to return 200 |
 | `--ack-timeout-seconds` | 1800 (30 min) | max wait for single-item import ACK latency to converge |
 | `--ack-latency-threshold-seconds` | 2.0 | the ACK latency convergence target |

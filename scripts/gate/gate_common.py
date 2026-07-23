@@ -328,6 +328,47 @@ class ImportRequestError(GateError):
         self.status_code = status_code
 
 
+class TransientImportError(GateError):
+    """A network-level failure (timeout / connection error / 5xx) on a single
+    import attempt.
+
+    This is expected to happen — e.g. a fresh container doing backlog
+    catch-up can take well over a minute to ACK a single import. Callers
+    must treat this as "not converged yet" / "this attempt's latency
+    exceeded", not as an unhandled crash. It is a GateError only so a
+    caller that doesn't specifically handle it still gets a readable
+    "GATE FAILED" message instead of the raw httpx/requests exception
+    surfacing as "unexpected error".
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        elapsed_seconds: float,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.elapsed_seconds = elapsed_seconds
+        self.status_code = status_code
+
+
+def _is_transient_network_error(error: BaseException) -> bool:
+    """True for timeouts/connection-level failures from whichever HTTP
+    backend is active (never for a clean non-2xx HTTP response, which is
+    handled separately by status code)."""
+    if _HTTP_BACKEND == "httpx":
+        return isinstance(error, _httpx.TransportError)  # type: ignore[union-attr]
+    return isinstance(
+        error,
+        (
+            _requests.exceptions.Timeout,  # type: ignore[union-attr]
+            _requests.exceptions.ConnectionError,  # type: ignore[union-attr]
+            _requests.exceptions.ChunkedEncodingError,  # type: ignore[union-attr]
+        ),
+    )
+
+
 @dataclass
 class BulkSessionResult:
     """Response from POST /api/import/bulk-sessions/{begin,{id}/end}.
@@ -406,11 +447,27 @@ class ImportClient:
             "Authorization": f"Bearer {self._token}",
             "Content-Type": "application/json",
         }
+        request_timeout = timeout or self.default_timeout
         started = time.monotonic()
-        status_code, response = _http_post_json(
-            url, body, headers, timeout or self.default_timeout
-        )
+        try:
+            status_code, response = _http_post_json(url, body, headers, request_timeout)
+        except Exception as error:
+            elapsed = time.monotonic() - started
+            if _is_transient_network_error(error):
+                raise TransientImportError(
+                    f"{type(error).__name__} after {elapsed:.1f}s "
+                    f"(request timeout was {request_timeout:.1f}s): {error}",
+                    elapsed_seconds=elapsed,
+                ) from error
+            raise
         elapsed = time.monotonic() - started
+        if status_code >= 500:
+            body_text = getattr(response, "text", "<no body>")
+            raise TransientImportError(
+                f"HTTP {status_code} after {elapsed:.1f}s: {body_text[:300]}",
+                elapsed_seconds=elapsed,
+                status_code=status_code,
+            )
         if status_code != 200:
             body_text = getattr(response, "text", "<no body>")
             raise ImportRequestError(status_code, body_text)
@@ -459,6 +516,67 @@ class ImportClient:
             body_text = getattr(response, "text", "<no body>")
             raise ImportRequestError(status_code, body_text)
         return BulkSessionResult(report=response.json(), elapsed_seconds=elapsed)
+
+
+@dataclass
+class RetryOutcome:
+    """Result of send_drafts_with_retry: the eventual success, plus a record
+    of any transient (timeout/connection/5xx) attempts that preceded it."""
+
+    result: ImportBatchResult
+    attempts: int
+    transient_events: list[dict[str, Any]]
+
+
+def send_drafts_with_retry(
+    client: "ImportClient",
+    source_instance_id: str,
+    drafts: list[dict[str, Any]],
+    *,
+    bulk_session_id: str | None = None,
+    timeout: float | None = None,
+    max_consecutive_timeouts: int = 3,
+    context: str,
+    on_transient: Any = None,
+) -> RetryOutcome:
+    """Send one import batch, retrying on transient network failures.
+
+    A timeout / connection error / 5xx is recorded as a latency spike for
+    that batch (not an unhandled crash) and the same batch is retried.
+    ``max_consecutive_timeouts`` consecutive transient failures on this one
+    batch raise a GateError explaining the abort — a real request to
+    ``on_transient(event)`` (if given) is invoked once per transient
+    attempt, e.g. to log a single line before retrying.
+    """
+    transient_events: list[dict[str, Any]] = []
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            result = client.send_drafts(
+                source_instance_id,
+                drafts,
+                bulk_session_id=bulk_session_id,
+                timeout=timeout,
+            )
+            return RetryOutcome(
+                result=result, attempts=attempt, transient_events=transient_events
+            )
+        except TransientImportError as error:
+            event = {
+                "attempt": attempt,
+                "elapsed_seconds": error.elapsed_seconds,
+                "status_code": error.status_code,
+                "message": str(error),
+            }
+            transient_events.append(event)
+            if on_transient is not None:
+                on_transient(event)
+            if attempt >= max_consecutive_timeouts:
+                raise GateError(
+                    f"{context}: {attempt} consecutive transient import failures "
+                    f"(timeout/connection-error/5xx), aborting: {error}"
+                ) from error
 
 
 def assert_no_failures(counts: OutcomeCounts, *, context: str) -> None:
