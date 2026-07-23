@@ -673,6 +673,12 @@ pub trait ObservationStore: Send {
         &self,
         privacy_key: &str,
     ) -> StorageResult<Vec<StoredObservation>>;
+    fn observations_for_privacy_key_page(
+        &self,
+        privacy_key: &str,
+        after_append_seq: u64,
+        limit: usize,
+    ) -> StorageResult<Vec<StoredObservation>>;
     fn leaf_positions(&self) -> StorageResult<Vec<LeafPosition>>;
     fn split_leaf_if_capacity(&self, capacity: usize) -> StorageResult<bool>;
 }

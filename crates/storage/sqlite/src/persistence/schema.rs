@@ -704,38 +704,51 @@ impl SqlitePersistence {
                 ON observation_privacy_keys (privacy_key, append_seq);
             ",
         )?;
-        let rows = {
+        let mut cursor = 0_u64;
+        loop {
             let mut statement = transaction.prepare(
                 "SELECT id, append_seq, observation_json
-                 FROM observations ORDER BY append_seq",
+                 FROM observations
+                 WHERE append_seq > ?1
+                 ORDER BY append_seq
+                 LIMIT ?2",
             )?;
-            statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, u64>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        for (observation_id, append_seq, json) in rows {
-            let observation: Observation = serde_json::from_str(&json)?;
-            if observation.id.as_str() != observation_id {
-                return Err(PersistenceError::SchemaInvariant(format!(
-                    "observation {} disagrees with stored payload {}",
-                    observation_id,
-                    observation.id.as_str()
-                )));
+            let page = statement
+                .query_map(
+                    rusqlite::params![cursor, OBSERVATION_SCHEMA_BACKFILL_BATCH_SIZE],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, u64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+            let Some((_, last_append_seq, _)) = page.last() else {
+                break;
+            };
+            let next_cursor = *last_append_seq;
+            for (observation_id, append_seq, json) in page {
+                let observation: Observation = serde_json::from_str(&json)?;
+                if observation.id.as_str() != observation_id {
+                    return Err(PersistenceError::SchemaInvariant(format!(
+                        "observation {} disagrees with stored payload {}",
+                        observation_id,
+                        observation.id.as_str()
+                    )));
+                }
+                for privacy_key in lethe_core::domain::observation_privacy_keys(&observation) {
+                    transaction.execute(
+                        "INSERT OR IGNORE INTO observation_privacy_keys (
+                            privacy_key, observation_id, append_seq
+                         ) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![privacy_key, observation_id, append_seq],
+                    )?;
+                }
             }
-            for privacy_key in lethe_core::domain::observation_privacy_keys(&observation) {
-                transaction.execute(
-                    "INSERT OR IGNORE INTO observation_privacy_keys (
-                        privacy_key, observation_id, append_seq
-                     ) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![privacy_key, observation_id, append_seq],
-                )?;
-            }
+            cursor = next_cursor;
         }
         record_schema_migration(
             &transaction,

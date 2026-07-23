@@ -976,7 +976,41 @@ impl AppService {
     }
 
     pub(super) fn publish_core_snapshot(&self, core: &AppCore) {
+        #[cfg(test)]
+        self.publish_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.core_snapshot.store(Arc::new(core.clone()));
+    }
+
+    pub(super) fn try_acquire_import_permit(&self) -> Result<ImportPermit, SelfHostError> {
+        let maximum = self.config.resource_limits.max_concurrent_imports;
+        let mut current = self
+            .import_in_flight
+            .load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            if current >= maximum {
+                return Err(SelfHostError::ImportConcurrencyLimit { maximum });
+            }
+            match self.import_in_flight.compare_exchange_weak(
+                current,
+                current + 1,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(ImportPermit {
+                        in_flight: Arc::clone(&self.import_in_flight),
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn publish_count(&self) -> usize {
+        self.publish_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(super) fn persistence_lock(
@@ -1076,21 +1110,6 @@ impl AppService {
                 .append_consumer_in_flight
                 .store(false, std::sync::atomic::Ordering::Release);
         });
-    }
-
-    pub(super) fn refresh_capture_consent_snapshot(
-        &self,
-        observations: &[Observation],
-    ) -> Result<(), SelfHostError> {
-        if observations.is_empty() {
-            return Ok(());
-        }
-        let mut core = self.core_lock()?;
-        for observation in observations {
-            core.compact_state.capture_consent_decision(observation);
-        }
-        self.publish_core_snapshot(&core);
-        Ok(())
     }
 
     pub(super) fn trigger_search_index_catch_up(&self) {

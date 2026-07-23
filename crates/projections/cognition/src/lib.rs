@@ -721,8 +721,6 @@ pub struct CommunicationFact {
 pub struct CommunicationProjectionState {
     facts_by_thread: BTreeMap<String, BTreeMap<String, CommunicationFact>>,
     observation_keys: BTreeMap<String, CommunicationThreadKey>,
-    #[serde(skip)]
-    observations: BTreeMap<String, Observation>,
     #[serde(default)]
     source_object_ids: BTreeMap<String, String>,
     #[serde(default)]
@@ -743,6 +741,7 @@ impl CommunicationProjectionState {
     pub fn from_observations(observations: &[Observation], join_index: &ReplySloJoinIndex) -> Self {
         let mut state = Self::default();
         state.fold_observations(observations, join_index);
+        state.rematerialize_observations(observations, join_index);
         state
     }
 
@@ -755,7 +754,14 @@ impl CommunicationProjectionState {
         for observation in observations {
             if observation.schema.as_str() == "schema:consent-decision" {
                 for privacy_key in self.apply_consent(observation) {
-                    self.rematerialize_privacy_key(&privacy_key, join_index, &mut delta);
+                    let observation_ids = self
+                        .observation_ids_by_privacy_key
+                        .get(&privacy_key)
+                        .cloned()
+                        .unwrap_or_default();
+                    for observation_id in observation_ids {
+                        self.remove_observation(&observation_id);
+                    }
                 }
                 continue;
             }
@@ -766,7 +772,7 @@ impl CommunicationProjectionState {
                 if let Some(observation_id) = target.observation_id {
                     self.retracted_observation_ids
                         .insert(observation_id.as_str().to_owned());
-                    self.remove_observation(observation_id.as_str());
+                    self.forget_observation(observation_id.as_str());
                 }
                 if let Some(source_object_id) = target.source_object_id {
                     self.retracted_source_object_ids
@@ -778,13 +784,13 @@ impl CommunicationProjectionState {
                         .map(|(id, _)| id.clone())
                         .collect::<Vec<_>>();
                     for observation_id in target_ids {
-                        self.remove_observation(&observation_id);
+                        self.forget_observation(&observation_id);
                     }
                 }
                 continue;
             }
             if communication_fact(observation, join_index).is_some() {
-                self.remember_observation(observation);
+                self.remember_observation_scalars(observation);
             }
             self.materialize_observation(observation, join_index, &mut delta);
         }
@@ -800,9 +806,8 @@ impl CommunicationProjectionState {
         }
     }
 
-    /// Remember canonical observations without materializing them.  This is
-    /// used by the consumer lane when a persisted state receives a
-    /// re-consent and must restore previously shielded communication facts.
+    /// Remember only scalar/reverse-index data without materializing facts.
+    /// Storage-aware callers use this before a bounded re-materialization.
     pub fn remember_observations(
         &mut self,
         observations: &[Observation],
@@ -815,14 +820,46 @@ impl CommunicationProjectionState {
             {
                 continue;
             }
-            self.remember_observation(observation);
+            self.remember_observation_scalars(observation);
         }
     }
 
-    fn remember_observation(&mut self, observation: &Observation) {
+    pub fn rematerialize_observations(
+        &mut self,
+        observations: &[Observation],
+        join_index: &ReplySloJoinIndex,
+    ) -> ReplySloProjection {
+        let mut delta = Vec::new();
+        for observation in observations {
+            if communication_fact(observation, join_index).is_none()
+                || self
+                    .retracted_observation_ids
+                    .contains(observation.id.as_str())
+                || observation
+                    .meta
+                    .get("object_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| self.retracted_source_object_ids.contains(id))
+            {
+                continue;
+            }
+            self.remember_observation_scalars(observation);
+            self.materialize_observation(observation, join_index, &mut delta);
+        }
+        sort_reply_slo_rows(&mut delta);
+        let overdue = delta
+            .iter()
+            .filter(|row| is_overdue_reply(row.status))
+            .cloned()
+            .collect();
+        ReplySloProjection {
+            rows: delta,
+            overdue,
+        }
+    }
+
+    fn remember_observation_scalars(&mut self, observation: &Observation) {
         let observation_id = observation.id.as_str().to_owned();
-        self.observations
-            .insert(observation_id.clone(), observation.clone());
         self.observation_subjects.insert(
             observation_id.clone(),
             observation.subject.as_str().to_owned(),
@@ -894,33 +931,6 @@ impl CommunicationProjectionState {
         delta.push(reply_latency_from_fact(&fact, Utc::now()));
     }
 
-    fn rematerialize_privacy_key(
-        &mut self,
-        privacy_key: &str,
-        join_index: &ReplySloJoinIndex,
-        delta: &mut Vec<ReplyLatency>,
-    ) {
-        let observation_ids = self
-            .observation_ids_by_privacy_key
-            .get(privacy_key)
-            .cloned()
-            .unwrap_or_default();
-
-        // Canonical observations are deliberately not serialized into this
-        // materialization. Remove persisted facts first so a restored state
-        // cannot retain an opted-out record while the observation is being
-        // re-pulled from storage.
-        for observation_id in &observation_ids {
-            self.remove_observation(observation_id);
-        }
-        for observation_id in observation_ids {
-            let Some(observation) = self.observations.get(&observation_id).cloned() else {
-                continue;
-            };
-            self.materialize_observation(&observation, join_index, delta);
-        }
-    }
-
     fn visible(&self, observation: &Observation) -> bool {
         if self
             .retracted_observation_ids
@@ -975,6 +985,17 @@ impl CommunicationProjectionState {
                     .remove(&communication_thread_storage_key(&key));
             }
         }
+    }
+
+    fn forget_observation(&mut self, observation_id: &str) {
+        self.remove_observation(observation_id);
+        self.observation_subjects.remove(observation_id);
+        self.source_object_ids.remove(observation_id);
+        for observation_ids in self.observation_ids_by_privacy_key.values_mut() {
+            observation_ids.remove(observation_id);
+        }
+        self.observation_ids_by_privacy_key
+            .retain(|_, observation_ids| !observation_ids.is_empty());
     }
 
     pub fn refresh_sent_at(
@@ -2372,7 +2393,12 @@ mod tests {
 
         let mut restored: CommunicationProjectionState =
             serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
-        assert!(restored.observations.is_empty());
+        assert!(
+            serde_json::to_value(&restored)
+                .unwrap()
+                .get("observations")
+                .is_none()
+        );
 
         // This is the reverse-index pull performed by the application after
         // restart, before folding the consent delta.
@@ -2405,6 +2431,7 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
         restored.remember_observations(std::slice::from_ref(&target), &join_index);
         restored.fold_observations(std::slice::from_ref(&reconsent), &join_index);
+        restored.rematerialize_observations(std::slice::from_ref(&target), &join_index);
         assert_eq!(restored.len(), 1);
     }
 
@@ -2443,9 +2470,10 @@ mod tests {
         let join_index = ReplySloJoinIndex::default();
         let mut state = CommunicationProjectionState::default();
 
-        state.fold_observations(&[target, opt_out], &join_index);
+        state.fold_observations(&[target.clone(), opt_out], &join_index);
         assert!(state.is_empty());
         state.fold_observations(&[reconsent], &join_index);
+        state.rematerialize_observations(std::slice::from_ref(&target), &join_index);
         assert_eq!(state.len(), 1);
         state.fold_observations(&[late_old_opt_out], &join_index);
         assert_eq!(state.len(), 1);

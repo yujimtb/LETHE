@@ -1396,6 +1396,17 @@ impl From<SelfHostError> for ApiError {
                     retry_after: None,
                 },
             },
+            SelfHostError::ImportConcurrencyLimit { maximum } => Self {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                body: ErrorResponse {
+                    error: "import_concurrency_limit".to_owned(),
+                    detail: Some(format!(
+                        "concurrent import limit {maximum} is currently full"
+                    )),
+                    details: Some(serde_json::json!({"maximum": maximum})),
+                    retry_after: Some(1),
+                },
+            },
             SelfHostError::ProjectionStale(detail) => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 body: ErrorResponse::projection_stale(&detail, 30),
@@ -1630,6 +1641,16 @@ mod search_index_error_tests {
             error.body.details,
             Some(serde_json::json!({"actual": 11, "maximum": 10}))
         );
+    }
+
+    #[test]
+    fn import_concurrency_limit_maps_to_immediate_429() {
+        let error = ApiError::from(SelfHostError::ImportConcurrencyLimit { maximum: 2 });
+
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error.body.error, "import_concurrency_limit");
+        assert_eq!(error.body.details, Some(serde_json::json!({"maximum": 2})));
+        assert_eq!(error.body.retry_after, Some(1));
     }
 
     #[test]

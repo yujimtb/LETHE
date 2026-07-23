@@ -120,8 +120,11 @@ pub struct ResourceLimits {
     pub max_blob_bytes: usize,
     pub max_payload_bytes: usize,
     pub max_sync_items: usize,
+    pub max_concurrent_imports: usize,
+    pub max_import_drafts: usize,
     pub max_page_size: usize,
     pub max_search_job_workers: usize,
+    pub max_search_job_records: usize,
     pub max_leaf_observations: usize,
     pub retention_days: u32,
 }
@@ -281,8 +284,11 @@ struct LimitsFileConfig {
     max_blob_bytes: usize,
     max_payload_bytes: usize,
     max_sync_items: usize,
+    max_concurrent_imports: usize,
+    max_import_drafts: usize,
     max_page_size: usize,
     max_search_job_workers: usize,
+    max_search_job_records: usize,
     max_leaf_observations: usize,
     retention_days: u32,
 }
@@ -526,8 +532,11 @@ impl SelfHostConfig {
                 max_blob_bytes: raw.limits.max_blob_bytes,
                 max_payload_bytes: raw.limits.max_payload_bytes,
                 max_sync_items: raw.limits.max_sync_items,
+                max_concurrent_imports: raw.limits.max_concurrent_imports,
+                max_import_drafts: raw.limits.max_import_drafts,
                 max_page_size: raw.limits.max_page_size,
                 max_search_job_workers: raw.limits.max_search_job_workers,
+                max_search_job_records: raw.limits.max_search_job_records,
                 max_leaf_observations: raw.limits.max_leaf_observations,
                 retention_days: raw.limits.retention_days,
             },
@@ -586,10 +595,19 @@ impl FileConfig {
         require_positive("limits.max_blob_bytes", self.limits.max_blob_bytes)?;
         require_positive("limits.max_payload_bytes", self.limits.max_payload_bytes)?;
         require_positive("limits.max_sync_items", self.limits.max_sync_items)?;
+        require_positive(
+            "limits.max_concurrent_imports",
+            self.limits.max_concurrent_imports,
+        )?;
+        require_positive("limits.max_import_drafts", self.limits.max_import_drafts)?;
         require_positive("limits.max_page_size", self.limits.max_page_size)?;
         require_positive(
             "limits.max_search_job_workers",
             self.limits.max_search_job_workers,
+        )?;
+        require_positive(
+            "limits.max_search_job_records",
+            self.limits.max_search_job_records,
         )?;
         require_positive(
             "limits.max_leaf_observations",
@@ -1095,8 +1113,11 @@ mod tests {
             max_blob_bytes = 1
             max_payload_bytes = 1
             max_sync_items = 1
+            max_concurrent_imports = 2
+            max_import_drafts = 1
             max_page_size = 1
             max_search_job_workers = 2
+            max_search_job_records = 2
             max_leaf_observations = 1
             retention_days = 30
             [corpus]
@@ -1167,8 +1188,11 @@ mod tests {
             max_blob_bytes = 1
             max_payload_bytes = 1
             max_sync_items = 1
+            max_concurrent_imports = 2
+            max_import_drafts = 1
             max_page_size = 1
             max_search_job_workers = 2
+            max_search_job_records = 2
             max_leaf_observations = 1
             retention_days = 3650
             [corpus]
@@ -1227,8 +1251,11 @@ mod tests {
             max_blob_bytes = 1
             max_payload_bytes = 1
             max_sync_items = 1
+            max_concurrent_imports = 2
+            max_import_drafts = 1
             max_page_size = 1
             max_search_job_workers = 2
+            max_search_job_records = 2
             max_leaf_observations = 1
             retention_days = 3650
             [corpus]
@@ -1288,8 +1315,11 @@ mod tests {
             max_blob_bytes = 1
             max_payload_bytes = 1
             max_sync_items = 1
+            max_concurrent_imports = 2
+            max_import_drafts = 1
             max_page_size = 1
             max_search_job_workers = 2
+            max_search_job_records = 2
             max_leaf_observations = 1
             retention_days = 30
             [corpus]

@@ -820,6 +820,62 @@ impl SqlitePersistence {
         .collect()
     }
 
+    pub fn observations_for_privacy_key_page(
+        &self,
+        privacy_key: &str,
+        after_append_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredObservation>, PersistenceError> {
+        if privacy_key.trim().is_empty() {
+            return Err(PersistenceError::SchemaInvariant(
+                "privacy key must not be blank".to_owned(),
+            ));
+        }
+        if limit == 0 {
+            return Err(PersistenceError::SchemaInvariant(
+                "privacy key page limit must be greater than zero".to_owned(),
+            ));
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT reverse_index.append_seq, reverse_index.observation_id,
+                    observations.leaf_id, observations.observation_json
+             FROM observation_privacy_keys reverse_index
+             JOIN observations ON observations.id = reverse_index.observation_id
+             WHERE reverse_index.privacy_key = ?1
+               AND reverse_index.append_seq > ?2
+             ORDER BY reverse_index.append_seq
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            rusqlite::params![privacy_key, after_append_seq, limit],
+            |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )?;
+        rows.map(|row| {
+            let (append_seq, observation_id, leaf_id, json) = row?;
+            let observation: Observation = serde_json::from_str(&json)?;
+            if observation.id.as_str() != observation_id {
+                return Err(PersistenceError::SchemaInvariant(format!(
+                    "privacy index observation id {} disagrees with payload {}",
+                    observation_id,
+                    observation.id.as_str()
+                )));
+            }
+            Ok(StoredObservation {
+                leaf_id,
+                append_seq,
+                observation,
+            })
+        })
+        .collect()
+    }
+
     pub fn leaf_positions(&self) -> Result<Vec<LeafPosition>, PersistenceError> {
         let tree = self.partition_tree_snapshot()?;
         let mut positions = Vec::new();
@@ -3362,6 +3418,21 @@ impl ObservationStorePort for SqlitePersistence {
         privacy_key: &str,
     ) -> StorageResult<Vec<StoredObservation>> {
         SqlitePersistence::observations_for_privacy_key(self, privacy_key).map_err(storage_error)
+    }
+
+    fn observations_for_privacy_key_page(
+        &self,
+        privacy_key: &str,
+        after_append_seq: u64,
+        limit: usize,
+    ) -> StorageResult<Vec<StoredObservation>> {
+        SqlitePersistence::observations_for_privacy_key_page(
+            self,
+            privacy_key,
+            after_append_seq,
+            limit,
+        )
+        .map_err(storage_error)
     }
 
     fn leaf_positions(&self) -> StorageResult<Vec<LeafPosition>> {

@@ -124,6 +124,8 @@ pub enum SelfHostError {
     Auth(String),
     #[error("bulk import session conflict ({code}): {detail}")]
     BulkImportSessionConflict { code: &'static str, detail: String },
+    #[error("import concurrency limit reached (maximum {maximum})")]
+    ImportConcurrencyLimit { maximum: usize },
     #[error("projection stale: {0}")]
     ProjectionStale(String),
     #[error("{code}: {detail}")]
@@ -524,7 +526,7 @@ pub struct ProjectionSnapshot {
 
 // ReplyCard.agent_name is derived during the supplemental fold; rebuild older
 // serialized snapshots so existing cards receive the attribution.
-const NON_CORPUS_MATERIALIZATION_VERSION: u32 = 10;
+const NON_CORPUS_MATERIALIZATION_VERSION: u32 = 11;
 const REPLY_SLO_ITEM_OWNER: &str = "__reply_slo__";
 const CLAIM_QUEUE_ITEM_OWNER: &str = "__claim_queue__";
 const CARD_QUEUE_ITEM_OWNER: &str = "__card_queue__";
@@ -535,6 +537,7 @@ const CANONICAL_OBSERVATION_FINGERPRINT_DOMAIN: &[u8] =
     b"lethe:canonical-observation-fingerprint:v1\0";
 const SUPPLEMENTAL_FINGERPRINT_DOMAIN: &[u8] = b"lethe:supplemental-fingerprint:v2\0";
 const IMPORT_PROCESS_BATCH_SIZE: usize = 512;
+const COMMUNICATION_RECONSENT_PAGE_SIZE: usize = 512;
 const OBSERVATION_IMPORT_SLOW_THRESHOLD_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -983,9 +986,11 @@ trait ComponentProjectionLookup {
         observation_id: &ObservationId,
     ) -> Result<Option<StoredObservation>, SelfHostError>;
 
-    fn observations_for_privacy_key(
+    fn observations_for_privacy_key_page(
         &self,
         privacy_key: &str,
+        after_append_seq: u64,
+        limit: usize,
     ) -> Result<Vec<StoredObservation>, SelfHostError>;
 
     fn person_message_items(&self, owner_key: &str) -> Result<Vec<ProjectionItem>, SelfHostError>;
@@ -1003,11 +1008,15 @@ impl ComponentProjectionLookup for StorageComponentProjectionLookup<'_> {
         Ok(self.storage.observation_by_id(observation_id)?)
     }
 
-    fn observations_for_privacy_key(
+    fn observations_for_privacy_key_page(
         &self,
         privacy_key: &str,
+        after_append_seq: u64,
+        limit: usize,
     ) -> Result<Vec<StoredObservation>, SelfHostError> {
-        Ok(self.storage.observations_for_privacy_key(privacy_key)?)
+        Ok(self
+            .storage
+            .observations_for_privacy_key_page(privacy_key, after_append_seq, limit)?)
     }
 
     fn person_message_items(&self, owner_key: &str) -> Result<Vec<ProjectionItem>, SelfHostError> {
@@ -1885,8 +1894,10 @@ pub struct AppService {
     history_projection: Arc<Mutex<HistoryProjection>>,
     derived_projection_lane: Arc<Mutex<()>>,
     bulk_import_operation: Arc<Mutex<()>>,
+    import_in_flight: Arc<std::sync::atomic::AtomicUsize>,
     search_index: search_index::SearchIndexManager,
     search_jobs: Arc<Mutex<BTreeMap<String, SearchJobRecord>>>,
+    search_job_sequence: Arc<std::sync::atomic::AtomicU64>,
     search_job_queue: Arc<SearchJobQueue>,
     config: Arc<SelfHostConfig>,
     slack_sources: Vec<SlackSourceRuntime>,
@@ -1900,6 +1911,8 @@ pub struct AppService {
     non_corpus_rebuild_error: Arc<Mutex<Option<String>>>,
     #[cfg(test)]
     non_corpus_rebuild_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    publish_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     search_job_test_gate: Option<Arc<std::sync::Barrier>>,
     #[cfg(test)]
@@ -1918,9 +1931,21 @@ pub struct SearchJobStatus {
 
 #[derive(Debug, Clone)]
 struct SearchJobRecord {
+    sequence: u64,
     status: String,
     result: Option<serde_json::Value>,
     error: Option<String>,
+}
+
+struct ImportPermit {
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for ImportPermit {
+    fn drop(&mut self) {
+        self.in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 struct SearchJobWork {
@@ -2797,6 +2822,66 @@ impl MaterializedProjectionSnapshot {
     }
 }
 
+fn rematerialize_communication_privacy_keys(
+    projection: &mut CommunicationProjectionState,
+    privacy_keys: &BTreeSet<String>,
+    lookup: &dyn ComponentProjectionLookup,
+    join_index: &ReplySloJoinIndex,
+    delta: &mut ReplySloProjection,
+) -> Result<(), SelfHostError> {
+    let mut rematerialized_ids = BTreeSet::new();
+    for privacy_key in privacy_keys {
+        let mut cursor = 0_u64;
+        loop {
+            let page = lookup.observations_for_privacy_key_page(
+                privacy_key,
+                cursor,
+                COMMUNICATION_RECONSENT_PAGE_SIZE,
+            )?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map(|stored| stored.append_seq).ok_or_else(|| {
+                SelfHostError::Ingestion("privacy reverse-index page unexpectedly empty".to_owned())
+            })?;
+            let observations = page
+                .iter()
+                .filter(|stored| {
+                    rematerialized_ids.insert(stored.observation.id.as_str().to_owned())
+                })
+                .map(|stored| stored.observation.clone())
+                .collect::<Vec<_>>();
+            merge_reply_slo_delta(
+                delta,
+                projection.rematerialize_observations(&observations, join_index),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn merge_reply_slo_delta(target: &mut ReplySloProjection, next: ReplySloProjection) {
+    target.rows.extend(next.rows);
+    target.rows.sort_by(|left, right| {
+        left.due_at.cmp(&right.due_at).then_with(|| {
+            left.incoming_observation_id
+                .as_str()
+                .cmp(right.incoming_observation_id.as_str())
+        })
+    });
+    target.overdue = target
+        .rows
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.status,
+                ReplySloStatus::Overdue | ReplySloStatus::SentLate
+            )
+        })
+        .cloned()
+        .collect();
+}
+
 fn apply_compact_incremental_delta(
     core: &mut AppCore,
     appended_observations: &[Observation],
@@ -2879,25 +2964,13 @@ fn apply_compact_incremental_delta_with_sequences(
         &core.canonical_observation_fingerprint,
         appended_observations,
     )?;
-    let mut consent_affected_observations = BTreeMap::new();
+    let mut consent_privacy_keys = BTreeSet::new();
     for observation in appended_observations {
         let Some(decision) = consent_decision_from_observation(observation) else {
             continue;
         };
-        for privacy_key in consent_decision_keys(&decision) {
-            for stored in lookup.observations_for_privacy_key(&privacy_key)? {
-                consent_affected_observations
-                    .entry(stored.observation.id.as_str().to_owned())
-                    .or_insert(stored.observation);
-            }
-        }
+        consent_privacy_keys.extend(consent_decision_keys(&decision));
     }
-    core.communication_projection.remember_observations(
-        &consent_affected_observations
-            .into_values()
-            .collect::<Vec<_>>(),
-        &core.supplemental_projection_cache.reply_slo,
-    );
     let compact_apply = core
         .compact_state
         .apply_observation_page(appended_observations)?;
@@ -3014,10 +3087,17 @@ fn apply_compact_incremental_delta_with_sequences(
         })
         .map(|event| identity_replay_event_projection_item(&event))
         .collect::<Result<Vec<_>, _>>()?;
-    let reply_slo_delta = core.communication_projection.fold_observations(
+    let mut reply_slo_delta = core.communication_projection.fold_observations(
         appended_observations,
         &core.supplemental_projection_cache.reply_slo,
     );
+    rematerialize_communication_privacy_keys(
+        &mut core.communication_projection,
+        &consent_privacy_keys,
+        lookup,
+        &core.supplemental_projection_cache.reply_slo,
+        &mut reply_slo_delta,
+    )?;
     let reply_slo_inserts = reply_slo_delta
         .rows
         .iter()
@@ -4901,6 +4981,35 @@ fn rebuild_materialized_snapshot_paged(
         privacy_filter.apply_observations(observations);
         compact_state.apply_observation_page(observations)?;
         communication_projection.fold_observations(observations, &reply_slo_join_index);
+        let consent_privacy_keys = observations
+            .iter()
+            .filter_map(consent_decision_from_observation)
+            .flat_map(|decision| consent_decision_keys(&decision))
+            .collect::<BTreeSet<_>>();
+        for privacy_key in consent_privacy_keys {
+            let mut cursor = 0_u64;
+            loop {
+                let page = persistence.observations_for_privacy_key_page(
+                    &privacy_key,
+                    cursor,
+                    page_size,
+                )?;
+                if page.is_empty() {
+                    break;
+                }
+                cursor = page.last().map(|stored| stored.append_seq).ok_or_else(|| {
+                    SelfHostError::Ingestion(
+                        "privacy reverse-index page unexpectedly empty".to_owned(),
+                    )
+                })?;
+                let observations = page
+                    .iter()
+                    .map(|stored| stored.observation.clone())
+                    .collect::<Vec<_>>();
+                communication_projection
+                    .rematerialize_observations(&observations, &reply_slo_join_index);
+            }
+        }
         for observation in observations {
             add_observation_to_fingerprint(&mut canonical_fingerprint, observation)?;
         }
@@ -6019,8 +6128,10 @@ impl AppService {
             history_projection: Arc::new(Mutex::new(history_projection)),
             derived_projection_lane: Arc::new(Mutex::new(())),
             bulk_import_operation: Arc::new(Mutex::new(())),
+            import_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             search_index,
             search_jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            search_job_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             search_job_queue,
             config: Arc::new(config),
             slack_sources,
@@ -6037,6 +6148,8 @@ impl AppService {
             non_corpus_rebuild_error: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             non_corpus_rebuild_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            publish_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             search_job_test_gate: None,
             #[cfg(test)]
@@ -6442,10 +6555,18 @@ impl AppService {
         let mut timer = ObservationImportTimer::new();
         let mut materialization_state = ImportMaterializationState::NotRun;
         let result = (|| {
+            let _import_permit = self.try_acquire_import_permit()?;
             if source_instance_id.trim().is_empty() {
                 return Err(SelfHostError::Ingestion(
                     "source_instance_id must not be blank".to_owned(),
                 ));
+            }
+            if drafts.len() > self.config.resource_limits.max_import_drafts {
+                return Err(SelfHostError::Ingestion(format!(
+                    "draft count {} exceeds configured maximum {}",
+                    drafts.len(),
+                    self.config.resource_limits.max_import_drafts
+                )));
             }
             self.enforce_cutover_admission(
                 source_instance_id,
@@ -6588,7 +6709,6 @@ impl AppService {
 
             let request_had_canonical_attempt = !audit_events.is_empty();
             if request_had_canonical_attempt {
-                self.refresh_capture_consent_snapshot(&request_appended_observations)?;
                 if let Some(session) = bulk_session.clone() {
                     self.record_deferred_bulk_import_append(session)?;
                     let _derived_lane = self
@@ -6596,10 +6716,13 @@ impl AppService {
                         .lock()
                         .map_err(|_| SelfHostError::LockPoisoned)?;
                     let mut core = self.core_lock()?;
+                    for observation in &request_appended_observations {
+                        core.compact_state.capture_consent_decision(observation);
+                    }
                     core.mark_non_corpus_materializations_stale();
                     self.publish_core_snapshot(&core);
-                    materialization_state = ImportMaterializationState::Deferred;
                     self.trigger_search_index_catch_up();
+                    materialization_state = ImportMaterializationState::Deferred;
                 } else {
                     let classification =
                         classify_non_corpus_delta_with_reason(&request_appended_observations);
@@ -6673,6 +6796,7 @@ impl AppService {
         let mut timer = ObservationImportTimer::new();
         let mut materialization_state = ImportMaterializationState::NotRun;
         let result = (|| {
+            let _import_permit = self.try_acquire_import_permit()?;
             if source_instance_id.trim().is_empty() {
                 return Err(SelfHostError::IngestionRequest {
                     code: "source_instance_required",
@@ -6685,21 +6809,7 @@ impl AppService {
                 CutoverApiVersion::V2,
                 admission_generation,
             )?;
-            if drafts.len() > self.config.resource_limits.max_sync_items {
-                return Err(SelfHostError::IngestionRequest {
-                    code: "draft_count_exceeded",
-                    detail: format!(
-                        "draft count {} exceeds configured maximum {}",
-                        drafts.len(),
-                        self.config.resource_limits.max_sync_items
-                    ),
-                    details: serde_json::json!({
-                        "field": "drafts",
-                        "actual": drafts.len(),
-                        "maximum": self.config.resource_limits.max_sync_items,
-                    }),
-                });
-            }
+            let request_draft_count = drafts.len();
 
             let _operation = self.bulk_import_operation_lock()?;
             let core = (*self.core_snapshot()).clone();
@@ -6721,6 +6831,22 @@ impl AppService {
                     .client_ref
                     .clone()
                     .unwrap_or_else(|| index.to_string());
+                if index >= self.config.resource_limits.max_import_drafts {
+                    item_results[index] = Some(rejected_item(
+                        client_ref,
+                        "draft_count_exceeded",
+                        format!(
+                            "draft index {index} exceeds configured maximum {}",
+                            self.config.resource_limits.max_import_drafts
+                        ),
+                        Some(serde_json::json!({
+                            "field": "drafts",
+                            "actual": request_draft_count,
+                            "maximum": self.config.resource_limits.max_import_drafts,
+                        })),
+                    ));
+                    continue;
+                }
                 if client_ref.trim().is_empty() {
                     item_results[index] = Some(rejected_item(
                         client_ref,
@@ -6915,7 +7041,6 @@ impl AppService {
 
             let request_had_canonical_attempt = !audit_events.is_empty();
             if request_had_canonical_attempt {
-                self.refresh_capture_consent_snapshot(&request_appended_observations)?;
                 if let Some(session) = bulk_session {
                     if let Err(error) = self.record_deferred_bulk_import_append(session) {
                         tracing::error!(
@@ -6928,10 +7053,13 @@ impl AppService {
                         .lock()
                         .map_err(|_| SelfHostError::LockPoisoned)?;
                     let mut core = self.core_lock()?;
+                    for observation in &request_appended_observations {
+                        core.compact_state.capture_consent_decision(observation);
+                    }
                     core.mark_non_corpus_materializations_stale();
                     self.publish_core_snapshot(&core);
-                    materialization_state = ImportMaterializationState::Deferred;
                     self.trigger_search_index_catch_up();
+                    materialization_state = ImportMaterializationState::Deferred;
                 } else {
                     let classification =
                         classify_non_corpus_delta_with_reason(&request_appended_observations);

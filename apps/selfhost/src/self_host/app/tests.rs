@@ -18,8 +18,8 @@ use lethe_api::api::grep::GrepRequest;
 use lethe_core::domain::supplemental::InputAnchorSet;
 
 use super::{
-    AppCore, AppService, CompactProjectionState, GoogleSourceRuntime, ImportOutcome,
-    SearchJobStatus, SelfHostError, SlackSourceRuntime, classify_slack_ingress,
+    AppCore, AppService, CompactProjectionState, GoogleSourceRuntime, ImportItemResult,
+    ImportOutcome, SearchJobStatus, SelfHostError, SlackSourceRuntime, classify_slack_ingress,
     discovered_slack_threads, extract_slide_text_fragments, infer_profile_name_from_fragments,
     latest_revision_to_capture, namespace_draft, non_empty_state, ranked_self_intro_slide_indices,
     thread_root_ts,
@@ -223,8 +223,11 @@ fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
             max_blob_bytes: 10 * 1024 * 1024,
             max_payload_bytes: 1024 * 1024,
             max_sync_items: 10_000,
+            max_concurrent_imports: 2,
+            max_import_drafts: 10_000,
             max_page_size: 100,
             max_search_job_workers: 2,
+            max_search_job_records: 1_000,
             max_leaf_observations: 100_000,
             retention_days: 30,
         },
@@ -345,9 +348,9 @@ fn operational_ledger_survives_interface_service_restart() {
 }
 
 #[test]
-fn v9_manifest_with_legacy_opt_out_fields_rebuilds_on_restart() {
+fn v10_manifest_shape_rebuilds_on_restart_without_body_cache() {
     let root = std::env::temp_dir().join(format!(
-        "lethe-self-host-v9-manifest-test-{}",
+        "lethe-self-host-v10-manifest-test-{}",
         uuid::Uuid::now_v7()
     ));
     let db = root.join("lethe.sqlite3");
@@ -355,9 +358,9 @@ fn v9_manifest_with_legacy_opt_out_fields_rebuilds_on_restart() {
     let config = test_config(db.clone(), blobs.clone());
     let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
     let target = wave2_slack_observation(
-        "U-V9",
-        "V9 manifest target",
-        Some("v9@example.test"),
+        "U-V10",
+        "V10 manifest target",
+        Some("v10@example.test"),
         "1.000001",
         "2026-07-12T00:00:00Z".parse().unwrap(),
     );
@@ -372,21 +375,7 @@ fn v9_manifest_with_legacy_opt_out_fields_rebuilds_on_restart() {
         .projection_records(&ProjectionRef::new("proj:person-page"))
         .unwrap()
         .unwrap();
-    legacy_manifest["format_version"] = serde_json::json!(9);
-    let communication = legacy_manifest["communication_projection"]
-        .as_object_mut()
-        .unwrap();
-    communication.remove("consent_by_subject");
-    communication.remove("consent_by_identifier");
-    communication.remove("observation_ids_by_privacy_key");
-    communication.insert(
-        "opted_out_subjects".to_owned(),
-        serde_json::json!(["person:v9-legacy"]),
-    );
-    communication.insert(
-        "opted_out_sender_ids".to_owned(),
-        serde_json::json!(["U-V9"]),
-    );
+    legacy_manifest["format_version"] = serde_json::json!(10);
     service
         .persistence_lock()
         .unwrap()
@@ -588,8 +577,10 @@ fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppSe
         history_projection,
         derived_projection_lane: Arc::new(Mutex::new(())),
         bulk_import_operation: Arc::new(Mutex::new(())),
+        import_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         search_index,
         search_jobs: Arc::new(Mutex::new(BTreeMap::new())),
+        search_job_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         search_job_queue,
         config: Arc::new(config.clone()),
         slack_sources: vec![SlackSourceRuntime {
@@ -621,6 +612,7 @@ fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppSe
         non_corpus_rebuild_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         non_corpus_rebuild_error: Arc::new(Mutex::new(None)),
         non_corpus_rebuild_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        publish_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         search_job_test_gate: None,
         search_job_test_fault: None,
     };
@@ -772,6 +764,54 @@ fn regex_search_job_worker_error_and_panic_become_failed_terminal_states() {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("search job worker panicked"))
+    );
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn terminal_search_jobs_are_evicted_oldest_first() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-self-host-search-job-retention-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let mut config = test_config(db.clone(), blobs.clone());
+    config.resource_limits.max_search_job_records = 1;
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let service = test_service(config, persistence);
+    wait_for_search_index_ready(&service);
+
+    let first = service
+        .submit_corpus_search_job(GrepRequest {
+            pattern: "[a-z]+".to_owned(),
+            ..GrepRequest::default()
+        })
+        .unwrap();
+    assert_eq!(
+        wait_for_search_job_terminal(&service, &first.job_id).status,
+        "completed"
+    );
+
+    let second = service
+        .submit_corpus_search_job(GrepRequest {
+            pattern: "[0-9]+".to_owned(),
+            ..GrepRequest::default()
+        })
+        .unwrap();
+    assert_eq!(
+        wait_for_search_job_terminal(&service, &second.job_id).status,
+        "completed"
+    );
+    assert!(matches!(
+        service.search_job_status(&first.job_id),
+        Err(SelfHostError::NotFound(_))
+    ));
+    assert_eq!(
+        service.search_job_status(&second.job_id).unwrap().status,
+        "completed"
     );
 
     drop(service);
@@ -2327,22 +2367,28 @@ impl super::ComponentProjectionLookup for TestComponentProjectionLookup {
         Ok(self.observations.get(observation_id.as_str()).cloned())
     }
 
-    fn observations_for_privacy_key(
+    fn observations_for_privacy_key_page(
         &self,
         privacy_key: &str,
+        after_append_seq: u64,
+        limit: usize,
     ) -> Result<Vec<lethe_storage_api::StoredObservation>, SelfHostError> {
         self.requested_privacy_keys
             .borrow_mut()
             .push(privacy_key.to_owned());
-        Ok(self
+        let mut page = self
             .observations
             .values()
             .filter(|stored| {
-                lethe_core::domain::observation_privacy_keys(&stored.observation)
-                    .contains(privacy_key)
+                stored.append_seq > after_append_seq
+                    && lethe_core::domain::observation_privacy_keys(&stored.observation)
+                        .contains(privacy_key)
             })
             .cloned()
-            .collect())
+            .collect::<Vec<_>>();
+        page.sort_by_key(|stored| stored.append_seq);
+        page.truncate(limit);
+        Ok(page)
     }
 
     fn person_message_items(
@@ -2903,6 +2949,14 @@ fn communication_incremental_consent_repulls_after_state_restore() {
         "1.000001",
         initial_at,
     );
+    let root = std::env::temp_dir().join(format!(
+        "lethe-communication-reconsent-storage-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let storage =
+        SqlitePersistence::open(&root.join("lethe.sqlite3"), &root.join("blobs"), &[7; 32])
+            .unwrap();
+    storage.persist_observation(&target).unwrap();
     let initial_stats = lethe_storage_api::ObservationStats {
         count: 1,
         max_append_seq: 1,
@@ -2930,8 +2984,13 @@ fn communication_incremental_consent_repulls_after_state_restore() {
         "restore-opt-out",
         initial_at + chrono::Duration::minutes(1),
     );
-    let all_after_opt_out = vec![target.clone(), opt_out.clone()];
-    let lookup_after_opt_out = component_projection_lookup(&all_after_opt_out, BTreeMap::new());
+    let mut persisted_opt_out = opt_out.clone();
+    persisted_opt_out.meta = serde_json::json!({
+        "canonical_json": "{\"kind\":\"consent\"}",
+        "source_container": "consent-test",
+    });
+    storage.persist_observation(&persisted_opt_out).unwrap();
+    let lookup_after_opt_out = super::StorageComponentProjectionLookup { storage: &storage };
     let opt_out_stats = lethe_storage_api::ObservationStats {
         count: 2,
         max_append_seq: 2,
@@ -2945,13 +3004,6 @@ fn communication_incremental_consent_repulls_after_state_restore() {
     )
     .unwrap();
     assert!(core.communication_projection.is_empty());
-    assert!(
-        lookup_after_opt_out
-            .requested_privacy_keys
-            .borrow()
-            .iter()
-            .any(|key| key == "person@example.test")
-    );
 
     let reconsent = component_consent_observation(
         "person@example.test",
@@ -2959,8 +3011,13 @@ fn communication_incremental_consent_repulls_after_state_restore() {
         "restore-reconsent",
         initial_at + chrono::Duration::minutes(2),
     );
-    let all_after_reconsent = vec![target, opt_out, reconsent.clone()];
-    let lookup_after_reconsent = component_projection_lookup(&all_after_reconsent, BTreeMap::new());
+    let mut persisted_reconsent = reconsent.clone();
+    persisted_reconsent.meta = serde_json::json!({
+        "canonical_json": "{\"kind\":\"consent\"}",
+        "source_container": "consent-test",
+    });
+    storage.persist_observation(&persisted_reconsent).unwrap();
+    let lookup_after_reconsent = super::StorageComponentProjectionLookup { storage: &storage };
     let reconsent_stats = lethe_storage_api::ObservationStats {
         count: 3,
         max_append_seq: 3,
@@ -2974,13 +3031,15 @@ fn communication_incremental_consent_repulls_after_state_restore() {
     )
     .unwrap();
     assert_eq!(core.communication_projection.len(), 1);
-    assert!(
-        lookup_after_reconsent
-            .requested_privacy_keys
-            .borrow()
-            .iter()
-            .any(|key| key == "person@example.test")
+    assert_eq!(
+        storage
+            .observations_for_privacy_key_page("person@example.test", 0, 1)
+            .unwrap()
+            .len(),
+        1
     );
+    drop(storage);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4560,6 +4619,122 @@ fn five_thousand_corpus_only_records_do_not_trigger_full_observation_load() {
         "freshness-only bulk import must not call load_observations"
     );
 
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn import_publish_count_is_bounded_per_request_and_consumer_batch() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-self-host-publish-count-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let service = test_service(test_config(db.clone(), blobs.clone()), persistence);
+
+    let report = service
+        .ingest_observation_drafts(
+            (0..1_000)
+                .map(|index| freshness_only_draft(&format!("publish-one-{index:04}")))
+                .collect(),
+            "publish-count-one-request",
+        )
+        .unwrap();
+    assert_eq!(report.ingested, 1_000);
+    wait_for_append_consumer(&service);
+    let one_request_publishes = service.publish_count();
+    eprintln!("publish_count(1000 in one request)={one_request_publishes}");
+    assert!(one_request_publishes <= 2);
+    drop(service);
+
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let service = test_service(test_config(db, blobs), persistence);
+    for request_index in 0..40 {
+        let report = service
+            .ingest_observation_drafts(
+                (0..25)
+                    .map(|item_index| {
+                        freshness_only_draft(&format!(
+                            "publish-serial-{request_index:02}-{item_index:02}"
+                        ))
+                    })
+                    .collect(),
+                "publish-count-serial",
+            )
+            .unwrap();
+        assert_eq!(report.ingested, 25);
+    }
+    wait_for_append_consumer(&service);
+    let serial_publishes = service.publish_count();
+    eprintln!("publish_count(25x40 serial requests)={serial_publishes}");
+    assert!(serial_publishes <= 43);
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn import_admission_and_draft_limit_fail_fast_for_v1_and_v2() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-self-host-import-limit-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let mut config = test_config(db.clone(), blobs.clone());
+    config.resource_limits.max_concurrent_imports = 1;
+    config.resource_limits.max_import_drafts = 1;
+    let service = test_service(config, persistence);
+
+    let permit = service.try_acquire_import_permit().unwrap();
+    assert!(matches!(
+        service.ingest_observation_drafts(vec![freshness_only_draft("busy-v1")], "limits"),
+        Err(SelfHostError::ImportConcurrencyLimit { maximum: 1 })
+    ));
+    assert!(matches!(
+        service.ingest_observation_drafts_v2(vec![freshness_only_draft("busy-v2")], "limits"),
+        Err(SelfHostError::ImportConcurrencyLimit { maximum: 1 })
+    ));
+    drop(permit);
+
+    let now = Utc::now();
+    let drafts = vec![
+        v2_slack_draft(1, now),
+        v2_slack_draft(2, now + chrono::Duration::seconds(1)),
+    ];
+    assert!(matches!(
+        service.ingest_observation_drafts(drafts.clone(), "slack-test"),
+        Err(SelfHostError::Ingestion(detail)) if detail.contains("draft count 2")
+    ));
+    let v2_report = service
+        .ingest_observation_drafts_v2(drafts, "slack-test")
+        .unwrap();
+    assert_eq!(v2_report.ingested, 1);
+    assert_eq!(v2_report.rejected, 1);
+    assert!(matches!(
+        v2_report.results.as_slice(),
+        [_, ImportItemResult {
+            outcome: ImportOutcome::Rejected,
+            error_code: Some(code),
+            details: Some(details),
+            ..
+        }] if code == "draft_count_exceeded"
+            && details["actual"] == 2
+            && details["maximum"] == 1
+    ));
+    assert_eq!(
+        service
+            .persistence_lock()
+            .unwrap()
+            .observation_stats()
+            .unwrap()
+            .count,
+        1
+    );
+
+    drop(service);
     let _ = std::fs::remove_dir_all(root);
 }
 

@@ -5,6 +5,25 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 const PROJECTION_CURSOR_SEPARATOR: char = '\u{001f}';
 
+fn evict_oldest_terminal_search_job(
+    jobs: &mut BTreeMap<String, SearchJobRecord>,
+) -> Option<String> {
+    let candidate = jobs
+        .iter()
+        .filter(|(_, job)| matches!(job.status.as_str(), "completed" | "failed"))
+        .min_by_key(|(_, job)| job.sequence)
+        .map(|(job_id, _)| job_id.clone());
+    candidate.and_then(|job_id| jobs.remove(&job_id).map(|_| job_id))
+}
+
+fn evict_excess_terminal_search_jobs(jobs: &mut BTreeMap<String, SearchJobRecord>, maximum: usize) {
+    while jobs.len() > maximum {
+        if evict_oldest_terminal_search_job(jobs).is_none() {
+            break;
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CorpusSourceTypeSummary {
     pub source_type: String,
@@ -811,9 +830,21 @@ impl AppService {
                 .search_jobs
                 .lock()
                 .map_err(|_| SelfHostError::LockPoisoned)?;
+            let maximum = self.config.resource_limits.max_search_job_records;
+            if jobs.len() >= maximum {
+                evict_oldest_terminal_search_job(&mut jobs).ok_or_else(|| {
+                    SelfHostError::ReadMode(format!(
+                        "search job record limit is full (capacity {maximum})"
+                    ))
+                })?;
+            }
+            let sequence = self
+                .search_job_sequence
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             jobs.insert(
                 job_id.clone(),
                 SearchJobRecord {
+                    sequence,
                     status: "queued".to_owned(),
                     result: None,
                     error: None,
@@ -885,6 +916,10 @@ impl AppService {
             .ok_or_else(|| SelfHostError::NotFound(format!("search job {}", work.job_id)))?;
         job.status = "completed".to_owned();
         job.result = Some(result);
+        evict_excess_terminal_search_jobs(
+            &mut jobs,
+            self.config.resource_limits.max_search_job_records,
+        );
         Ok(())
     }
 
@@ -896,6 +931,10 @@ impl AppService {
                     job.error = Some(error);
                     job.result = None;
                 }
+                evict_excess_terminal_search_jobs(
+                    &mut jobs,
+                    self.config.resource_limits.max_search_job_records,
+                );
             }
             Err(lock_error) => {
                 tracing::error!(

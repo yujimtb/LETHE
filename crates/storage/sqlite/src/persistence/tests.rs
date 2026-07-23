@@ -777,6 +777,165 @@ fn reconsent_privacy_reverse_index_tracks_subject_and_identifier_keys() {
 }
 
 #[test]
+fn v13_privacy_backfill_streaming_matches_pre_migration_rows_across_pages() {
+    let tmp = std::env::temp_dir().join(format!("lethe-v13-streaming-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    for index in 0..1_025 {
+        store
+            .append_observation_idempotent(&sample_observation_with_identity(
+                &format!("streaming-{index:04}"),
+                "streaming",
+            ))
+            .unwrap();
+    }
+    let expected_ids = store
+        .observations_for_privacy_key("entity:test")
+        .unwrap()
+        .into_iter()
+        .map(|stored| stored.observation.id.as_str().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    store
+        .conn
+        .execute_batch(
+            "
+            DROP TRIGGER cutover_transition_log_no_update;
+            DROP TRIGGER cutover_transition_log_no_delete;
+            DROP INDEX cutover_credentials_active;
+            DROP INDEX cutover_transition_unit_seq;
+            DROP INDEX identity_bridge_gaps_source_append;
+            DROP INDEX identity_bridge_candidates_source_append;
+            DROP INDEX identity_bridge_candidates_key_append;
+            DROP TABLE cutover_unit_metrics;
+            DROP TABLE cutover_credentials;
+            DROP TABLE cutover_transition_log;
+            DROP TABLE identity_bridge_watermark;
+            DROP TABLE identity_bridge_gaps;
+            DROP TABLE identity_bridge_candidates;
+            DROP INDEX observation_privacy_keys_append;
+            DROP TABLE observation_privacy_keys;
+            DELETE FROM schema_migrations WHERE version >= 13;
+            ",
+        )
+        .unwrap();
+    drop(store);
+
+    let migrated = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    let actual_ids = migrated
+        .observations_for_privacy_key("entity:test")
+        .unwrap()
+        .into_iter()
+        .map(|stored| stored.observation.id.as_str().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(actual_ids, expected_ids);
+    assert_eq!(
+        migrated
+            .observations_for_privacy_key_page("entity:test", 0, 17)
+            .unwrap()
+            .len(),
+        17
+    );
+
+    drop(migrated);
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn v13_privacy_backfill_rolls_back_and_retries_from_first_page() {
+    let tmp = std::env::temp_dir().join(format!("lethe-v13-rollback-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    for index in 0..513 {
+        store
+            .append_observation_idempotent(&sample_observation_with_identity(
+                &format!("rollback-{index:04}"),
+                "rollback",
+            ))
+            .unwrap();
+    }
+    let bad_append_seq = 513_u64;
+    let valid_json: String = store
+        .conn
+        .query_row(
+            "SELECT observation_json FROM observations WHERE append_seq = ?1",
+            [bad_append_seq],
+            |row| row.get(0),
+        )
+        .unwrap();
+    store
+        .conn
+        .execute_batch(
+            "
+            DROP TRIGGER cutover_transition_log_no_update;
+            DROP TRIGGER cutover_transition_log_no_delete;
+            DROP INDEX cutover_credentials_active;
+            DROP INDEX cutover_transition_unit_seq;
+            DROP INDEX identity_bridge_gaps_source_append;
+            DROP INDEX identity_bridge_candidates_source_append;
+            DROP INDEX identity_bridge_candidates_key_append;
+            DROP TABLE cutover_unit_metrics;
+            DROP TABLE cutover_credentials;
+            DROP TABLE cutover_transition_log;
+            DROP TABLE identity_bridge_watermark;
+            DROP TABLE identity_bridge_gaps;
+            DROP TABLE identity_bridge_candidates;
+            DROP INDEX observation_privacy_keys_append;
+            DROP TABLE observation_privacy_keys;
+            DELETE FROM schema_migrations WHERE version >= 13;
+            ",
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE observations SET observation_json = ?1 WHERE append_seq = ?2",
+            rusqlite::params!["{not-json", bad_append_seq],
+        )
+        .unwrap();
+    drop(store);
+
+    assert!(SqlitePersistence::open(&db, &blob_dir, &[7; 32]).is_err());
+
+    let repair = rusqlite::Connection::open(&db).unwrap();
+    let table_count: i64 = repair
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'observation_privacy_keys'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(table_count, 0);
+    let migration_count: i64 = repair
+        .query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version >= 13",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(migration_count, 0);
+    repair
+        .execute(
+            "UPDATE observations SET observation_json = ?1 WHERE append_seq = ?2",
+            rusqlite::params![valid_json, bad_append_seq],
+        )
+        .unwrap();
+    drop(repair);
+
+    let migrated = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    assert_eq!(
+        migrated
+            .observations_for_privacy_key("entity:test")
+            .unwrap()
+            .len(),
+        513
+    );
+    drop(migrated);
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
 fn schema_v14_converges_from_fresh_v12_and_v13_upgrade_paths() {
     let fresh_tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let fresh = SqlitePersistence::open(
