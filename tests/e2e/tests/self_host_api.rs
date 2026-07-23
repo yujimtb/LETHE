@@ -877,7 +877,8 @@ fn history_import_and_single_query_http_contract_are_data_space_scoped() {
                         .body(Body::from(
                             serde_json::json!({
                                 "inventory": inventory,
-                                "expected_manifest_digest": manifest_digest
+                                "expected_manifest_digest": manifest_digest,
+                                "admission_generations": {}
                             })
                             .to_string(),
                         ))

@@ -53,6 +53,8 @@ Source options (at least one pair is required):
   --lethe-source-page-size=<n>           Maximum observations held per source page
   --lethe-upstream-instance=<sys:id>=<instance>
                                         Repeatable upstream native identity mapping
+  --admission-generation=<source-instance>=<generation>
+                                        Repeatable v2 cutover generation for direct append
 
 SQLite execute backend:
   --backend=sqlite --sqlite-database=<path> --sqlite-blob-dir=<path> --sqlite-key-env=<name>
@@ -292,6 +294,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         store.as_ref(),
         *max_blob_bytes,
         options.max_resident_batch_records,
+        &options.admission_generations,
     )?;
     println!(
         "{}",
@@ -753,12 +756,19 @@ struct ImportMetrics {
     max_resident_batch_records: usize,
 }
 
+#[derive(Default)]
+struct ImportCounts {
+    appended_messages: u64,
+    duplicate_messages: u64,
+}
+
 fn execute_spool<T: OperationalStoragePorts + ?Sized>(
     spool: &HistorySpool,
     plan: &StreamingPlan,
     store: &T,
     max_blob_bytes: usize,
     max_resident_batch_records: usize,
+    admission_generations: &BTreeMap<String, u64>,
 ) -> Result<(HistoryImportResult, ImportMetrics), Box<dyn std::error::Error>> {
     if store.data_space_id() != &plan.data_space_id {
         return Err(format!(
@@ -778,8 +788,19 @@ fn execute_spool<T: OperationalStoragePorts + ?Sized>(
         )
         .into());
     }
-    let mut appended_messages = 0_u64;
-    let mut duplicate_messages = 0_u64;
+    for source_instance_id in admission_generations.keys() {
+        if !plan
+            .sources
+            .iter()
+            .any(|source| &source.source_instance_id == source_instance_id)
+        {
+            return Err(format!(
+                "admission generation was supplied for source_instance_id {source_instance_id}, which is not in the import plan"
+            )
+            .into());
+        }
+    }
+    let mut counts = ImportCounts::default();
     let mut metrics = ImportMetrics::default();
     for source in &plan.sources {
         let owner_id = match &source.ownership {
@@ -788,6 +809,9 @@ fn execute_spool<T: OperationalStoragePorts + ?Sized>(
                 return Err(format!("history ownership unresolved: {reason}").into());
             }
         };
+        let generation = admission_generations
+            .get(&source.source_instance_id)
+            .copied();
         let mut statement = spool.connection.prepare(
             "SELECT record_json, raw FROM records WHERE source_key = ?1
              ORDER BY published_at, ordinal, source_session_id, source_message_id",
@@ -806,8 +830,8 @@ fn execute_spool<T: OperationalStoragePorts + ?Sized>(
                     owner_id,
                     &mut records,
                     max_blob_bytes,
-                    &mut appended_messages,
-                    &mut duplicate_messages,
+                    generation,
+                    &mut counts,
                 )?;
             }
         }
@@ -817,8 +841,8 @@ fn execute_spool<T: OperationalStoragePorts + ?Sized>(
             owner_id,
             &mut records,
             max_blob_bytes,
-            &mut appended_messages,
-            &mut duplicate_messages,
+            generation,
+            &mut counts,
         )?;
     }
     let cutover_cursors = plan
@@ -860,8 +884,8 @@ fn execute_spool<T: OperationalStoragePorts + ?Sized>(
     Ok((
         HistoryImportResult {
             receipt,
-            appended_messages,
-            duplicate_messages,
+            appended_messages: counts.appended_messages,
+            duplicate_messages: counts.duplicate_messages,
             receipt_cursor,
             receipt_was_duplicate,
         },
@@ -875,8 +899,8 @@ fn apply_record_batch<T: OperationalStoragePorts + ?Sized>(
     owner_id: &str,
     records: &mut Vec<HistoryRawRecord>,
     max_blob_bytes: usize,
-    appended: &mut u64,
-    duplicates: &mut u64,
+    generation: Option<u64>,
+    counts: &mut ImportCounts,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if records.is_empty() {
         return Ok(());
@@ -900,13 +924,22 @@ fn apply_record_batch<T: OperationalStoragePorts + ?Sized>(
             blob_ref,
         )?);
     }
-    apply_message_batch(store, &mut requests, appended, duplicates)?;
+    apply_message_batch(
+        store,
+        &source.source_instance_id,
+        generation,
+        &mut requests,
+        &mut counts.appended_messages,
+        &mut counts.duplicate_messages,
+    )?;
     records.clear();
     Ok(())
 }
 
 fn apply_message_batch<T: OperationalStoragePorts + ?Sized>(
     store: &T,
+    source_instance_id: &str,
+    generation: Option<u64>,
     requests: &mut Vec<lethe_storage_api::OperationalAppendRequest>,
     appended: &mut u64,
     duplicates: &mut u64,
@@ -914,7 +947,8 @@ fn apply_message_batch<T: OperationalStoragePorts + ?Sized>(
     if requests.is_empty() {
         return Ok(());
     }
-    let outcomes = store.append_operational_events(requests)?;
+    let outcomes =
+        store.append_operational_events_v2_with_bridge(source_instance_id, generation, requests)?;
     if outcomes.len() != requests.len() {
         return Err("operational store returned the wrong history batch outcome count".into());
     }
@@ -985,6 +1019,7 @@ struct Options {
     max_resident_batch_records: usize,
     max_handoff_session_entries: usize,
     require_activation_source_set: bool,
+    admission_generations: BTreeMap<String, u64>,
     claude: Option<NativeSource>,
     codex: Option<NativeSource>,
     generic_sources: Vec<GenericSource>,
@@ -1078,6 +1113,7 @@ impl Options {
         let mut values = BTreeMap::new();
         let mut generic_sources = Vec::new();
         let mut lethe_upstream_instances = BTreeMap::new();
+        let mut admission_generations = BTreeMap::new();
         for arg in args {
             let Some((name, value)) = arg.split_once('=') else {
                 return Err(format!("argument must use --name=value syntax: {arg}").into());
@@ -1087,6 +1123,30 @@ impl Options {
             }
             if name == "--history-jsonl" {
                 generic_sources.push(parse_generic_source(value)?);
+                continue;
+            }
+            if name == "--admission-generation" {
+                let (source_instance_id, generation) = value
+                    .split_once('=')
+                    .ok_or("--admission-generation must use <source-instance>=<generation>")?;
+                if source_instance_id.trim().is_empty() {
+                    return Err("--admission-generation source-instance must not be blank".into());
+                }
+                let generation = generation.parse::<u64>().map_err(|error| {
+                    format!("--admission-generation generation must be a positive integer: {error}")
+                })?;
+                if generation == 0 {
+                    return Err("--admission-generation generation must be positive".into());
+                }
+                if admission_generations
+                    .insert(source_instance_id.to_owned(), generation)
+                    .is_some()
+                {
+                    return Err(format!(
+                        "duplicate --admission-generation for {source_instance_id}"
+                    )
+                    .into());
+                }
                 continue;
             }
             if name == "--lethe-upstream-instance" {
@@ -1198,6 +1258,7 @@ impl Options {
             max_resident_batch_records,
             max_handoff_session_entries,
             require_activation_source_set,
+            admission_generations,
             claude,
             codex,
             generic_sources,
@@ -1641,6 +1702,29 @@ mod tests {
     }
 
     #[test]
+    fn admission_generation_is_explicit_per_source_instance() {
+        let base = vec![
+            "--mode=dry-run".to_owned(),
+            "--inventory-id=inventory:test".to_owned(),
+            "--data-space-id=space:personal".to_owned(),
+            "--owner-id=owner".to_owned(),
+            "--captured-at=2026-07-20T00:00:00Z".to_owned(),
+            "--spool-database=C:\\spool.sqlite3".to_owned(),
+            "--max-source-record-bytes=1024".to_owned(),
+            "--max-resident-batch-records=2".to_owned(),
+            "--max-handoff-session-entries=100".to_owned(),
+            "--history-jsonl=codex:codex-personal:C:\\history.jsonl".to_owned(),
+            "--admission-generation=codex-personal=7".to_owned(),
+        ];
+        let options = Options::parse(base.clone()).unwrap();
+        assert_eq!(options.admission_generations["codex-personal"], 7);
+
+        let mut duplicate = base;
+        duplicate.push("--admission-generation=codex-personal=8".to_owned());
+        assert!(Options::parse(duplicate).is_err());
+    }
+
+    #[test]
     fn existing_lethe_source_requires_explicit_backend_location_key_and_page_size() {
         let base = vec![
             "--mode=dry-run".to_owned(),
@@ -1925,7 +2009,8 @@ mod tests {
             &[7; 32],
         )
         .unwrap();
-        let (result, metrics) = execute_spool(&spool, &plan, &store, 1024, 2).unwrap();
+        let (result, metrics) =
+            execute_spool(&spool, &plan, &store, 1024, 2, &BTreeMap::new()).unwrap();
         assert_eq!(result.appended_messages, 5);
         assert_eq!(metrics.max_resident_batch_records, 2);
         drop(store);

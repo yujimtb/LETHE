@@ -22,6 +22,8 @@ pub const HISTORY_IMPORT_SCHEMA: &str = "schema:history-import-receipt";
 pub const HISTORY_SCHEMA_VERSION: &str = "1.0.0";
 pub const HISTORY_ACTIVATION_HANDOFF_SCHEMA: &str = "schema:history-activation-handoff";
 pub const HISTORY_ACTIVATION_HANDOFF_VERSION: &str = "1.0.0";
+pub const HISTORY_SOURCE_INSTANCE_META: &str = "source_instance";
+pub const HISTORY_OBJECT_ID_META: &str = "object_id";
 pub const UPSTREAM_SOURCE_KIND_META: &str = "upstream_source_kind";
 pub const UPSTREAM_SOURCE_INSTANCE_META: &str = "upstream_source_instance_id";
 pub const UPSTREAM_SESSION_META: &str = "upstream_session_id";
@@ -213,6 +215,7 @@ pub struct HistoryInventoryReport {
 pub struct HistoryImportCommand {
     pub inventory: HistoryInventoryRequest,
     pub expected_manifest_digest: String,
+    pub admission_generations: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -675,16 +678,30 @@ pub fn import_history<T: OperationalStoragePorts + ?Sized>(
     }
 
     let raw_by_identity = raw_record_map(&command.inventory)?;
-    let mut requests = Vec::with_capacity(
-        usize::try_from(report.unique_records)
-            .unwrap_or(usize::MAX)
-            .saturating_add(1),
-    );
+    for (source_instance_id, generation) in &command.admission_generations {
+        if *generation == 0 {
+            return Err(HistoryError::Invariant(format!(
+                "admission generation for source_instance_id {source_instance_id} must be positive"
+            )));
+        }
+        if !report
+            .manifest
+            .sources
+            .iter()
+            .any(|source| &source.source_instance_id == source_instance_id)
+        {
+            return Err(HistoryError::Invariant(format!(
+                "admission generation was supplied for source_instance_id {source_instance_id}, which is not in the import manifest"
+            )));
+        }
+    }
+    let mut requests_by_source = Vec::with_capacity(report.manifest.sources.len());
     for source in &report.manifest.sources {
         let owner_id = match &source.ownership {
             OwnershipAssignment::Personal { owner_id } => owner_id,
             OwnershipAssignment::Unresolved { .. } => unreachable!("guarded above"),
         };
+        let mut requests = Vec::with_capacity(source.records.len());
         for entry in &source.records {
             let identity = source_record_identity(
                 &source.source_instance_id,
@@ -716,41 +733,51 @@ pub fn import_history<T: OperationalStoragePorts + ?Sized>(
                 blob_ref,
             )?);
         }
+        if !requests.is_empty() {
+            requests_by_source.push((
+                source.source_instance_id.clone(),
+                command
+                    .admission_generations
+                    .get(&source.source_instance_id)
+                    .copied(),
+                requests,
+            ));
+        }
     }
 
     let receipt = receipt_for(&report)?;
-    requests.push(prepare_history_receipt_request(
-        store.data_space_id(),
-        &receipt,
-    )?);
-    let outcomes = store.append_operational_events(&requests)?;
-    if outcomes.len() != requests.len() {
-        return Err(HistoryError::Invariant(format!(
-            "operational store returned {} outcomes for {} requests",
-            outcomes.len(),
-            requests.len()
-        )));
-    }
-
     let mut appended_messages = 0_u64;
     let mut duplicate_messages = 0_u64;
-    for outcome in outcomes.iter().take(outcomes.len().saturating_sub(1)) {
-        match outcome {
-            OperationalAppendOutcome::Appended { .. } => appended_messages += 1,
-            OperationalAppendOutcome::Duplicate { .. } => duplicate_messages += 1,
-            OperationalAppendOutcome::VersionConflict { expected, actual } => {
-                return Err(HistoryError::Invariant(format!(
-                    "unexpected history message stream conflict: expected {expected}, actual {actual}"
-                )));
+    for (source_instance_id, generation, requests) in requests_by_source {
+        let outcomes = store.append_operational_events_v2_with_bridge(
+            &source_instance_id,
+            generation,
+            &requests,
+        )?;
+        if outcomes.len() != requests.len() {
+            return Err(HistoryError::Invariant(format!(
+                "operational store returned {} outcomes for {} requests",
+                outcomes.len(),
+                requests.len()
+            )));
+        }
+        for outcome in outcomes {
+            match outcome {
+                OperationalAppendOutcome::Appended { .. } => appended_messages += 1,
+                OperationalAppendOutcome::Duplicate { .. } => duplicate_messages += 1,
+                OperationalAppendOutcome::VersionConflict { expected, actual } => {
+                    return Err(HistoryError::Invariant(format!(
+                        "unexpected history message stream conflict: expected {expected}, actual {actual}"
+                    )));
+                }
             }
         }
     }
-    let receipt_outcome = outcomes.last().ok_or_else(|| {
-        HistoryError::Invariant("history import returned no receipt outcome".to_owned())
-    })?;
+    let receipt_request = prepare_history_receipt_request(store.data_space_id(), &receipt)?;
+    let receipt_outcome = store.append_operational_event(&receipt_request)?;
     let (receipt_cursor, receipt_was_duplicate) = match receipt_outcome {
-        OperationalAppendOutcome::Appended { cursor, .. } => (*cursor, false),
-        OperationalAppendOutcome::Duplicate { cursor, .. } => (*cursor, true),
+        OperationalAppendOutcome::Appended { cursor, .. } => (cursor, false),
+        OperationalAppendOutcome::Duplicate { cursor, .. } => (cursor, true),
         OperationalAppendOutcome::VersionConflict { expected, actual } => {
             return Err(HistoryError::Invariant(format!(
                 "unexpected history receipt conflict: expected {expected}, actual {actual}"
@@ -806,6 +833,7 @@ pub fn prepare_history_message_request(
         &entry.source_session_id,
         &entry.source_message_id,
     );
+    let object_id = history_object_id(&entry.source_session_id, &entry.source_message_id)?;
     let identity_digest = sha256_hex(identity.as_bytes());
     let event_id = OperationalEventId::new(format!("event:history-message:{identity_digest}"));
     let session_ref = history_session_ref(&source.source_instance_id, &entry.source_session_id);
@@ -833,6 +861,8 @@ pub fn prepare_history_message_request(
         metadata: entry.metadata.clone(),
     };
     let canonical_json = serde_json::to_string(&payload)?;
+    let v2_identity_key =
+        history_v2_identity_key(&source.source_instance_id, &object_id, &canonical_json)?;
     Ok(OperationalAppendRequest {
         expected_stream_version: 0,
         event: OperationalEvent {
@@ -868,16 +898,14 @@ pub fn prepare_history_message_request(
                 published: entry.published_at,
                 recorded_at: entry.published_at,
                 consent: None,
-                idempotency_key: IdempotencyKey::new(format!(
-                    "history-message:{}",
-                    sha256_hex(format!("{identity}:{}", entry.raw_sha256).as_bytes())
-                )),
+                idempotency_key: v2_identity_key,
                 meta: serde_json::json!({
                     "canonical_json": canonical_json,
                     "source_container": entry.source_session_id,
                     "data_space_id": data_space_id.as_str(),
                     "event_id": event_id.as_str(),
-                    "source_instance_id": source.source_instance_id,
+                    HISTORY_SOURCE_INSTANCE_META: source.source_instance_id,
+                    HISTORY_OBJECT_ID_META: object_id,
                     "source_message_id": entry.source_message_id,
                     "raw_sha256": entry.raw_sha256,
                 }),
@@ -2313,6 +2341,30 @@ pub fn history_session_reference(
     Ok(history_session_ref(source_instance_id, source_session_id))
 }
 
+pub fn history_object_id(
+    source_session_id: &str,
+    source_message_id: &str,
+) -> HistoryResult<String> {
+    validate_non_blank("source_session_id", source_session_id)?;
+    validate_non_blank("source_message_id", source_message_id)?;
+    Ok(format!("{source_session_id}:{source_message_id}"))
+}
+
+pub fn history_v2_identity_key(
+    source_instance_id: &str,
+    object_id: &str,
+    canonical_json: &str,
+) -> HistoryResult<IdempotencyKey> {
+    validate_non_blank("source_instance_id", source_instance_id)?;
+    validate_non_blank("object_id", object_id)?;
+    validate_non_blank("canonical_json", canonical_json)?;
+    serde_json::from_str::<serde_json::Value>(canonical_json)?;
+    Ok(IdempotencyKey::new(format!(
+        "{source_instance_id}:{object_id}:{}",
+        sha256_hex(canonical_json.as_bytes())
+    )))
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -2404,6 +2456,7 @@ pub mod conformance {
         let command = HistoryImportCommand {
             inventory: request.clone(),
             expected_manifest_digest: report.manifest.manifest_digest.clone(),
+            admission_generations: BTreeMap::new(),
         };
         let first = import_history(store, &command, 1024).unwrap();
         assert_eq!(first.appended_messages, 5);
@@ -2627,6 +2680,7 @@ pub mod conformance {
             &HistoryImportCommand {
                 inventory: delta_request,
                 expected_manifest_digest: delta_report.manifest.manifest_digest,
+                admission_generations: BTreeMap::new(),
             },
             1024,
         )
@@ -2650,6 +2704,7 @@ pub mod conformance {
             &HistoryImportCommand {
                 inventory: changed,
                 expected_manifest_digest: report.manifest.manifest_digest.clone(),
+                admission_generations: BTreeMap::new(),
             },
             1024,
         );
@@ -2672,6 +2727,7 @@ pub mod conformance {
                 &HistoryImportCommand {
                     inventory: unresolved,
                     expected_manifest_digest: unresolved_report.manifest.manifest_digest,
+                    admission_generations: BTreeMap::new(),
                 },
                 1024,
             ),
@@ -2977,6 +3033,54 @@ mod tests {
     }
 
     #[test]
+    fn history_message_identity_uses_the_v2_formula_and_metadata_names() {
+        let at = Utc.with_ymd_and_hms(2026, 7, 20, 0, 0, 0).unwrap();
+        let record = conformance::sample_record("session", "message", at, 1, "text", b"raw");
+        let entry = manifest_entry_for_raw_record(&record).unwrap();
+        let source = HistorySourceManifest {
+            source_kind: HistorySourceKind::Codex,
+            source_instance_id: "codex-personal".to_owned(),
+            cutover_cursor: "cursor:1".to_owned(),
+            ownership: OwnershipAssignment::Personal {
+                owner_id: "owner".to_owned(),
+            },
+            records: vec![entry.clone()],
+        };
+        let request = prepare_history_message_request(
+            &DataSpaceId::new("space:personal"),
+            &source,
+            "owner",
+            &entry,
+            BlobRef::new("blob:sha256:raw"),
+        )
+        .unwrap();
+        let canonical_json = request.event.observation.meta["canonical_json"]
+            .as_str()
+            .unwrap();
+        let object_id = history_object_id("session", "message").unwrap();
+        assert_eq!(
+            request.event.observation.idempotency_key,
+            history_v2_identity_key("codex-personal", &object_id, canonical_json).unwrap()
+        );
+        assert_eq!(
+            request.event.observation.meta[HISTORY_SOURCE_INSTANCE_META],
+            "codex-personal"
+        );
+        assert_eq!(
+            request.event.observation.meta[HISTORY_OBJECT_ID_META],
+            object_id
+        );
+        assert!(
+            request
+                .event
+                .observation
+                .meta
+                .get("source_instance_id")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn same_native_identity_with_changed_raw_is_rejected() {
         let at = Utc.with_ymd_and_hms(2026, 7, 20, 0, 0, 0).unwrap();
         let mut first = conformance::sample_record("session", "message", at, 1, "same", b"first");
@@ -3080,6 +3184,7 @@ mod tests {
                 &HistoryImportCommand {
                     inventory: request,
                     expected_manifest_digest: report.manifest.manifest_digest,
+                    admission_generations: BTreeMap::new(),
                 },
                 1024,
             ),

@@ -254,6 +254,18 @@ impl OperationalEventStore for PostgresOperationalEventStore {
         Ok(outcomes)
     }
 
+    fn append_operational_events_v2_with_bridge(
+        &self,
+        _source_instance_id: &str,
+        _generation: Option<u64>,
+        _requests: &[OperationalAppendRequest],
+    ) -> StorageResult<Vec<OperationalAppendOutcome>> {
+        Err(StorageError::Backend(
+            "history v2 operational append requires a backend with cutover bridge support; use the SQLite Personal Lake backend"
+                .to_owned(),
+        ))
+    }
+
     fn operational_event_stats(&self) -> StorageResult<OperationalEventStats> {
         let mut client = self.read_client()?;
         let row = client

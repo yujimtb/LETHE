@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 
 const CUTOVER_UNIT_META_KEY: &str = "source_instance";
 const OBJECT_ID_META_KEY: &str = "object_id";
+const LEGACY_HISTORY_SCHEMA: &str = "schema:history-message";
+const LEGACY_HISTORY_SOURCE_INSTANCE_META_KEY: &str = "source_instance_id";
 const CUTOVER_PRODUCER_META_KEYS: &[&str] = &["producer_id", "producer"];
 const CUTOVER_CREDENTIAL_META_KEYS: &[&str] = &["credential_id", "credential_ref"];
 
@@ -42,28 +44,51 @@ fn observation_identity_inputs(
         .meta
         .as_object()
         .ok_or_else(|| "meta is not an object".to_owned())?;
-    let source_instance_id = meta
-        .get(CUTOVER_UNIT_META_KEY)
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "meta.source_instance is missing or blank".to_owned())?;
-    let object_id = meta
-        .get(OBJECT_ID_META_KEY)
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "meta.object_id is missing or blank".to_owned())?;
     let canonical_json = meta
         .get(CANONICAL_JSON_META_KEY)
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "meta.canonical_json is missing or blank".to_owned())?;
-    serde_json::from_str::<serde_json::Value>(canonical_json)
+    let canonical_value = serde_json::from_str::<serde_json::Value>(canonical_json)
         .map_err(|_| "meta.canonical_json is not valid JSON")?;
-    Ok((
-        source_instance_id.to_owned(),
-        object_id.to_owned(),
-        canonical_json.to_owned(),
-    ))
+    let source_instance_id = meta
+        .get(CUTOVER_UNIT_META_KEY)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            (observation.schema.as_str() == LEGACY_HISTORY_SCHEMA)
+                .then(|| {
+                    meta.get(LEGACY_HISTORY_SOURCE_INSTANCE_META_KEY)
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .map(str::to_owned)
+                })
+                .flatten()
+        })
+        .ok_or_else(|| "meta.source_instance is missing or blank".to_owned())?;
+    let object_id = meta
+        .get(OBJECT_ID_META_KEY)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            (observation.schema.as_str() == LEGACY_HISTORY_SCHEMA)
+                .then(|| {
+                    let session_id = canonical_value
+                        .get("source_session_id")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.trim().is_empty())?;
+                    let message_id = canonical_value
+                        .get("source_message_id")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.trim().is_empty())?;
+                    Some(format!("{session_id}:{message_id}"))
+                })
+                .flatten()
+        })
+        .ok_or_else(|| "meta.object_id is missing or blank".to_owned())?;
+    Ok((source_instance_id, object_id, canonical_json.to_owned()))
 }
 
 fn cutover_state_connection(
@@ -522,6 +547,124 @@ fn readiness_transaction(
 }
 
 impl SqlitePersistence {
+    pub(super) fn append_v2_observation_for_operational_event(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        tree: &PartitionTree,
+        source_instance_id: &str,
+        observation: &Observation,
+    ) -> Result<(DurableAppendOutcome, bool), PersistenceError> {
+        let (observed_source, object_id, canonical_json) = observation_identity_inputs(observation)
+            .map_err(|reason| {
+                PersistenceError::SchemaInvariant(format!(
+                    "v2 bridge input for {} is invalid: {reason}",
+                    observation.id
+                ))
+            })?;
+        if observed_source != source_instance_id {
+            return Err(PersistenceError::SchemaInvariant(format!(
+                "v2 observation {} belongs to source_instance_id {}, expected {}",
+                observation.id, observed_source, source_instance_id
+            )));
+        }
+        let v2_identity_key = bridge_identity_key(source_instance_id, &object_id, &canonical_json);
+        if observation.idempotency_key.as_str() != v2_identity_key {
+            return Err(PersistenceError::SchemaInvariant(format!(
+                "v2 observation {} identity does not match bridge formula",
+                observation.id
+            )));
+        }
+        let resolution =
+            bridge_resolution_transaction(transaction, &v2_identity_key, &canonical_json)?;
+        if let Some(existing_id) = resolution.winner {
+            return Ok((
+                if resolution.canonical_collision {
+                    DurableAppendOutcome::CanonicalCollision(existing_id)
+                } else {
+                    DurableAppendOutcome::Duplicate(existing_id)
+                },
+                true,
+            ));
+        }
+        let mut appended = append_observations_in_transaction(
+            transaction,
+            tree,
+            self.routing_key_order,
+            std::slice::from_ref(observation),
+        )?;
+        Ok((appended.remove(0), false))
+    }
+
+    pub(super) fn record_v2_append_metrics(
+        transaction: &rusqlite::Transaction<'_>,
+        source_instance_id: &str,
+        bridge_hits: u64,
+        appended_ids: &[ObservationId],
+        authority: &str,
+        reason: &str,
+    ) -> StorageResult<()> {
+        if cutover_state_connection(transaction, source_instance_id)
+            .map_err(storage_error)?
+            .is_none()
+        {
+            return Ok(());
+        }
+        ensure_metrics_row(transaction, source_instance_id).map_err(storage_error)?;
+        if bridge_hits > 0 {
+            update_metric(
+                transaction,
+                source_instance_id,
+                "bridge_duplicate_hits",
+                bridge_hits,
+            )
+            .map_err(storage_error)?;
+        }
+        if appended_ids.is_empty() {
+            return Ok(());
+        }
+        let appended_count = u64::try_from(appended_ids.len())
+            .map_err(|_| StorageError::Invariant("v2 ingested count overflow".to_owned()))?;
+        let state =
+            required_state_transaction(transaction, source_instance_id).map_err(storage_error)?;
+        update_metric(
+            transaction,
+            source_instance_id,
+            "v2_ingested",
+            appended_count,
+        )
+        .map_err(storage_error)?;
+        if state.phase == CutoverPhase::V2Active {
+            let first_append_seq = appended_ids
+                .iter()
+                .map(|id| {
+                    transaction
+                        .query_row(
+                            "SELECT append_seq FROM observations WHERE id = ?1",
+                            [id.as_str()],
+                            |row| row.get::<_, u64>(0),
+                        )
+                        .map_err(PersistenceError::from)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(storage_error)?
+                .into_iter()
+                .min();
+            record_transition(
+                transaction,
+                source_instance_id,
+                state.phase.as_str(),
+                CutoverPhase::V2Committed,
+                authority,
+                reason,
+                state.generation,
+                state.fence_append_seq,
+                first_append_seq,
+            )
+            .map_err(storage_error)?;
+        }
+        Ok(())
+    }
+
     fn append_v2_in_transaction(
         &self,
         transaction: &rusqlite::Transaction<'_>,
@@ -532,52 +675,23 @@ impl SqlitePersistence {
         let mut outcomes = Vec::with_capacity(observations.len());
         let mut bridge_hits = 0_u64;
         for observation in observations {
-            let (observed_source, object_id, canonical_json) =
-                observation_identity_inputs(observation).map_err(|reason| {
-                    PersistenceError::SchemaInvariant(format!(
-                        "v2 bridge input for {} is invalid: {reason}",
-                        observation.id
-                    ))
-                })?;
-            if observed_source != source_instance_id {
-                return Err(PersistenceError::SchemaInvariant(format!(
-                    "v2 observation {} belongs to source_instance_id {}, expected {}",
-                    observation.id, observed_source, source_instance_id
-                )));
-            }
-            let v2_identity_key =
-                bridge_identity_key(source_instance_id, &object_id, &canonical_json);
-            if observation.idempotency_key.as_str() != v2_identity_key {
-                return Err(PersistenceError::SchemaInvariant(format!(
-                    "v2 observation {} identity does not match bridge formula",
-                    observation.id
-                )));
-            }
-            let resolution =
-                bridge_resolution_transaction(transaction, &v2_identity_key, &canonical_json)?;
-            if let Some(existing_id) = resolution.winner {
-                if resolution.canonical_collision {
-                    outcomes.push(DurableAppendOutcome::CanonicalCollision(existing_id));
-                } else {
-                    bridge_hits = bridge_hits.checked_add(1).ok_or_else(|| {
-                        PersistenceError::SchemaInvariant("bridge hit count overflow".to_owned())
-                    })?;
-                    outcomes.push(DurableAppendOutcome::Duplicate(existing_id));
-                }
-                continue;
-            }
-            let mut appended = append_observations_in_transaction(
+            let (outcome, bridge_hit) = self.append_v2_observation_for_operational_event(
                 transaction,
                 tree,
-                self.routing_key_order,
-                std::slice::from_ref(observation),
+                source_instance_id,
+                observation,
             )?;
-            outcomes.push(appended.remove(0));
+            if bridge_hit && matches!(outcome, DurableAppendOutcome::Duplicate(_)) {
+                bridge_hits = bridge_hits.checked_add(1).ok_or_else(|| {
+                    PersistenceError::SchemaInvariant("bridge hit count overflow".to_owned())
+                })?;
+            }
+            outcomes.push(outcome);
         }
         Ok((outcomes, bridge_hits))
     }
 
-    fn cutover_admit_transaction(
+    pub(super) fn cutover_admit_transaction(
         &self,
         transaction: &rusqlite::Transaction<'_>,
         source_instance_id: &str,
@@ -758,72 +872,22 @@ impl CutoverStore for SqlitePersistence {
         for audit in audit_events {
             insert_audit_event(&transaction, audit).map_err(storage_error)?;
         }
-        if cutover_state_connection(&transaction, source_instance_id)
-            .map_err(storage_error)?
-            .is_some()
-        {
-            ensure_metrics_row(&transaction, source_instance_id).map_err(storage_error)?;
-            if bridge_hits > 0 {
-                update_metric(
-                    &transaction,
-                    source_instance_id,
-                    "bridge_duplicate_hits",
-                    bridge_hits,
-                )
-                .map_err(storage_error)?;
-            }
-            let appended_ids = outcomes
-                .iter()
-                .filter_map(|outcome| match outcome {
-                    DurableAppendOutcome::Appended(id) => Some(id),
-                    DurableAppendOutcome::Duplicate(_)
-                    | DurableAppendOutcome::CanonicalCollision(_) => None,
-                })
-                .collect::<Vec<_>>();
-            if !appended_ids.is_empty() {
-                let appended_count = u64::try_from(appended_ids.len()).map_err(|_| {
-                    StorageError::Invariant("v2 ingested count overflow".to_owned())
-                })?;
-                let state = required_state_transaction(&transaction, source_instance_id)
-                    .map_err(storage_error)?;
-                update_metric(
-                    &transaction,
-                    source_instance_id,
-                    "v2_ingested",
-                    appended_count,
-                )
-                .map_err(storage_error)?;
-                if state.phase == CutoverPhase::V2Active {
-                    let first_append_seq = appended_ids
-                        .iter()
-                        .map(|id| {
-                            transaction
-                                .query_row(
-                                    "SELECT append_seq FROM observations WHERE id = ?1",
-                                    [id.as_str()],
-                                    |row| row.get::<_, u64>(0),
-                                )
-                                .map_err(PersistenceError::from)
-                        })
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(storage_error)?
-                        .into_iter()
-                        .min();
-                    record_transition(
-                        &transaction,
-                        source_instance_id,
-                        state.phase.as_str(),
-                        CutoverPhase::V2Committed,
-                        "actor:self-host",
-                        "first v2 ingested observation committed",
-                        state.generation,
-                        state.fence_append_seq,
-                        first_append_seq,
-                    )
-                    .map_err(storage_error)?;
-                }
-            }
-        }
+        let appended_ids = outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                DurableAppendOutcome::Appended(id) => Some(id.clone()),
+                DurableAppendOutcome::Duplicate(_)
+                | DurableAppendOutcome::CanonicalCollision(_) => None,
+            })
+            .collect::<Vec<_>>();
+        Self::record_v2_append_metrics(
+            &transaction,
+            source_instance_id,
+            bridge_hits,
+            &appended_ids,
+            "actor:self-host",
+            "first v2 ingested observation committed",
+        )?;
         transaction
             .commit()
             .map_err(PersistenceError::from)

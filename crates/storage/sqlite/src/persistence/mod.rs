@@ -2214,16 +2214,11 @@ impl SqliteOperationalEventStore {
     fn storage_error(error: impl std::fmt::Display) -> StorageError {
         StorageError::Backend(error.to_string())
     }
-}
 
-impl OperationalEventStore for SqliteOperationalEventStore {
-    fn data_space_id(&self) -> &DataSpaceId {
-        &self.data_space_id
-    }
-
-    fn append_operational_events(
+    fn append_operational_events_internal(
         &self,
         requests: &[OperationalAppendRequest],
+        v2_admission: Option<(&str, Option<u64>)>,
     ) -> StorageResult<Vec<OperationalAppendOutcome>> {
         for request in requests {
             request.event.validate()?;
@@ -2243,6 +2238,15 @@ impl OperationalEventStore for SqliteOperationalEventStore {
             }
         }
 
+        if v2_admission.is_some() {
+            loop {
+                let report = self.persistence.identity_bridge_apply_batch(16_384)?;
+                if report.read_count == 0 {
+                    break;
+                }
+            }
+        }
+
         let tree = self
             .persistence
             .partition_tree_snapshot()
@@ -2252,7 +2256,20 @@ impl OperationalEventStore for SqliteOperationalEventStore {
             .conn
             .unchecked_transaction()
             .map_err(Self::storage_error)?;
+        if let Some((source_instance_id, generation)) = v2_admission
+            && let Err(error) = self.persistence.cutover_admit_transaction(
+                &transaction,
+                source_instance_id,
+                CutoverApiVersion::V2,
+                generation,
+            )
+        {
+            transaction.commit().map_err(Self::storage_error)?;
+            return Err(storage_error(error));
+        }
         let mut outcomes = Vec::with_capacity(requests.len());
+        let mut bridge_hits = 0_u64;
+        let mut appended_ids = Vec::new();
 
         for request in requests {
             let event_json = serde_json::to_string(&request.event).map_err(Self::storage_error)?;
@@ -2291,6 +2308,54 @@ impl OperationalEventStore for SqliteOperationalEventStore {
                 continue;
             }
 
+            if let Some((source_instance_id, _)) = v2_admission {
+                let (observation_outcome, bridge_hit) = self
+                    .persistence
+                    .append_v2_observation_for_operational_event(
+                        &transaction,
+                        &tree,
+                        source_instance_id,
+                        &request.event.observation,
+                    )
+                    .map_err(Self::storage_error)?;
+                match observation_outcome {
+                    DurableAppendOutcome::Duplicate(existing_id) => {
+                        if bridge_hit {
+                            bridge_hits = bridge_hits.checked_add(1).ok_or_else(|| {
+                                StorageError::Invariant("bridge hit count overflow".to_owned())
+                            })?;
+                        }
+                        let existing_event = transaction
+                            .query_row(
+                                "SELECT cursor, stream_version FROM operational_events
+                                 WHERE observation_id = ?1",
+                                [existing_id.as_str()],
+                                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+                            )
+                            .optional()
+                            .map_err(Self::storage_error)?
+                            .ok_or_else(|| {
+                                StorageError::Invariant(format!(
+                                    "bridge winner observation {existing_id} has no operational event"
+                                ))
+                            })?;
+                        outcomes.push(OperationalAppendOutcome::Duplicate {
+                            cursor: existing_event.0,
+                            stream_version: existing_event.1,
+                        });
+                        continue;
+                    }
+                    DurableAppendOutcome::CanonicalCollision(existing_id) => {
+                        return Err(StorageError::Invariant(format!(
+                            "history v2 canonical collision with observation {existing_id}"
+                        )));
+                    }
+                    DurableAppendOutcome::Appended(observation_id) => {
+                        appended_ids.push(observation_id);
+                    }
+                }
+            }
+
             let existing_event = transaction
                 .query_row(
                     "SELECT cursor, event_sha256 FROM operational_events
@@ -2323,6 +2388,12 @@ impl OperationalEventStore for SqliteOperationalEventStore {
                 )
                 .map_err(Self::storage_error)?;
             if actual != request.expected_stream_version {
+                if v2_admission.is_some() {
+                    return Err(StorageError::Invariant(format!(
+                        "v2 history event stream {} conflicts: expected {}, actual {}",
+                        request.event.stream_id, request.expected_stream_version, actual
+                    )));
+                }
                 outcomes.push(OperationalAppendOutcome::VersionConflict {
                     expected: request.expected_stream_version,
                     actual,
@@ -2330,24 +2401,28 @@ impl OperationalEventStore for SqliteOperationalEventStore {
                 continue;
             }
 
-            let mut observation_outcomes = append_observations_in_transaction(
-                &transaction,
-                &tree,
-                self.persistence.routing_key_order,
-                std::slice::from_ref(&request.event.observation),
-            )
-            .map_err(Self::storage_error)?;
-            match observation_outcomes.remove(0) {
-                DurableAppendOutcome::Appended(_) => {}
-                DurableAppendOutcome::Duplicate(observation_id) => {
-                    return Err(StorageError::Invariant(format!(
-                        "observation {observation_id} exists without its operational event"
-                    )));
-                }
-                DurableAppendOutcome::CanonicalCollision(observation_id) => {
-                    return Err(StorageError::Invariant(format!(
-                        "operational observation identity collision with {observation_id}"
-                    )));
+            if v2_admission.is_none() {
+                let mut observation_outcomes = append_observations_in_transaction(
+                    &transaction,
+                    &tree,
+                    self.persistence.routing_key_order,
+                    std::slice::from_ref(&request.event.observation),
+                )
+                .map_err(Self::storage_error)?;
+                match observation_outcomes.remove(0) {
+                    DurableAppendOutcome::Appended(observation_id) => {
+                        appended_ids.push(observation_id);
+                    }
+                    DurableAppendOutcome::Duplicate(observation_id) => {
+                        return Err(StorageError::Invariant(format!(
+                            "observation {observation_id} exists without its operational event"
+                        )));
+                    }
+                    DurableAppendOutcome::CanonicalCollision(observation_id) => {
+                        return Err(StorageError::Invariant(format!(
+                            "operational observation identity collision with {observation_id}"
+                        )));
+                    }
                 }
             }
 
@@ -2391,8 +2466,51 @@ impl OperationalEventStore for SqliteOperationalEventStore {
                 stream_version: request.event.stream_version,
             });
         }
+
+        if let Some((source_instance_id, _)) = v2_admission {
+            SqlitePersistence::record_v2_append_metrics(
+                &transaction,
+                source_instance_id,
+                bridge_hits,
+                &appended_ids,
+                "actor:history-importer",
+                "first v2 history observation committed",
+            )?;
+        }
         transaction.commit().map_err(Self::storage_error)?;
         Ok(outcomes)
+    }
+}
+
+impl OperationalEventStore for SqliteOperationalEventStore {
+    fn data_space_id(&self) -> &DataSpaceId {
+        &self.data_space_id
+    }
+
+    fn append_operational_events(
+        &self,
+        requests: &[OperationalAppendRequest],
+    ) -> StorageResult<Vec<OperationalAppendOutcome>> {
+        self.append_operational_events_internal(requests, None)
+    }
+
+    fn append_operational_events_v2_with_bridge(
+        &self,
+        source_instance_id: &str,
+        generation: Option<u64>,
+        requests: &[OperationalAppendRequest],
+    ) -> StorageResult<Vec<OperationalAppendOutcome>> {
+        if source_instance_id.trim().is_empty() {
+            return Err(StorageError::Invariant(
+                "v2 source_instance_id must not be blank".to_owned(),
+            ));
+        }
+        if generation == Some(0) {
+            return Err(StorageError::Invariant(
+                "v2 admission generation must be positive".to_owned(),
+            ));
+        }
+        self.append_operational_events_internal(requests, Some((source_instance_id, generation)))
     }
 
     fn operational_event_stats(&self) -> StorageResult<OperationalEventStats> {
