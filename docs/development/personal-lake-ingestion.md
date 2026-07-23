@@ -110,6 +110,17 @@ Each import CLI supports `--help` / `-h`; use it before running a new source to
 confirm the required arguments and the token environment variable expected by
 `--api-token-env`.
 
+The five regular import CLIs (`lethe-import-chatgpt`, `lethe-import-claude`,
+`lethe-import-claude-code`, `lethe-import-codex`, and `lethe-import-github`)
+also accept `--api-version=<1|2>` and
+`--admission-generation=<positive-integer>`. API version defaults to `1`,
+preserving the frozen v1 wire contract. The same settings can be supplied with
+`LETHE_INGEST_API_VERSION` and `LETHE_ADMISSION_GENERATION`; an explicit CLI
+flag takes precedence over its environment variable. API version 2 requires a
+positive admission generation and sends it as
+`X-LETHE-Admission-Generation`. `lethe-import-history` is intentionally not
+part of this setting surface.
+
 ### Ingestion API contract versions
 
 The existing /api/import/observation-drafts endpoint is the frozen v1
@@ -134,6 +145,18 @@ as a retry identity or routing uniqueness key. The request body limit is
 128 MiB, the configured payload limit defaults to 1 MiB, and the configured
 page limit defaults to 500 for the personal lake. Limit errors include both
 the actual value and the applied maximum.
+
+For v2, the shared Rust client replaces each adapter's v1 idempotency key only
+at the HTTP boundary using `meta.object_id` and `meta.canonical_json`; the
+adapter draft itself remains unchanged. `ingested` and
+`duplicate`/`duplicate.existing_id` are successful outcomes, `quarantined` is
+reported as isolation, and any `rejected` item is listed as an error and makes
+the CLI exit non-zero after all per-item results have been aggregated.
+
+The Claude personal-lake PowerShell wrapper and its Task Scheduler registration
+forward `-ApiVersion` and `-AdmissionGeneration` when supplied. Omitting both
+keeps the existing behavior and allows the imported environment file to supply
+`LETHE_INGEST_API_VERSION` / `LETHE_ADMISSION_GENERATION` for scheduled jobs.
 
 Quarantine error codes are classified from the typed quarantine cause, not
 from the display text in `ticket.reason`: future timestamps use
