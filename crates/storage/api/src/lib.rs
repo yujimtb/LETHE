@@ -656,6 +656,10 @@ pub trait ObservationStore: Send {
         limit: usize,
     ) -> StorageResult<Vec<StoredObservation>>;
     fn observation_by_id(&self, id: &ObservationId) -> StorageResult<Option<StoredObservation>>;
+    fn observations_for_privacy_key(
+        &self,
+        privacy_key: &str,
+    ) -> StorageResult<Vec<StoredObservation>>;
     fn leaf_positions(&self) -> StorageResult<Vec<LeafPosition>>;
     fn split_leaf_if_capacity(&self, capacity: usize) -> StorageResult<bool>;
 }

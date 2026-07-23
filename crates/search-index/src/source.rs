@@ -12,6 +12,11 @@ pub trait CorpusIndexSource: Send {
         after_append_seq: u64,
         limit: usize,
     ) -> StorageResult<Vec<StoredObservation>>;
+
+    fn observations_for_privacy_key(
+        &self,
+        privacy_key: &str,
+    ) -> StorageResult<Vec<StoredObservation>>;
 }
 
 impl<T> CorpusIndexSource for T
@@ -28,5 +33,12 @@ where
         limit: usize,
     ) -> StorageResult<Vec<StoredObservation>> {
         ObservationStore::observation_page(self, after_append_seq, limit)
+    }
+
+    fn observations_for_privacy_key(
+        &self,
+        privacy_key: &str,
+    ) -> StorageResult<Vec<StoredObservation>> {
+        ObservationStore::observations_for_privacy_key(self, privacy_key)
     }
 }

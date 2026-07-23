@@ -30,3 +30,9 @@
 
 - [x] 6.1 [Reviewer] SSV/CGE/RPS/CBV/PDA の各 spec について registry・governance・corpus-projection・supplemental-store の既存契約に回帰がないことを確認する。受入: 既存 spec の意味論が保たれ、strict 化・consent 評価・遮蔽が非破壊であることを確認する。
 - [x] 6.2 [Reviewer] workspace 全テスト、cargo fmt、clippy を実行する。受入: 全コマンド成功、既存テスト全緑。
+
+## 7. F1フォローアップ: re-consentによる遮蔽解除
+
+- [x] 7.1 [Implementer] RPS-03に従い consent最新状態をretractionと分離し、capture gateと同一のdecision orderでsubject / identifier別に評価する。
+- [x] 7.2 [Implementer] opt-out後のunrestrictedでcorpus・検索・通信projectionを増分復帰し、検索はreverse indexとconsumer catch-upを経由して過去Observationを再 indexする。
+- [x] 7.3 [Reviewer] retraction後のunrestricted非復帰、遅着した古いdecisionの無効化、capture gate / projectionの順序一致をテストで固定する。v13 reverse index migrationとwire contract不変を検証する。
