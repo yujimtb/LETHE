@@ -2904,6 +2904,80 @@ fn legacy_history_message_is_resolved_by_v2_operational_append_without_ledger_de
 }
 
 #[test]
+fn v2_operational_append_is_denied_for_v1_active_and_draining_units() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let data_space_id = DataSpaceId::new("space:cutover-admission");
+    let store = SqliteOperationalEventStore::open(
+        data_space_id.clone(),
+        &tmp.join("test.sqlite3"),
+        &tmp.join("blobs"),
+        &[7; 32],
+    )
+    .unwrap();
+    let source_instance_id = "cutover-admission-unit";
+    let canonical_json = serde_json::json!({"body": "must not append"}).to_string();
+    let mut observation = bridge_observation(
+        source_instance_id,
+        "object-1",
+        &canonical_json,
+        &bridge_identity(source_instance_id, "object-1", &canonical_json),
+    );
+    observation.meta.as_object_mut().unwrap().insert(
+        "data_space_id".to_owned(),
+        serde_json::json!(data_space_id.as_str()),
+    );
+    let request = history_event_request(
+        &data_space_id,
+        "event:cutover-admission",
+        "cutover-admission-stream",
+        observation,
+    );
+
+    let registered = store
+        .persistence()
+        .cutover_register(source_instance_id, "owner:test", "register")
+        .unwrap();
+    assert_eq!(registered.phase, lethe_storage_api::CutoverPhase::V1Active);
+    assert_eq!(registered.generation, 1);
+    let v1_active = store.append_operational_events_v2_with_bridge(
+        source_instance_id,
+        Some(registered.generation),
+        std::slice::from_ref(&request),
+    );
+    assert!(
+        matches!(
+            &v1_active,
+            Err(lethe_storage_api::StorageError::CutoverAdmissionDenied(reason))
+                if reason.contains("v1_active") && reason.contains("not admitting v2")
+        ),
+        "unexpected v1_active admission result: {v1_active:?}"
+    );
+
+    let draining = store
+        .persistence()
+        .cutover_begin_drain(source_instance_id, "owner:test", "drain")
+        .unwrap();
+    assert_eq!(draining.phase, lethe_storage_api::CutoverPhase::Draining);
+    assert_eq!(draining.generation, 1);
+    let draining_result = store.append_operational_events_v2_with_bridge(
+        source_instance_id,
+        Some(draining.generation),
+        std::slice::from_ref(&request),
+    );
+    assert!(
+        matches!(
+            &draining_result,
+            Err(lethe_storage_api::StorageError::CutoverAdmissionDenied(reason))
+                if reason.contains("draining") && reason.contains("not admitting v2")
+        ),
+        "unexpected draining admission result: {draining_result:?}"
+    );
+    assert_eq!(store.operational_event_stats().unwrap().count, 0);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
 fn v2_bridge_duplicate_preserves_ledger_delta_and_canonical_collision() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let store =

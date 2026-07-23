@@ -247,6 +247,9 @@ errorで停止します。cutover register、drain、bridge watermark、zero-gap
 canary、generationをローカル/stagingで確認してからexecuteしてください。本番DBへの
 接続や本番切替はこの手順の対象外です。
 
+この拒否契約は、SQLiteの`v1_active`および`draining` unitへの直接appendと、
+PostgreSQL backendのv2 bridge append拒否を、PostgreSQL実接続なしの回帰テストで固定します。
+
 取込はJSONLを1 recordずつ読み、rawとcanonical順序を明示した新規SQLite spoolへ
 保存します。source file digestもincremental SHA-256で計算し、source tree全体や
 全recordをメモリに保持しません。executeは最大
