@@ -308,6 +308,8 @@ impl SqlitePersistence {
             self.schema_migration_recorded(SCHEMA_VERSION_PRIVACY_PROJECTION)?;
         let reconsent_privacy_index_recorded =
             self.schema_migration_recorded(SCHEMA_VERSION_RECONSENT_PRIVACY_INDEX)?;
+        let cutover_bridge_recorded =
+            self.schema_migration_recorded(SCHEMA_VERSION_CUTOVER_BRIDGE)?;
 
         if lock_split_recorded && !identity_lookup_recorded {
             return Err(PersistenceError::SchemaInvariant(
@@ -327,6 +329,11 @@ impl SqlitePersistence {
         if reconsent_privacy_index_recorded && !privacy_projection_recorded {
             return Err(PersistenceError::SchemaInvariant(
                 "schema migration v13 is recorded without prerequisite v12".to_owned(),
+            ));
+        }
+        if cutover_bridge_recorded && !reconsent_privacy_index_recorded {
+            return Err(PersistenceError::SchemaInvariant(
+                "schema migration v14 is recorded without prerequisite v13".to_owned(),
             ));
         }
 
@@ -378,6 +385,16 @@ impl SqlitePersistence {
             self.require_reconsent_privacy_index_schema_objects()?;
         } else {
             self.apply_reconsent_privacy_index_migration()?;
+        }
+
+        if cutover_bridge_recorded {
+            self.require_schema_migration_name(
+                SCHEMA_VERSION_CUTOVER_BRIDGE,
+                "v1_v2_cutover_bridge",
+            )?;
+            self.require_cutover_bridge_schema_objects()?;
+        } else {
+            self.apply_cutover_bridge_migration()?;
         }
 
         Ok(())
@@ -580,6 +597,99 @@ impl SqlitePersistence {
         Ok(())
     }
 
+    fn apply_cutover_bridge_migration(&self) -> Result<(), PersistenceError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS identity_bridge_candidates (
+                v2_identity_key TEXT NOT NULL,
+                observation_id TEXT NOT NULL,
+                source_instance_id TEXT NOT NULL,
+                append_seq INTEGER NOT NULL CHECK (append_seq > 0),
+                canonical_json TEXT NOT NULL,
+                canonical_json_sha256 TEXT NOT NULL CHECK (length(canonical_json_sha256) = 64),
+                PRIMARY KEY (v2_identity_key, observation_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS identity_bridge_gaps (
+                append_seq INTEGER PRIMARY KEY CHECK (append_seq > 0),
+                observation_id TEXT NOT NULL,
+                source_instance_id TEXT,
+                reason TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS identity_bridge_watermark (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                last_append_seq INTEGER NOT NULL CHECK (last_append_seq >= 0)
+            );
+
+            CREATE TABLE IF NOT EXISTS cutover_transition_log (
+                event_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_instance_id TEXT NOT NULL CHECK (length(trim(source_instance_id)) > 0),
+                from_phase TEXT NOT NULL,
+                to_phase TEXT NOT NULL,
+                authority TEXT NOT NULL CHECK (length(trim(authority)) > 0),
+                reason TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+                generation INTEGER NOT NULL CHECK (generation > 0),
+                fence_append_seq INTEGER,
+                first_v2_append_seq INTEGER,
+                committed_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS cutover_credentials (
+                source_instance_id TEXT NOT NULL,
+                api_version TEXT NOT NULL CHECK (api_version IN ('v1', 'v2')),
+                generation INTEGER NOT NULL CHECK (generation > 0),
+                credential_ref TEXT NOT NULL CHECK (length(trim(credential_ref)) > 0),
+                active INTEGER NOT NULL CHECK (active IN (0, 1)),
+                issued_at TEXT NOT NULL,
+                PRIMARY KEY (source_instance_id, api_version, generation)
+            );
+
+            CREATE TABLE IF NOT EXISTS cutover_unit_metrics (
+                source_instance_id TEXT PRIMARY KEY,
+                bridge_duplicate_hits INTEGER NOT NULL CHECK (bridge_duplicate_hits >= 0),
+                stale_v1_rejections INTEGER NOT NULL CHECK (stale_v1_rejections >= 0),
+                v2_ingested INTEGER NOT NULL CHECK (v2_ingested >= 0),
+                updated_at TEXT NOT NULL
+            );
+
+            INSERT OR IGNORE INTO identity_bridge_watermark (singleton, last_append_seq)
+            VALUES (1, 0);
+
+            CREATE INDEX IF NOT EXISTS identity_bridge_candidates_key_append
+                ON identity_bridge_candidates(v2_identity_key, append_seq, observation_id);
+            CREATE INDEX IF NOT EXISTS identity_bridge_candidates_source_append
+                ON identity_bridge_candidates(source_instance_id, append_seq, observation_id);
+            CREATE INDEX IF NOT EXISTS identity_bridge_gaps_source_append
+                ON identity_bridge_gaps(source_instance_id, append_seq, observation_id);
+            CREATE INDEX IF NOT EXISTS cutover_transition_unit_seq
+                ON cutover_transition_log(source_instance_id, event_seq);
+            CREATE INDEX IF NOT EXISTS cutover_credentials_active
+                ON cutover_credentials(source_instance_id, api_version, active, generation);
+
+            CREATE TRIGGER IF NOT EXISTS cutover_transition_log_no_update
+            BEFORE UPDATE ON cutover_transition_log
+            BEGIN
+                SELECT RAISE(ABORT, 'cutover_transition_log is append-only');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS cutover_transition_log_no_delete
+            BEFORE DELETE ON cutover_transition_log
+            BEGIN
+                SELECT RAISE(ABORT, 'cutover_transition_log is append-only');
+            END;
+            ",
+        )?;
+        record_schema_migration(
+            &transaction,
+            SCHEMA_VERSION_CUTOVER_BRIDGE,
+            "v1_v2_cutover_bridge",
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn apply_reconsent_privacy_index_migration(&self) -> Result<(), PersistenceError> {
         let transaction = self.conn.unchecked_transaction()?;
         transaction.execute_batch(
@@ -777,6 +887,27 @@ impl SqlitePersistence {
             return Err(PersistenceError::SchemaInvariant(
                 "projection_visible_blob_refs column is missing: subject_key".to_owned(),
             ));
+        }
+        Ok(())
+    }
+
+    fn require_cutover_bridge_schema_objects(&self) -> Result<(), PersistenceError> {
+        for (object_type, object_name) in [
+            ("table", "identity_bridge_candidates"),
+            ("table", "identity_bridge_gaps"),
+            ("table", "identity_bridge_watermark"),
+            ("table", "cutover_transition_log"),
+            ("table", "cutover_credentials"),
+            ("table", "cutover_unit_metrics"),
+            ("index", "identity_bridge_candidates_key_append"),
+            ("index", "identity_bridge_candidates_source_append"),
+            ("index", "identity_bridge_gaps_source_append"),
+            ("index", "cutover_transition_unit_seq"),
+            ("index", "cutover_credentials_active"),
+            ("trigger", "cutover_transition_log_no_update"),
+            ("trigger", "cutover_transition_log_no_delete"),
+        ] {
+            self.require_schema_object(object_type, object_name)?;
         }
         Ok(())
     }

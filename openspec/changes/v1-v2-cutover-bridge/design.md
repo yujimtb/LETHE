@@ -1,12 +1,12 @@
-## オーナー判断が必要な Q
+## オーナー確定済みの Q
 
-以下は実装開始前に owner が確定する。本文と spec は安全側の推奨案を設計案として記述しているが、Q が未決のまま実装 task へ進んではならない。
+以下は owner 承認済みであり、本 change の実装・運用の正とする。Q1〜Q3 は全て「確定」している。
 
-| Q | 判断点 | 推奨案 | 推奨理由 |
+| Q | 判断点 | 確定内容 | 理由 |
 |---|---|---|---|
-| Q1 | cutover の原子的単位を何にするか | v1/v2 で同じ値を維持する `source_instance_id` を unit とし、その値を共有する producer は一括移行する | v2 identity の先頭成分そのものであり、既知 client の列挙なしに任意数へ拡張できる。切替時の rename は別 identity を作るため禁止する |
-| Q2 | 同一 unit の v1 admission をどう fence するか | `source_instance_id` と API version に束縛した専用 credential/admission generation を発行し、drain 後に v1 credential を失効してから v2 を有効化する | stale process・遅延 retry を handler 到達前に既存の認可失敗として止められ、凍結 v1 の応答・error・identity 判定を変更しない |
-| Q3 | 最初の v2 `outcome=ingested` 後の rollback を一般機能として許すか | 許可せず forward-fix とする。例外的な v1 再開機構は作らない | v1 は v2 key を参照しないため、任意 retry を含む安全な切戻しを一般 client に証明できない。client 固有 cursor 分岐はスケールしない |
+| Q1（確定） | cutover の原子的単位を何にするか | v1/v2 で同じ値を維持する `source_instance_id` を unit とし、その値を共有する producer は一括移行する。切替時の rename は禁止する | v2 identity の先頭成分そのものであり、既知 client の列挙なしに任意数へ拡張できる |
+| Q2（確定） | 同一 unit の v1 admission をどう fence するか | unit/API バージョンに束縛した credential generation を handler 前に検証する。stale v1 は既存の認可失敗として拒否する | stale process・遅延 retry を handler 到達前に停止し、凍結 v1 の応答・error・identity 判定を変更しない |
+| Q3（確定） | 最初の v2 `outcome=ingested` 後の rollback を一般機能として許すか | `ingested=0`（duplicate/rejected/quarantined のみ）の間は pre-commit rollback を許可する。最初の v2 `ingested` 後は `v2_committed` を記録し、一般 rollback は不許可として forward-fix にする | v1 は v2 key を参照しないため、任意 retry を含む安全な切戻しを一般 client に証明できない |
 
 ## Context
 
@@ -169,4 +169,4 @@ gap を無視する bounded time window や「見つからなければ append」
 
 ## Open Questions
 
-冒頭 Q1-Q3 を owner が確定する。推奨案以外を選ぶ場合、CUT-02 の v1 不変条件、CUT-03 の single-protocol admission、CUT-05 の fail-closed rollback を同時に満たす代替設計へ本文・spec・tasks を更新してから実装する。
+冒頭 Q1-Q3 は owner により確定済みである。実装はこの確定内容に従い、CUT-02 の v1 不変条件、CUT-03 の single-protocol admission、CUT-05 の fail-closed rollback を同時に満たす。

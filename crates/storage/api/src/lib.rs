@@ -17,6 +17,12 @@ pub enum StorageError {
     OperationalIdempotencyCollision(String),
     #[error("operational event_id collision for {0}")]
     OperationalEventIdCollision(String),
+    #[error("cutover admission denied: {0}")]
+    CutoverAdmissionDenied(String),
+    #[error("cutover conflict: {0}")]
+    CutoverConflict(String),
+    #[error("cutover rollback refused: {0}")]
+    CutoverRollbackRefused(String),
 }
 
 pub type StorageResult<T> = Result<T, StorageError>;
@@ -664,6 +670,208 @@ pub trait ObservationStore: Send {
     fn split_leaf_if_capacity(&self, capacity: usize) -> StorageResult<bool>;
 }
 
+/// Durable storage operations for the v1/v2 cutover bridge.
+///
+/// These operations are deliberately separate from the frozen v1 observation
+/// port.  The bridge is an admission and v2-resolution concern; v1 callers
+/// must opt into the fenced append method explicitly.
+pub trait CutoverStore: Send {
+    fn append_observations_v1_with_admission(
+        &self,
+        source_instance_id: &str,
+        generation: Option<u64>,
+        observations: &[Observation],
+        audit_events: &[AuditEventRecord],
+    ) -> StorageResult<Vec<AppendOutcome>>;
+
+    fn append_slack_observation_v1_with_admission(
+        &self,
+        source_instance_id: &str,
+        generation: Option<u64>,
+        observation: &Observation,
+        thread: &SlackThreadKey,
+        audit_events: &[AuditEventRecord],
+    ) -> StorageResult<AppendOutcome>;
+
+    fn append_observations_v2_with_bridge(
+        &self,
+        source_instance_id: &str,
+        generation: Option<u64>,
+        observations: &[Observation],
+        audit_events: &[AuditEventRecord],
+    ) -> StorageResult<Vec<AppendOutcome>>;
+
+    fn cutover_admit(
+        &self,
+        source_instance_id: &str,
+        api_version: CutoverApiVersion,
+        generation: Option<u64>,
+    ) -> StorageResult<()>;
+
+    fn identity_bridge_apply_batch(
+        &self,
+        batch_size: usize,
+    ) -> StorageResult<IdentityBridgeBatchReport>;
+    fn identity_bridge_watermark(&self) -> StorageResult<u64>;
+    fn identity_bridge_resolve(
+        &self,
+        v2_identity_key: &str,
+        canonical_json: &str,
+    ) -> StorageResult<IdentityBridgeResolution>;
+
+    fn cutover_register(
+        &self,
+        source_instance_id: &str,
+        authority: &str,
+        reason: &str,
+    ) -> StorageResult<CutoverState>;
+    fn cutover_state(&self, source_instance_id: &str) -> StorageResult<CutoverState>;
+    fn cutover_inventory(&self) -> StorageResult<Vec<CutoverInventoryItem>>;
+    fn cutover_begin_drain(
+        &self,
+        source_instance_id: &str,
+        authority: &str,
+        reason: &str,
+    ) -> StorageResult<CutoverState>;
+    fn cutover_readiness(
+        &self,
+        source_instance_id: &str,
+        fixture: Option<&CutoverFixture>,
+    ) -> StorageResult<CutoverReadinessReport>;
+    fn cutover_activate(
+        &self,
+        source_instance_id: &str,
+        authority: &str,
+        reason: &str,
+        fixture: &CutoverFixture,
+    ) -> StorageResult<CutoverState>;
+    fn cutover_rollback(
+        &self,
+        source_instance_id: &str,
+        authority: &str,
+        reason: &str,
+    ) -> StorageResult<CutoverState>;
+    fn cutover_health(&self, source_instance_id: &str) -> StorageResult<CutoverHealth>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CutoverApiVersion {
+    V1,
+    V2,
+}
+
+impl CutoverApiVersion {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CutoverPhase {
+    V1Active,
+    Draining,
+    V2Active,
+    V2Committed,
+}
+
+impl CutoverPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::V1Active => "v1_active",
+            Self::Draining => "draining",
+            Self::V2Active => "v2_active",
+            Self::V2Committed => "v2_committed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CutoverState {
+    pub source_instance_id: String,
+    pub phase: CutoverPhase,
+    pub generation: u64,
+    pub fence_append_seq: Option<u64>,
+    pub first_v2_append_seq: Option<u64>,
+    pub v2_ingested: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityBridgeBatchReport {
+    pub previous_watermark: u64,
+    pub watermark: u64,
+    pub read_count: usize,
+    pub candidate_count: usize,
+    pub gap_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityBridgeResolution {
+    pub v2_identity_key: String,
+    pub winner: Option<ObservationId>,
+    pub winner_append_seq: Option<u64>,
+    pub multiplicity: u64,
+    pub canonical_collision: bool,
+    pub collision_append_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CutoverFixture {
+    pub object_id: String,
+    pub canonical_json: String,
+    pub expected_identity_key: String,
+    pub expected_observation_id: Option<ObservationId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CutoverBlocker {
+    pub append_seq: Option<u64>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CutoverReadinessReport {
+    pub state: CutoverState,
+    pub bridge_watermark: u64,
+    pub bridge_lag: u64,
+    pub watermark_covered: bool,
+    pub unresolved_gap_count: u64,
+    pub exact_compare_error_count: u64,
+    pub fixture_identity_stable: bool,
+    pub dry_run_passed: bool,
+    pub candidate_count: u64,
+    pub multiplicity_count: u64,
+    pub collision_count: u64,
+    pub blockers: Vec<CutoverBlocker>,
+    pub ready: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CutoverInventoryItem {
+    pub source_instance_id: String,
+    pub observation_count: u64,
+    pub producer_ids: Vec<String>,
+    pub credential_ids: Vec<String>,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CutoverHealth {
+    pub state: CutoverState,
+    pub bridge_watermark: u64,
+    pub bridge_lag: u64,
+    pub candidate_count: u64,
+    pub gap_count: u64,
+    pub multiplicity_count: u64,
+    pub collision_count: u64,
+    pub bridge_duplicate_hit_count: u64,
+    pub stale_v1_rejection_count: u64,
+}
+
 pub trait BlobStore: Send {
     fn put_blob(&self, data: &[u8], max_bytes: usize) -> StorageResult<BlobRef>;
     fn put_blobs(&self, data: &[&[u8]], max_bytes: usize) -> StorageResult<Vec<BlobRef>>;
@@ -832,6 +1040,7 @@ pub trait ProjectionWatermarkStore: Send {
 
 pub trait StoragePorts:
     ObservationStore
+    + CutoverStore
     + BlobStore
     + SupplementalStore
     + ProjectionMaterializer
@@ -844,6 +1053,7 @@ pub trait StoragePorts:
 
 impl<T> StoragePorts for T where
     T: ObservationStore
+        + CutoverStore
         + BlobStore
         + SupplementalStore
         + ProjectionMaterializer

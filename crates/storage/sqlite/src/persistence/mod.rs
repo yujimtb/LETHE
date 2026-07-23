@@ -1,3 +1,4 @@
+mod cutover;
 mod schema;
 
 use std::collections::BTreeMap;
@@ -24,11 +25,13 @@ use lethe_runtime::runtime::partition::{
     split_commit_event_json, split_prepare_event_json,
 };
 use lethe_storage_api::{
-    AppendOutcome as PortAppendOutcome, BlobStore as BlobStorePort, DiscoveredSlackThread,
-    LeafPosition, ObservationStats, ObservationStore as ObservationStorePort,
-    OperationalAppendOutcome, OperationalAppendRequest, OperationalEventFilter,
-    OperationalEventStats, OperationalEventStore, PersistedSyncState, ProjectionItem,
-    ProjectionItemCommit, ProjectionLeafWatermark,
+    AppendOutcome as PortAppendOutcome, BlobStore as BlobStorePort, CutoverApiVersion,
+    CutoverBlocker, CutoverFixture, CutoverHealth, CutoverInventoryItem, CutoverPhase,
+    CutoverReadinessReport, CutoverState, CutoverStore, DiscoveredSlackThread,
+    IdentityBridgeBatchReport, IdentityBridgeResolution, LeafPosition, ObservationStats,
+    ObservationStore as ObservationStorePort, OperationalAppendOutcome, OperationalAppendRequest,
+    OperationalEventFilter, OperationalEventStats, OperationalEventStore, PersistedSyncState,
+    ProjectionItem, ProjectionItemCommit, ProjectionLeafWatermark,
     ProjectionMaterializer as ProjectionMaterializerPort,
     ProjectionWatermarkStore as ProjectionWatermarkStorePort, RehomeMode as PortRehomeMode,
     RuntimeStateStore as RuntimeStateStorePort, SlackThreadCatalogEntry,
@@ -48,6 +51,8 @@ pub enum PersistenceError {
     Json(#[from] serde_json::Error),
     #[error("schema invariant violation: {0}")]
     SchemaInvariant(String),
+    #[error("cutover admission denied: {0}")]
+    CutoverAdmissionDenied(String),
 }
 
 pub struct SqlitePersistence {
@@ -68,6 +73,9 @@ const SCHEMA_VERSION_LOCK_SPLIT_SCALARS: i64 = 10;
 const SCHEMA_VERSION_KEYSET_READS: i64 = 11;
 const SCHEMA_VERSION_PRIVACY_PROJECTION: i64 = 12;
 const SCHEMA_VERSION_RECONSENT_PRIVACY_INDEX: i64 = 13;
+const SCHEMA_VERSION_CUTOVER_BRIDGE: i64 = 14;
+#[cfg(test)]
+const CURRENT_SCHEMA_VERSION: i64 = SCHEMA_VERSION_CUTOVER_BRIDGE;
 const CANONICAL_JSON_META_KEY: &str = "canonical_json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2929,7 +2937,10 @@ fn projection_item_validation_error(error: StorageError) -> PersistenceError {
         StorageError::Invariant(message)
         | StorageError::Backend(message)
         | StorageError::OperationalIdempotencyCollision(message)
-        | StorageError::OperationalEventIdCollision(message) => {
+        | StorageError::OperationalEventIdCollision(message)
+        | StorageError::CutoverAdmissionDenied(message)
+        | StorageError::CutoverConflict(message)
+        | StorageError::CutoverRollbackRefused(message) => {
             PersistenceError::SchemaInvariant(message)
         }
     }
@@ -3137,6 +3148,9 @@ fn collect_blob_refs(value: &serde_json::Value, refs: &mut std::collections::BTr
 fn storage_error(error: PersistenceError) -> StorageError {
     match error {
         PersistenceError::SchemaInvariant(message) => StorageError::Invariant(message),
+        PersistenceError::CutoverAdmissionDenied(message) => {
+            StorageError::CutoverAdmissionDenied(message)
+        }
         other => StorageError::Backend(other.to_string()),
     }
 }

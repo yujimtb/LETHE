@@ -3813,6 +3813,53 @@ fn v2_identity_is_server_validated_and_retry_time_does_not_change_identity() {
 }
 
 #[test]
+fn v1_append_then_v2_canary_uses_bridge_duplicate_without_ledger_delta() {
+    let root = std::env::temp_dir().join(format!("lethe-v1-v2-bridge-{}", uuid::Uuid::now_v7()));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let service = test_service(test_config(db, blobs), persistence);
+
+    let mut v1_draft = wave2_slack_draft(42);
+    let object_id = "channel:C01ABC:ts:0000000042.000001";
+    v1_draft
+        .meta
+        .as_object_mut()
+        .unwrap()
+        .insert("object_id".to_owned(), serde_json::json!(object_id));
+    let v1 = service
+        .ingest_observation_drafts(vec![v1_draft], "slack-test")
+        .unwrap();
+    let existing_id = v1.results[0]
+        .observation_id
+        .clone()
+        .expect("v1 canary must append");
+    service.apply_identity_bridge_batch(32).unwrap();
+
+    let v2 = service
+        .ingest_observation_drafts_v2(vec![v2_slack_draft(42, Utc::now())], "slack-test")
+        .unwrap();
+    assert_eq!(v2.ingested, 0);
+    assert_eq!(v2.duplicates, 1);
+    assert_eq!(v2.results[0].existing_id, Some(existing_id));
+    assert_eq!(
+        v2.results[0].error_code.as_deref(),
+        Some("duplicate.existing_id")
+    );
+    assert_eq!(
+        service
+            .persistence_lock()
+            .unwrap()
+            .observation_stats()
+            .unwrap()
+            .count,
+        1
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn v2_payload_limit_is_an_item_error_with_actual_and_maximum() {
     let root =
         std::env::temp_dir().join(format!("lethe-v2-payload-limit-{}", uuid::Uuid::now_v7()));

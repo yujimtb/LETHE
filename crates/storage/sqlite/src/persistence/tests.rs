@@ -56,6 +56,31 @@ fn sample_observation_with_identity(identity_key: &str, body: &str) -> Observati
     observation
 }
 
+fn bridge_observation(
+    source_instance_id: &str,
+    object_id: &str,
+    canonical_json: &str,
+    identity_key: &str,
+) -> Observation {
+    let mut observation = sample_observation();
+    observation.id = Observation::new_id();
+    observation.idempotency_key = IdempotencyKey::new(identity_key);
+    observation.meta = serde_json::json!({
+        "source_instance": source_instance_id,
+        "object_id": object_id,
+        CANONICAL_JSON_META_KEY: canonical_json,
+        "source_container": format!("{source_instance_id}:test"),
+    });
+    observation
+}
+
+fn bridge_identity(source_instance_id: &str, object_id: &str, canonical_json: &str) -> String {
+    format!(
+        "{source_instance_id}:{object_id}:{}",
+        hex::encode(sha2::Sha256::digest(canonical_json.as_bytes()))
+    )
+}
+
 fn replace_with_legacy_canonical_json_observations_table(
     store: &SqlitePersistence,
     observation: &Observation,
@@ -635,11 +660,36 @@ fn migration_ledger_records_current_schema_version() {
         .conn
         .query_row(
             "SELECT version FROM schema_migrations WHERE version = ?1",
-            [SCHEMA_VERSION_RECONSENT_PRIVACY_INDEX],
+            [CURRENT_SCHEMA_VERSION],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, SCHEMA_VERSION_RECONSENT_PRIVACY_INDEX);
+    assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn schema_v14_requires_v13_reconsent_prerequisite() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let database_path = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let store = SqlitePersistence::open(&database_path, &blob_dir, &[7; 32]).unwrap();
+    store
+        .conn
+        .execute(
+            "DELETE FROM schema_migrations WHERE version = ?1",
+            [SCHEMA_VERSION_RECONSENT_PRIVACY_INDEX],
+        )
+        .unwrap();
+    drop(store);
+
+    let result = SqlitePersistence::open(&database_path, &blob_dir, &[7; 32]);
+    assert!(matches!(
+        result,
+        Err(PersistenceError::SchemaInvariant(reason))
+            if reason == "schema migration v14 is recorded without prerequisite v13"
+    ));
 
     let _ = fs::remove_dir_all(tmp);
 }
@@ -673,7 +723,7 @@ fn reconsent_privacy_reverse_index_tracks_subject_and_identifier_keys() {
 }
 
 #[test]
-fn schema_v13_converges_from_fresh_v9_and_v10_upgrade_paths() {
+fn schema_v14_converges_from_fresh_v12_and_v13_upgrade_paths() {
     let fresh_tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let fresh = SqlitePersistence::open(
         &fresh_tmp.join("test.sqlite3"),
@@ -703,15 +753,19 @@ fn schema_v13_converges_from_fresh_v9_and_v10_upgrade_paths() {
             SCHEMA_VERSION_RECONSENT_PRIVACY_INDEX,
             "reconsent_privacy_reverse_index".to_owned(),
         ),
+        (
+            SCHEMA_VERSION_CUTOVER_BRIDGE,
+            "v1_v2_cutover_bridge".to_owned(),
+        ),
     ];
-    assert_eq!(migration_ledger(&fresh), current_ledger.clone());
+    assert_eq!(migration_ledger(&fresh), current_ledger);
     drop(fresh);
 
-    let v9_tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let v12_tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     {
         let seed = SqlitePersistence::open(
-            &v9_tmp.join("test.sqlite3"),
-            &v9_tmp.join("blobs"),
+            &v12_tmp.join("test.sqlite3"),
+            &v12_tmp.join("blobs"),
             &[7; 32],
         )
         .unwrap();
@@ -720,89 +774,87 @@ fn schema_v13_converges_from_fresh_v9_and_v10_upgrade_paths() {
         seed.conn
             .execute_batch(
                 "
-                DROP TABLE operational_event_stats;
-                DROP INDEX audit_events_timestamp_id;
-                DROP TABLE projection_manifest_fields;
-                DROP TABLE observation_stats;
-                DELETE FROM schema_migrations WHERE version >= 10;
+                DROP TRIGGER cutover_transition_log_no_update;
+                DROP TRIGGER cutover_transition_log_no_delete;
+                DROP INDEX cutover_credentials_active;
+                DROP INDEX cutover_transition_unit_seq;
+                DROP INDEX identity_bridge_gaps_source_append;
+                DROP INDEX identity_bridge_candidates_source_append;
+                DROP INDEX identity_bridge_candidates_key_append;
+                DROP TABLE cutover_unit_metrics;
+                DROP TABLE cutover_credentials;
+                DROP TABLE cutover_transition_log;
+                DROP TABLE identity_bridge_watermark;
+                DROP TABLE identity_bridge_gaps;
+                DROP TABLE identity_bridge_candidates;
+                DROP INDEX observation_privacy_keys_append;
+                DROP TABLE observation_privacy_keys;
+                DELETE FROM schema_migrations WHERE version >= 13;
                 ",
             )
             .unwrap();
     }
-    let v9 = SqlitePersistence::open(
-        &v9_tmp.join("test.sqlite3"),
-        &v9_tmp.join("blobs"),
+    let v12 = SqlitePersistence::open(
+        &v12_tmp.join("test.sqlite3"),
+        &v12_tmp.join("blobs"),
         &[7; 32],
     )
     .unwrap();
-    assert_eq!(schema_object_signature(&v9), fresh_signature);
-    assert_eq!(migration_ledger(&v9), current_ledger);
-    assert_eq!(v9.observation_stats().unwrap().count, 1);
-    drop(v9);
-
-    let v8_tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
-    {
-        let seed = SqlitePersistence::open(
-            &v8_tmp.join("test.sqlite3"),
-            &v8_tmp.join("blobs"),
-            &[7; 32],
-        )
-        .unwrap();
-        seed.append_observation_idempotent(&sample_observation())
-            .unwrap();
-        seed.conn
-            .execute_batch(
-                "
-                DROP INDEX observations_identity_append;
-                DROP TABLE operational_event_stats;
-                DROP INDEX audit_events_timestamp_id;
-                DROP TABLE projection_manifest_fields;
-                DROP TABLE observation_stats;
-                DELETE FROM schema_migrations WHERE version >= 9;
-                INSERT INTO schema_migrations (version, name, applied_at)
-                VALUES (8, 'global_observation_identity_registry', '2026-07-22T00:00:00Z');
-                ",
-            )
-            .unwrap();
-    }
-    let v8 = SqlitePersistence::open(
-        &v8_tmp.join("test.sqlite3"),
-        &v8_tmp.join("blobs"),
-        &[7; 32],
-    )
-    .unwrap();
-    assert_eq!(schema_object_signature(&v8), fresh_signature);
+    assert_eq!(schema_object_signature(&v12), fresh_signature);
+    assert_eq!(migration_ledger(&v12), current_ledger);
+    assert_eq!(v12.observation_stats().unwrap().count, 1);
     assert_eq!(
-        migration_ledger(&v8),
-        vec![
-            (8, "global_observation_identity_registry".to_owned()),
-            (
-                SCHEMA_VERSION_IDENTITY_LOOKUP_INDEX,
-                "observation_identity_lookup_index".to_owned(),
-            ),
-            (
-                SCHEMA_VERSION_LOCK_SPLIT_SCALARS,
-                "append_commit_lock_split_scalars".to_owned(),
-            ),
-            (
-                SCHEMA_VERSION_KEYSET_READS,
-                "indexed_keyset_reads".to_owned()
-            ),
-            (
-                SCHEMA_VERSION_PRIVACY_PROJECTION,
-                "privacy_projection_visibility".to_owned(),
-            ),
-            (
-                SCHEMA_VERSION_RECONSENT_PRIVACY_INDEX,
-                "reconsent_privacy_reverse_index".to_owned(),
-            ),
-        ]
+        v12.observations_for_privacy_key("entity:test")
+            .unwrap()
+            .len(),
+        1
     );
-    assert_eq!(v8.observation_stats().unwrap().count, 1);
+    drop(v12);
+
+    let v13_tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    {
+        let seed = SqlitePersistence::open(
+            &v13_tmp.join("test.sqlite3"),
+            &v13_tmp.join("blobs"),
+            &[7; 32],
+        )
+        .unwrap();
+        seed.append_observation_idempotent(&sample_observation())
+            .unwrap();
+        seed.conn
+            .execute_batch(
+                "
+                DROP TRIGGER cutover_transition_log_no_update;
+                DROP TRIGGER cutover_transition_log_no_delete;
+                DROP INDEX cutover_credentials_active;
+                DROP INDEX cutover_transition_unit_seq;
+                DROP INDEX identity_bridge_gaps_source_append;
+                DROP INDEX identity_bridge_candidates_source_append;
+                DROP INDEX identity_bridge_candidates_key_append;
+                DROP TABLE cutover_unit_metrics;
+                DROP TABLE cutover_credentials;
+                DROP TABLE cutover_transition_log;
+                DROP TABLE identity_bridge_watermark;
+                DROP TABLE identity_bridge_gaps;
+                DROP TABLE identity_bridge_candidates;
+                DELETE FROM schema_migrations WHERE version = 14;
+                ",
+            )
+            .unwrap();
+    }
+    let v13 = SqlitePersistence::open(
+        &v13_tmp.join("test.sqlite3"),
+        &v13_tmp.join("blobs"),
+        &[7; 32],
+    )
+    .unwrap();
+    assert_eq!(schema_object_signature(&v13), fresh_signature);
+    assert_eq!(migration_ledger(&v13), current_ledger);
+    assert_eq!(v13.observation_stats().unwrap().count, 1);
 
     let _ = fs::remove_dir_all(fresh_tmp);
-    let _ = fs::remove_dir_all(v9_tmp);
-    let _ = fs::remove_dir_all(v8_tmp);
+    let _ = fs::remove_dir_all(v12_tmp);
+    let _ = fs::remove_dir_all(v13_tmp);
 }
 
 #[test]
@@ -2560,6 +2612,513 @@ fn sqlite_implements_storage_port_conformance_suite() {
     lethe_storage_api::conformance::observation_store_round_trip(&store);
     lethe_storage_api::conformance::blob_store_round_trip(&store);
     lethe_storage_api::conformance::materializer_round_trip(&store);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn identity_bridge_projection_is_incremental_idempotent_and_resumable() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let store =
+        SqlitePersistence::open(&tmp.join("test.sqlite3"), &tmp.join("blobs"), &[7; 32]).unwrap();
+    let canonical_json = serde_json::json!({"body": "one"}).to_string();
+    let v1 = bridge_observation(
+        "unit-a",
+        "object-1",
+        &canonical_json,
+        "unit-a:legacy:object-1",
+    );
+    store
+        .append_observations_v1_with_admission("unit-a", None, std::slice::from_ref(&v1), &[])
+        .unwrap();
+
+    let first = store.identity_bridge_apply_batch(16).unwrap();
+    assert_eq!(first.read_count, 1);
+    assert_eq!(first.candidate_count, 1);
+    assert_eq!(first.gap_count, 0);
+    assert_eq!(store.identity_bridge_watermark().unwrap(), 1);
+
+    let retry = store.identity_bridge_apply_batch(16).unwrap();
+    assert_eq!(retry.read_count, 0);
+    let candidate_count: u64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM identity_bridge_candidates",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(candidate_count, 1);
+
+    let second_json = serde_json::json!({"body": "two"}).to_string();
+    let second = bridge_observation("unit-a", "object-2", &second_json, "unit-a:legacy:object-2");
+    store
+        .append_observations_v1_with_admission("unit-a", None, &[second], &[])
+        .unwrap();
+    let tail = store.identity_bridge_apply_batch(16).unwrap();
+    assert_eq!(tail.read_count, 1);
+    assert_eq!(tail.previous_watermark, 1);
+    assert_eq!(tail.watermark, 2);
+
+    let resolution = store
+        .identity_bridge_resolve(
+            &bridge_identity("unit-a", "object-1", &canonical_json),
+            &canonical_json,
+        )
+        .unwrap();
+    assert_eq!(resolution.winner, Some(v1.id));
+    assert_eq!(resolution.multiplicity, 1);
+    assert!(!resolution.canonical_collision);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn v2_bridge_duplicate_preserves_ledger_delta_and_canonical_collision() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let store =
+        SqlitePersistence::open(&tmp.join("test.sqlite3"), &tmp.join("blobs"), &[7; 32]).unwrap();
+    let canonical_json = serde_json::json!({"body": "same"}).to_string();
+    let v1 = bridge_observation(
+        "unit-a",
+        "object-1",
+        &canonical_json,
+        "unit-a:legacy:object-1",
+    );
+    store
+        .append_observations_v1_with_admission("unit-a", None, std::slice::from_ref(&v1), &[])
+        .unwrap();
+    store.identity_bridge_apply_batch(16).unwrap();
+
+    let v2_identity = bridge_identity("unit-a", "object-1", &canonical_json);
+    let v2 = bridge_observation("unit-a", "object-1", &canonical_json, &v2_identity);
+    let outcomes = store
+        .append_observations_v2_with_bridge("unit-a", None, &[v2], &[])
+        .unwrap();
+    assert_eq!(
+        outcomes,
+        vec![lethe_storage_api::AppendOutcome::Duplicate(v1.id.clone())]
+    );
+    assert_eq!(store.observation_stats().unwrap().count, 1);
+
+    let mismatch_json = serde_json::json!({"body": "different"}).to_string();
+    store
+        .conn
+        .execute(
+            "INSERT INTO identity_bridge_candidates (
+                v2_identity_key, observation_id, source_instance_id, append_seq,
+                canonical_json, canonical_json_sha256
+             ) VALUES (?1, 'legacy-collision', 'unit-a', 999, ?2, ?3)",
+            params![
+                v2_identity,
+                mismatch_json,
+                canonical_json_sha256(&mismatch_json)
+            ],
+        )
+        .unwrap();
+    let mismatch_outcome = store
+        .append_observations_v2_with_bridge(
+            "unit-a",
+            None,
+            &[bridge_observation(
+                "unit-a",
+                "object-1",
+                &canonical_json,
+                &bridge_identity("unit-a", "object-1", &canonical_json),
+            )],
+            &[],
+        )
+        .unwrap();
+    assert!(matches!(
+        mismatch_outcome.as_slice(),
+        [lethe_storage_api::AppendOutcome::CanonicalCollision(_)]
+    ));
+    assert_eq!(store.observation_stats().unwrap().count, 1);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn cutover_fence_activation_generation_and_rollback_boundary_are_durable() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let store =
+        SqlitePersistence::open(&tmp.join("test.sqlite3"), &tmp.join("blobs"), &[7; 32]).unwrap();
+    let canonical_json = serde_json::json!({"body": "canary"}).to_string();
+    let v1 = bridge_observation(
+        "unit-a",
+        "object-1",
+        &canonical_json,
+        "unit-a:legacy:object-1",
+    );
+    store
+        .append_observations_v1_with_admission("unit-a", None, std::slice::from_ref(&v1), &[])
+        .unwrap();
+    store.identity_bridge_apply_batch(16).unwrap();
+    store
+        .cutover_register("unit-a", "owner:test", "register")
+        .unwrap();
+    let draining = store
+        .cutover_begin_drain("unit-a", "owner:test", "fence")
+        .unwrap();
+    assert_eq!(draining.phase, lethe_storage_api::CutoverPhase::Draining);
+    assert_eq!(draining.fence_append_seq, Some(1));
+
+    let fixture = lethe_storage_api::CutoverFixture {
+        object_id: "object-1".to_owned(),
+        canonical_json: canonical_json.clone(),
+        expected_identity_key: bridge_identity("unit-a", "object-1", &canonical_json),
+        expected_observation_id: Some(v1.id.clone()),
+    };
+    let readiness = store.cutover_readiness("unit-a", Some(&fixture)).unwrap();
+    assert!(readiness.ready, "{readiness:?}");
+    let active = store
+        .cutover_activate("unit-a", "owner:test", "activate", &fixture)
+        .unwrap();
+    assert_eq!(active.phase, lethe_storage_api::CutoverPhase::V2Active);
+    assert_eq!(active.generation, 2);
+
+    let stale = store.cutover_admit("unit-a", lethe_storage_api::CutoverApiVersion::V1, Some(1));
+    assert!(matches!(
+        stale,
+        Err(lethe_storage_api::StorageError::CutoverAdmissionDenied(_))
+    ));
+    assert!(
+        store
+            .cutover_admit("unit-a", lethe_storage_api::CutoverApiVersion::V2, Some(2),)
+            .is_ok()
+    );
+    store
+        .cutover_register("unit-b", "owner:test", "register independent unit")
+        .unwrap();
+    assert!(
+        store
+            .cutover_admit("unit-b", lethe_storage_api::CutoverApiVersion::V1, Some(1),)
+            .is_ok()
+    );
+    assert!(matches!(
+        store.cutover_admit("unit-a", lethe_storage_api::CutoverApiVersion::V1, Some(2)),
+        Err(lethe_storage_api::StorageError::CutoverAdmissionDenied(_))
+    ));
+
+    let new_json = serde_json::json!({"body": "new"}).to_string();
+    let new_identity = bridge_identity("unit-a", "object-2", &new_json);
+    let new_observation = bridge_observation("unit-a", "object-2", &new_json, &new_identity);
+    let outcomes = store
+        .append_observations_v2_with_bridge("unit-a", Some(2), &[new_observation], &[])
+        .unwrap();
+    assert!(matches!(
+        outcomes.as_slice(),
+        [lethe_storage_api::AppendOutcome::Appended(_)]
+    ));
+    assert_eq!(
+        store.cutover_state("unit-a").unwrap().phase,
+        lethe_storage_api::CutoverPhase::V2Committed
+    );
+    assert_eq!(store.identity_bridge_apply_batch(16).unwrap().read_count, 1);
+    let v2_resolution = store
+        .identity_bridge_resolve(&new_identity, &new_json)
+        .unwrap();
+    assert_eq!(v2_resolution.winner, None);
+    assert_eq!(v2_resolution.multiplicity, 0);
+    let rollback = store.cutover_rollback("unit-a", "owner:test", "unsafe");
+    assert!(
+        matches!(rollback, Err(lethe_storage_api::StorageError::CutoverRollbackRefused(reason)) if reason.contains("forward-fix"))
+    );
+
+    let health = store.cutover_health("unit-a").unwrap();
+    assert_eq!(health.bridge_duplicate_hit_count, 0);
+    assert_eq!(health.stale_v1_rejection_count, 2);
+    assert_eq!(health.state.v2_ingested, 1);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn pre_commit_rollback_returns_to_v1_without_deleting_bridge_state() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let store =
+        SqlitePersistence::open(&tmp.join("test.sqlite3"), &tmp.join("blobs"), &[7; 32]).unwrap();
+    store
+        .cutover_register("unit-b", "owner:test", "register")
+        .unwrap();
+    store
+        .cutover_begin_drain("unit-b", "owner:test", "fence")
+        .unwrap();
+    let state = store
+        .cutover_rollback("unit-b", "owner:test", "pre-commit rollback")
+        .unwrap();
+    assert_eq!(state.phase, lethe_storage_api::CutoverPhase::V1Active);
+    assert_eq!(state.generation, 2);
+    assert_eq!(store.identity_bridge_watermark().unwrap(), 0);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn cutover_state_fold_rejects_invalid_transition_log() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let store =
+        SqlitePersistence::open(&tmp.join("test.sqlite3"), &tmp.join("blobs"), &[7; 32]).unwrap();
+    store
+        .cutover_register("invalid-unit", "owner:test", "register")
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO cutover_transition_log (
+                source_instance_id, from_phase, to_phase, authority, reason,
+                generation, fence_append_seq, first_v2_append_seq, committed_at
+             ) VALUES ('invalid-unit', 'v1_active', 'v2_active', 'owner:test',
+                       'invalid direct activation', 2, NULL, NULL, ?1)",
+            [chrono::Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.cutover_state("invalid-unit"),
+        Err(lethe_storage_api::StorageError::Invariant(reason))
+            if reason.contains("invalid cutover transition")
+    ));
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn schema_v14_upgrades_true_v13_cutover_shape() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let database_path = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    {
+        let store = SqlitePersistence::open(&database_path, &blob_dir, &[7; 32]).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "
+                DROP TRIGGER cutover_transition_log_no_update;
+                DROP TRIGGER cutover_transition_log_no_delete;
+                DROP INDEX cutover_credentials_active;
+                DROP INDEX cutover_transition_unit_seq;
+                DROP INDEX identity_bridge_gaps_source_append;
+                DROP INDEX identity_bridge_candidates_source_append;
+                DROP INDEX identity_bridge_candidates_key_append;
+                DROP TABLE cutover_unit_metrics;
+                DROP TABLE cutover_credentials;
+                DROP TABLE cutover_transition_log;
+                DROP TABLE identity_bridge_watermark;
+                DROP TABLE identity_bridge_gaps;
+                DROP TABLE identity_bridge_candidates;
+                DELETE FROM schema_migrations WHERE version = 14;
+                ",
+            )
+            .unwrap();
+    }
+    let reopened = SqlitePersistence::open(&database_path, &blob_dir, &[7; 32]).unwrap();
+    assert_eq!(
+        reopened
+            .conn
+            .query_row(
+                "SELECT name FROM schema_migrations WHERE version = 13",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "reconsent_privacy_reverse_index"
+    );
+    assert_eq!(
+        reopened
+            .conn
+            .query_row(
+                "SELECT name FROM schema_migrations WHERE version = 14",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "v1_v2_cutover_bridge"
+    );
+    assert_eq!(reopened.identity_bridge_watermark().unwrap(), 0);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn identity_bridge_persists_missing_metadata_as_a_gap_without_guessing() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let store =
+        SqlitePersistence::open(&tmp.join("test.sqlite3"), &tmp.join("blobs"), &[7; 32]).unwrap();
+    let observation = sample_observation();
+    store.append_observation_idempotent(&observation).unwrap();
+    let report = store.identity_bridge_apply_batch(8).unwrap();
+    assert_eq!(report.read_count, 1);
+    assert_eq!(report.candidate_count, 0);
+    assert_eq!(report.gap_count, 1);
+    let gap: (u64, String) = store
+        .conn
+        .query_row(
+            "SELECT append_seq, reason FROM identity_bridge_gaps",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(gap.0, 1);
+    assert!(gap.1.contains("source_instance"));
+    assert_eq!(store.identity_bridge_apply_batch(8).unwrap().read_count, 0);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn identity_bridge_batch_failure_does_not_advance_watermark() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let store =
+        SqlitePersistence::open(&tmp.join("test.sqlite3"), &tmp.join("blobs"), &[7; 32]).unwrap();
+    store
+        .append_observations_v1_with_admission(
+            "atomic-unit",
+            None,
+            &[bridge_observation(
+                "atomic-unit",
+                "object-1",
+                &serde_json::json!({"body": "one"}).to_string(),
+                "atomic-unit:legacy:1",
+            )],
+            &[],
+        )
+        .unwrap();
+
+    assert!(
+        store
+            .identity_bridge_apply_batch_with_failure_for_test(8)
+            .is_err()
+    );
+    assert_eq!(store.identity_bridge_watermark().unwrap(), 0);
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM identity_bridge_candidates",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(store.identity_bridge_apply_batch(8).unwrap().read_count, 1);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn identity_bridge_steady_state_reads_only_new_tail_after_bounded_bootstrap() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let store =
+        SqlitePersistence::open(&tmp.join("test.sqlite3"), &tmp.join("blobs"), &[7; 32]).unwrap();
+    let history = (0..1024)
+        .map(|index| {
+            let canonical_json = serde_json::json!({"body": index}).to_string();
+            bridge_observation(
+                "large-unit",
+                &format!("object-{index}"),
+                &canonical_json,
+                &format!("large-unit:legacy:{index}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    store
+        .append_observations_v1_with_admission("large-unit", None, &history, &[])
+        .unwrap();
+    let mut processed = 0;
+    loop {
+        let report = store.identity_bridge_apply_batch(64).unwrap();
+        processed += report.read_count;
+        if report.read_count == 0 {
+            break;
+        }
+    }
+    assert_eq!(processed, 1024);
+    let tail = (0..7)
+        .map(|index| {
+            let n = 1024 + index;
+            let canonical_json = serde_json::json!({"body": n}).to_string();
+            bridge_observation(
+                "large-unit",
+                &format!("object-{n}"),
+                &canonical_json,
+                &format!("large-unit:legacy:{n}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    store
+        .append_observations_v1_with_admission("large-unit", None, &tail, &[])
+        .unwrap();
+    let tail_report = store.identity_bridge_apply_batch(64).unwrap();
+    assert_eq!(tail_report.previous_watermark, 1024);
+    assert_eq!(tail_report.read_count, 7);
+    assert_eq!(store.identity_bridge_apply_batch(64).unwrap().read_count, 0);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn cutover_inventory_reports_shared_producers_credentials_and_renames() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let store =
+        SqlitePersistence::open(&tmp.join("test.sqlite3"), &tmp.join("blobs"), &[7; 32]).unwrap();
+    let canonical_one = serde_json::json!({"body": "one"}).to_string();
+    let mut first = bridge_observation(
+        "shared-unit",
+        "object-1",
+        &canonical_one,
+        "shared-unit:legacy:1",
+    );
+    first.meta.as_object_mut().unwrap().extend([
+        ("producer_id".to_owned(), serde_json::json!("producer-a")),
+        (
+            "credential_id".to_owned(),
+            serde_json::json!("credential-shared"),
+        ),
+    ]);
+    let canonical_two = serde_json::json!({"body": "two"}).to_string();
+    let mut second = bridge_observation(
+        "shared-unit",
+        "object-2",
+        &canonical_two,
+        "shared-unit:legacy:2",
+    );
+    second.meta.as_object_mut().unwrap().extend([
+        ("producer_id".to_owned(), serde_json::json!("producer-b")),
+        (
+            "credential_id".to_owned(),
+            serde_json::json!("credential-shared"),
+        ),
+        (
+            "source_instance_id".to_owned(),
+            serde_json::json!("renamed-unit"),
+        ),
+    ]);
+    store
+        .append_observations_v1_with_admission("shared-unit", None, &[first, second], &[])
+        .unwrap();
+    let inventory = store.cutover_inventory().unwrap();
+    let item = inventory
+        .iter()
+        .find(|item| item.source_instance_id == "shared-unit")
+        .unwrap();
+    assert_eq!(item.producer_ids, vec!["producer-a", "producer-b"]);
+    assert_eq!(item.credential_ids, vec!["credential-shared"]);
+    assert!(
+        item.blockers
+            .iter()
+            .any(|blocker| blocker.contains("multiple producers"))
+    );
+    assert!(
+        item.blockers
+            .iter()
+            .any(|blocker| blocker.contains("one credential reference"))
+    );
+    assert!(
+        item.blockers
+            .iter()
+            .any(|blocker| blocker.contains("rename detected"))
+    );
 
     let _ = fs::remove_dir_all(tmp);
 }

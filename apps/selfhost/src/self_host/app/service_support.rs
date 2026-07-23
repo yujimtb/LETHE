@@ -5,6 +5,121 @@ impl AppService {
         self.config.mcp_oauth.clone()
     }
 
+    pub(super) fn enforce_cutover_admission(
+        &self,
+        source_instance_id: &str,
+        api_version: lethe_storage_api::CutoverApiVersion,
+        generation: Option<u64>,
+    ) -> Result<(), SelfHostError> {
+        match self
+            .persistence_lock()?
+            .cutover_admit(source_instance_id, api_version, generation)
+        {
+            Ok(()) => Ok(()),
+            Err(StorageError::CutoverAdmissionDenied(detail)) => Err(SelfHostError::Auth(detail)),
+            Err(error) => Err(SelfHostError::Storage(error)),
+        }
+    }
+
+    pub fn apply_identity_bridge_batch(
+        &self,
+        batch_size: usize,
+    ) -> Result<lethe_storage_api::IdentityBridgeBatchReport, SelfHostError> {
+        Ok(self
+            .persistence_lock()?
+            .identity_bridge_apply_batch(batch_size)?)
+    }
+
+    pub(super) fn catch_up_identity_bridge(&self) -> Result<(), SelfHostError> {
+        loop {
+            let report = self.apply_identity_bridge_batch(16_384)?;
+            if report.read_count == 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    pub fn identity_bridge_watermark(&self) -> Result<u64, SelfHostError> {
+        Ok(self.persistence_read_lock()?.identity_bridge_watermark()?)
+    }
+
+    pub fn cutover_register_unit(
+        &self,
+        source_instance_id: &str,
+        authority: &str,
+        reason: &str,
+    ) -> Result<CutoverState, SelfHostError> {
+        Ok(self
+            .persistence_lock()?
+            .cutover_register(source_instance_id, authority, reason)?)
+    }
+
+    pub fn cutover_inventory(&self) -> Result<Vec<CutoverInventoryItem>, SelfHostError> {
+        Ok(self.persistence_read_lock()?.cutover_inventory()?)
+    }
+
+    pub fn cutover_state(&self, source_instance_id: &str) -> Result<CutoverState, SelfHostError> {
+        Ok(self
+            .persistence_read_lock()?
+            .cutover_state(source_instance_id)?)
+    }
+
+    pub fn cutover_begin_drain(
+        &self,
+        source_instance_id: &str,
+        authority: &str,
+        reason: &str,
+    ) -> Result<CutoverState, SelfHostError> {
+        let _operation = self.bulk_import_operation_lock()?;
+        Ok(self
+            .persistence_lock()?
+            .cutover_begin_drain(source_instance_id, authority, reason)?)
+    }
+
+    pub fn cutover_readiness(
+        &self,
+        source_instance_id: &str,
+        fixture: Option<&CutoverFixture>,
+    ) -> Result<CutoverReadinessReport, SelfHostError> {
+        Ok(self
+            .persistence_read_lock()?
+            .cutover_readiness(source_instance_id, fixture)?)
+    }
+
+    pub fn cutover_activate(
+        &self,
+        source_instance_id: &str,
+        authority: &str,
+        reason: &str,
+        fixture: &CutoverFixture,
+    ) -> Result<CutoverState, SelfHostError> {
+        let _operation = self.bulk_import_operation_lock()?;
+        Ok(self.persistence_lock()?.cutover_activate(
+            source_instance_id,
+            authority,
+            reason,
+            fixture,
+        )?)
+    }
+
+    pub fn cutover_rollback(
+        &self,
+        source_instance_id: &str,
+        authority: &str,
+        reason: &str,
+    ) -> Result<CutoverState, SelfHostError> {
+        let _operation = self.bulk_import_operation_lock()?;
+        Ok(self
+            .persistence_lock()?
+            .cutover_rollback(source_instance_id, authority, reason)?)
+    }
+
+    pub fn cutover_health(&self, source_instance_id: &str) -> Result<CutoverHealth, SelfHostError> {
+        Ok(self
+            .persistence_read_lock()?
+            .cutover_health(source_instance_id)?)
+    }
+
     pub fn health(&self) -> Result<HealthResponse, SelfHostError> {
         let core = self.core_snapshot();
         let append_consumer = self.append_consumer_health_dependency()?;
@@ -505,9 +620,21 @@ impl AppService {
             serde_json::json!({"observation_id": observation.id.as_str()}),
         )?;
         let audit_record = AppService::audit_record(&audit_event)?;
+        let source_instance_id = observation
+            .meta
+            .get("source_instance")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                SelfHostError::Ingestion(
+                    "prepared observation is missing meta.source_instance".to_owned(),
+                )
+            })?;
         let durable_outcome = self
             .persistence_lock()?
-            .append_observations_with_audit(
+            .append_observations_v1_with_admission(
+                source_instance_id,
+                None,
                 std::slice::from_ref(&observation),
                 std::slice::from_ref(&audit_record),
             )?
@@ -545,9 +672,21 @@ impl AppService {
             serde_json::json!({"observation_id": observation.id.as_str()}),
         )?;
         let audit_record = AppService::audit_record(&audit_event)?;
+        let source_instance_id = observation
+            .meta
+            .get("source_instance")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                SelfHostError::Ingestion(
+                    "prepared Slack observation is missing meta.source_instance".to_owned(),
+                )
+            })?;
         let durable_outcome = self
             .persistence_lock()?
-            .append_slack_observation_with_audit(
+            .append_slack_observation_v1_with_admission(
+                source_instance_id,
+                None,
                 &observation,
                 thread,
                 std::slice::from_ref(&audit_record),
@@ -990,6 +1129,7 @@ impl AppService {
             .lock()
             .map_err(|_| SelfHostError::LockPoisoned)?;
         loop {
+            self.catch_up_identity_bridge()?;
             let cursor = self
                 .persistence_read_lock()?
                 .get_state("append_consumer:person-page")?

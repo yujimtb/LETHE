@@ -147,15 +147,108 @@ deduplication after an event-time routing change across leaves, v2 canonical
 collision responses (`quarantined` + ticket + `existing_id`), and HTTP-level
 clock-skew/policy quarantine classification.
 
+### v1/v2 cutover bridge runbook
+
+The atomic cutover unit is the stable `source_instance_id`, not a product or
+client name. If multiple producers share one value, inventory and drain all of
+them together; do not rename the value during cutover. The read-only inventory
+endpoint is `GET /api/v2/cutover/units` with `admin:cutover`. It reports shared
+producer/credential and source-instance-rename blockers without a hard-coded
+client list. This procedure applies equally to `nanihold_intercom`, `Nanihold
+OS`, or any future producer.
+
+Run the local procedure per unit:
+
+**Warning: `cutover_register` is not a neutral, read-only observation.** The
+instant a unit is registered it becomes `v1_active`/generation 1 and is
+subject to fencing: any v1 client submission for that unit that does not
+present the `X-LETHE-Admission-Generation` header is rejected outright with
+401 (`stale_v1_rejection`). Do not register a unit just to inspect its
+inventory or health — an unregistered unit stays fully frozen, i.e. it keeps
+accepting v1 traffic unconditionally, exactly as before cutover work started.
+
+The correct order is therefore: (a) implement and deploy generation
+presentation in every v1 client for the target unit, (b) only then call
+`cutover_register`, and (c) proceed to `/drain` and the remaining steps
+below.
+
+Two related operational notes. First, the bridge's first-boot bootstrap is a
+bounded batch scan proportional to ledger size (16384 records per batch); if
+it is killed mid-run it resumes from the durable watermark on restart, which
+is expected behavior, not a hang. Second, the `/readiness` fixture must
+genuinely select an item keyed under the v1 formula — an item that is already
+reconciled to the v2 key leaves no dry-run winner and blocks activation. That
+is a safe false-negative, not a bridge defect.
+
+1. `POST /api/v2/cutover/units/{source_instance_id}/register` with an
+   authority and reason. The response establishes the v1 generation.
+2. Stop new sends for every producer in the unit, allow already authorized v1
+   requests to finish, then call `/drain`. The admission barrier records the
+   canonical `fence_append_seq` and closes new v1 admission.
+3. Run the bounded bridge consumer repeatedly with a local maintenance call
+   (or `AppService::apply_identity_bridge_batch`). It reads only rows after the
+   durable watermark. Only legacy rows whose idempotency key is not the v2
+   formula become bridge candidates; v2 rows advance the watermark without
+   being re-aliased. Candidate/gap writes and watermark advance commit as one
+   transaction; a gap is a blocker, never a guessed fallback identity.
+4. Submit the v1 sample fixture to `/readiness`. Activation is fail-closed
+   until watermark coverage, zero unit gaps, zero exact-compare collisions,
+   stable v2 identity inputs, and a no-ledger-delta dry-run all pass.
+5. Call `/activate` with the same fixture. The new v2 credential generation is
+   valid only for that unit and version. Send it in the
+   `X-LETHE-Admission-Generation` header on v2 ingestion. A stale v1
+   generation is rejected as authorization failure before the v1 handler.
+6. A v1 sample→v2 canary must return an item with
+   `outcome=duplicate`, `existing_id=<the v1 observation id>`, and
+   `error_code=duplicate.existing_id`; canonical ledger count and ledger delta
+   must both remain unchanged. A new object may return `ingested`.
+
+The identity fixture is concrete and must be recorded before activation. For
+canonical JSON `{"object_id":"msg-42","body":"hello"}` and unit
+`unit-a`, the v2 key is
+`unit-a:msg-42:sha256(canonical_json)`. A typical frozen-v1 key is
+`unit-a:source:msg-42:sha256(canonical_json)`; v1 keeps that opaque key and
+never consults the bridge. v2 resolves only the alias candidate and maps an
+exact match to `duplicate.existing_id`; an exact mismatch is
+`canonical_collision` and is quarantined.
+
+Rollback is phase-bound. While the unit is `draining` or `v2_active` with zero
+v2 `ingested` results (duplicates, rejected items, and quarantines only), close
+v2, drain in-flight work, and call `/rollback` to issue a new v1 generation.
+The bridge candidates, gaps, and watermark remain intact. After the first v2
+`ingested`, the unit is durably `v2_committed`; general rollback is refused with
+an explicit forward-fix error. There is no silent legacy-identity fallback.
+
+All verification is local/staging-only. Do not point these commands at the
+production service or perform a client switch without separate explicit owner
+approval. Health for a unit is available at
+`GET /api/v2/cutover/units/{source_instance_id}` and includes phase,
+generation, fence/first-v2 sequences, bridge lag, gaps, multiplicity,
+collisions, bridge hits, and stale-v1 rejections.
+
 The schema-v9 SQLite migration adds `observations_identity_append` on
 `(identity_key, append_seq)`. The v8 identity-registry lookup is backed by the
 registry primary-key index; the legacy observation fallback and the registry
 backfill both use this observation index, so identity lookup does not scan the
 corpus. Schema-v10 then adds the persisted observation and operational-event
 high-water scalars, per-field projection manifest table, and audit page index
-used by append-commit/lock-split. Fresh databases apply v9 then v10; a
-production v9 database applies only v10; a v8 database applies v9 then v10.
-All three paths are covered by a schema-signature convergence test.
+used by append-commit/lock-split.
+
+The current chain is strictly schema v12 → v13 → v14. Schema v13 owns the
+`observation_privacy_keys` reverse index and backfills it from the append-only
+observation ledger; new appends and partition rebuilds maintain the same index.
+The consent projection uses it for targeted re-evaluation. The same release
+requires non-corpus communication manifests at format 10 and search-index
+metadata at format 3, so stale materializations/index generations are rebuilt
+or rejected by their existing version checks. Schema v14 then adds only the
+cutover bridge tables, append-only transition log, unit/version credential
+generations, and metrics. Its migration is transactional and idempotent, and
+checks v13 as its prerequisite before applying the bridge objects.
+
+Fresh databases, true-shape v12 upgrades, and true-shape v13 upgrades are
+covered by a schema-signature convergence test. The transition log is replayed
+deterministically; an invalid phase or generation edge fails closed instead of
+being treated as current state.
 
 `/health` and `/health/deep` execute their synchronous health and SQLite checks
 on Tokio's blocking pool, preserving the existing response and error contracts
