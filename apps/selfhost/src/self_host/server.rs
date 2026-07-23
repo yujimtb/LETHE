@@ -29,6 +29,7 @@ use lethe_history::{
 use lethe_projection_claim_queue::ClaimState;
 use lethe_projection_cognition::CardState;
 use lethe_storage_api::{
+    CutoverFixture, CutoverHealth, CutoverInventoryItem, CutoverReadinessReport, CutoverState,
     OperationalAppendOutcome, OperationalAppendRequest, OperationalEventFilter,
     OperationalEventStats, StoredOperationalEvent,
 };
@@ -49,6 +50,31 @@ pub fn build_router(service: AppService) -> Router {
             "/api/v2/import/observation-drafts",
             post(import_observation_drafts_v2)
                 .layer(DefaultBodyLimit::max(IMPORT_REQUEST_BODY_LIMIT_BYTES)),
+        )
+        .route("/api/v2/cutover/units", get(cutover_inventory))
+        .route(
+            "/api/v2/cutover/units/{source_instance_id}",
+            get(cutover_health),
+        )
+        .route(
+            "/api/v2/cutover/units/{source_instance_id}/register",
+            post(cutover_register),
+        )
+        .route(
+            "/api/v2/cutover/units/{source_instance_id}/drain",
+            post(cutover_drain),
+        )
+        .route(
+            "/api/v2/cutover/units/{source_instance_id}/readiness",
+            post(cutover_readiness),
+        )
+        .route(
+            "/api/v2/cutover/units/{source_instance_id}/activate",
+            post(cutover_activate),
+        )
+        .route(
+            "/api/v2/cutover/units/{source_instance_id}/rollback",
+            post(cutover_rollback),
         )
         .route(
             "/api/import/bulk-sessions/begin",
@@ -519,6 +545,24 @@ struct ImportObservationDraftsRequest {
     drafts: Vec<ObservationDraft>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CutoverTransitionRequest {
+    authority: String,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CutoverReadinessRequest {
+    fixture: Option<CutoverFixture>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CutoverActivateRequest {
+    authority: String,
+    reason: String,
+    fixture: CutoverFixture,
+}
+
 async fn health(State(service): State<AppService>) -> Result<Json<HealthResponse>, ApiError> {
     let health = tokio::task::spawn_blocking(move || service.health())
         .await
@@ -565,11 +609,13 @@ async fn import_observation_drafts(
     Json(request): Json<ImportObservationDraftsRequest>,
 ) -> Result<Json<ImportReport>, ApiError> {
     service.authorize_headers(&headers, "write:observations")?;
+    let admission_generation = cutover_generation(&headers)?;
     let report = tokio::task::spawn_blocking(move || {
-        service.ingest_observation_drafts_with_session(
+        service.ingest_observation_drafts_with_admission_generation(
             request.drafts,
             &request.source_instance_id,
             request.bulk_session_id.as_deref(),
+            admission_generation,
         )
     })
     .await
@@ -600,16 +646,139 @@ async fn import_observation_drafts_v2(
             ));
         }
     };
+    let admission_generation = cutover_generation(&headers)?;
     let report = tokio::task::spawn_blocking(move || {
-        service.ingest_observation_drafts_v2_with_session(
+        service.ingest_observation_drafts_v2_with_admission_generation(
             request.drafts,
             &request.source_instance_id,
             request.bulk_session_id.as_deref(),
+            admission_generation,
         )
     })
     .await
     .map_err(|err| ApiError::internal(err.to_string()))??;
     Ok(Json(report))
+}
+
+async fn cutover_inventory(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<CutoverInventoryItem>>, ApiError> {
+    service.authorize_headers(&headers, "admin:cutover")?;
+    let inventory = tokio::task::spawn_blocking(move || service.cutover_inventory())
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))??;
+    Ok(Json(inventory))
+}
+
+async fn cutover_health(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Path(source_instance_id): Path<String>,
+) -> Result<Json<CutoverHealth>, ApiError> {
+    service.authorize_headers(&headers, "admin:cutover")?;
+    let health = tokio::task::spawn_blocking(move || service.cutover_health(&source_instance_id))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))??;
+    Ok(Json(health))
+}
+
+async fn cutover_register(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Path(source_instance_id): Path<String>,
+    Json(request): Json<CutoverTransitionRequest>,
+) -> Result<Json<CutoverState>, ApiError> {
+    service.authorize_headers(&headers, "admin:cutover")?;
+    let state = tokio::task::spawn_blocking(move || {
+        service.cutover_register_unit(&source_instance_id, &request.authority, &request.reason)
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))??;
+    Ok(Json(state))
+}
+
+async fn cutover_drain(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Path(source_instance_id): Path<String>,
+    Json(request): Json<CutoverTransitionRequest>,
+) -> Result<Json<CutoverState>, ApiError> {
+    service.authorize_headers(&headers, "admin:cutover")?;
+    let state = tokio::task::spawn_blocking(move || {
+        service.cutover_begin_drain(&source_instance_id, &request.authority, &request.reason)
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))??;
+    Ok(Json(state))
+}
+
+async fn cutover_readiness(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Path(source_instance_id): Path<String>,
+    Json(request): Json<CutoverReadinessRequest>,
+) -> Result<Json<CutoverReadinessReport>, ApiError> {
+    service.authorize_headers(&headers, "admin:cutover")?;
+    let report = tokio::task::spawn_blocking(move || {
+        service.cutover_readiness(&source_instance_id, request.fixture.as_ref())
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))??;
+    Ok(Json(report))
+}
+
+async fn cutover_activate(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Path(source_instance_id): Path<String>,
+    Json(request): Json<CutoverActivateRequest>,
+) -> Result<Json<CutoverState>, ApiError> {
+    service.authorize_headers(&headers, "admin:cutover")?;
+    let state = tokio::task::spawn_blocking(move || {
+        service.cutover_activate(
+            &source_instance_id,
+            &request.authority,
+            &request.reason,
+            &request.fixture,
+        )
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))??;
+    Ok(Json(state))
+}
+
+async fn cutover_rollback(
+    State(service): State<AppService>,
+    headers: HeaderMap,
+    Path(source_instance_id): Path<String>,
+    Json(request): Json<CutoverTransitionRequest>,
+) -> Result<Json<CutoverState>, ApiError> {
+    service.authorize_headers(&headers, "admin:cutover")?;
+    let state = tokio::task::spawn_blocking(move || {
+        service.cutover_rollback(&source_instance_id, &request.authority, &request.reason)
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))??;
+    Ok(Json(state))
+}
+
+fn cutover_generation(headers: &HeaderMap) -> Result<Option<u64>, ApiError> {
+    let Some(value) = headers.get("x-lethe-admission-generation") else {
+        return Ok(None);
+    };
+    let raw = value
+        .to_str()
+        .map_err(|_| ApiError::bad_request("invalid x-lethe-admission-generation header"))?;
+    let generation = raw.parse::<u64>().map_err(|_| {
+        ApiError::bad_request("x-lethe-admission-generation must be a positive integer")
+    })?;
+    if generation == 0 {
+        return Err(ApiError::bad_request(
+            "x-lethe-admission-generation must be a positive integer",
+        ));
+    }
+    Ok(Some(generation))
 }
 
 async fn begin_bulk_import_session(
@@ -1140,6 +1309,13 @@ impl ApiError {
         }
     }
 
+    fn bad_request(detail: &str) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            body: ErrorResponse::bad_request(detail),
+        }
+    }
+
     fn unprocessable_entity(code: &'static str, detail: serde_json::Value) -> Self {
         Self {
             status: StatusCode::UNPROCESSABLE_ENTITY,
@@ -1248,6 +1424,26 @@ impl From<SelfHostError> for ApiError {
             ) => Self::conflict(
                 "operational_event_id_collision",
                 serde_json::json!({"event_id": event_id}),
+            ),
+            SelfHostError::Storage(lethe_storage_api::StorageError::CutoverAdmissionDenied(
+                detail,
+            )) => Self {
+                status: StatusCode::UNAUTHORIZED,
+                body: ErrorResponse {
+                    error: "authorization_failed".to_owned(),
+                    detail: Some(detail),
+                    details: None,
+                    retry_after: None,
+                },
+            },
+            SelfHostError::Storage(lethe_storage_api::StorageError::CutoverConflict(detail)) => {
+                Self::conflict("cutover_conflict", serde_json::json!({"detail": detail}))
+            }
+            SelfHostError::Storage(lethe_storage_api::StorageError::CutoverRollbackRefused(
+                detail,
+            )) => Self::conflict(
+                "cutover_rollback_refused",
+                serde_json::json!({"detail": detail, "action": "forward_fix"}),
             ),
             SelfHostError::Storage(lethe_storage_api::StorageError::Invariant(detail)) => {
                 Self::unprocessable_entity(

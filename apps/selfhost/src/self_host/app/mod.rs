@@ -87,11 +87,12 @@ use lethe_projection_person::person_page::types::{
     PersonMessage, PersonPageOutput, PersonProfile, PersonSlide, TimelineEvent,
 };
 use lethe_storage_api::{
-    AppendOutcome as DurableAppendOutcome, AuditEventRecord, DiscoveredSlackThread,
-    ObservationStats, OperationalAppendOutcome, OperationalAppendRequest, OperationalEventFilter,
-    OperationalEventStats, OperationalStoragePorts, PersistedSyncState, ProjectionItem,
-    ProjectionItemCommit, SlackThreadCatalogEntry, SlackThreadKey, StorageError, StoragePorts,
-    StoredObservation, StoredOperationalEvent,
+    AppendOutcome as DurableAppendOutcome, AuditEventRecord, CutoverApiVersion, CutoverFixture,
+    CutoverHealth, CutoverInventoryItem, CutoverReadinessReport, CutoverState,
+    DiscoveredSlackThread, ObservationStats, OperationalAppendOutcome, OperationalAppendRequest,
+    OperationalEventFilter, OperationalEventStats, OperationalStoragePorts, PersistedSyncState,
+    ProjectionItem, ProjectionItemCommit, SlackThreadCatalogEntry, SlackThreadKey, StorageError,
+    StoragePorts, StoredObservation, StoredOperationalEvent,
 };
 use lethe_storage_postgres::PostgresOperationalEventStore;
 use lethe_storage_sqlite::persistence::{
@@ -6053,6 +6054,7 @@ impl AppService {
                 &current_high_water.to_string(),
             )?;
         }
+        service.catch_up_identity_bridge()?;
         Ok(service)
     }
 
@@ -6384,7 +6386,12 @@ impl AppService {
         drafts: Vec<ObservationDraft>,
         source_instance_id: &str,
     ) -> Result<ImportReport, SelfHostError> {
-        self.ingest_observation_drafts_with_session(drafts, source_instance_id, None)
+        self.ingest_observation_drafts_with_admission_generation(
+            drafts,
+            source_instance_id,
+            None,
+            None,
+        )
     }
 
     pub fn ingest_observation_drafts_with_session(
@@ -6392,6 +6399,21 @@ impl AppService {
         drafts: Vec<ObservationDraft>,
         source_instance_id: &str,
         bulk_session_id: Option<&str>,
+    ) -> Result<ImportReport, SelfHostError> {
+        self.ingest_observation_drafts_with_admission_generation(
+            drafts,
+            source_instance_id,
+            bulk_session_id,
+            None,
+        )
+    }
+
+    pub fn ingest_observation_drafts_with_admission_generation(
+        &self,
+        drafts: Vec<ObservationDraft>,
+        source_instance_id: &str,
+        bulk_session_id: Option<&str>,
+        admission_generation: Option<u64>,
     ) -> Result<ImportReport, SelfHostError> {
         let context = ObservationImportContext::from_drafts(&drafts);
         let bulk_session_requested = bulk_session_id.is_some();
@@ -6403,6 +6425,11 @@ impl AppService {
                     "source_instance_id must not be blank".to_owned(),
                 ));
             }
+            self.enforce_cutover_admission(
+                source_instance_id,
+                CutoverApiVersion::V1,
+                admission_generation,
+            )?;
 
             let _operation = self.bulk_import_operation_lock()?;
             let mut core = (*self.core_snapshot()).clone();
@@ -6458,7 +6485,12 @@ impl AppService {
                 let stage_started_at = Instant::now();
                 let append_result = self
                     .persistence_lock()?
-                    .append_observations_with_audit(&prepared_observations, &audit_events)
+                    .append_observations_v1_with_admission(
+                        source_instance_id,
+                        admission_generation,
+                        &prepared_observations,
+                        &audit_events,
+                    )
                     .map_err(SelfHostError::Storage);
                 timer.record_stage(ImportTimingStage::LedgerAppend, stage_started_at.elapsed());
                 append_result?
@@ -6585,7 +6617,12 @@ impl AppService {
         drafts: Vec<ObservationDraft>,
         source_instance_id: &str,
     ) -> Result<ImportReport, SelfHostError> {
-        self.ingest_observation_drafts_v2_with_session(drafts, source_instance_id, None)
+        self.ingest_observation_drafts_v2_with_admission_generation(
+            drafts,
+            source_instance_id,
+            None,
+            None,
+        )
     }
 
     pub fn ingest_observation_drafts_v2_with_session(
@@ -6593,6 +6630,21 @@ impl AppService {
         drafts: Vec<ObservationDraft>,
         source_instance_id: &str,
         bulk_session_id: Option<&str>,
+    ) -> Result<ImportReport, SelfHostError> {
+        self.ingest_observation_drafts_v2_with_admission_generation(
+            drafts,
+            source_instance_id,
+            bulk_session_id,
+            None,
+        )
+    }
+
+    pub fn ingest_observation_drafts_v2_with_admission_generation(
+        &self,
+        drafts: Vec<ObservationDraft>,
+        source_instance_id: &str,
+        bulk_session_id: Option<&str>,
+        admission_generation: Option<u64>,
     ) -> Result<ImportReport, SelfHostError> {
         let context = ObservationImportContext::from_drafts(&drafts);
         let bulk_session_requested = bulk_session_id.is_some();
@@ -6606,6 +6658,11 @@ impl AppService {
                     details: serde_json::json!({"field": "source_instance_id"}),
                 });
             }
+            self.enforce_cutover_admission(
+                source_instance_id,
+                CutoverApiVersion::V2,
+                admission_generation,
+            )?;
             if drafts.len() > self.config.resource_limits.max_sync_items {
                 return Err(SelfHostError::IngestionRequest {
                     code: "draft_count_exceeded",
@@ -6730,9 +6787,12 @@ impl AppService {
                 Vec::new()
             } else {
                 let stage_started_at = Instant::now();
-                let append_result = self
-                    .persistence_lock()?
-                    .append_observations_with_audit(&append_input, &audit_events);
+                let append_result = self.persistence_lock()?.append_observations_v2_with_bridge(
+                    source_instance_id,
+                    admission_generation,
+                    &append_input,
+                    &audit_events,
+                );
                 timer.record_stage(ImportTimingStage::LedgerAppend, stage_started_at.elapsed());
                 match append_result {
                     Ok(outcomes) => outcomes,
@@ -6786,7 +6846,7 @@ impl AppService {
                             observation_id: None,
                             existing_id: Some(existing_id),
                             ticket: None,
-                            error_code: None,
+                            error_code: Some("duplicate.existing_id".to_owned()),
                             failure_class: None,
                             reason: None,
                             details: None,
