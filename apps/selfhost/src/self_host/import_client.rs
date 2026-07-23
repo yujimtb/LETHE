@@ -10,6 +10,12 @@ const OBSERVATION_V1_PATH: &str = "/api/import/observation-drafts";
 const OBSERVATION_V2_PATH: &str = "/api/v2/import/observation-drafts";
 const ADMISSION_GENERATION_HEADER: &str = "X-LETHE-Admission-Generation";
 
+/// import API returns HTTP 429 with error code `import_concurrency_limit` when the
+/// shared import concurrency permit is full. That condition is transient, so the
+/// client retries up to this many times, honoring the server's `retry_after` hint.
+const IMPORT_CONCURRENCY_RETRY_LIMIT: u32 = 30;
+const IMPORT_CONCURRENCY_DEFAULT_RETRY_AFTER_SECS: u64 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportApiVersion {
     V1,
@@ -254,7 +260,7 @@ impl ImportApiClient {
         if let Some(generation) = self.admission_generation {
             request_builder = request_builder.header(ADMISSION_GENERATION_HEADER, generation);
         }
-        let response = request_builder.json(&request).send()?;
+        let response = send_with_concurrency_retry(request_builder.json(&request))?;
         let report = decode_response(response)?;
         match self.api_version {
             ImportApiVersion::V1 => Ok(report),
@@ -269,6 +275,48 @@ struct ImportObservationDraftsRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     bulk_session_id: Option<String>,
     drafts: Vec<ObservationDraft>,
+}
+
+/// Sends `request_builder`, retrying on HTTP 429 (`import_concurrency_limit`) up to
+/// [`IMPORT_CONCURRENCY_RETRY_LIMIT`] times. Each retry resends the identical request
+/// (safe because requests carry an idempotency key) after sleeping for the server's
+/// `retry_after` hint (default 1s if absent). Non-429 responses, and 429s once the
+/// retry budget is exhausted, are returned as-is for `decode_response` to classify.
+fn send_with_concurrency_retry(
+    request_builder: reqwest::blocking::RequestBuilder,
+) -> Result<reqwest::blocking::Response, ImportClientError> {
+    let mut builder = request_builder;
+    let mut attempt = 0_u32;
+    loop {
+        let retry_builder = builder.try_clone();
+        let response = builder.send()?;
+        if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS
+            || attempt >= IMPORT_CONCURRENCY_RETRY_LIMIT
+        {
+            return Ok(response);
+        }
+        let Some(next_builder) = retry_builder else {
+            return Ok(response);
+        };
+        attempt += 1;
+        let retry_after_secs = retry_after_secs_from_response(response)?;
+        eprintln!(
+            "import API returned 429 import_concurrency_limit; retrying in {retry_after_secs}s (attempt {attempt}/{IMPORT_CONCURRENCY_RETRY_LIMIT})"
+        );
+        std::thread::sleep(std::time::Duration::from_secs(retry_after_secs));
+        builder = next_builder;
+    }
+}
+
+fn retry_after_secs_from_response(
+    response: reqwest::blocking::Response,
+) -> Result<u64, ImportClientError> {
+    let body = response.text()?;
+    let retry_after = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| value.get("retry_after")?.as_u64())
+        .unwrap_or(IMPORT_CONCURRENCY_DEFAULT_RETRY_AFTER_SECS);
+    Ok(retry_after)
 }
 
 fn decode_response<T: serde::de::DeserializeOwned>(
@@ -482,6 +530,33 @@ mod tests {
         (address, handle)
     }
 
+    /// Serves one canned `(status, body)` response per accepted connection, in order,
+    /// then returns the raw request text captured for each connection.
+    fn spawn_http_responses(responses: Vec<(u16, String)>) -> (String, JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                requests.push(read_request(&mut stream));
+                let reason = match status {
+                    200 => "OK",
+                    429 => "Too Many Requests",
+                    other => panic!("unsupported status in test helper: {other}"),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            requests
+        });
+        (address, handle)
+    }
+
     fn read_request(stream: &mut TcpStream) -> String {
         let mut bytes = Vec::new();
         let mut chunk = [0_u8; 4096];
@@ -650,6 +725,84 @@ mod tests {
             error,
             ImportClientError::MissingAdmissionGeneration
         ));
+    }
+
+    #[test]
+    fn retries_after_429_import_concurrency_limit_then_succeeds() {
+        let _guard = env_lock();
+        set_test_token();
+        let drafts = adapter_drafts(1);
+        let (base_url, server) = spawn_http_responses(vec![
+            (
+                429,
+                serde_json::json!({
+                    "error": "import_concurrency_limit",
+                    "detail": "concurrent import limit 2 is currently full",
+                    "details": {"maximum": 2},
+                    "retry_after": 0
+                })
+                .to_string(),
+            ),
+            (
+                200,
+                serde_json::json!({"ingested": 1, "duplicates": 0, "quarantined": 0}).to_string(),
+            ),
+        ]);
+
+        let report = test_config(base_url, ImportApiVersion::V1)
+            .connect()
+            .unwrap()
+            .ingest_observation_drafts(drafts, "claude-personal")
+            .unwrap();
+
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "client must resend the identical request after a 429"
+        );
+        assert_eq!(requests[0], requests[1], "retry must resend the same body");
+        assert_eq!(report.ingested, 1);
+    }
+
+    #[test]
+    fn gives_up_after_max_retries_and_surfaces_429_error() {
+        let _guard = env_lock();
+        set_test_token();
+        let drafts = adapter_drafts(1);
+        let attempts = (IMPORT_CONCURRENCY_RETRY_LIMIT + 1) as usize;
+        let responses = std::iter::repeat((
+            429,
+            serde_json::json!({
+                "error": "import_concurrency_limit",
+                "detail": "concurrent import limit 2 is currently full",
+                "details": {"maximum": 2},
+                "retry_after": 0
+            })
+            .to_string(),
+        ))
+        .take(attempts)
+        .collect();
+        let (base_url, server) = spawn_http_responses(responses);
+
+        let error = test_config(base_url, ImportApiVersion::V1)
+            .connect()
+            .unwrap()
+            .ingest_observation_drafts(drafts, "claude-personal")
+            .unwrap_err();
+
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests.len(),
+            attempts,
+            "client must exhaust the retry budget before giving up"
+        );
+        match error {
+            ImportClientError::Api { status, .. } => {
+                assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+            }
+            other => panic!("expected ImportClientError::Api(429), got {other:?}"),
+        }
     }
 
     #[test]
