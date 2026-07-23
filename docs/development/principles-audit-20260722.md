@@ -6,17 +6,17 @@
 
 1. **Lake は append-only の canonical capture である**
 
-   Canonical Observation は更新・削除せず、訂正は `meta.corrects`、撤回は `meta.retracts`、オプトアウトは Consent Ledger と filtering projection で表現する。[system-overview.md:784](/D:/userdata/docs/projects/skcollege_database/docs/architecture/system-overview.md:784)、[observation-lake.md:140](/D:/userdata/docs/projects/skcollege_database/openspec/specs/observation-lake.md:140)
+   Canonical Observation は更新・削除せず、訂正は `meta.corrects`、撤回は `meta.retracts`、オプトアウトは Consent Ledger と filtering projection で表現する。[system-overview.md:784](../../docs/architecture/system-overview.md#L784)、[observation-lake.md:140](../../openspec/specs/observation-lake.md#L140)
 
 2. **Lake が正で、Projection は破棄・再生可能な派生物である**
 
-   Lake は canonical、projection materialization は replaceable で Ground Truth ではない。[domain-algebra.md:286](/D:/userdata/docs/projects/skcollege_database/docs/architecture/domain-algebra.md:286)、[system-overview.md:813](/D:/userdata/docs/projects/skcollege_database/docs/architecture/system-overview.md:813)
+   Lake は canonical、projection materialization は replaceable で Ground Truth ではない。[domain-algebra.md:286](../../docs/architecture/domain-algebra.md#L286)、[system-overview.md:813](../../docs/architecture/system-overview.md#L813)
 
 3. **Projection は決定論的な fold であり、通常伝播は増分である**
 
-   Projection は決定的順序の入力に純粋な `foldl(applyInput)` を適用する。通常更新は watermark 以降だけを処理し、アクセス時 rebuild は非推奨。[domain-algebra.md:348](/D:/userdata/docs/projects/skcollege_database/docs/architecture/domain-algebra.md:348)、[dag-propagation.md:11](/D:/userdata/docs/projects/skcollege_database/openspec/specs/dag-propagation.md:11)
+   Projection は決定的順序の入力に純粋な `foldl(applyInput)` を適用する。通常更新は watermark 以降だけを処理し、アクセス時 rebuild は非推奨。[domain-algebra.md:348](../../docs/architecture/domain-algebra.md#L348)、[dag-propagation.md:11](../../openspec/specs/dag-propagation.md#L11)
 
-   本日確定した規範では、増分規則を定義できない projection は状態表現・キー設計が誤っていると明文化されている。[communication-projection/design.md:72](/D:/userdata/docs/projects/skcollege_database/openspec/changes/communication-projection/design.md:72)
+   本日確定した規範では、増分規則を定義できない projection は状態表現・キー設計が誤っていると明文化されている。[communication-projection/design.md:72](../../openspec/changes/communication-projection/design.md#L72)
 
 4. **期待計算量はデータ全量ではなく差分・返却量に依存する**
 
@@ -28,37 +28,37 @@
    - cursor読み: O(返却件数)
    - rebuild O(N): 移行・復旧・bootstrapのみ
 
-   append-sequence watermark と per-leaf tail は設計文書でも明示されている。[sharding.md:140](/D:/userdata/docs/projects/skcollege_database/docs/architecture/sharding.md:140)
+   append-sequence watermark と per-leaf tail は設計文書でも明示されている。[sharding.md:140](../../docs/architecture/sharding.md#L140)
 
 5. **取り込みは exact idempotent である**
 
-   正規キーは `source:object_id:H(canonical_content)`。同じキー・同じcanonical内容は既存IDを返し、同じキー・異なる内容はcollisionとして拒否する。[domain-algebra.md:552](/D:/userdata/docs/projects/skcollege_database/docs/architecture/domain-algebra.md:552)、[sharding.md:61](/D:/userdata/docs/projects/skcollege_database/docs/architecture/sharding.md:61)
+   正規キーは `source:object_id:H(canonical_content)`。同じキー・同じcanonical内容は既存IDを返し、同じキー・異なる内容はcollisionとして拒否する。[domain-algebra.md:552](../../docs/architecture/domain-algebra.md#L552)、[sharding.md:61](../../docs/architecture/sharding.md#L61)
 
 6. **契約は Registry と strict validation で明示する**
 
-   Schema Registry が payload形式・version・source contractを一元管理し、全ObservationがSchemaに適合しなければならない。[registry.md:63](/D:/userdata/docs/projects/skcollege_database/openspec/specs/registry.md:63)、[system-overview.md:248](/D:/userdata/docs/projects/skcollege_database/docs/architecture/system-overview.md:248)
+   Schema Registry が payload形式・version・source contractを一元管理し、全ObservationがSchemaに適合しなければならない。[registry.md:63](../../openspec/specs/registry.md#L63)、[system-overview.md:248](../../docs/architecture/system-overview.md#L248)
 
 7. **取り込み結果はID・重複・quarantineを明示する**
 
-   `Ingested { id }`、`Duplicate { existingId }`、`Rejected`、`Quarantined` が正式契約である。[observation-lake.md:128](/D:/userdata/docs/projects/skcollege_database/openspec/specs/observation-lake.md:128)
+   `Ingested { id }`、`Duplicate { existingId }`、`Rejected`、`Quarantined` が正式契約である。[observation-lake.md:128](../../openspec/specs/observation-lake.md#L128)
 
 8. **Effect IsolationとACK境界**
 
-   取り込みゲートはprojection materializationを直接更新しない。DB書き込みやsourceアクセスはfoldの外側に置く。[observation-lake.md:76](/D:/userdata/docs/projects/skcollege_database/openspec/specs/observation-lake.md:76)、[domain-algebra.md:365](/D:/userdata/docs/projects/skcollege_database/docs/architecture/domain-algebra.md:365)
+   取り込みゲートはprojection materializationを直接更新しない。DB書き込みやsourceアクセスはfoldの外側に置く。[observation-lake.md:76](../../openspec/specs/observation-lake.md#L76)、[domain-algebra.md:365](../../docs/architecture/domain-algebra.md#L365)
 
-   「canonical commit成功を、後続projection/index失敗で取り込み失敗に見せてはならない」は単独のLawとしては未記載。ただしLake authoritative、IngestResult契約、検索indexの「SQLite appendは戻さない」という決定から必然的に導かれる。[persistent-search-index/design.md:47](/D:/userdata/docs/projects/skcollege_database/openspec/changes/persistent-search-index/design.md:47)
+   「canonical commit成功を、後続projection/index失敗で取り込み失敗に見せてはならない」は単独のLawとしては未記載。ただしLake authoritative、IngestResult契約、検索indexの「SQLite appendは戻さない」という決定から必然的に導かれる。[persistent-search-index/design.md:47](../../openspec/changes/persistent-search-index/design.md#L47)
 
 9. **Consent/privacyはcapture時と公開時の両境界を持つ**
 
-   policy/consent違反はappend前にquarantineし、restricted dataは公開前にfiltering projectionを通す。[platform-robustness/spec.md:22](/D:/userdata/docs/projects/skcollege_database/openspec/specs/platform-robustness/spec.md:22)、[system-overview.md:74](/D:/userdata/docs/projects/skcollege_database/docs/architecture/system-overview.md:74)
+   policy/consent違反はappend前にquarantineし、restricted dataは公開前にfiltering projectionを通す。[platform-robustness/spec.md:22](../../openspec/specs/platform-robustness/spec.md#L22)、[system-overview.md:74](../../docs/architecture/system-overview.md#L74)
 
 10. **状態は台帳・永続materializationから再構築できる**
 
-    hidden mutable stateに意味論を依存させず、同じ入力から同じ状態を再生する。[domain-algebra.md:533](/D:/userdata/docs/projects/skcollege_database/docs/architecture/domain-algebra.md:533)
+    hidden mutable stateに意味論を依存させず、同じ入力から同じ状態を再生する。[domain-algebra.md:533](../../docs/architecture/domain-algebra.md#L533)
 
 11. **並行性はstorage能力を不必要に潰さない**
 
-    SQLite writerの直列化は許容されるが、他storageはmulti-writerを許容できる設計とし、長時間処理は再開可能jobに置く。[platform-robustness/spec.md:73](/D:/userdata/docs/projects/skcollege_database/openspec/specs/platform-robustness/spec.md:73)
+    SQLite writerの直列化は許容されるが、他storageはmulti-writerを許容できる設計とし、長時間処理は再開可能jobに置く。[platform-robustness/spec.md:73](../../openspec/specs/platform-robustness/spec.md#L73)
 
 ---
 
@@ -66,7 +66,7 @@
 
 ### B-01. canonical appendのACKが派生処理完了まで返らない
 
-- **原理・実装・判定**: Lake authoritative、Effect Isolation、明示的IngestResultに違反する。SQLite append後、非corpus materialization、audit、検索index catch-upを同期実行し、その失敗をHTTP失敗として返す。[mod.rs:5478](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/mod.rs:5478)、[mod.rs:5512](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/mod.rs:5512)、[mod.rs:5534](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/mod.rs:5534)、[server.rs:399](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/server.rs:399)。**確証**。
+- **原理・実装・判定**: Lake authoritative、Effect Isolation、明示的IngestResultに違反する。SQLite append後、非corpus materialization、audit、検索index catch-upを同期実行し、その失敗をHTTP失敗として返す。[mod.rs:5478](../../apps/selfhost/src/self_host/app/mod.rs#L5478)、[mod.rs:5512](../../apps/selfhost/src/self_host/app/mod.rs#L5512)、[mod.rs:5534](../../apps/selfhost/src/self_host/app/mod.rs#L5534)、[server.rs:399](../../apps/selfhost/src/self_host/server.rs#L399)。**確証**。
 - **計算量**: 期待はappend O(B)とID返却。実装は `O(B + COUNT(N) + projection Δ + manifest全量S + index catch-up Δ + fsync)`。既知のフルリビルド分岐はこの評価から除外しても全量要因が残る。
 - **破綻**: canonical append済みなのに、後続失敗・timeoutでクライアントは未保存と判断する。再送がDuplicateになった場合、`request_appended_observations` が空なので失敗したmaterializationを再実行しない。取り込み結果とcanonical事実が分離する。
 - **修正方向**: canonical append、最小durable audit/outbox、ID結果を一つのcommit境界にする。Projection/indexはappend-seqをconsumeする非同期jobとし、失敗はprojection healthでsurfaceする。
@@ -74,7 +74,7 @@
 
 ### B-02. AppCore・primary storage・OELが巨大な排他ロックで直列化される
 
-- **原理・実装・判定**: `AppCore`、primary persistence、OEL、history projectionがすべて単一`Mutex`。[mod.rs:1320](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/mod.rs:1320)。通常importはbulk-operation lockとAppCore lockをリクエスト全体で保持する。[mod.rs:5447](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/mod.rs:5447)。OELのappend/page/by-id/blobも同じOEL mutexを使う。[mod.rs:5172](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/mod.rs:5172)。PostgreSQLも内部で単一`Client`をmutex化する。[postgres/lib.rs:19](/D:/userdata/docs/projects/skcollege_database/crates/storage/postgres/src/lib.rs:19)。**実装は確証、47秒待ち・並行2件ハングとの因果は強い推定**。
+- **原理・実装・判定**: `AppCore`、primary persistence、OEL、history projectionがすべて単一`Mutex`。[mod.rs:1320](../../apps/selfhost/src/self_host/app/mod.rs#L1320)。通常importはbulk-operation lockとAppCore lockをリクエスト全体で保持する。[mod.rs:5447](../../apps/selfhost/src/self_host/app/mod.rs#L5447)。OELのappend/page/by-id/blobも同じOEL mutexを使う。[mod.rs:5172](../../apps/selfhost/src/self_host/app/mod.rs#L5172)。PostgreSQLも内部で単一`Client`をmutex化する。[postgres/lib.rs:19](../../crates/storage/postgres/src/lib.rs#L19)。**実装は確証、47秒待ち・並行2件ハングとの因果は強い推定**。
 - **計算量**: 期待は各読み `O(log N+k)` かつ相互独立。実装の応答時間は `O(自処理 + 先行する全critical sectionの総時間)`。並行数Cに対してtail latencyが概ねC倍まで増える。
 - **破綻**: 1件の長いimport/history query/blob I/Oが、既知ID読み・cursor page・別projection読みまで停止させる。`spawn_blocking` はasync workerを保護するだけでstorage並行性を増やさない。
 - **修正方向**: immutable snapshotの`Arc`公開、短時間のwriter lock、SQLite read connection pool、PostgreSQL poolを分離する。I/O中にAppCore lockを保持しない。
@@ -82,7 +82,7 @@
 
 ### B-03. 差分処理の境界確認が毎回 `COUNT(*)` でO(N)
 
-- **原理・実装・判定**: 増分materializationの直前に`observation_stats()`を呼び、SQLiteは`COUNT(*), MAX(append_seq)`を実行する。[service_support.rs:245](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/service_support.rs:245)、[persistence/mod.rs:138](/D:/userdata/docs/projects/skcollege_database/crates/storage/sqlite/src/persistence/mod.rs:138)。検索catch-upは空tail時を含め同じstatsを最大2回読む。[search-index/index.rs:669](/D:/userdata/docs/projects/skcollege_database/crates/search-index/src/index.rs:669)。OEL statsも同じ構造。[persistence/mod.rs:1988](/D:/userdata/docs/projects/skcollege_database/crates/storage/sqlite/src/persistence/mod.rs:1988)。**確証**。
+- **原理・実装・判定**: 増分materializationの直前に`observation_stats()`を呼び、SQLiteは`COUNT(*), MAX(append_seq)`を実行する。[service_support.rs:245](../../apps/selfhost/src/self_host/app/service_support.rs#L245)、[persistence/mod.rs:138](../../crates/storage/sqlite/src/persistence/mod.rs#L138)。検索catch-upは空tail時を含め同じstatsを最大2回読む。[search-index/index.rs:669](../../crates/search-index/src/index.rs#L669)。OEL statsも同じ構造。[persistence/mod.rs:1988](../../crates/storage/sqlite/src/persistence/mod.rs#L1988)。**確証**。
 - **計算量**: 期待は保存済みcount/high-waterをO(1)で読むこと。SQLiteの現行`COUNT(*)`はO(N)。通常1件appendでも複数回O(N)を払う。
 - **破綻**: データ量に比例して「差分があるか確かめるだけ」の時間が増え、projection自体をO(Δ)にしてもappend latencyがN依存のまま残る。
 - **修正方向**: transaction内で単調count/high-water行を更新するか、`MAX(PK)`と保存済みcountを使う。通常catch-upで全件count整合性検証をしない。
@@ -90,7 +90,7 @@
 
 ### B-04. appendごとにpartition log全体をreplayする
 
-- **原理・実装・判定**: Observation appendは毎回`load_partition_tree()`を呼び、全`partition_log`を読み`PartitionTree::from_events`する。[persistence/mod.rs:190](/D:/userdata/docs/projects/skcollege_database/crates/storage/sqlite/src/persistence/mod.rs:190)、[persistence/mod.rs:1142](/D:/userdata/docs/projects/skcollege_database/crates/storage/sqlite/src/persistence/mod.rs:1142)。OEL appendにも同じ処理が入る。[persistence/mod.rs:1827](/D:/userdata/docs/projects/skcollege_database/crates/storage/sqlite/src/persistence/mod.rs:1827)。**確証**。
+- **原理・実装・判定**: Observation appendは毎回`load_partition_tree()`を呼び、全`partition_log`を読み`PartitionTree::from_events`する。[persistence/mod.rs:190](../../crates/storage/sqlite/src/persistence/mod.rs#L190)、[persistence/mod.rs:1142](../../crates/storage/sqlite/src/persistence/mod.rs#L1142)。OEL appendにも同じ処理が入る。[persistence/mod.rs:1827](../../crates/storage/sqlite/src/persistence/mod.rs#L1827)。**確証**。
 - **計算量**: 期待はroute O(tree depth)＋append O(B)。実装はO(P+B)、Pはpartition control event総数。
 - **破綻**: split/failover履歴が増えるほど、無関係な通常appendとOEL appendが遅くなる。
 - **修正方向**: 起動時にpartition treeを再生してimmutable snapshot化し、partition event追加時だけ差分適用・atomic交換する。
@@ -98,7 +98,7 @@
 
 ### B-05. ClaimQueue更新とmanifest永続化が「差分のふりをした全量処理」
 
-- **原理・実装・判定**: ClaimQueue影響kindでは、全supplemental recordを`project_ordered_records`へ渡す。[mod.rs:685](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/mod.rs:685)、[mod.rs:2426](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/mod.rs:2426)。さらに全writeでanswer log、ClaimQueue、CardQueue等を含むmanifest全体をJSON化して上書きする。[mod.rs:969](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/mod.rs:969)、[persistence/mod.rs:1283](/D:/userdata/docs/projects/skcollege_database/crates/storage/sqlite/src/persistence/mod.rs:1283)。**確証**。開発文書も1 writeの下限O(S)、逐次投入O(S²)を認めている。[persistent-index-design.md:128](/D:/userdata/docs/projects/skcollege_database/docs/development/persistent-index-design.md:128)
+- **原理・実装・判定**: ClaimQueue影響kindでは、全supplemental recordを`project_ordered_records`へ渡す。[mod.rs:685](../../apps/selfhost/src/self_host/app/mod.rs#L685)、[mod.rs:2426](../../apps/selfhost/src/self_host/app/mod.rs#L2426)。さらに全writeでanswer log、ClaimQueue、CardQueue等を含むmanifest全体をJSON化して上書きする。[mod.rs:969](../../apps/selfhost/src/self_host/app/mod.rs#L969)、[persistence/mod.rs:1283](../../crates/storage/sqlite/src/persistence/mod.rs#L1283)。**確証**。開発文書も1 writeの下限O(S)、逐次投入O(S²)を認めている。[persistent-index-design.md:128](../../docs/development/persistent-index-design.md#L128)
 - **計算量**: 期待はaffected recordに対するO(Δ log S)。ClaimQueueはO(S log S+edges)、manifestは毎回O(S)。逐次S件で少なくともO(S²)。
 - **破綻**: supplementalが増えるほど、小さなdecision/claim/card writeが遅くなり、AppCoreとDB lockの保持時間も伸びる。
 - **修正方向**: Claim/Decisionをkeyed reducerと逆indexへ分解する。manifestはscalar metadataと個別row stateへ分割し、変更rowだけtransactional upsertする。
@@ -106,7 +106,7 @@
 
 ### B-06. OELにcorrelation/causation/event-type検索契約がない
 
-- **原理・実装・判定**: モデルには`correlation_id`と`causation_id`があるが、storage traitはcursor、stream、event-idしか提供しない。[storage/api/lib.rs:24](/D:/userdata/docs/projects/skcollege_database/crates/storage/api/src/lib.rs:24)、[storage/api/lib.rs:128](/D:/userdata/docs/projects/skcollege_database/crates/storage/api/src/lib.rs:128)。SQLiteはevent_type列を持つが、indexはstream用だけで、correlation/causationはJSON内にしかない。[schema.rs:28](/D:/userdata/docs/projects/skcollege_database/crates/storage/sqlite/src/persistence/schema.rs:28)。HTTP surfaceも同様。[server.rs:58](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/server.rs:58)。**確証**。
+- **原理・実装・判定**: モデルには`correlation_id`と`causation_id`があるが、storage traitはcursor、stream、event-idしか提供しない。[storage/api/lib.rs:24](../../crates/storage/api/src/lib.rs#L24)、[storage/api/lib.rs:128](../../crates/storage/api/src/lib.rs#L128)。SQLiteはevent_type列を持つが、indexはstream用だけで、correlation/causationはJSON内にしかない。[schema.rs:28](../../crates/storage/sqlite/src/persistence/schema.rs#L28)。HTTP surfaceも同様。[server.rs:58](../../apps/selfhost/src/self_host/server.rs#L58)。**確証**。
 - **計算量**: 期待は既知correlation/causation/typeでO(log N+k)。現状はcursor 0からO(N) page scan＋クライアント側JSON filter。
 - **破綻**: 監査traceが台帳量に比例し、単一OEL mutexのため他read/writeも数分停止する。Naniholdの3～6分実測と整合する。
 - **修正方向**: correlation、causation、event_typeを列・複合index化し、keyset cursor付きfilter endpointをstorage traitから追加する。
@@ -114,7 +114,7 @@
 
 ### B-07. 取り込みAPIがObservation IDを返さない
 
-- **原理・実装・判定**: 正式契約はIngested IDまたはDuplicate existing ID返却だが、`ImportReport`は件数だけ。[observation-lake.md:128](/D:/userdata/docs/projects/skcollege_database/openspec/specs/observation-lake.md:128)、[mod.rs:146](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/mod.rs:146)。storage outcomeのIDは件数へ捨てられる。[mod.rs:5494](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/mod.rs:5494)。**確証**。
+- **原理・実装・判定**: 正式契約はIngested IDまたはDuplicate existing ID返却だが、`ImportReport`は件数だけ。[observation-lake.md:128](../../openspec/specs/observation-lake.md#L128)、[mod.rs:146](../../apps/selfhost/src/self_host/app/mod.rs#L146)。storage outcomeのIDは件数へ捨てられる。[mod.rs:5494](../../apps/selfhost/src/self_host/app/mod.rs#L5494)。**確証**。
 - **計算量**: 期待はappend結果と同時にO(B)でIDを返すこと。現状のID回収はgrepで最悪O(N)、曖昧一致なら追加照合も必要。
 - **破綻**: timeout時にevent-id lookupで成否確認できず、再送・grep・重複の連鎖になる。
 - **修正方向**: request itemごとにclient correlation key、`Ingested{id}`、`Duplicate{existing_id}`、`Quarantined{ticket}`を同じ順序で返す。
@@ -122,7 +122,7 @@
 
 ### B-08. 冪等キーの正規契約をサーバが検証しない
 
-- **原理・実装・判定**: adapter utilityには正しい`source:object_id:H(canonical_json)`生成がある。[idempotency.rs:27](/D:/userdata/docs/projects/skcollege_database/crates/adapters/api/src/idempotency.rs:27)。しかしimportはcaller提供keyを`source_instance_id`でprefixするだけ。[service_support.rs:714](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/service_support.rs:714)。storageもkeyとcanonical JSONの対応を再計算せず、そのままUNIQUE判定する。[persistence/mod.rs:2131](/D:/userdata/docs/projects/skcollege_database/crates/storage/sqlite/src/persistence/mod.rs:2131)。**確証**。
+- **原理・実装・判定**: adapter utilityには正しい`source:object_id:H(canonical_json)`生成がある。[idempotency.rs:27](../../crates/adapters/api/src/idempotency.rs#L27)。しかしimportはcaller提供keyを`source_instance_id`でprefixするだけ。[service_support.rs:714](../../apps/selfhost/src/self_host/app/service_support.rs#L714)。storageもkeyとcanonical JSONの対応を再計算せず、そのままUNIQUE判定する。[persistence/mod.rs:2131](../../crates/storage/sqlite/src/persistence/mod.rs#L2131)。**確証**。
 - **計算量**: 正しい再送はindex lookup O(log N)でDuplicateになるべき。クライアントがevent_time/keyを再生成すると新規append O(1)が繰り返され、後処理・重複解消はO(N)以上になる。
 - **破綻**: client retryごとに時刻を作り直すとcanonical hashも変わる。publishedがpartitionを跨げばper-leaf UNIQUEも効かない。ユーザー観測の3重複を説明できる。
 - **修正方向**: stable source object IDとcanonical tupleを入力契約にし、サーバでkeyを導出または厳密再検証する。retry用client operation IDも独立して持つ。
@@ -130,7 +130,7 @@
 
 ### B-09. Schema Registryが実質「JSON objectなら何でも可」
 
-- **原理・実装・判定**: Claude/ChatGPT/GitHub/coding-agent/Slack/Gmail/Discord/workspace/heartbeatのschemaがほぼ`{"type":"object"}`のみで、required fieldも型も追加属性制約もない。source contractsも空。[registry.rs:424](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/registry.rs:424)。JSON Schema validator自体は動作しているが、入力schemaが空疎。[ingestion.rs:470](/D:/userdata/docs/projects/skcollege_database/crates/engine/src/lake/ingestion.rs:470)。**確証**。
+- **原理・実装・判定**: Claude/ChatGPT/GitHub/coding-agent/Slack/Gmail/Discord/workspace/heartbeatのschemaがほぼ`{"type":"object"}`のみで、required fieldも型も追加属性制約もない。source contractsも空。[registry.rs:424](../../apps/selfhost/src/self_host/registry.rs#L424)。JSON Schema validator自体は動作しているが、入力schemaが空疎。[ingestion.rs:470](../../crates/engine/src/lake/ingestion.rs#L470)。**確証**。
 - **計算量**: 原理上はO(payload) validationで欠落を止める。現状はO(1)に近い形式確認だけで通し、下流でmissing key、rebuild、検索不能、手動復旧O(N)へ転嫁する。
 - **破綻**: Slack `user_id`欠落のような不正Observationがcanonical化され、全projectionが防御分岐を持つか停止する必要が生じる。
 - **修正方向**: schema/versionごとのrequired fields、型、format、`additionalProperties`方針、observer/source contractを実データ契約として定義する。
@@ -138,7 +138,7 @@
 
 ### B-10. consent gateが実際のconsentを見ず定数で評価する
 
-- **原理・実装・判定**: append前policyは常に`Role::SystemAdmin`、`AccessScope::Internal`、`ConsentStatus::RestrictedCapture`で評価される。[ingestion.rs:168](/D:/userdata/docs/projects/skcollege_database/crates/engine/src/lake/ingestion.rs:168)。channel contextと実際のConsentRef適用はその後。[ingestion.rs:201](/D:/userdata/docs/projects/skcollege_database/crates/engine/src/lake/ingestion.rs:201)。`IngestRequest`自体にcaller consent fieldもない。[ingestion.rs:23](/D:/userdata/docs/projects/skcollege_database/crates/engine/src/lake/ingestion.rs:23)。**確証**。
+- **原理・実装・判定**: append前policyは常に`Role::SystemAdmin`、`AccessScope::Internal`、`ConsentStatus::RestrictedCapture`で評価される。[ingestion.rs:168](../../crates/engine/src/lake/ingestion.rs#L168)。channel contextと実際のConsentRef適用はその後。[ingestion.rs:201](../../crates/engine/src/lake/ingestion.rs#L201)。`IngestRequest`自体にcaller consent fieldもない。[ingestion.rs:23](../../crates/engine/src/lake/ingestion.rs#L23)。**確証**。
 - **計算量**: 期待はsubject/channelのconsent lookup O(1)～O(log C)。実装はO(1)の定数判定だが、境界として正しくない。
 - **破綻**: consent失効・opt-out・channel固有statusがappend前policyへ反映されず、quarantine契約が形骸化する。
 - **修正方向**: channel/subject consentを先に解決し、その実値でpolicyを評価する。未解決は明示quarantineとする。
@@ -146,7 +146,7 @@
 
 ### B-11. generic retractionとpersonal corpusのprivacy反映が実装されていない
 
-- **原理・実装・判定**: Slack deleteは`meta.retracts`へObservation IDではなく`message:slack:...`というsubject文字列を入れる。[mapper.rs:80](/D:/userdata/docs/projects/skcollege_database/crates/adapters/slack/src/slack/mapper.rs:80)。PersonalAllTextは新Observation IDから新しいcorpus record IDを作り、`meta.retracts`も`observation.consent`も参照しない。[corpus/lib.rs:588](/D:/userdata/docs/projects/skcollege_database/crates/projections/corpus/src/lib.rs:588)。personal deploymentは実際に`personal_all_text`。[config.toml:84](/D:/userdata/docs/projects/skcollege_database/deploy/personal-lake/config.toml:84)。**PersonalAllTextとgeneric retractionについて確証**。
+- **原理・実装・判定**: Slack deleteは`meta.retracts`へObservation IDではなく`message:slack:...`というsubject文字列を入れる。[mapper.rs:80](../../crates/adapters/slack/src/slack/mapper.rs#L80)。PersonalAllTextは新Observation IDから新しいcorpus record IDを作り、`meta.retracts`も`observation.consent`も参照しない。[corpus/lib.rs:588](../../crates/projections/corpus/src/lib.rs#L588)。personal deploymentは実際に`personal_all_text`。[config.toml:84](../../deploy/personal-lake/config.toml#L84)。**PersonalAllTextとgeneric retractionについて確証**。
 - **計算量**: 期待はtarget ID/object IDの逆indexをO(1)～O(log N)で更新し、projection rowを差分削除・置換すること。現状はoriginal recordが残り、手動探索はO(N)、完全な撤回はできない。
 - **破綻**: canonical Lakeを消さないという原理は守れても、公開projectionから撤回・opt-out対象が消えず、privacy境界が破れる。
 - **修正方向**: corrects/retractsをtyped metadataにし、active-version/tombstone projectionを増分管理する。Corpus indexは同一commitで対象recordをdeleteし、consent changeも逆index経由で反映する。
@@ -154,7 +154,7 @@
 
 ### B-12. Auditが同期ボトルネックなのにdurabilityはfail-open
 
-- **原理・実装・判定**: 全認証・write・filter判定でprimary persistence lockを取りaudit insertするが、lock取得失敗・serialization失敗・DB失敗をログだけで握り潰す。[mod.rs:5388](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/mod.rs:5388)。その後、無制限`Vec`のInMemoryAuditLogにも追加する。[audit.rs:18](/D:/userdata/docs/projects/skcollege_database/crates/policy/src/governance/audit.rs:18)。**確証**。
+- **原理・実装・判定**: 全認証・write・filter判定でprimary persistence lockを取りaudit insertするが、lock取得失敗・serialization失敗・DB失敗をログだけで握り潰す。[mod.rs:5388](../../apps/selfhost/src/self_host/app/mod.rs#L5388)。その後、無制限`Vec`のInMemoryAuditLogにも追加する。[audit.rs:18](../../crates/policy/src/governance/audit.rs#L18)。**確証**。
 - **計算量**: 期待はO(1)のdurable audit appendまたは明示失敗。実装はO(primary-lock待ち＋insert)を全requestに課しつつ、失敗時はdurable記録なし。メモリは監査件数Aに対しO(A)。
 - **破綻**: heavy import中は認証だけでも待たされる一方、DB障害時には保護操作が監査なしで成功する。再起動でin-memory auditは消える。
 - **修正方向**: canonical transaction/outbox内のmandatory auditに統合し、失敗時は保護操作も失敗させる。in-memory全履歴mirrorを削除し、永続台帳をpage queryする。
@@ -172,20 +172,20 @@ AppCoreは`ArcSwap`のimmutable snapshotを読み取りへ公開し、canonical 
 
 ### B-13. persistent search後も任意regexは全document scan
 
-- **原理・実装・判定**: safe literal n-gramを抽出できないregexは`AllQuery`になり、128件ずつ全documentを読みregex判定する。[search.rs:178](/D:/userdata/docs/projects/skcollege_database/crates/search-index/src/search.rs:178)。timeoutは固定500ms。[grep.rs:12](/D:/userdata/docs/projects/skcollege_database/crates/api/src/api/grep.rs:12)。設計文書でもこのtrade-offを認識している。[persistent-search-index/design.md:75](/D:/userdata/docs/projects/skcollege_database/openspec/changes/persistent-search-index/design.md:75)。**確証**。
+- **原理・実装・判定**: safe literal n-gramを抽出できないregexは`AllQuery`になり、128件ずつ全documentを読みregex判定する。[search.rs:178](../../crates/search-index/src/search.rs#L178)。timeoutは固定500ms。[grep.rs:12](../../crates/api/src/api/grep.rs#L12)。設計文書でもこのtrade-offを認識している。[persistent-search-index/design.md:75](../../openspec/changes/persistent-search-index/design.md#L75)。**確証**。
 - **計算量**: literal/filter検索はO(postings＋candidate)。絞り込み不能regexはO(N)、しかもN増加時は結果ではなくtimeout率が増える。
-- **破綻**: ID回収をgrepに依存する現在のクライアント契約と組み合わさると、取り込みreconciliation自体が500msで失敗する。500k実測もpeak RSS約3.87GiBでmemory gate未達、検索max 714秒のtailを記録している。[result.md:64](/D:/userdata/docs/projects/skcollege_database/openspec/changes/persistent-search-index/result.md:64)
+- **破綻**: ID回収をgrepに依存する現在のクライアント契約と組み合わさると、取り込みreconciliation自体が500msで失敗する。500k実測もpeak RSS約3.87GiBでmemory gate未達、検索max 714秒のtailを記録している。[result.md:64](../../openspec/changes/persistent-search-index/result.md#L64)
 - **修正方向**: exact metadata/object-id検索を別API・indexにする。任意regexは非同期search job、明示的cost class、必須filter等として通常SLOから分離する。
 - **重大度**: **高**
 
 ### B-14. ページングAPIが返却件数ではなく全集合・offsetに比例する
 
 - **原理・実装・判定**:
-  - person一覧は全personをcollectして毎回sortする。[projection_api.rs:150](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/projection_api.rs:150)
-  - ClaimQueue/CardQueueは全集合をfilter・cloneしてからoffset sliceする。[projection_api.rs:660](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/projection_api.rs:660)、[projection_api.rs:901](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/projection_api.rs:901)
-  - lineage生成は全supplemental IDをcollect・sort・hashする。[service_support.rs:813](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/service_support.rs:813)
-  - Corpusのoffset pageは先頭から`offset`件を再びskipする。[search-index/read.rs:658](/D:/userdata/docs/projects/skcollege_database/crates/search-index/src/read.rs:658)
-  - person messages/slides/timelineとReplySLOはpaginationなしで全行を返す。[projection_api.rs:122](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/projection_api.rs:122)、[projection_api.rs:196](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/projection_api.rs:196)
+  - person一覧は全personをcollectして毎回sortする。[projection_api.rs:150](../../apps/selfhost/src/self_host/app/projection_api.rs#L150)
+  - ClaimQueue/CardQueueは全集合をfilter・cloneしてからoffset sliceする。[projection_api.rs:660](../../apps/selfhost/src/self_host/app/projection_api.rs#L660)、[projection_api.rs:901](../../apps/selfhost/src/self_host/app/projection_api.rs#L901)
+  - lineage生成は全supplemental IDをcollect・sort・hashする。[service_support.rs:813](../../apps/selfhost/src/self_host/app/service_support.rs#L813)
+  - Corpusのoffset pageは先頭から`offset`件を再びskipする。[search-index/read.rs:658](../../crates/search-index/src/read.rs#L658)
+  - person messages/slides/timelineとReplySLOはpaginationなしで全行を返す。[projection_api.rs:122](../../apps/selfhost/src/self_host/app/projection_api.rs#L122)、[projection_api.rs:196](../../apps/selfhost/src/self_host/app/projection_api.rs#L196)
 
   すべて**確証**。
 - **計算量**: 期待はcursor page O(k)。実装はperson O(P log P)、claim/card O(C)、lineage O(S log S)、深いcorpus page O(offset+k)、person detail O(当該人物全履歴)。
@@ -195,7 +195,7 @@ AppCoreは`ArcSwap`のimmutable snapshotを読み取りへ公開し、canonical 
 
 ### B-15. 既知BlobRefの認可が全person scan
 
-- **原理・実装・判定**: blob hashが既知でも、全`person_components`とslide refsを`any()`で走査して参照可否を判定する。[service_support.rs:389](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/service_support.rs:389)。**確証**。
+- **原理・実装・判定**: blob hashが既知でも、全`person_components`とslide refsを`any()`で走査して参照可否を判定する。[service_support.rs:389](../../apps/selfhost/src/self_host/app/service_support.rs#L389)。**確証**。
 - **計算量**: 期待は`blob_ref -> visible projection owner` indexによるO(1)～O(log N)。実装はO(person数＋全blob ref数)。
 - **破綻**: person/slide増加と画像並行取得が重なると、各画像要求がAppCore lockを長く保持して相互ブロックする。
 - **修正方向**: projection materializationにvisible blob reference tableを持たせ、consent deltaと同時にupsert/deleteする。
@@ -203,7 +203,7 @@ AppCoreは`ArcSwap`のimmutable snapshotを読み取りへ公開し、canonical 
 
 ### B-16. batch quarantine契約が全体abortへ潰される
 
-- **原理・実装・判定**: future timestampやpolicy quarantineは`Quarantined{ticket}`で返す契約だが、import batchでは最初の1件を`SelfHostError::Ingestion`へ変換し、残りも含め全requestを400で停止する。[mod.rs:5581](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/mod.rs:5581)、[server.rs:879](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/server.rs:879)。partial success要件にも反する。[platform-robustness/spec.md:47](/D:/userdata/docs/projects/skcollege_database/openspec/specs/platform-robustness/spec.md:47)。**確証**。
+- **原理・実装・判定**: future timestampやpolicy quarantineは`Quarantined{ticket}`で返す契約だが、import batchでは最初の1件を`SelfHostError::Ingestion`へ変換し、残りも含め全requestを400で停止する。[mod.rs:5581](../../apps/selfhost/src/self_host/app/mod.rs#L5581)、[server.rs:879](../../apps/selfhost/src/self_host/server.rs#L879)。partial success要件にも反する。[platform-robustness/spec.md:47](../../openspec/specs/platform-robustness/spec.md#L47)。**確証**。
 - **計算量**: 期待はO(B)で全itemを分類し結果を返すこと。現状も単回はO(B)だが、クライアント再送によりO(retry回数×B)へ増幅し、正常itemも進まない。
 - **破綻**: 10分を超えるclock skew 1件がrequest全体を止め、quarantine件数・ticketも返らない。クライアントはtransient errorとvalidation errorを区別しにくい。
 - **修正方向**: item単位結果を保持し、invalid/quarantineだけ隔離してvalid itemをappendする。clock-skewは構造化error codeとticketで返す。
@@ -211,7 +211,7 @@ AppCoreは`ArcSwap`のimmutable snapshotを読み取りへ公開し、canonical 
 
 ### B-17. 永続化済みsync状態を再起動時に復元しない
 
-- **原理・実装・判定**: `sync_metrics`テーブルへ記録する実装はあるが、AppCore生成時に`last_sync_at=None`、error=None、metrics=defaultへ戻す。[schema.rs:150](/D:/userdata/docs/projects/skcollege_database/crates/storage/sqlite/src/persistence/schema.rs:150)、[mod.rs:1084](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/mod.rs:1084)。healthはこのin-memory値を返す。[service_support.rs:8](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/service_support.rs:8)。**確証**。
+- **原理・実装・判定**: `sync_metrics`テーブルへ記録する実装はあるが、AppCore生成時に`last_sync_at=None`、error=None、metrics=defaultへ戻す。[schema.rs:150](../../crates/storage/sqlite/src/persistence/schema.rs#L150)、[mod.rs:1084](../../apps/selfhost/src/self_host/app/mod.rs#L1084)。healthはこのin-memory値を返す。[service_support.rs:8](../../apps/selfhost/src/self_host/app/service_support.rs#L8)。**確証**。
 - **計算量**: 期待は起動時O(source数)の復元、または台帳cursorからの再構築。実装はO(1)だが偽の初期状態。
 - **破綻**: 再起動直後に「sync実績なし・metricsゼロ」と見え、監査・運用判断が実際の台帳と不一致になる。
 - **修正方向**: persisted metrics/last-sync recordを起動時に厳密ロードし、欠損・不整合は明示する。
@@ -233,19 +233,19 @@ AppCoreは`ArcSwap`のimmutable snapshotを読み取りへ公開し、canonical 
 
 3. **`source_instance_id`は冪等identityの一部**
 
-   同じsource dataでも`source_instance_id`が変わると別keyになる。[service_support.rs:714](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/service_support.rs:714)
+   同じsource dataでも`source_instance_id`が変わると別keyになる。[service_support.rs:714](../../apps/selfhost/src/self_host/app/service_support.rs#L714)
 
 4. **retryではpublished・object ID・canonical JSON・idempotency keyを完全固定する必要がある**
 
-   event_timeをretry時刻で作り直すと別版として保存される。OELではさらにObservation IDとrecorded_atを含むevent envelope全体を同一bytesで再送する必要がある。[operational-event-ledger.md:99](/D:/userdata/docs/projects/skcollege_database/docs/architecture/operational-event-ledger.md:99)
+   event_timeをretry時刻で作り直すと別版として保存される。OELではさらにObservation IDとrecorded_atを含むevent envelope全体を同一bytesで再送する必要がある。[operational-event-ledger.md:99](../../docs/architecture/operational-event-ledger.md#L99)
 
 5. **未来時刻許容幅は固定10分**
 
-   `published > recordedAt + 10m`はquarantine対象だが、draft importでは構造化quarantineでなく400になる。[values.rs:103](/D:/userdata/docs/projects/skcollege_database/crates/core/src/domain/values.rs:103)
+   `published > recordedAt + 10m`はquarantine対象だが、draft importでは構造化quarantineでなく400になる。[values.rs:103](../../crates/core/src/domain/values.rs#L103)
 
 6. **personal deploymentのpage上限は500**
 
-   `max_page_size=500`で、それを超えるOEL/projection limitは拒否される。[config.toml:75](/D:/userdata/docs/projects/skcollege_database/deploy/personal-lake/config.toml:75)
+   `max_page_size=500`で、それを超えるOEL/projection limitは拒否される。[config.toml:75](../../deploy/personal-lake/config.toml#L75)
 
 7. **OELの`after_cursor`と`limit`は両方必須**
 
@@ -266,11 +266,11 @@ AppCoreは`ArcSwap`のimmutable snapshotを読み取りへ公開し、canonical 
 
 10. **通常append中は検索indexが`CatchingUp`になり、全検索が503になり得る**
 
-    ready handleは`Ready`以外を拒否する。[search_index.rs:269](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/search_index.rs:269)、[search_index.rs:685](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/app/search_index.rs:685)
+    ready handleは`Ready`以外を拒否する。[search_index.rs:269](../../apps/selfhost/src/self_host/app/search_index.rs#L269)、[search_index.rs:685](../../apps/selfhost/src/self_host/app/search_index.rs#L685)
 
 11. **import request body上限は128MiB、1 payloadのpersonal設定上限は1MiB**
 
-    body上限はrouteに直書きされている。[server.rs:37](/D:/userdata/docs/projects/skcollege_database/apps/selfhost/src/self_host/server.rs:37)。文書は最大10,000 draftsを前提にするが、取り込み関数にはdraft件数の明示的上限検査がなく、全prepared observationsを保持する。
+    body上限はrouteに直書きされている。[server.rs:37](../../apps/selfhost/src/self_host/server.rs#L37)。文書は最大10,000 draftsを前提にするが、取り込み関数にはdraft件数の明示的上限検査がなく、全prepared observationsを保持する。
 
 12. **bulk import session中はsession IDの伝播が必須**
 

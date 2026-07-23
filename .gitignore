@@ -14,3 +14,7 @@ data/*
 !data/.gitkeep
 !data/README.md
 deploy/personal-lake/data/
+
+# local deploy artifacts
+deploy/personal-lake/backups-*/
+deploy/personal-lake/rehearsal-data/
