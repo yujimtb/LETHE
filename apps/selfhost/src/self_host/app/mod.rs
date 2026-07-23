@@ -523,7 +523,7 @@ pub struct ProjectionSnapshot {
 
 // ReplyCard.agent_name is derived during the supplemental fold; rebuild older
 // serialized snapshots so existing cards receive the attribution.
-const NON_CORPUS_MATERIALIZATION_VERSION: u32 = 9;
+const NON_CORPUS_MATERIALIZATION_VERSION: u32 = 10;
 const REPLY_SLO_ITEM_OWNER: &str = "__reply_slo__";
 const CLAIM_QUEUE_ITEM_OWNER: &str = "__claim_queue__";
 const CARD_QUEUE_ITEM_OWNER: &str = "__card_queue__";
@@ -2878,23 +2878,23 @@ fn apply_compact_incremental_delta_with_sequences(
         &core.canonical_observation_fingerprint,
         appended_observations,
     )?;
-    let mut reconsent_observations = BTreeMap::new();
+    let mut consent_affected_observations = BTreeMap::new();
     for observation in appended_observations {
-        let Some(decision) = consent_decision_from_observation(observation)
-            .filter(|decision| decision.status == "unrestricted")
-        else {
+        let Some(decision) = consent_decision_from_observation(observation) else {
             continue;
         };
         for privacy_key in consent_decision_keys(&decision) {
             for stored in lookup.observations_for_privacy_key(&privacy_key)? {
-                reconsent_observations
+                consent_affected_observations
                     .entry(stored.observation.id.as_str().to_owned())
                     .or_insert(stored.observation);
             }
         }
     }
     core.communication_projection.remember_observations(
-        &reconsent_observations.into_values().collect::<Vec<_>>(),
+        &consent_affected_observations
+            .into_values()
+            .collect::<Vec<_>>(),
         &core.supplemental_projection_cache.reply_slo,
     );
     let compact_apply = core
@@ -5572,6 +5572,9 @@ fn current_materialized_snapshot(
         return Ok(None);
     };
     let current_format_version = u64::from(NON_CORPUS_MATERIALIZATION_VERSION);
+    if format_version < current_format_version {
+        return Ok(None);
+    }
     if format_version > current_format_version {
         return Err(SelfHostError::Ingestion(format!(
             "proj:person-page materialization format {format_version} is newer than supported format {current_format_version}"
@@ -5715,21 +5718,7 @@ fn current_materialized_snapshot(
             .filter_map(|component| component.activity.clone())
             .collect(),
     };
-    let communication_projection = if format_version < current_format_version
-        && manifest.communication_projection.is_empty()
-    {
-        let rows = persistence
-            .projection_items_by_owner(
-                &ProjectionRef::new("proj:person-page"),
-                REPLY_SLO_ITEM_OWNER,
-            )?
-            .iter()
-            .map(reply_slo_from_projection_item)
-            .collect::<Result<Vec<_>, _>>()?;
-        CommunicationProjectionState::from_reply_latencies(&rows)
-    } else {
-        manifest.communication_projection
-    };
+    let communication_projection = manifest.communication_projection;
     let auxiliary = manifest.snapshot;
     let materialized = MaterializedProjectionSnapshot {
         format_version: manifest.format_version,
@@ -5933,6 +5922,7 @@ impl AppService {
             }
             None => true,
         };
+        let persisted_materialization_missing = persisted_materialized.is_none();
         let materialized = match persisted_materialized {
             Some(materialized) => materialized,
             None => bootstrap_materialized_placeholder(stats, &supplementals, &config.channels)?,
@@ -6052,7 +6042,7 @@ impl AppService {
             search_job_test_fault: None,
         };
         if requires_background_rebuild {
-            if !had_persisted_manifest {
+            if persisted_materialization_missing {
                 let _derived_lane = service
                     .derived_projection_lane
                     .lock()

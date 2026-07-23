@@ -344,6 +344,80 @@ fn operational_ledger_survives_interface_service_restart() {
     );
 }
 
+#[test]
+fn v9_manifest_with_legacy_opt_out_fields_rebuilds_on_restart() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-self-host-v9-manifest-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let config = test_config(db.clone(), blobs.clone());
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let target = wave2_slack_observation(
+        "U-V9",
+        "V9 manifest target",
+        Some("v9@example.test"),
+        "1.000001",
+        "2026-07-12T00:00:00Z".parse().unwrap(),
+    );
+    persistence.persist_observation(&target).unwrap();
+    drop(persistence);
+
+    let service = AppService::bootstrap(config.clone()).unwrap();
+    service.wait_for_non_corpus_rebuild().unwrap();
+    let mut legacy_manifest = service
+        .persistence_lock()
+        .unwrap()
+        .projection_records(&ProjectionRef::new("proj:person-page"))
+        .unwrap()
+        .unwrap();
+    legacy_manifest["format_version"] = serde_json::json!(9);
+    let communication = legacy_manifest["communication_projection"]
+        .as_object_mut()
+        .unwrap();
+    communication.remove("consent_by_subject");
+    communication.remove("consent_by_identifier");
+    communication.remove("observation_ids_by_privacy_key");
+    communication.insert(
+        "opted_out_subjects".to_owned(),
+        serde_json::json!(["person:v9-legacy"]),
+    );
+    communication.insert(
+        "opted_out_sender_ids".to_owned(),
+        serde_json::json!(["U-V9"]),
+    );
+    service
+        .persistence_lock()
+        .unwrap()
+        .materialize_projection(&ProjectionRef::new("proj:person-page"), &legacy_manifest)
+        .unwrap();
+    drop(service);
+
+    let restarted = AppService::bootstrap(config).unwrap();
+    restarted.wait_for_non_corpus_rebuild().unwrap();
+    assert_eq!(
+        restarted
+            .non_corpus_rebuild_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    let rebuilt_manifest = restarted
+        .persistence_lock()
+        .unwrap()
+        .projection_records(&ProjectionRef::new("proj:person-page"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rebuilt_manifest["format_version"],
+        super::NON_CORPUS_MATERIALIZATION_VERSION
+    );
+    assert_eq!(restarted.reply_slo_response().unwrap().data.rows.len(), 1);
+
+    drop(restarted);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn health_and_operational_read_do_not_occupy_async_worker_while_storage_is_locked() {
     let root = std::env::temp_dir().join(format!(
@@ -1678,7 +1752,7 @@ fn materialized_snapshot_selection_is_versioned_strict_and_stats_bound() {
             0
         )
         .unwrap()
-        .is_some()
+        .is_none()
     );
 
     let mut missing_version = value.clone();
@@ -2239,6 +2313,7 @@ struct TestComponentProjectionLookup {
     observations: std::collections::BTreeMap<String, lethe_storage_api::StoredObservation>,
     rows: std::collections::BTreeMap<String, lethe_storage_api::ProjectionItem>,
     requested_observations: std::cell::RefCell<Vec<String>>,
+    requested_privacy_keys: std::cell::RefCell<Vec<String>>,
 }
 
 impl super::ComponentProjectionLookup for TestComponentProjectionLookup {
@@ -2256,6 +2331,9 @@ impl super::ComponentProjectionLookup for TestComponentProjectionLookup {
         &self,
         privacy_key: &str,
     ) -> Result<Vec<lethe_storage_api::StoredObservation>, SelfHostError> {
+        self.requested_privacy_keys
+            .borrow_mut()
+            .push(privacy_key.to_owned());
         Ok(self
             .observations
             .values()
@@ -2569,6 +2647,7 @@ fn component_projection_lookup(
             .collect(),
         rows,
         requested_observations: std::cell::RefCell::new(Vec::new()),
+        requested_privacy_keys: std::cell::RefCell::new(Vec::new()),
     }
 }
 
@@ -2809,6 +2888,98 @@ fn slack_identifier_consent_change_reprojects_component_and_matches_full_rebuild
     assert_eq!(
         serde_json::to_value(&core.person_components).unwrap(),
         serde_json::to_value(&full.person_components).unwrap()
+    );
+}
+
+#[test]
+fn communication_incremental_consent_repulls_after_state_restore() {
+    let initial_at = chrono::DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    let target = wave2_slack_observation(
+        "U-A",
+        "Affected",
+        Some("person@example.test"),
+        "1.000001",
+        initial_at,
+    );
+    let initial_stats = lethe_storage_api::ObservationStats {
+        count: 1,
+        max_append_seq: 1,
+    };
+    let mut initial_materialized = super::MaterializedProjectionSnapshot::build_at(
+        vec![target.clone()],
+        vec![],
+        vec![],
+        vec![],
+        initial_stats,
+        initial_at,
+    )
+    .unwrap();
+    initial_materialized.communication_projection = serde_json::from_value(
+        serde_json::to_value(&initial_materialized.communication_projection).unwrap(),
+    )
+    .unwrap();
+    let mut core =
+        AppCore::from_materialized(initial_materialized, vec![], vec![], vec![], vec![]).unwrap();
+    assert_eq!(core.communication_projection.len(), 1);
+
+    let opt_out = component_consent_observation(
+        "person@example.test",
+        "opted_out",
+        "restore-opt-out",
+        initial_at + chrono::Duration::minutes(1),
+    );
+    let all_after_opt_out = vec![target.clone(), opt_out.clone()];
+    let lookup_after_opt_out = component_projection_lookup(&all_after_opt_out, BTreeMap::new());
+    let opt_out_stats = lethe_storage_api::ObservationStats {
+        count: 2,
+        max_append_seq: 2,
+    };
+    super::apply_compact_incremental_delta(
+        &mut core,
+        std::slice::from_ref(&opt_out),
+        opt_out_stats,
+        initial_at + chrono::Duration::minutes(1),
+        &lookup_after_opt_out,
+    )
+    .unwrap();
+    assert!(core.communication_projection.is_empty());
+    assert!(
+        lookup_after_opt_out
+            .requested_privacy_keys
+            .borrow()
+            .iter()
+            .any(|key| key == "person@example.test")
+    );
+
+    let reconsent = component_consent_observation(
+        "person@example.test",
+        "unrestricted",
+        "restore-reconsent",
+        initial_at + chrono::Duration::minutes(2),
+    );
+    let all_after_reconsent = vec![target, opt_out, reconsent.clone()];
+    let lookup_after_reconsent = component_projection_lookup(&all_after_reconsent, BTreeMap::new());
+    let reconsent_stats = lethe_storage_api::ObservationStats {
+        count: 3,
+        max_append_seq: 3,
+    };
+    super::apply_compact_incremental_delta(
+        &mut core,
+        std::slice::from_ref(&reconsent),
+        reconsent_stats,
+        initial_at + chrono::Duration::minutes(2),
+        &lookup_after_reconsent,
+    )
+    .unwrap();
+    assert_eq!(core.communication_projection.len(), 1);
+    assert!(
+        lookup_after_reconsent
+            .requested_privacy_keys
+            .borrow()
+            .iter()
+            .any(|key| key == "person@example.test")
     );
 }
 

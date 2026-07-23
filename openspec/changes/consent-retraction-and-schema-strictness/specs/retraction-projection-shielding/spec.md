@@ -56,3 +56,21 @@ retraction 反映後も canonical Lake は破壊 SHALL NOT し、遮蔽状態は
 #### Scenario: retraction と consent の独立性
 - **WHEN** retraction 済み record に `unrestricted` の consent decision が append される
 - **THEN** record は corpus・検索・通信 projection のいずれにも復帰しない
+
+### Requirement: RPS-04 通信projectionの永続化境界と再起動後の増分遮蔽
+
+通信projectionは最新consent state(`consent_by_subject` / `consent_by_identifier`)と privacy reverse key を materialization manifest に永続化 SHALL し、canonical Observation 本体を in-memory stateだけに依存して SHALL NOT ならない。manifest format version はこのschema変更時に bump SHALL し、旧versionはfull deserialize前のversion判定で background rebuildへ送 SHALL る。incremental foldは `opted_out` と `unrestricted` の双方で `observations_for_privacy_key` から対象Observationを再pullしてから再materialize SHALL する。再pull前でも persisted observation key/fact の遮蔽除去は SHALL 完了する。
+
+#### Scenario: 旧manifestは起動時deserialize失敗にならず再構築される
+- **WHEN** 旧versionの通信projection manifestが旧privacy field名を含んでロードされる
+- **THEN** 新schemaへfull deserializeせず background rebuildへ送られる
+- **AND** rebuild完了後は新format versionと新privacy fieldで保存される
+
+#### Scenario: 再起動後のopt-outは既存factを遮蔽する
+- **WHEN** 通信projectionをserde往復した後に `opted_out` decisionがappendされる
+- **THEN** reverse indexから対象Observationを再pullして既存factを増分遮蔽する
+- **AND** 同じopted-out subjectの新規Observationも通信projectionへ現れない
+
+#### Scenario: 再起動後のre-consentは対象factを増分復帰する
+- **WHEN** serde往復後に `unrestricted` decisionがappendされる
+- **THEN** reverse indexから対象Observationを再pullして通信factを増分再materializeする

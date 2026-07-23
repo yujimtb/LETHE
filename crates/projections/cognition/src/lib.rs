@@ -718,7 +718,6 @@ pub struct CommunicationFact {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CommunicationProjectionState {
     facts_by_thread: BTreeMap<String, BTreeMap<String, CommunicationFact>>,
     observation_keys: BTreeMap<String, CommunicationThreadKey>,
@@ -744,35 +743,6 @@ impl CommunicationProjectionState {
     pub fn from_observations(observations: &[Observation], join_index: &ReplySloJoinIndex) -> Self {
         let mut state = Self::default();
         state.fold_observations(observations, join_index);
-        state
-    }
-
-    pub fn from_reply_latencies(rows: &[ReplyLatency]) -> Self {
-        let mut state = Self::default();
-        for row in rows {
-            let fact = CommunicationFact {
-                incoming_observation_id: row.incoming_observation_id.clone(),
-                channel_id: row.channel_id.clone(),
-                sender_id: row.sender_id.clone(),
-                thread_ref: row.thread_ref.clone(),
-                published: row.published,
-                due_at: row.due_at,
-                sent_at: row.sent_at,
-            };
-            let observation_id = fact.incoming_observation_id.as_str().to_owned();
-            let key = CommunicationThreadKey {
-                channel_id: fact.channel_id.clone(),
-                thread_ref: fact.thread_ref.clone(),
-            };
-            state
-                .observation_keys
-                .insert(observation_id.clone(), key.clone());
-            state
-                .facts_by_thread
-                .entry(communication_thread_storage_key(&key))
-                .or_default()
-                .insert(observation_id, fact);
-        }
         state
     }
 
@@ -935,6 +905,14 @@ impl CommunicationProjectionState {
             .get(privacy_key)
             .cloned()
             .unwrap_or_default();
+
+        // Canonical observations are deliberately not serialized into this
+        // materialization. Remove persisted facts first so a restored state
+        // cannot retain an opted-out record while the observation is being
+        // re-pulled from storage.
+        for observation_id in &observation_ids {
+            self.remove_observation(observation_id);
+        }
         for observation_id in observation_ids {
             let Some(observation) = self.observations.get(&observation_id).cloned() else {
                 continue;
@@ -2379,6 +2357,80 @@ mod tests {
         let join_index = ReplySloJoinIndex::default();
         state.fold_observations(&[target, consent], &join_index);
         assert!(state.is_empty());
+    }
+
+    #[test]
+    fn communication_privacy_state_survives_restart_and_repulls_opt_out_targets() {
+        let mut target = communication_observation("obs:target", "chan:mail", at(1), at(8));
+        target.subject = EntityRef::new("person:1");
+        let opt_out = consent_observation("person:1", "opted_out", at(2));
+        let join_index = ReplySloJoinIndex::default();
+        let mut state = CommunicationProjectionState::default();
+
+        state.fold_observations(std::slice::from_ref(&target), &join_index);
+        assert_eq!(state.len(), 1);
+
+        let mut restored: CommunicationProjectionState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        assert!(restored.observations.is_empty());
+
+        // This is the reverse-index pull performed by the application after
+        // restart, before folding the consent delta.
+        restored.remember_observations(std::slice::from_ref(&target), &join_index);
+        restored.fold_observations(std::slice::from_ref(&opt_out), &join_index);
+        assert!(restored.is_empty());
+        assert_eq!(
+            serde_json::to_value(&restored).unwrap()["consent_by_subject"]["person:1"]["status"],
+            "opted_out"
+        );
+
+        let mut new_target = communication_observation("obs:new-target", "chan:mail", at(3), at(9));
+        new_target.subject = EntityRef::new("person:1");
+        restored.fold_observations(std::slice::from_ref(&new_target), &join_index);
+        assert!(restored.is_empty());
+    }
+
+    #[test]
+    fn communication_reconsent_repulls_targets_after_restart() {
+        let mut target = communication_observation("obs:target", "chan:mail", at(1), at(8));
+        target.subject = EntityRef::new("person:1");
+        let opt_out = consent_observation("person:1", "opted_out", at(2));
+        let reconsent = consent_observation("person:1", "unrestricted", at(3));
+        let join_index = ReplySloJoinIndex::default();
+        let mut state = CommunicationProjectionState::default();
+        state.fold_observations(&[target.clone(), opt_out], &join_index);
+        assert!(state.is_empty());
+
+        let mut restored: CommunicationProjectionState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        restored.remember_observations(std::slice::from_ref(&target), &join_index);
+        restored.fold_observations(std::slice::from_ref(&reconsent), &join_index);
+        assert_eq!(restored.len(), 1);
+    }
+
+    #[test]
+    fn communication_projection_accepts_v9_legacy_privacy_fields_for_rebuild() {
+        let target = communication_observation("obs:target", "chan:mail", at(1), at(8));
+        let state = CommunicationProjectionState::from_observations(
+            std::slice::from_ref(&target),
+            &ReplySloJoinIndex::default(),
+        );
+        let mut legacy = serde_json::to_value(state).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("consent_by_subject");
+        object.remove("consent_by_identifier");
+        object.remove("observation_ids_by_privacy_key");
+        object.insert(
+            "opted_out_subjects".to_owned(),
+            serde_json::json!(["person:legacy"]),
+        );
+        object.insert(
+            "opted_out_sender_ids".to_owned(),
+            serde_json::json!(["sender@example.test"]),
+        );
+
+        let restored: CommunicationProjectionState = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.len(), 1);
     }
 
     #[test]
