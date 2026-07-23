@@ -5,6 +5,8 @@ services:
       dockerfile: apps/selfhost/Dockerfile
     environment:
       RUST_LOG: info
+      # glibc multi-arenaが一時割当を返却せず保持する実測(2026-07-23、568k規模dup-only計測)への多重防御
+      MALLOC_ARENA_MAX: "1"
       LETHE_CONFIG_PATH: /etc/lethe/config.toml
       LETHE_STORAGE_ENCRYPTION_KEY: ${LETHE_STORAGE_ENCRYPTION_KEY:?}
       LETHE_OPERATIONAL_STORAGE_ENCRYPTION_KEY: ${LETHE_OPERATIONAL_STORAGE_ENCRYPTION_KEY:?}
