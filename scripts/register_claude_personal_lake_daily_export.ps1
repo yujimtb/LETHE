@@ -23,6 +23,11 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$SourceInstance,
 
+    [ValidateSet("1", "2")]
+    [string]$ApiVersion,
+
+    [int]$AdmissionGeneration,
+
     [Parameter(Mandatory = $true)]
     [string]$BrowserProfileDir,
 
@@ -72,6 +77,9 @@ function Quote-Argument {
 if ($BrowserTimeoutMinutes -le 0) {
     throw "BrowserTimeoutMinutes must be positive"
 }
+if ($PSBoundParameters.ContainsKey("AdmissionGeneration") -and $AdmissionGeneration -le 0) {
+    throw "AdmissionGeneration must be positive"
+}
 if ([string]::IsNullOrWhiteSpace($SlackWebhookEnvName) -and $NotifyOnFailure) {
     throw "SlackWebhookEnvName is required when NotifyOnFailure is set"
 }
@@ -106,6 +114,14 @@ $arguments = @(
     "-ExportPeriod", (Quote-Argument $ExportPeriod),
     "-BrowserTimeoutMinutes", $BrowserTimeoutMinutes
 )
+if ($PSBoundParameters.ContainsKey("ApiVersion")) {
+    $arguments += "-ApiVersion"
+    $arguments += (Quote-Argument $ApiVersion)
+}
+if ($PSBoundParameters.ContainsKey("AdmissionGeneration")) {
+    $arguments += "-AdmissionGeneration"
+    $arguments += $AdmissionGeneration
+}
 if ($Headless) {
     $arguments += "-Headless"
 }

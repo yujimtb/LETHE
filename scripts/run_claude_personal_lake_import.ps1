@@ -21,7 +21,12 @@ param(
     [string]$ApiTokenEnv,
 
     [Parameter(Mandatory = $true)]
-    [string]$SourceInstance
+    [string]$SourceInstance,
+
+    [ValidateSet("1", "2")]
+    [string]$ApiVersion,
+
+    [int]$AdmissionGeneration
 )
 
 $ErrorActionPreference = "Stop"
@@ -77,6 +82,9 @@ if ([string]::IsNullOrWhiteSpace($BaseUrl)) {
 if ([string]::IsNullOrWhiteSpace($ApiTokenEnv)) {
     throw "ApiTokenEnv must not be blank"
 }
+if ($PSBoundParameters.ContainsKey("AdmissionGeneration") -and $AdmissionGeneration -le 0) {
+    throw "AdmissionGeneration must be positive"
+}
 
 & (Join-Path $PSScriptRoot "archive_claude_export.ps1") `
     -ZipPath $ZipPath `
@@ -84,7 +92,20 @@ if ([string]::IsNullOrWhiteSpace($ApiTokenEnv)) {
     -ConversationDir $ConversationDir `
     -CommitMessage $CommitMessage
 
-$firstOutput = cargo run -q -p lethe-import-claude -- "--zip=$ZipPath" "--source-instance=$SourceInstance" "--base-url=$BaseUrl" "--api-token-env=$ApiTokenEnv" | Out-String
+$importArguments = @(
+    "--zip=$ZipPath",
+    "--source-instance=$SourceInstance",
+    "--base-url=$BaseUrl",
+    "--api-token-env=$ApiTokenEnv"
+)
+if ($PSBoundParameters.ContainsKey("ApiVersion")) {
+    $importArguments += "--api-version=$ApiVersion"
+}
+if ($PSBoundParameters.ContainsKey("AdmissionGeneration")) {
+    $importArguments += "--admission-generation=$AdmissionGeneration"
+}
+
+$firstOutput = cargo run -q -p lethe-import-claude -- @importArguments | Out-String
 if ($LASTEXITCODE -ne 0) {
     throw "first lethe-import-claude failed"
 }
@@ -93,7 +114,7 @@ if ($firstReport.quarantined -ne 0) {
     throw "first import quarantined $($firstReport.quarantined) observations"
 }
 
-$secondOutput = cargo run -q -p lethe-import-claude -- "--zip=$ZipPath" "--source-instance=$SourceInstance" "--base-url=$BaseUrl" "--api-token-env=$ApiTokenEnv" | Out-String
+$secondOutput = cargo run -q -p lethe-import-claude -- @importArguments | Out-String
 if ($LASTEXITCODE -ne 0) {
     throw "second lethe-import-claude failed"
 }

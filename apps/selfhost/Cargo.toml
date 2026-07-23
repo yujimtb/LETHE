@@ -46,5 +46,6 @@ unicode-normalization.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+lethe-adapter-claude = { path = "../../crates/adapters/claude" }
 pretty_assertions.workspace = true
 tower.workspace = true

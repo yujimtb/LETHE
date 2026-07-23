@@ -4,21 +4,29 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use lethe_adapter_chatgpt::{ChatGptImportFilter, ChatGptImporter};
 use lethe_core::domain::SemVer;
-use lethe_selfhost::self_host::import_client::ImportApiConfig;
+use lethe_selfhost::self_host::import_client::{
+    ImportApiConfig, ImportApiVersion, normalize_import_option_args, resolve_admission_generation,
+    resolve_api_version,
+};
 
 const HELP: &str = "\
 Import ChatGPT export files into LETHE through the online import API.
 
-Usage: lethe-import-chatgpt --archive-root=<path> --source-instance=<id> --base-url=<url> --api-token-env=<name> [--backfill] [--from=<rfc3339>] [--to=<rfc3339>] [--conversation-id=<id>] [--json]
+Usage: lethe-import-chatgpt --archive-root=<path> --source-instance=<id> --base-url=<url> --api-token-env=<name> [--api-version=<1|2>] [--admission-generation=<int>] [--backfill] [--from=<rfc3339>] [--to=<rfc3339>] [--conversation-id=<id>] [--json]
 
 Required arguments:
   --archive-root=<path>     Archive working copy containing chatgpt/ JSON files
   --source-instance=<id>    Stable source instance id, for example chatgpt-personal
   --base-url=<url>          LETHE internal API base URL
   --api-token-env=<name>    Environment variable that holds the API token
+  --api-version=<1|2>      Import API version; defaults to 1
+  --admission-generation=<int>
+                            Required for API version 2; sent as the admission header
 
 Required environment:
   The variable named by --api-token-env must be set to a token with write:observations.
+  LETHE_INGEST_API_VERSION may provide --api-version (default: 1).
+  LETHE_ADMISSION_GENERATION may provide --admission-generation.
 
 Example:
   lethe-import-chatgpt --archive-root=D:\\archive --source-instance=chatgpt-personal --base-url=http://127.0.0.1:8080 --api-token-env=LETHE_API_WRITE_TOKEN --backfill
@@ -52,6 +60,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let report = ImportApiConfig {
         base_url: options.base_url,
         api_token_env: options.api_token_env,
+        api_version: options.api_version,
+        admission_generation: options.admission_generation,
     }
     .connect()?
     .ingest_observation_drafts(batch.drafts, &options.source_instance)?;
@@ -97,6 +107,8 @@ struct CliOptions {
     source_instance: String,
     base_url: String,
     api_token_env: String,
+    api_version: ImportApiVersion,
+    admission_generation: Option<u64>,
     filter: ChatGptImportFilter,
     json: bool,
 }
@@ -108,10 +120,12 @@ fn parse_options(
     let mut source_instance = None;
     let mut base_url = None;
     let mut api_token_env = None;
+    let mut api_version = None;
+    let mut admission_generation = None;
     let mut filter = ChatGptImportFilter::default();
     let mut json = false;
 
-    for arg in args {
+    for arg in normalize_import_option_args(args)? {
         if let Some(raw) = arg.strip_prefix("--archive-root=") {
             archive_root = Some(PathBuf::from(raw));
         } else if let Some(raw) = arg.strip_prefix("--source-instance=") {
@@ -123,6 +137,12 @@ fn parse_options(
         } else if let Some(raw) = arg.strip_prefix("--api-token-env=") {
             require_non_blank("--api-token-env", raw)?;
             api_token_env = Some(raw.to_owned());
+        } else if let Some(raw) = arg.strip_prefix("--api-version=") {
+            require_non_blank("--api-version", raw)?;
+            api_version = Some(raw.to_owned());
+        } else if let Some(raw) = arg.strip_prefix("--admission-generation=") {
+            require_non_blank("--admission-generation", raw)?;
+            admission_generation = Some(raw.to_owned());
         } else if let Some(raw) = arg.strip_prefix("--from=") {
             filter.from = Some(parse_rfc3339("--from", raw)?);
         } else if let Some(raw) = arg.strip_prefix("--to=") {
@@ -138,6 +158,8 @@ fn parse_options(
             return Err(format!("unknown argument: {arg}. Run with --help for usage.").into());
         }
     }
+    let api_version = resolve_api_version(api_version.as_deref())?;
+    let admission_generation = resolve_admission_generation(admission_generation.as_deref())?;
     Ok(CliOptions {
         archive_root: archive_root.ok_or_else(|| {
             missing_argument(
@@ -160,6 +182,8 @@ fn parse_options(
                 "Pass --api-token-env=LETHE_API_WRITE_TOKEN and set that environment variable.",
             )
         })?,
+        api_version,
+        admission_generation,
         filter,
         json,
     })

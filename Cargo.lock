@@ -1746,6 +1746,7 @@ dependencies = [
  "chrono",
  "hex",
  "lethe-adapter-api",
+ "lethe-adapter-claude",
  "lethe-adapter-gslides",
  "lethe-adapter-slack",
  "lethe-api",

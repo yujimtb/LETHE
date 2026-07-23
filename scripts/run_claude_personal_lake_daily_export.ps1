@@ -20,6 +20,11 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$SourceInstance,
 
+    [ValidateSet("1", "2")]
+    [string]$ApiVersion,
+
+    [int]$AdmissionGeneration,
+
     [Parameter(Mandatory = $true)]
     [string]$BrowserProfileDir,
 
@@ -49,6 +54,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($PSBoundParameters.ContainsKey("AdmissionGeneration") -and $AdmissionGeneration -le 0) {
+    throw "AdmissionGeneration must be positive"
+}
 
 function Require-Command {
     param([Parameter(Mandatory = $true)][string]$Name)
@@ -233,15 +242,23 @@ try {
     }
 
     $commitMessage = "Archive claude.ai export $($startedAt.ToString("yyyy-MM-dd"))"
-    $importOutput = & (Join-Path $PSScriptRoot "run_claude_personal_lake_import.ps1") `
-        -ZipPath $browserReport.zip_path `
-        -ArchiveRepo $ArchiveRepo `
-        -ConversationDir $ConversationDir `
-        -CommitMessage $commitMessage `
-        -DatabasePath $DatabasePath `
-        -BaseUrl $BaseUrl `
-        -ApiTokenEnv $ApiTokenEnv `
-        -SourceInstance $SourceInstance | Out-String
+    $importParameters = @{
+        ZipPath = $browserReport.zip_path
+        ArchiveRepo = $ArchiveRepo
+        ConversationDir = $ConversationDir
+        CommitMessage = $commitMessage
+        DatabasePath = $DatabasePath
+        BaseUrl = $BaseUrl
+        ApiTokenEnv = $ApiTokenEnv
+        SourceInstance = $SourceInstance
+    }
+    if ($PSBoundParameters.ContainsKey("ApiVersion")) {
+        $importParameters.ApiVersion = $ApiVersion
+    }
+    if ($PSBoundParameters.ContainsKey("AdmissionGeneration")) {
+        $importParameters.AdmissionGeneration = $AdmissionGeneration
+    }
+    $importOutput = & (Join-Path $PSScriptRoot "run_claude_personal_lake_import.ps1") @importParameters | Out-String
 
     $freshConversation = $null
     if ($RequireFreshConversation) {
