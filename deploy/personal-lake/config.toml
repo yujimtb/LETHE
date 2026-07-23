@@ -110,7 +110,7 @@ scopes = ["write:supplemental", "write:observations", "write:operational", "writ
 
 [[api_tokens]]
 token_env = "LETHE_API_SYNC_TOKEN"
-scopes = ["admin:sync", "admin:health"]
+scopes = ["admin:sync", "admin:health", "admin:cutover"]
 
 [[api_tokens]]
 token_env = "LETHE_NANIHOLD_TOKEN"
