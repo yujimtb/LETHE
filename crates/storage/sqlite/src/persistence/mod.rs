@@ -65,7 +65,8 @@ pub struct SqliteOperationalEventStore {
 
 const SCHEMA_VERSION_IDENTITY_LOOKUP_INDEX: i64 = 9;
 const SCHEMA_VERSION_LOCK_SPLIT_SCALARS: i64 = 10;
-const CURRENT_SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION_KEYSET_READS: i64 = 11;
+const CURRENT_SCHEMA_VERSION: i64 = 12;
 const CANONICAL_JSON_META_KEY: &str = "canonical_json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1536,9 +1537,9 @@ impl SqlitePersistence {
         }
         transaction.execute(
             "INSERT INTO projection_visible_blob_refs (
-                projection_id, item_key, blob_ref, owner_key, consent_scope
+                projection_id, item_key, blob_ref, owner_key, consent_scope, subject_key
              )
-             SELECT ?1, item_key, blob_ref, owner_key, consent_scope
+             SELECT ?1, item_key, blob_ref, owner_key, consent_scope, subject_key
              FROM projection_visible_blob_refs
              WHERE projection_id = ?2",
             params![target.as_str(), staging.as_str()],
@@ -3019,14 +3020,15 @@ fn replace_visible_blob_refs(
     for blob_ref in refs {
         transaction.execute(
             "INSERT INTO projection_visible_blob_refs (
-                projection_id, item_key, blob_ref, owner_key, consent_scope
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                projection_id, item_key, blob_ref, owner_key, consent_scope, subject_key
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 projection.as_str(),
                 item.item_key,
                 blob_ref,
                 item.owner_key,
                 consent_scope,
+                item.item_key,
             ],
         )?;
     }

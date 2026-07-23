@@ -2,7 +2,8 @@ use lethe_core::domain::*;
 use lethe_engine::projection::catalog::ProjectionCatalog;
 use lethe_engine::projection::spec::*;
 use lethe_registry::registry::{
-    ObservationSchema, Observer, RegistryStore, SourceSystem, base_supplemental_kind_schemas,
+    ObservationSchema, Observer, RegistryStore, SchemaSourceContract, SourceSystem,
+    base_supplemental_kind_schemas,
 };
 
 pub fn seed_registry() -> RegistryStore {
@@ -349,8 +350,40 @@ pub fn seed_registry() -> RegistryStore {
         })
         .unwrap();
 
-    for schema in base_schemas() {
-        registry.register_schema(schema).unwrap();
+    for strict_schema in base_schemas() {
+        // v1 is the frozen permissive contract.  v2 is the first contract
+        // that carries the projection-required fields and types.  Keeping
+        // both snapshots in the registry lets old observations retain their
+        // write-time schema version without being revalidated.
+        let mut frozen_v1 = strict_schema.clone();
+        frozen_v1.version = SemVer::new("1.0.0");
+        frozen_v1.source_contracts.clear();
+        frozen_v1.payload_schema = match frozen_v1.id.as_str() {
+            "schema:bot-answer-log" => frozen_v1.payload_schema.clone(),
+            "schema:consent-decision" => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["unrestricted", "restricted_capture", "opted_out"]
+                    },
+                    "identifier": {"type": "string"},
+                    "reason": {"type": "string"}
+                },
+                "required": ["status"],
+                "additionalProperties": false
+            }),
+            _ => serde_json::json!({"type": "object"}),
+        };
+        registry.register_schema(frozen_v1).unwrap();
+        registry
+            .add_schema_version(
+                &strict_schema.id,
+                SemVer::new("2.0.0"),
+                strict_schema.payload_schema,
+                strict_schema.source_contracts,
+            )
+            .unwrap();
     }
     for schema in base_supplemental_kind_schemas() {
         registry.register_supplemental_kind_schema(schema).unwrap();
@@ -429,8 +462,8 @@ fn base_schemas() -> Vec<ObservationSchema> {
             version: SemVer::new("1.0.0"),
             subject_type: EntityTypeRef::new("et:message"),
             target_type: None,
-            payload_schema: serde_json::json!({"type": "object"}),
-            source_contracts: vec![],
+            payload_schema: message_schema(&["text"]),
+            source_contracts: contracts(&["obs:claude-ai-importer"]),
             attachment_config: None,
             registered_by: None,
             registered_at: None,
@@ -441,8 +474,8 @@ fn base_schemas() -> Vec<ObservationSchema> {
             version: SemVer::new("1.0.0"),
             subject_type: EntityTypeRef::new("et:message"),
             target_type: None,
-            payload_schema: serde_json::json!({"type": "object"}),
-            source_contracts: vec![],
+            payload_schema: message_schema(&["conversation_id", "message_id", "sender", "text"]),
+            source_contracts: contracts(&["obs:chatgpt-importer"]),
             attachment_config: None,
             registered_by: None,
             registered_at: None,
@@ -453,8 +486,8 @@ fn base_schemas() -> Vec<ObservationSchema> {
             version: SemVer::new("1.0.0"),
             subject_type: EntityTypeRef::new("et:*"),
             target_type: None,
-            payload_schema: serde_json::json!({"type": "object"}),
-            source_contracts: vec![],
+            payload_schema: message_schema(&["object_type", "repo", "created_at"]),
+            source_contracts: contracts(&["obs:github-importer"]),
             attachment_config: None,
             registered_by: None,
             registered_at: None,
@@ -465,8 +498,14 @@ fn base_schemas() -> Vec<ObservationSchema> {
             version: SemVer::new("1.0.0"),
             subject_type: EntityTypeRef::new("et:message"),
             target_type: None,
-            payload_schema: serde_json::json!({"type": "object"}),
-            source_contracts: vec![],
+            payload_schema: message_schema(&[
+                "agent",
+                "session_id",
+                "transcript_id",
+                "object_id",
+                "item",
+            ]),
+            source_contracts: contracts(&["obs:claude-code-importer", "obs:codex-importer"]),
             attachment_config: None,
             registered_by: None,
             registered_at: None,
@@ -477,8 +516,15 @@ fn base_schemas() -> Vec<ObservationSchema> {
             version: SemVer::new("1.0.0"),
             subject_type: EntityTypeRef::new("et:message"),
             target_type: None,
-            payload_schema: serde_json::json!({"type": "object"}),
-            source_contracts: vec![],
+            payload_schema: message_schema(&[
+                "channel_id",
+                "channel_name",
+                "ts",
+                "user_id",
+                "user_name",
+                "text",
+            ]),
+            source_contracts: contracts(&["obs:slack-crawler"]),
             attachment_config: None,
             registered_by: None,
             registered_at: None,
@@ -489,8 +535,15 @@ fn base_schemas() -> Vec<ObservationSchema> {
             version: SemVer::new("1.0.0"),
             subject_type: EntityTypeRef::new("et:message"),
             target_type: None,
-            payload_schema: serde_json::json!({"type": "object"}),
-            source_contracts: vec![],
+            payload_schema: message_schema(&[
+                "account_id",
+                "message_id",
+                "thread_id",
+                "from",
+                "subject",
+                "text",
+            ]),
+            source_contracts: contracts(&["obs:gmail-importer"]),
             attachment_config: None,
             registered_by: None,
             registered_at: None,
@@ -501,8 +554,15 @@ fn base_schemas() -> Vec<ObservationSchema> {
             version: SemVer::new("1.0.0"),
             subject_type: EntityTypeRef::new("et:message"),
             target_type: None,
-            payload_schema: serde_json::json!({"type": "object"}),
-            source_contracts: vec![],
+            payload_schema: message_schema(&[
+                "channel_id",
+                "message_id",
+                "timestamp",
+                "author_id",
+                "author_name",
+                "content",
+            ]),
+            source_contracts: contracts(&["obs:discord-importer"]),
             attachment_config: None,
             registered_by: None,
             registered_at: None,
@@ -513,8 +573,13 @@ fn base_schemas() -> Vec<ObservationSchema> {
             version: SemVer::new("1.0.0"),
             subject_type: EntityTypeRef::new("et:*"),
             target_type: None,
-            payload_schema: serde_json::json!({"type": "object"}),
-            source_contracts: vec![],
+            payload_schema: message_schema(&[
+                "channel_id",
+                "channel_name",
+                "member_count",
+                "snapshot_at",
+            ]),
+            source_contracts: contracts(&["obs:slack-crawler"]),
             attachment_config: None,
             registered_by: None,
             registered_at: None,
@@ -525,8 +590,14 @@ fn base_schemas() -> Vec<ObservationSchema> {
             version: SemVer::new("1.0.0"),
             subject_type: EntityTypeRef::new("et:document"),
             target_type: None,
-            payload_schema: serde_json::json!({"type": "object"}),
-            source_contracts: vec![],
+            payload_schema: workspace_schema(),
+            source_contracts: contracts(&[
+                "obs:gslides-crawler",
+                "obs:gdocs-crawler",
+                "obs:gsheets-crawler",
+                "obs:gforms-crawler",
+                "obs:gdrive-crawler",
+            ]),
             attachment_config: None,
             registered_by: None,
             registered_at: None,
@@ -537,8 +608,22 @@ fn base_schemas() -> Vec<ObservationSchema> {
             version: SemVer::new("1.0.0"),
             subject_type: EntityTypeRef::new("et:observer"),
             target_type: None,
-            payload_schema: serde_json::json!({"type": "object"}),
-            source_contracts: vec![],
+            payload_schema: message_schema(&["status"]),
+            source_contracts: contracts(&[
+                "obs:slack-crawler",
+                "obs:gmail-importer",
+                "obs:discord-importer",
+                "obs:claude-ai-importer",
+                "obs:chatgpt-importer",
+                "obs:github-importer",
+                "obs:claude-code-importer",
+                "obs:codex-importer",
+                "obs:gslides-crawler",
+                "obs:gdocs-crawler",
+                "obs:gsheets-crawler",
+                "obs:gforms-crawler",
+                "obs:gdrive-crawler",
+            ]),
             attachment_config: None,
             registered_by: None,
             registered_at: None,
@@ -565,7 +650,7 @@ fn base_schemas() -> Vec<ObservationSchema> {
                     "unknowns": {"type": "array"}
                 }
             }),
-            source_contracts: vec![],
+            source_contracts: contracts(&["obs:search-bot"]),
             attachment_config: None,
             registered_by: None,
             registered_at: None,
@@ -576,8 +661,8 @@ fn base_schemas() -> Vec<ObservationSchema> {
             version: SemVer::new("1.0.0"),
             subject_type: EntityTypeRef::new("et:person"),
             target_type: Some(EntityTypeRef::new("et:document")),
-            payload_schema: serde_json::json!({"type": "object"}),
-            source_contracts: vec![],
+            payload_schema: message_schema(&["analysis_kind", "source_observation_id"]),
+            source_contracts: contracts(&["obs:slide-analysis-projector"]),
             attachment_config: None,
             registered_by: None,
             registered_at: None,
@@ -599,14 +684,69 @@ fn base_schemas() -> Vec<ObservationSchema> {
                     "reason": { "type": "string" }
                 },
                 "required": ["status"],
-                "additionalProperties": false
             }),
-            source_contracts: vec![],
+            source_contracts: contracts(&["obs:consent-ledger"]),
             attachment_config: None,
             registered_by: None,
             registered_at: None,
         },
     ]
+}
+
+fn contracts(observer_ids: &[&str]) -> Vec<SchemaSourceContract> {
+    observer_ids
+        .iter()
+        .map(|observer_id| SchemaSourceContract {
+            observer_id: ObserverRef::new(*observer_id),
+            adapter_version: SemVer::new("1.0.0"),
+            compatible_range: ">=1.0.0 <2.0.0".to_owned(),
+        })
+        .collect()
+}
+
+/// Projection contracts declare only the fields read by a projector.  The
+/// absence of `additionalProperties: false` is intentional: ingestion keeps
+/// unknown fields for later salvage while projections remain contract-strict.
+fn message_schema(required: &[&str]) -> serde_json::Value {
+    let properties = required
+        .iter()
+        .map(|field| ((*field).to_owned(), field_schema(field)))
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::json!({
+        "type": "object",
+        "required": required,
+        "properties": properties
+    })
+}
+
+fn field_schema(field: &str) -> serde_json::Value {
+    match field {
+        "item" => serde_json::json!({"type": "object"}),
+        "member_count" => serde_json::json!({"type": "integer"}),
+        "timestamp" | "created_at" => serde_json::json!({
+            "type": "string",
+            "format": "date-time"
+        }),
+        _ => serde_json::json!({"type": "string"}),
+    }
+}
+
+fn workspace_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["artifact"],
+        "properties": {
+            "artifact": {
+                "type": "object",
+                "required": ["service", "objectType", "sourceObjectId"],
+                "properties": {
+                    "service": {"type": "string"},
+                    "objectType": {"type": "string"},
+                    "sourceObjectId": {"type": "string"}
+                }
+            }
+        }
+    })
 }
 
 fn identity_spec() -> ProjectionSpec {

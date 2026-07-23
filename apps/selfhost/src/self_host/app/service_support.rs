@@ -580,19 +580,26 @@ impl AppService {
 
     pub fn projection_blob_bytes(
         &self,
+        projection: &ProjectionRef,
         blob_ref: &BlobRef,
     ) -> Result<Option<Vec<u8>>, SelfHostError> {
         let core = self.core_snapshot();
-        self.ensure_projection_fresh(&core.catalog, "proj:person-page")?;
+        self.ensure_projection_fresh(&core.catalog, projection.as_str())?;
         drop(core);
         let referenced = self
             .persistence_read_lock()?
-            .projection_blob_ref_visible(&ProjectionRef::new("proj:person-page"), blob_ref)?;
+            .projection_blob_ref_visible(projection, blob_ref)?;
         self.emit_audit(
             "actor:self-host",
-            AuditEventKind::ReadRestricted,
+            AuditEventKind::BlobAuthorization,
             serde_json::json!({
-                "decision": "filtering-before-exposure",
+                "actor": "actor:self-host",
+                "subject": format!("blob:{blob_ref}"),
+                "scope": format!("projection:{}", projection.as_str()),
+                "decision": if referenced { "visible" } else { "deny" },
+                "rule": "projection_visible_blob_refs subject-key lookup",
+                "timestamp": Utc::now(),
+                "exposure_rule": "filtering-before-exposure",
                 "masked_fields": [],
             }),
         )?;
@@ -600,6 +607,21 @@ impl AppService {
             return Ok(None);
         }
         Ok(self.persistence_read_lock()?.get_blob(blob_ref)?)
+    }
+
+    /// Run the explicit operator-triggered privacy completeness validation.
+    /// Normal append/consumer paths use incremental folds and do not call
+    /// this method.
+    pub fn validate_privacy_projections_on_demand(
+        &self,
+    ) -> Result<lethe_projection_corpus::PrivacyValidationReport, SelfHostError> {
+        let observations = self.persistence_read_lock()?.load_observations()?;
+        let projector = CorpusProjector::new(self.config.corpus.projector_config());
+        let report = projector
+            .validate_on_demand_full(&observations)
+            .map_err(SelfHostError::Ingestion)?;
+        self.search_index.execute(|index| index.validate())?;
+        Ok(report)
     }
 
     pub(super) fn ingest_slack_message<A: SlackClient, F: SlackClient>(
@@ -915,6 +937,21 @@ impl AppService {
                 .append_consumer_in_flight
                 .store(false, std::sync::atomic::Ordering::Release);
         });
+    }
+
+    pub(super) fn refresh_capture_consent_snapshot(
+        &self,
+        observations: &[Observation],
+    ) -> Result<(), SelfHostError> {
+        if observations.is_empty() {
+            return Ok(());
+        }
+        let mut core = self.core_lock()?;
+        for observation in observations {
+            core.compact_state.capture_consent_decision(observation);
+        }
+        self.publish_core_snapshot(&core);
+        Ok(())
     }
 
     pub(super) fn trigger_search_index_catch_up(&self) {

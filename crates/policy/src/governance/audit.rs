@@ -1,7 +1,9 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use crate::governance::types::{AuditEvent, AuditEventKind};
+use crate::governance::types::{
+    AuditEvent, AuditEventKind, PrivacyAuditDecision, PrivacyAuditDetail,
+};
 use lethe_core::domain::values::ActorRef;
 
 // ---------------------------------------------------------------------------
@@ -106,6 +108,30 @@ impl AuditEmitter {
         self.log.emit(event);
     }
 
+    pub fn emit_privacy_decision(
+        &self,
+        actor: &ActorRef,
+        kind: AuditEventKind,
+        subject: impl Into<String>,
+        scope: impl Into<String>,
+        decision: PrivacyAuditDecision,
+        rule: impl Into<String>,
+    ) {
+        let detail = PrivacyAuditDetail {
+            actor: actor.clone(),
+            subject: subject.into(),
+            scope: scope.into(),
+            decision,
+            rule: rule.into(),
+            timestamp: chrono::Utc::now(),
+        };
+        self.emit(
+            actor,
+            kind,
+            serde_json::to_value(detail).expect("privacy audit detail must serialize"),
+        );
+    }
+
     pub fn log(&self) -> &dyn AuditLog {
         self.log.as_ref()
     }
@@ -188,6 +214,45 @@ mod tests {
         assert_eq!(events.len(), RECENT_AUDIT_EVENT_LIMIT);
         assert_eq!(events.first().unwrap().id, "audit:2");
         assert_eq!(events.last().unwrap().id, "audit:1025");
+    }
+
+    #[test]
+    fn privacy_decision_audit_contains_required_content() {
+        let (log, emitter) = make_emitter();
+        let actor = ActorRef::new("actor:privacy-gate");
+        emitter.emit_privacy_decision(
+            &actor,
+            AuditEventKind::ConsentGate,
+            "person:1",
+            "record:message:1",
+            PrivacyAuditDecision::Deny,
+            "latest consent decision is opted_out",
+        );
+        emitter.emit_privacy_decision(
+            &actor,
+            AuditEventKind::RetractionShield,
+            "person:1",
+            "record:message:1",
+            PrivacyAuditDecision::Shield,
+            "typed retraction target",
+        );
+        emitter.emit_privacy_decision(
+            &actor,
+            AuditEventKind::BlobAuthorization,
+            "person:1",
+            "record:message:1",
+            PrivacyAuditDecision::Visible,
+            "visible blob reference index",
+        );
+        let events = log.all_events();
+        assert_eq!(events.len(), 3);
+        for event in events {
+            let detail: PrivacyAuditDetail = serde_json::from_value(event.detail).unwrap();
+            assert_eq!(detail.actor, actor);
+            assert_eq!(detail.subject, "person:1");
+            assert_eq!(detail.scope, "record:message:1");
+            assert!(!detail.rule.is_empty());
+        }
     }
 
     #[test]

@@ -52,7 +52,10 @@ use lethe_engine::identity::types::{
 };
 #[cfg(test)]
 use lethe_engine::lake::LakeStore;
-use lethe_engine::lake::{BlobStore, IngestRequest, ObservationPreparer};
+use lethe_engine::lake::{
+    BlobStore, ConsentDecisionResolver, IngestRequest, ObservationPreparer,
+    count_surplus_payload_fields,
+};
 use lethe_engine::projection::catalog::ProjectionCatalog;
 use lethe_engine::projection::lineage::{LineageManifest, SourceSnapshot};
 use lethe_engine::supplemental::SupplementalStore;
@@ -77,7 +80,7 @@ use lethe_projection_cognition::{
     FreshnessThreshold, PlanStateProjection, ReplyLatency, ReplySloJoinIndex, ReplySloProjection,
     ReplySloStatus, ResumeSnapshotProjection, SourceFreshness,
 };
-use lethe_projection_corpus::CorpusProjector;
+use lethe_projection_corpus::{CorpusProjector, PrivacyFilter};
 use lethe_projection_person::person_page::projector::PersonPageProjector;
 use lethe_projection_person::person_page::types::{
     FrontendProfile, IdentityInfo, PersonActivity, PersonDetailResponse, PersonListItem,
@@ -673,6 +676,7 @@ struct ObservationImportTiming {
     non_corpus_materialize_ms: u64,
     search_index_catch_up_ms: u64,
     audit_ms: u64,
+    surplus_payload_fields: u64,
     total_ms: u64,
 }
 
@@ -702,6 +706,13 @@ impl ObservationImportTimer {
         self.timing.total_ms = u64::try_from(self.started_at.elapsed().as_millis())
             .expect("observation import total duration does not fit u64 milliseconds");
         self.timing
+    }
+
+    fn record_surplus_payload_fields(&mut self, count: usize) {
+        self.timing.surplus_payload_fields = self
+            .timing
+            .surplus_payload_fields
+            .saturating_add(u64::try_from(count).expect("surplus field count fits u64"));
     }
 }
 
@@ -774,6 +785,7 @@ impl ObservationImportTimingLog {
             "full_rebuild_reason",
             "search_index_catch_up_ms",
             "audit_ms",
+            "surplus_payload_fields",
             "total_ms",
             "slow_threshold_ms",
             "bulk_session_requested",
@@ -813,6 +825,7 @@ impl ObservationImportTimingLog {
                 full_rebuild_reason,
                 search_index_catch_up_ms = self.timing.search_index_catch_up_ms,
                 audit_ms = self.timing.audit_ms,
+                surplus_payload_fields = self.timing.surplus_payload_fields,
                 total_ms = self.timing.total_ms,
                 slow_threshold_ms = OBSERVATION_IMPORT_SLOW_THRESHOLD_MS,
                 bulk_session_requested = self.bulk_session_requested,
@@ -835,6 +848,7 @@ impl ObservationImportTimingLog {
                 full_rebuild_reason,
                 search_index_catch_up_ms = self.timing.search_index_catch_up_ms,
                 audit_ms = self.timing.audit_ms,
+                surplus_payload_fields = self.timing.surplus_payload_fields,
                 total_ms = self.timing.total_ms,
                 slow_threshold_ms = OBSERVATION_IMPORT_SLOW_THRESHOLD_MS,
                 bulk_session_requested = self.bulk_session_requested,
@@ -868,6 +882,28 @@ struct CompactConsentDecision {
     status: Option<String>,
     published: DateTime<Utc>,
     recorded_at: DateTime<Utc>,
+}
+
+impl ConsentDecisionResolver for CompactProjectionState {
+    fn resolve(
+        &self,
+        subject: &EntityRef,
+        identifiers: &[String],
+        _consent_scope: Option<&str>,
+    ) -> ConsentStatus {
+        self.consent_by_subject
+            .get(subject.as_str())
+            .into_iter()
+            .chain(
+                identifiers
+                    .iter()
+                    .filter_map(|identifier| self.consent_by_identifier.get(identifier)),
+            )
+            .max_by(|left, right| consent_decision_order(left).cmp(&consent_decision_order(right)))
+            .and_then(|decision| decision.status.as_deref())
+            .and_then(compact_consent_status)
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1775,21 +1811,51 @@ impl AppCore {
 }
 
 fn prepare_draft(core: &AppCore, draft: ObservationDraft) -> Result<Observation, IngestResult> {
-    ObservationPreparer::new(&core.registry, &core.blobs).prepare(IngestRequest {
-        schema: draft.schema,
-        schema_version: draft.schema_version,
-        observer: draft.observer,
-        source_system: draft.source_system,
-        authority_model: draft.authority_model,
-        capture_model: draft.capture_model,
-        subject: draft.subject,
-        target: draft.target,
-        payload: draft.payload,
-        attachments: draft.attachments,
-        published: draft.published,
-        idempotency_key: draft.idempotency_key,
-        meta: draft.meta,
-    })
+    ObservationPreparer::new_with_consent_resolver(&core.registry, &core.blobs, &core.compact_state)
+        .prepare(IngestRequest {
+            schema: draft.schema,
+            schema_version: draft.schema_version,
+            observer: draft.observer,
+            source_system: draft.source_system,
+            authority_model: draft.authority_model,
+            capture_model: draft.capture_model,
+            subject: draft.subject,
+            target: draft.target,
+            payload: draft.payload,
+            attachments: draft.attachments,
+            published: draft.published,
+            idempotency_key: draft.idempotency_key,
+            meta: draft.meta,
+        })
+}
+
+fn privacy_audit_details(observations: &[Observation]) -> Vec<serde_json::Value> {
+    observations
+        .iter()
+        .map(|observation| {
+            let (decision, rule) = if observation.meta.get("retracts").is_some() {
+                ("shield", "typed retraction target is applied incrementally")
+            } else {
+                (
+                    "allow",
+                    "capture gate evaluated latest consent before append",
+                )
+            };
+            serde_json::json!({
+                "actor": "actor:self-host",
+                "subject": observation.subject,
+                "scope": observation
+                    .consent
+                    .as_ref()
+                    .map(|scope| scope.as_str())
+                    .unwrap_or("record"),
+                "decision": decision,
+                "rule": rule,
+                "timestamp": Utc::now(),
+                "observation_id": observation.id,
+            })
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -4796,8 +4862,10 @@ fn rebuild_materialized_snapshot_paged(
     let mut answer_log = Vec::new();
     let reply_slo_join_index = ReplySloJoinIndex::from_records(supplementals);
     let mut communication_projection = CommunicationProjectionState::default();
+    let mut privacy_filter = PrivacyFilter::default();
 
     for_each_observation_page(persistence, stats, page_size, |_, observations| {
+        privacy_filter.apply_observations(observations);
         compact_state.apply_observation_page(observations)?;
         communication_projection.fold_observations(observations, &reply_slo_join_index);
         for observation in observations {
@@ -4890,10 +4958,10 @@ fn rebuild_materialized_snapshot_paged(
                 })?;
             }
         }
-        for observation in observations
-            .iter()
-            .filter(|observation| observation.schema.as_str() == "schema:slack-message")
-        {
+        for observation in observations.iter().filter(|observation| {
+            observation.schema.as_str() == "schema:slack-message"
+                && privacy_filter.visible(observation)
+        }) {
             let node_id = slack_identity_node_for_observation(&compact_state, observation)?;
             let person_id = compact_state.person_id_for_node(node_id)?;
             if person_consents.get(&person_id) == Some(&ConsentStatus::OptedOut) {
@@ -4927,7 +4995,10 @@ fn rebuild_materialized_snapshot_paged(
 
         let non_slack = observations
             .iter()
-            .filter(|observation| observation.schema.as_str() != "schema:slack-message")
+            .filter(|observation| {
+                observation.schema.as_str() != "schema:slack-message"
+                    && privacy_filter.visible(observation)
+            })
             .cloned()
             .collect::<Vec<_>>();
         if !non_slack.is_empty() {
@@ -6360,6 +6431,7 @@ impl AppService {
                     &mut core,
                     batch,
                     source_instance_id,
+                    &mut timer,
                     &mut prepared_observations,
                 )?;
             }
@@ -6375,6 +6447,7 @@ impl AppService {
                         "source_instance_id": source_instance_id,
                         "requested": prepared_observations.len(),
                         "bulk_session_id": bulk_session_id,
+                        "privacy_decisions": privacy_audit_details(&prepared_observations),
                     }),
                 )?;
                 vec![AppService::audit_record(&event)?]
@@ -6461,6 +6534,7 @@ impl AppService {
 
             let request_had_canonical_attempt = !audit_events.is_empty();
             if request_had_canonical_attempt {
+                self.refresh_capture_consent_snapshot(&request_appended_observations)?;
                 if let Some(session) = bulk_session.clone() {
                     self.record_deferred_bulk_import_append(session)?;
                     let _derived_lane = self
@@ -6609,11 +6683,22 @@ impl AppService {
                     }
                 };
                 match prepare_draft(&core, draft) {
-                    Ok(observation) => prepared.push(PreparedImportObservation {
-                        index,
-                        client_ref,
-                        observation,
-                    }),
+                    Ok(observation) => {
+                        if let Some(schema) = core
+                            .registry
+                            .get_schema_at_version(&observation.schema, &observation.schema_version)
+                        {
+                            timer.record_surplus_payload_fields(count_surplus_payload_fields(
+                                &schema.payload_schema,
+                                &observation.payload,
+                            ));
+                        }
+                        prepared.push(PreparedImportObservation {
+                            index,
+                            client_ref,
+                            observation,
+                        })
+                    }
                     Err(result) => {
                         item_results[index] =
                             Some(item_result_from_ingest_result(client_ref, result));
@@ -6636,6 +6721,7 @@ impl AppService {
                         "source_instance_id": source_instance_id,
                         "requested": append_input.len(),
                         "bulk_session_id": bulk_session_id,
+                        "privacy_decisions": privacy_audit_details(&append_input),
                     }),
                 )?;
                 vec![AppService::audit_record(&event)?]
@@ -6747,6 +6833,7 @@ impl AppService {
 
             let request_had_canonical_attempt = !audit_events.is_empty();
             if request_had_canonical_attempt {
+                self.refresh_capture_consent_snapshot(&request_appended_observations)?;
                 if let Some(session) = bulk_session {
                     if let Err(error) = self.record_deferred_bulk_import_append(session) {
                         tracing::error!(
@@ -6801,6 +6888,7 @@ impl AppService {
         core: &mut AppCore,
         drafts: Vec<ObservationDraft>,
         source_instance_id: &str,
+        timer: &mut ObservationImportTimer,
         prepared_observations: &mut Vec<Observation>,
     ) -> Result<(), SelfHostError> {
         let mut observations = Vec::with_capacity(drafts.len());
@@ -6813,7 +6901,18 @@ impl AppService {
                 )));
             }
             match prepare_draft(core, namespace_draft(draft, source_instance_id)) {
-                Ok(observation) => observations.push(observation),
+                Ok(observation) => {
+                    if let Some(schema) = core
+                        .registry
+                        .get_schema_at_version(&observation.schema, &observation.schema_version)
+                    {
+                        timer.record_surplus_payload_fields(count_surplus_payload_fields(
+                            &schema.payload_schema,
+                            &observation.payload,
+                        ));
+                    }
+                    observations.push(observation)
+                }
                 Err(IngestResult::Rejected { message, .. }) => {
                     return Err(SelfHostError::Ingestion(message));
                 }

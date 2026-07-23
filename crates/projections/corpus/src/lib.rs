@@ -1,9 +1,9 @@
 //! Access-controlled corpus projection for workspace search.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use chrono::{DateTime, Utc};
-use lethe_core::domain::{Observation, ProjectionRef};
+use lethe_core::domain::{Observation, ProjectionRef, RetractionTarget};
 use lethe_engine::projection::runner::Projector;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -126,6 +126,12 @@ pub struct CorpusRecord {
     pub metadata: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrivacyValidationReport {
+    pub observations_checked: usize,
+    pub records_checked: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct CorpusProjector {
     config: CorpusConfig,
@@ -148,10 +154,59 @@ impl CorpusProjector {
     }
 
     pub fn project_observations(&self, observations: &[Observation]) -> Vec<CorpusRecord> {
+        let privacy = PrivacyFilter::from_observations(observations);
+        let visible = observations
+            .iter()
+            .filter(|observation| privacy.visible(observation))
+            .cloned()
+            .collect::<Vec<_>>();
         match self.config.mode {
-            CorpusMode::WorkspaceFiltered => self.project_workspace_filtered(observations),
-            CorpusMode::PersonalAllText => self.project_personal_all_text(observations),
+            CorpusMode::WorkspaceFiltered => self.project_workspace_filtered(&visible),
+            CorpusMode::PersonalAllText => self.project_personal_all_text(&visible),
         }
+    }
+
+    /// Explicit operator-triggered full privacy validation.  The normal
+    /// append path never invokes this corpus-wide scan.
+    pub fn validate_on_demand_full(
+        &self,
+        observations: &[Observation],
+    ) -> Result<PrivacyValidationReport, String> {
+        let records = self.project_observations(observations);
+        let privacy = PrivacyFilter::from_observations(observations);
+        let mut record_ids = BTreeSet::new();
+        for record in &records {
+            if !record_ids.insert(record.record_id.clone()) {
+                return Err(format!(
+                    "privacy projection produced duplicate record {}",
+                    record.record_id
+                ));
+            }
+            let observation_id = record
+                .metadata
+                .get("observation_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("record {} lacks observation_id", record.record_id))?;
+            let observation = observations
+                .iter()
+                .find(|observation| observation.id.as_str() == observation_id)
+                .ok_or_else(|| {
+                    format!(
+                        "record {} references unknown observation {}",
+                        record.record_id, observation_id
+                    )
+                })?;
+            if !privacy.visible(observation) {
+                return Err(format!(
+                    "privacy projection exposed shielded observation {}",
+                    observation.id
+                ));
+            }
+        }
+        Ok(PrivacyValidationReport {
+            observations_checked: observations.len(),
+            records_checked: records.len(),
+        })
     }
 
     /// Projects one canonical Observation using the persisted workspace exclusion state.
@@ -160,6 +215,11 @@ impl CorpusProjector {
         observation: &Observation,
         form_response_sheet_ids: &HashSet<String>,
     ) -> Vec<CorpusRecord> {
+        if observation.schema.as_str() == "schema:consent-decision"
+            || observation.meta.get("retracts").is_some()
+        {
+            return Vec::new();
+        }
         let mut records = match self.config.mode {
             CorpusMode::WorkspaceFiltered => {
                 if observation.schema.as_str() == "schema:bot-answer-log" {
@@ -267,6 +327,11 @@ impl CorpusProjector {
             container: Some(channel.to_owned()),
             metadata: serde_json::json!({
                 "observation_id": observation.id,
+                "source_object_id": observation
+                    .meta
+                    .get("object_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(observation.id.as_str()),
                 "channel_id": channel_id,
                 "author": string_at(&observation.payload, &["user_name"]),
             }),
@@ -527,6 +592,270 @@ impl CorpusProjector {
             }),
         })]
     }
+}
+
+/// Incremental corpus fold.  A retraction removes already-materialized
+/// records in the same fold; it never mutates the canonical observation.
+#[derive(Debug, Default)]
+pub struct CorpusProjectionState {
+    observations: BTreeMap<String, Observation>,
+    records: BTreeMap<String, CorpusRecord>,
+    record_observation_ids: BTreeMap<String, String>,
+    record_source_object_ids: BTreeMap<String, String>,
+    record_privacy_keys: BTreeMap<String, BTreeSet<String>>,
+    privacy: PrivacyFilter,
+}
+
+impl CorpusProjectionState {
+    pub fn fold_observations(
+        &mut self,
+        projector: &CorpusProjector,
+        observations: &[Observation],
+    ) -> Vec<CorpusRecord> {
+        for observation in observations {
+            self.observations
+                .insert(observation.id.as_str().to_owned(), observation.clone());
+
+            if let Some(value) = observation.meta.get("retracts") {
+                match RetractionTarget::from_value(value) {
+                    Ok(target) => {
+                        self.privacy.apply_retraction(&target);
+                        self.remove_records_for_retraction(&target);
+                    }
+                    Err(_) => self.privacy.invalid_retraction = true,
+                }
+                continue;
+            }
+
+            if observation.schema.as_str() == "schema:consent-decision" {
+                self.privacy.apply_consent(observation);
+                if self.privacy.is_opted_out(observation) {
+                    self.remove_records_for_privacy_key(observation.subject.as_str());
+                    if let Some(identifier) = observation
+                        .payload
+                        .get("identifier")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        self.remove_records_for_privacy_key(identifier);
+                    }
+                }
+                continue;
+            }
+
+            self.remove_records_for_observation(observation.id.as_str());
+            if !self.privacy.visible(observation) {
+                continue;
+            }
+            for record in projector.project_observation(observation, &HashSet::new()) {
+                self.insert_record(record);
+            }
+        }
+        self.records.values().cloned().collect()
+    }
+
+    fn insert_record(&mut self, record: CorpusRecord) {
+        self.remove_record(&record.record_id);
+        let record_id = record.record_id.clone();
+        if let Some(observation_id) = record
+            .metadata
+            .get("observation_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            self.record_observation_ids
+                .insert(record_id.clone(), observation_id.to_owned());
+        }
+        if let Some(source_object_id) = record
+            .metadata
+            .get("source_object_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            self.record_source_object_ids
+                .insert(record_id.clone(), source_object_id.to_owned());
+        }
+        self.record_privacy_keys.insert(
+            record_id.clone(),
+            record
+                .metadata
+                .get("privacy_keys")
+                .and_then(serde_json::Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
+        self.records.insert(record_id, record);
+    }
+
+    fn remove_record(&mut self, record_id: &str) {
+        self.records.remove(record_id);
+        self.record_observation_ids.remove(record_id);
+        self.record_source_object_ids.remove(record_id);
+        self.record_privacy_keys.remove(record_id);
+    }
+
+    fn remove_records_for_observation(&mut self, observation_id: &str) {
+        let record_ids = self
+            .record_observation_ids
+            .iter()
+            .filter(|(_, value)| value.as_str() == observation_id)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for record_id in record_ids {
+            self.remove_record(&record_id);
+        }
+    }
+
+    fn remove_records_for_retraction(&mut self, target: &RetractionTarget) {
+        let record_ids = self
+            .records
+            .keys()
+            .filter(|record_id| {
+                target.observation_id.as_ref().is_some_and(|id| {
+                    self.record_observation_ids
+                        .get(*record_id)
+                        .is_some_and(|value| value == id.as_str())
+                }) || target
+                    .source_object_id
+                    .as_ref()
+                    .is_some_and(|id| self.record_source_object_ids.get(*record_id) == Some(id))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for record_id in record_ids {
+            self.remove_record(&record_id);
+        }
+    }
+
+    fn remove_records_for_privacy_key(&mut self, privacy_key: &str) {
+        let record_ids = self
+            .record_privacy_keys
+            .iter()
+            .filter(|(_, keys)| keys.contains(privacy_key))
+            .map(|(record_id, _)| record_id.clone())
+            .collect::<Vec<_>>();
+        for record_id in record_ids {
+            self.remove_record(&record_id);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct PrivacyFilter {
+    retracted_observation_ids: BTreeSet<String>,
+    retracted_source_object_ids: BTreeSet<String>,
+    opted_out_subjects: BTreeSet<String>,
+    opted_out_identifiers: BTreeSet<String>,
+    invalid_retraction: bool,
+}
+
+impl PrivacyFilter {
+    pub fn from_observations(observations: &[Observation]) -> Self {
+        let mut fold = Self::default();
+        fold.apply_observations(observations);
+        fold
+    }
+
+    pub fn apply_observations(&mut self, observations: &[Observation]) {
+        for observation in observations {
+            if let Some(value) = observation.meta.get("retracts") {
+                match RetractionTarget::from_value(value) {
+                    Ok(target) => self.apply_retraction(&target),
+                    Err(_) => self.invalid_retraction = true,
+                }
+            }
+            self.apply_consent(observation);
+        }
+    }
+
+    fn apply_retraction(&mut self, target: &RetractionTarget) {
+        if let Some(id) = &target.observation_id {
+            self.retracted_observation_ids
+                .insert(id.as_str().to_owned());
+        }
+        if let Some(id) = &target.source_object_id {
+            self.retracted_source_object_ids.insert(id.clone());
+        }
+    }
+
+    fn apply_consent(&mut self, observation: &Observation) {
+        if observation.schema.as_str() == "schema:consent-decision"
+            && observation
+                .payload
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                == Some("opted_out")
+        {
+            self.opted_out_subjects
+                .insert(observation.subject.as_str().to_owned());
+            if let Some(identifier) = observation
+                .payload
+                .get("identifier")
+                .and_then(serde_json::Value::as_str)
+            {
+                self.opted_out_identifiers.insert(identifier.to_owned());
+            }
+        }
+    }
+
+    fn is_opted_out(&self, observation: &Observation) -> bool {
+        observation.schema.as_str() == "schema:consent-decision"
+            && observation
+                .payload
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                == Some("opted_out")
+    }
+
+    pub fn visible(&self, observation: &Observation) -> bool {
+        if self.invalid_retraction {
+            return false;
+        }
+        if observation.schema.as_str() == "schema:consent-decision"
+            || observation.meta.get("retracts").is_some()
+        {
+            return false;
+        }
+        if self
+            .retracted_observation_ids
+            .contains(observation.id.as_str())
+        {
+            return false;
+        }
+        if observation
+            .meta
+            .get("object_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| self.retracted_source_object_ids.contains(id))
+        {
+            return false;
+        }
+        if self
+            .opted_out_subjects
+            .contains(observation.subject.as_str())
+        {
+            return false;
+        }
+        !observation_identifiers(observation)
+            .iter()
+            .any(|identifier| self.opted_out_identifiers.contains(identifier))
+    }
+}
+
+fn observation_identifiers(observation: &Observation) -> Vec<String> {
+    [
+        observation.meta.get("communication_sender_id"),
+        observation.payload.get("user_id"),
+        observation.payload.get("from"),
+        observation.payload.get("author_id"),
+        observation.payload.get("email"),
+    ]
+    .into_iter()
+    .filter_map(|value| value.and_then(serde_json::Value::as_str).map(str::to_owned))
+    .collect()
 }
 
 impl Projector for CorpusProjector {
@@ -896,6 +1225,29 @@ fn personal_metadata(
         "source_type".to_owned(),
         serde_json::Value::String(source_type.to_owned()),
     );
+    metadata.insert(
+        "source_object_id".to_owned(),
+        serde_json::Value::String(
+            observation
+                .meta
+                .get("object_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(observation.id.as_str())
+                .to_owned(),
+        ),
+    );
+    let mut privacy_keys = vec![serde_json::Value::String(
+        observation.subject.as_str().to_owned(),
+    )];
+    privacy_keys.extend(
+        observation_identifiers(observation)
+            .into_iter()
+            .map(serde_json::Value::String),
+    );
+    metadata.insert(
+        "privacy_keys".to_owned(),
+        serde_json::Value::Array(privacy_keys),
+    );
     if let Some(source_system) = &observation.source_system {
         metadata.insert(
             "source_system".to_owned(),
@@ -1147,6 +1499,66 @@ mod tests {
             idempotency_key: IdempotencyKey::new("test"),
             meta: serde_json::json!({"canonical_json": "{}"}),
         }
+    }
+
+    #[test]
+    fn retraction_removes_prior_record_incrementally_and_keeps_canonical_target() {
+        let projector = CorpusProjector::personal_all_text_config();
+        let mut target = obs(
+            "schema:claude-message",
+            serde_json::json!({"text": "salvageable secret"}),
+        );
+        target.meta["object_id"] = serde_json::json!("claude:message:1");
+        let mut retraction = obs(
+            "schema:claude-message",
+            serde_json::json!({"text": "retraction event"}),
+        );
+        retraction.meta["retracts"] = serde_json::json!({
+            "source_object_id": "claude:message:1"
+        });
+
+        let mut state = CorpusProjectionState::default();
+        assert_eq!(
+            state.fold_observations(&projector, &[target.clone()]).len(),
+            1
+        );
+        assert!(
+            state
+                .fold_observations(&projector, &[retraction])
+                .is_empty()
+        );
+        assert_eq!(target.payload["text"], "salvageable secret");
+    }
+
+    #[test]
+    fn consent_opt_out_is_record_scoped_and_validated_on_demand() {
+        let projector = CorpusProjector::personal_all_text_config();
+        let target = obs(
+            "schema:claude-message",
+            serde_json::json!({"text": "person secret"}),
+        );
+        let mut consent = obs(
+            "schema:consent-decision",
+            serde_json::json!({"status": "opted_out"}),
+        );
+        consent.subject = target.subject.clone();
+        assert_eq!(
+            projector
+                .project_observations(std::slice::from_ref(&target))
+                .len(),
+            1
+        );
+        assert!(
+            projector
+                .project_observations(&[target.clone(), consent.clone()])
+                .is_empty()
+        );
+        let observations = vec![target, consent];
+        let report = projector
+            .validate_on_demand_full(&observations)
+            .expect("on-demand privacy validation should pass");
+        assert_eq!(report.observations_checked, 2);
+        assert_eq!(report.records_checked, 0);
     }
 
     #[test]

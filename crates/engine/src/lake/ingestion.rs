@@ -48,15 +48,42 @@ pub const COMM_CHANNEL_EXTERNAL_ID_META_KEY: &str = "communication_channel_exter
 pub const COMM_SENDER_ID_META_KEY: &str = "communication_sender_id";
 pub const COMM_THREAD_REF_META_KEY: &str = "communication_thread_ref";
 
+/// Resolves the latest consent decision at the capture boundary.
+pub trait ConsentDecisionResolver {
+    fn resolve(
+        &self,
+        subject: &EntityRef,
+        identifiers: &[String],
+        consent_scope: Option<&str>,
+    ) -> ConsentStatus;
+}
+
 /// Validates and normalizes an ingestion request without accessing the lake.
 pub struct ObservationPreparer<'a> {
     registry: &'a RegistryStore,
     blobs: &'a BlobStore,
+    consent_resolver: Option<&'a dyn ConsentDecisionResolver>,
 }
 
 impl<'a> ObservationPreparer<'a> {
     pub fn new(registry: &'a RegistryStore, blobs: &'a BlobStore) -> Self {
-        Self { registry, blobs }
+        Self {
+            registry,
+            blobs,
+            consent_resolver: None,
+        }
+    }
+
+    pub fn new_with_consent_resolver(
+        registry: &'a RegistryStore,
+        blobs: &'a BlobStore,
+        consent_resolver: &'a dyn ConsentDecisionResolver,
+    ) -> Self {
+        Self {
+            registry,
+            blobs,
+            consent_resolver: Some(consent_resolver),
+        }
     }
 
     /// Validate and normalize a request into an Observation ready for durable append.
@@ -72,10 +99,22 @@ impl<'a> ObservationPreparer<'a> {
         };
 
         // Step 2: Resolve source contract — verify schema exists.
-        let Some(schema) = self.registry.get_schema(&req.schema) else {
+        if self.registry.get_schema(&req.schema).is_none() {
             return Err(IngestResult::Rejected {
                 class: lethe_core::domain::FailureClass::ValidationFailure,
                 message: format!("Schema {} not registered", req.schema),
+            });
+        }
+        let Some(frozen_schema) = self
+            .registry
+            .get_schema_at_version(&req.schema, &req.schema_version)
+        else {
+            return Err(IngestResult::Rejected {
+                class: lethe_core::domain::FailureClass::ValidationFailure,
+                message: format!(
+                    "Schema {} version {} is not registered",
+                    req.schema, req.schema_version
+                ),
             });
         };
 
@@ -144,8 +183,8 @@ impl<'a> ObservationPreparer<'a> {
             });
         }
 
-        if !schema.source_contracts.is_empty()
-            && !schema
+        if !frozen_schema.source_contracts.is_empty()
+            && !frozen_schema
                 .source_contracts
                 .iter()
                 .any(|contract| contract.observer_id == observer.id)
@@ -160,14 +199,33 @@ impl<'a> ObservationPreparer<'a> {
         }
 
         // Step 3: Validate payload (JSON Schema).
-        if let Err(message) = validate_payload(&schema.payload_schema, &req.payload) {
+        if let Err(message) = validate_payload(&frozen_schema.payload_schema, &req.payload) {
             return Err(IngestResult::Rejected {
                 class: lethe_core::domain::FailureClass::ValidationFailure,
                 message,
             });
         }
 
-        // Step 4: Governance policy before append.
+        if let Err(message) = lethe_core::domain::retraction_target_from_meta(&req.meta) {
+            return Err(IngestResult::Rejected {
+                class: lethe_core::domain::FailureClass::ValidationFailure,
+                message,
+            });
+        }
+
+        // Step 4: Resolve channel context and evaluate the latest consent
+        // decision immediately before the append gate.
+        let (consent, consent_identifiers) = match self.apply_channel_context(&mut req) {
+            Ok(context) => context,
+            Err(ticket) => return Err(IngestResult::Quarantined { ticket }),
+        };
+        let consent_scope = consent.as_ref().map(|value| value.as_str());
+        let consent_status = self
+            .consent_resolver
+            .map(|resolver| resolver.resolve(&req.subject, &consent_identifiers, consent_scope))
+            .unwrap_or(ConsentStatus::RestrictedCapture);
+
+        // Step 5: Governance policy before append.
         let policy = PolicyEngine::evaluate(&PolicyRequest {
             actor: ActorRef::new(req.observer.as_str().replace("obs:", "actor:")),
             role: Role::SystemAdmin,
@@ -176,7 +234,7 @@ impl<'a> ObservationPreparer<'a> {
                 authority: req.authority_model,
             },
             data_scope: AccessScope::Internal,
-            consent_status: ConsentStatus::RestrictedCapture,
+            consent_status,
             environment: Environment::Production,
         });
         match policy {
@@ -201,9 +259,9 @@ impl<'a> ObservationPreparer<'a> {
             }
         }
 
-        // Step 5: Idempotency is decided by the append boundary.
+        // Step 6: Idempotency is decided by the append boundary.
 
-        // Step 6: Verify blob refs exist (if any).
+        // Step 7: Verify blob refs exist (if any).
         for br in &req.attachments {
             if !self.blobs.contains(br) {
                 return Err(IngestResult::Rejected {
@@ -213,7 +271,7 @@ impl<'a> ObservationPreparer<'a> {
             }
         }
 
-        // Step 7 & 8: Temporal validation (L11).
+        // Step 8 & 9: Temporal validation (L11).
         if req.published > recorded_at + MAX_CLOCK_SKEW {
             return Err(IngestResult::Quarantined {
                 ticket: QuarantineTicket {
@@ -227,12 +285,7 @@ impl<'a> ObservationPreparer<'a> {
             });
         }
 
-        let consent = match self.apply_channel_context(&mut req) {
-            Ok(consent) => consent,
-            Err(ticket) => return Err(IngestResult::Quarantined { ticket }),
-        };
-
-        // Step 9: Build the Observation. Appending is the caller's responsibility.
+        // Step 10: Build the Observation. Appending is the caller's responsibility.
         Ok(Observation {
             id: Observation::new_id(),
             schema: req.schema,
@@ -257,34 +310,46 @@ impl<'a> ObservationPreparer<'a> {
     fn apply_channel_context(
         &self,
         req: &mut IngestRequest,
-    ) -> Result<Option<lethe_core::domain::ConsentRef>, QuarantineTicket> {
+    ) -> Result<(Option<lethe_core::domain::ConsentRef>, Vec<String>), QuarantineTicket> {
         let Some(source_system) = req.source_system.as_ref() else {
-            return Ok(None);
+            return Ok((None, Vec::new()));
         };
         let Some(kind) = lethe_registry::registry::ChannelKind::from_source_system(source_system)
         else {
-            return Ok(None);
+            return Ok((None, Vec::new()));
         };
         if !is_communication_message_schema(req.schema.as_str()) {
-            return Ok(None);
+            return Ok((None, Vec::new()));
         }
 
         let mut meta = req.meta.as_object().cloned().unwrap_or_default();
+        let required_metadata = [
+            ("source_instance", "source_instance"),
+            (COMM_CHANNEL_KIND_META_KEY, "communication channel kind"),
+            (
+                COMM_CHANNEL_EXTERNAL_ID_META_KEY,
+                "communication channel external id",
+            ),
+            (COMM_SENDER_ID_META_KEY, "communication sender"),
+            (COMM_THREAD_REF_META_KEY, "communication thread context"),
+        ];
+        for (key, label) in required_metadata {
+            if meta.get(key).and_then(serde_json::Value::as_str).is_none() {
+                return Err(channel_quarantine(format!(
+                    "communication observation missing {label} metadata"
+                )));
+            }
+        }
         let source_instance_id = meta
             .get("source_instance")
             .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                channel_quarantine("communication observation missing source_instance")
-            })?;
+            .expect("required source_instance metadata was checked")
+            .to_owned();
         let external_id = meta
             .get(COMM_CHANNEL_EXTERNAL_ID_META_KEY)
             .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| communication_external_id(kind, &req.payload))
-            .ok_or_else(|| {
-                channel_quarantine("communication observation missing channel external id")
-            })?;
+            .expect("required channel external id metadata was checked")
+            .to_owned();
         let channel = if let Some(channel_id) = meta
             .get(COMM_CHANNEL_ID_META_KEY)
             .and_then(serde_json::Value::as_str)
@@ -315,21 +380,33 @@ impl<'a> ObservationPreparer<'a> {
                 channel.id
             )));
         }
+        let payload_external_id = match kind {
+            lethe_registry::registry::ChannelKind::Slack
+            | lethe_registry::registry::ChannelKind::Discord => req
+                .payload
+                .get("channel_id")
+                .and_then(serde_json::Value::as_str),
+            lethe_registry::registry::ChannelKind::Gmail => req
+                .payload
+                .get("account_id")
+                .and_then(serde_json::Value::as_str),
+        };
+        if payload_external_id != Some(external_id.as_str()) {
+            return Err(channel_quarantine(
+                "communication channel external id does not match payload",
+            ));
+        }
 
         let sender = meta
             .get(COMM_SENDER_ID_META_KEY)
             .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| communication_sender(kind, &req.payload))
-            .ok_or_else(|| channel_quarantine("communication observation missing sender"))?;
+            .expect("required sender metadata was checked")
+            .to_owned();
         let thread_ref = meta
             .get(COMM_THREAD_REF_META_KEY)
             .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| communication_thread_ref(kind, &req.payload))
-            .ok_or_else(|| {
-                channel_quarantine("communication observation missing thread context")
-            })?;
+            .expect("required thread metadata was checked")
+            .to_owned();
         let reply_due_at =
             req.published + chrono::TimeDelta::seconds(channel.reply_slo_seconds as i64);
 
@@ -371,9 +448,12 @@ impl<'a> ObservationPreparer<'a> {
         );
         req.meta = serde_json::Value::Object(meta);
 
-        Ok(Some(lethe_core::domain::ConsentRef::new(
-            channel.default_consent_scope.clone(),
-        )))
+        Ok((
+            Some(lethe_core::domain::ConsentRef::new(
+                channel.default_consent_scope.clone(),
+            )),
+            vec![sender, external_id],
+        ))
     }
 }
 
@@ -416,67 +496,6 @@ fn is_communication_message_schema(schema: &str) -> bool {
     )
 }
 
-fn communication_external_id(
-    kind: lethe_registry::registry::ChannelKind,
-    payload: &serde_json::Value,
-) -> Option<String> {
-    let field = match kind {
-        lethe_registry::registry::ChannelKind::Slack => "channel_id",
-        lethe_registry::registry::ChannelKind::Gmail => "account_id",
-        lethe_registry::registry::ChannelKind::Discord => "channel_id",
-    };
-    payload
-        .get(field)
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-}
-
-fn communication_sender(
-    kind: lethe_registry::registry::ChannelKind,
-    payload: &serde_json::Value,
-) -> Option<String> {
-    match kind {
-        lethe_registry::registry::ChannelKind::Slack => payload
-            .get("user_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
-        lethe_registry::registry::ChannelKind::Gmail => payload
-            .get("from")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
-        lethe_registry::registry::ChannelKind::Discord => payload
-            .get("author_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
-    }
-}
-
-fn communication_thread_ref(
-    kind: lethe_registry::registry::ChannelKind,
-    payload: &serde_json::Value,
-) -> Option<String> {
-    match kind {
-        lethe_registry::registry::ChannelKind::Slack => payload
-            .get("thread_ts")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| payload.get("ts").and_then(serde_json::Value::as_str))
-            .map(|value| format!("slack:thread:{value}")),
-        lethe_registry::registry::ChannelKind::Gmail => payload
-            .get("thread_id")
-            .and_then(serde_json::Value::as_str)
-            .map(|value| format!("gmail:thread:{value}")),
-        lethe_registry::registry::ChannelKind::Discord => payload
-            .get("referenced_message_id")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| {
-                payload
-                    .get("message_id")
-                    .and_then(serde_json::Value::as_str)
-            })
-            .map(|value| format!("discord:thread:{value}")),
-    }
-}
-
 fn channel_quarantine(message: impl Into<String>) -> QuarantineTicket {
     QuarantineTicket {
         id: uuid::Uuid::now_v7().to_string(),
@@ -491,6 +510,43 @@ fn validate_payload(schema: &serde_json::Value, payload: &serde_json::Value) -> 
     validator
         .validate(payload)
         .map_err(|err| format!("Payload does not match schema: {err}"))
+}
+
+/// Count top-level payload fields not declared by the projection contract.
+/// Such fields remain in canonical storage and are reported as import
+/// telemetry; they are never silently discarded at the ingestion boundary.
+pub fn count_surplus_payload_fields(
+    schema: &serde_json::Value,
+    payload: &serde_json::Value,
+) -> usize {
+    fn count(schema: &serde_json::Value, payload: &serde_json::Value) -> usize {
+        let mut surplus = 0;
+        if let (Some(properties), Some(object)) = (
+            schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object),
+            payload.as_object(),
+        ) {
+            surplus += object
+                .keys()
+                .filter(|key| !properties.contains_key(*key))
+                .count();
+            for (key, property_schema) in properties {
+                if let Some(property) = object.get(key) {
+                    surplus += count(property_schema, property);
+                }
+            }
+        }
+        if let (Some(item_schema), Some(items)) = (schema.get("items"), payload.as_array()) {
+            surplus += items
+                .iter()
+                .map(|item| count(item_schema, item))
+                .sum::<usize>();
+        }
+        surplus
+    }
+
+    count(schema, payload)
 }
 
 // ===========================================================================
@@ -586,6 +642,10 @@ mod tests {
             meta: serde_json::json!({
                 "canonical_json": canonical_json,
                 "source_instance": "slack-test",
+                "communication_channel_kind": "slack",
+                "communication_channel_external_id": "C01",
+                "communication_sender_id": "U01",
+                "communication_thread_ref": "slack:thread:999.000000",
             }),
         }
     }
@@ -1019,5 +1079,124 @@ mod tests {
 
         let delta = lake.since(wm.position);
         assert_eq!(delta.len(), 1);
+    }
+
+    struct OptedOutResolver;
+
+    impl ConsentDecisionResolver for OptedOutResolver {
+        fn resolve(
+            &self,
+            _subject: &EntityRef,
+            _identifiers: &[String],
+            _consent_scope: Option<&str>,
+        ) -> ConsentStatus {
+            ConsentStatus::OptedOut
+        }
+    }
+
+    #[test]
+    fn capture_gate_uses_latest_consent_and_quarantines_opted_out_capture() {
+        let registry = setup_registry();
+        let blobs = BlobStore::new();
+        let result =
+            ObservationPreparer::new_with_consent_resolver(&registry, &blobs, &OptedOutResolver)
+                .prepare(valid_request());
+        assert!(matches!(result, Err(IngestResult::Quarantined { .. })));
+    }
+
+    #[test]
+    fn surplus_fields_are_counted_and_typed_retraction_rejects_legacy_string() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"]
+        });
+        assert_eq!(
+            count_surplus_payload_fields(
+                &schema,
+                &serde_json::json!({
+                    "text": "kept",
+                    "future": 1
+                })
+            ),
+            1
+        );
+        let registry = setup_registry();
+        let blobs = BlobStore::new();
+        let mut request = valid_request();
+        request.meta["retracts"] = serde_json::json!("legacy-target");
+        let result = ObservationPreparer::new(&registry, &blobs).prepare(request);
+        assert!(matches!(result, Err(IngestResult::Rejected { .. })));
+    }
+
+    #[test]
+    fn strict_v2_rejects_missing_declared_fields_but_preserves_extras() {
+        let mut registry = setup_registry();
+        registry
+            .add_schema_version(
+                &SchemaRef::new("schema:slack-message"),
+                SemVer::new("2.0.0"),
+                serde_json::json!({
+                    "type": "object",
+                    "required": ["text"],
+                    "properties": {"text": {"type": "string"}}
+                }),
+                vec![],
+            )
+            .unwrap();
+        let blobs = BlobStore::new();
+        let mut lake = LakeStore::new();
+
+        let mut missing = valid_request();
+        missing.schema_version = SemVer::new("2.0.0");
+        missing.payload.as_object_mut().unwrap().remove("text");
+        let result = (IngestionGate {
+            registry: &registry,
+            lake: &mut lake,
+            blobs: &blobs,
+        })
+        .ingest(missing);
+        assert!(matches!(result, IngestResult::Rejected { .. }));
+        assert!(lake.list().is_empty());
+
+        let mut accepted = valid_request();
+        accepted.schema_version = SemVer::new("2.0.0");
+        accepted.idempotency_key = IdempotencyKey::new("slack:C01:1000");
+        accepted.payload["extra_for_salvage"] = serde_json::json!({"future": true});
+        let result = (IngestionGate {
+            registry: &registry,
+            lake: &mut lake,
+            blobs: &blobs,
+        })
+        .ingest(accepted);
+        assert!(matches!(result, IngestResult::Ingested { .. }));
+        assert_eq!(lake.list()[0].payload["extra_for_salvage"]["future"], true);
+        let later_projection_schema = serde_json::json!({
+            "type": "object",
+            "required": [
+                "text",
+                "channel_id",
+                "user_id",
+                "ts",
+                "thread_ts",
+                "extra_for_salvage"
+            ],
+            "properties": {
+                "text": {"type": "string"},
+                "channel_id": {"type": "string"},
+                "user_id": {"type": "string"},
+                "ts": {"type": "string"},
+                "thread_ts": {"type": "string"},
+                "extra_for_salvage": {
+                    "type": "object",
+                    "properties": {"future": {"type": "boolean"}}
+                }
+            }
+        });
+        assert_eq!(
+            count_surplus_payload_fields(&later_projection_schema, &lake.list()[0].payload),
+            0,
+            "stored extras remain available when a later projection declares them"
+        );
     }
 }
