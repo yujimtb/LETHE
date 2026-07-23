@@ -328,6 +328,35 @@ class ImportRequestError(GateError):
         self.status_code = status_code
 
 
+@dataclass
+class BulkSessionResult:
+    """Response from POST /api/import/bulk-sessions/{begin,{id}/end}.
+
+    ``report`` mirrors BulkImportSessionReport (session_id, state,
+    base_append_seq, target_append_seq, target_observation_count) from
+    apps/selfhost/src/self_host/app/bulk_import.rs.
+    """
+
+    report: dict[str, Any]
+    elapsed_seconds: float
+
+    @property
+    def session_id(self) -> str:
+        return self.report["session_id"]
+
+    @property
+    def state(self) -> str:
+        return self.report.get("state", "<unknown>")
+
+
+# HTTP statuses that indicate the bulk-session API family is unusable in
+# this environment (auth/scope/routing), as opposed to a real business-logic
+# conflict (e.g. a stray already-active session, which is a genuine failure
+# worth surfacing, not a "skip"). Per gate policy, only this class of error
+# causes bulk-session tests to be marked skipped instead of failed.
+SESSION_API_UNAVAILABLE_STATUS_CODES = {401, 403, 404, 405, 501}
+
+
 def _http_post_json(
     url: str, json_body: dict[str, Any], headers: dict[str, str], timeout: float
 ) -> tuple[int, Any]:
@@ -394,6 +423,42 @@ class ImportClient:
         except Exception:
             return False, None
         return status_code == 200, status_code
+
+    def begin_bulk_session(self, timeout: float | None = None) -> BulkSessionResult:
+        """POST /api/import/bulk-sessions/begin — no request body."""
+        return self._bulk_session_call(
+            f"{self.base_url}/api/import/bulk-sessions/begin", timeout
+        )
+
+    def end_bulk_session(
+        self, session_id: str, timeout: float | None = None
+    ) -> BulkSessionResult:
+        """POST /api/import/bulk-sessions/{session_id}/end — no request body.
+
+        This is the call that triggers the (potentially expensive)
+        materialized-snapshot refresh / non-corpus-projection rebuild in
+        apps/selfhost/src/self_host/app/bulk_import.rs::end_bulk_import_session
+        when the session's target isn't already materialized — the code
+        path the corpus-scale-proportional-rebuild regression lives in.
+        """
+        return self._bulk_session_call(
+            f"{self.base_url}/api/import/bulk-sessions/{session_id}/end", timeout
+        )
+
+    def _bulk_session_call(self, url: str, timeout: float | None) -> BulkSessionResult:
+        headers = {
+            "Authorization": f"Bearer {self._token}",
+            "Content-Type": "application/json",
+        }
+        started = time.monotonic()
+        status_code, response = _http_post_json(
+            url, {}, headers, timeout or self.default_timeout
+        )
+        elapsed = time.monotonic() - started
+        if status_code != 200:
+            body_text = getattr(response, "text", "<no body>")
+            raise ImportRequestError(status_code, body_text)
+        return BulkSessionResult(report=response.json(), elapsed_seconds=elapsed)
 
 
 def assert_no_failures(counts: OutcomeCounts, *, context: str) -> None:

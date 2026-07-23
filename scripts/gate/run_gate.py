@@ -7,11 +7,27 @@ seeded data directory (see seed_gate_corpus.py), memory-capped with
 
   1. dup-only replay  — resend already-seeded drafts; nothing should be
      durably retained beyond a small residual.
+  1b. bulk session dup-only — same dup-only replay, but each 100-item
+     batch is wrapped in its own bulk-session begin/import/end cycle.
+     Targets the pathology found by the sol audit: `end` triggers a full
+     corpus/materialization rebuild path
+     (bulk_import.rs::end_bulk_import_session), and pre-fix that rebuild
+     scaled with corpus size even for a session that only ever saw
+     duplicates.
   2. new bulk import  — 1000 fresh drafts, once batched at 25 and once at
      1000, bounding both peak-over-baseline and post-settle residual.
+  2b. bulk session new import — the batch=25 new-1000 case again, this
+     time wrapped in a single begin/.../end bulk session.
   3. slope detection   — repeat dup-only batches and regress
      batch-number vs. post-settle RSS; a corpus-size-proportional leak
      shows up as a positive slope even when a single batch looks fine.
+
+Tests 1b and 2b drive POST /api/import/bulk-sessions/begin and
+POST /api/import/bulk-sessions/{session_id}/end (apps/selfhost/src/self_host/
+server.rs). If the bulk-session API is unusable in this environment (auth,
+scope, or routing — see gate_common.SESSION_API_UNAVAILABLE_STATUS_CODES),
+those two tests are marked skipped (not failed) with a reason recorded in
+the report, and a warning is printed to stdout.
 
 Never pushes anywhere and never talks to a non-loopback host: the
 container is published on 127.0.0.1 only, and this script performs no
@@ -100,6 +116,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bulk-peak-threshold-mib", type=float, default=4096.0)
     parser.add_argument("--bulk-residual-threshold-mib", type=float, default=768.0)
     parser.add_argument("--slope-threshold-mib-per-batch", type=float, default=8.0)
+    parser.add_argument(
+        "--bulk-session-end-latency-threshold-seconds",
+        type=float,
+        default=10.0,
+        help=(
+            "test 1b: max acceptable POST .../bulk-sessions/{id}/end duration per "
+            "batch. The regression this gate targets showed ~26s/batch; a fixed "
+            "session-end should stay in the single-digit seconds"
+        ),
+    )
 
     return parser.parse_args()
 
@@ -301,6 +327,123 @@ def run_test1_dup_only(
     }
 
 
+def _skipped_test_result(name: str, reason: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "passed": True,
+        "skipped": True,
+        "skip_reason": reason,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Test 1b: bulk session dup-only (begin -> 100 dup drafts -> end, x4)
+# ---------------------------------------------------------------------------
+
+
+def run_test1b_bulk_session_dup_only(
+    client: gc.ImportClient,
+    sampler: gc.DockerStatsSampler,
+    *,
+    source_instance_id: str,
+    tag: str,
+    start_index: int,
+    baseline_mib: float,
+    container_name: str,
+    post_batch_wait_seconds: float,
+    rss_average_window_seconds: float,
+    residual_threshold_mib: float,
+    end_latency_threshold_seconds: float,
+) -> dict[str, Any]:
+    log("=== test 1b: bulk session dup-only (begin -> 100 dup -> end, x4) ===")
+
+    gc.assert_container_alive(container_name)
+    try:
+        first_begin = client.begin_bulk_session(timeout=60.0)
+    except gc.ImportRequestError as error:
+        if error.status_code in gc.SESSION_API_UNAVAILABLE_STATUS_CODES:
+            reason = (
+                f"bulk-sessions/begin returned HTTP {error.status_code}; "
+                "treating the bulk-session API as unavailable in this environment"
+            )
+            log(f"WARNING: skipping test 1b — {reason}")
+            return _skipped_test_result("bulk_session_dup_only", reason)
+        raise
+
+    import_latencies: list[float] = []
+    end_durations: list[float] = []
+    end_latency_violations: list[dict[str, Any]] = []
+    session_states: list[str] = []
+
+    def run_one_batch(batch_num: int, begin_result: gc.BulkSessionResult) -> None:
+        session_id = begin_result.session_id
+        lo = start_index + batch_num * 100
+        hi = lo + 100
+        drafts = [
+            gc.build_corpus_draft(tag=tag, source_instance_id=source_instance_id, index=i)
+            for i in range(lo, hi)
+        ]
+        import_result = client.send_drafts(
+            source_instance_id, drafts, bulk_session_id=session_id, timeout=120.0
+        )
+        gc.assert_all_duplicate(
+            import_result.counts,
+            100,
+            context=f"bulk-session dup batch {batch_num + 1} [{lo},{hi})",
+        )
+        import_latencies.append(import_result.elapsed_seconds)
+
+        end_result = client.end_bulk_session(session_id, timeout=1800.0)
+        end_durations.append(end_result.elapsed_seconds)
+        session_states.append(end_result.state)
+        if end_result.elapsed_seconds > end_latency_threshold_seconds:
+            end_latency_violations.append(
+                {"batch": batch_num + 1, "end_seconds": end_result.elapsed_seconds}
+            )
+        log(
+            f"bulk-session dup batch {batch_num + 1}/4: import={import_result.elapsed_seconds:.3f}s "
+            f"end={end_result.elapsed_seconds:.3f}s state={end_result.state}"
+        )
+
+    run_one_batch(0, first_begin)
+    for batch_num in range(1, 4):
+        gc.assert_container_alive(container_name)
+        begin_result = client.begin_bulk_session(timeout=60.0)
+        run_one_batch(batch_num, begin_result)
+
+    log(f"test 1b sending done; settling {post_batch_wait_seconds:.0f}s before residual RSS sample ...")
+    time.sleep(post_batch_wait_seconds)
+    gc.assert_container_alive(container_name)
+    after_mib = sampler.average_recent(rss_average_window_seconds)
+    residual_mib = after_mib - baseline_mib
+
+    residual_ok = residual_mib <= residual_threshold_mib
+    end_latency_ok = len(end_latency_violations) == 0
+    passed = residual_ok and end_latency_ok
+    log(
+        f"test 1b result: baseline={baseline_mib:.1f}MiB after={after_mib:.1f}MiB "
+        f"residual={residual_mib:.1f}MiB (threshold={residual_threshold_mib:.1f}MiB) "
+        f"end_durations={[f'{d:.1f}s' for d in end_durations]} "
+        f"(threshold={end_latency_threshold_seconds:.1f}s) pass={passed}"
+    )
+    if end_latency_violations:
+        log(f"test 1b FAIL REASON: session-end latency regression reproduced: {end_latency_violations}")
+    return {
+        "name": "bulk_session_dup_only",
+        "passed": passed,
+        "skipped": False,
+        "import_batch_latencies_seconds": import_latencies,
+        "end_duration_seconds": end_durations,
+        "session_states_after_end": session_states,
+        "end_latency_threshold_seconds": end_latency_threshold_seconds,
+        "end_latency_violations": end_latency_violations,
+        "baseline_mib": baseline_mib,
+        "after_mib": after_mib,
+        "residual_mib": residual_mib,
+        "residual_threshold_mib": residual_threshold_mib,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Test 2: new bulk import (batch=25 and batch=1000)
 # ---------------------------------------------------------------------------
@@ -384,6 +527,111 @@ def run_bulk_subtest(
 
 
 # ---------------------------------------------------------------------------
+# Test 2b: new bulk import wrapped in a single bulk session (batch=25)
+# ---------------------------------------------------------------------------
+
+
+def run_test2b_bulk_session_new(
+    client: gc.ImportClient,
+    sampler: gc.DockerStatsSampler,
+    *,
+    source_instance_id: str,
+    tag: str,
+    start_index: int,
+    count: int,
+    batch_size: int,
+    baseline_mib: float,
+    container_name: str,
+    post_batch_wait_seconds: float,
+    rss_average_window_seconds: float,
+    peak_threshold_mib: float,
+    residual_threshold_mib: float,
+) -> dict[str, Any]:
+    log(f"=== test 2b: bulk session new import ({count} drafts, batch={batch_size}, session-wrapped) ===")
+
+    gc.assert_container_alive(container_name)
+    try:
+        begin_result = client.begin_bulk_session(timeout=60.0)
+    except gc.ImportRequestError as error:
+        if error.status_code in gc.SESSION_API_UNAVAILABLE_STATUS_CODES:
+            reason = (
+                f"bulk-sessions/begin returned HTTP {error.status_code}; "
+                "treating the bulk-session API as unavailable in this environment"
+            )
+            log(f"WARNING: skipping test 2b — {reason}")
+            return _skipped_test_result("bulk_session_new_batch25", reason)
+        raise
+
+    session_id = begin_result.session_id
+    marker = sampler.mark()
+    total = gc.OutcomeCounts()
+    latencies: list[float] = []
+    index = start_index
+    end_index = start_index + count
+    while index < end_index:
+        gc.assert_container_alive(container_name)
+        batch_end = min(index + batch_size, end_index)
+        drafts = [
+            gc.build_corpus_draft(tag=tag, source_instance_id=source_instance_id, index=i)
+            for i in range(index, batch_end)
+        ]
+        result = client.send_drafts(
+            source_instance_id, drafts, bulk_session_id=session_id, timeout=180.0
+        )
+        gc.assert_all_ingested(
+            result.counts, len(drafts), context=f"bulk-session new batch [{index},{batch_end})"
+        )
+        total = total + result.counts
+        latencies.append(result.elapsed_seconds)
+        index = batch_end
+
+    end_result = client.end_bulk_session(session_id, timeout=1800.0)
+    peak_mib = sampler.peak_since(marker)
+    peak_over_baseline_mib = peak_mib - baseline_mib
+    log(
+        f"test 2b sending+end done ({total.ingested} ingested, end={end_result.elapsed_seconds:.1f}s); "
+        f"settling {post_batch_wait_seconds:.0f}s before residual RSS sample ..."
+    )
+    time.sleep(post_batch_wait_seconds)
+    gc.assert_container_alive(container_name)
+    after_mib = sampler.average_recent(rss_average_window_seconds)
+    residual_mib = after_mib - baseline_mib
+
+    peak_ok = peak_over_baseline_mib <= peak_threshold_mib
+    residual_ok = residual_mib <= residual_threshold_mib
+    ingested_ok = total.ingested == count and total.duplicates == 0
+    passed = peak_ok and residual_ok and ingested_ok
+    log(
+        f"test 2b result: peak={peak_mib:.1f}MiB peak_over_baseline={peak_over_baseline_mib:.1f}MiB "
+        f"(threshold={peak_threshold_mib:.1f}MiB) after={after_mib:.1f}MiB "
+        f"residual={residual_mib:.1f}MiB (threshold={residual_threshold_mib:.1f}MiB) "
+        f"ingested={total.ingested}/{count} pass={passed}"
+    )
+    return {
+        "name": "bulk_session_new_batch25",
+        "passed": passed,
+        "skipped": False,
+        "batch_size": batch_size,
+        "count": count,
+        "ingested": total.ingested,
+        "duplicates": total.duplicates,
+        "batch_latencies_seconds": latencies,
+        "peak_mib": peak_mib,
+        "peak_over_baseline_mib": peak_over_baseline_mib,
+        "peak_threshold_mib": peak_threshold_mib,
+        "baseline_mib": baseline_mib,
+        "after_mib": after_mib,
+        "residual_mib": residual_mib,
+        "residual_threshold_mib": residual_threshold_mib,
+        # informational only — this test's pass/fail uses the same
+        # peak/residual thresholds as test 2, per gate policy; only test 1b
+        # gates on session-end latency itself.
+        "end_duration_seconds": end_result.elapsed_seconds,
+        "session_state_after_end": end_result.state,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Test 3: slope detection
 # ---------------------------------------------------------------------------
 
@@ -451,10 +699,11 @@ def run_test3_slope(
 def main() -> int:
     args = parse_args()
 
-    if args.seed_count < 1600:
+    if args.seed_count < 2000:
         raise gc.GateError(
-            "--seed-count must be >= 1600 (test 1 and test 3 each consume 800 "
-            "distinct dup-sample indices from the seeded range)"
+            "--seed-count must be >= 2000 (test 1 and test 3 each consume 800 "
+            "distinct dup-sample indices, and test 1b consumes another 400, "
+            "all from the seeded range)"
         )
 
     env = gc.read_env_file(args.env_file)
@@ -478,6 +727,7 @@ def main() -> int:
             "bulk_peak_threshold_mib": args.bulk_peak_threshold_mib,
             "bulk_residual_threshold_mib": args.bulk_residual_threshold_mib,
             "slope_threshold_mib_per_batch": args.slope_threshold_mib_per_batch,
+            "bulk_session_end_latency_threshold_seconds": args.bulk_session_end_latency_threshold_seconds,
         },
         "phases": {},
         "tests": [],
@@ -539,6 +789,21 @@ def main() -> int:
         )
         report["tests"].append(test1)
 
+        test1b = run_test1b_bulk_session_dup_only(
+            client,
+            sampler,
+            source_instance_id=args.source_instance,
+            tag=args.tag,
+            start_index=1600,
+            baseline_mib=baseline_mib,
+            container_name=container_name,
+            post_batch_wait_seconds=args.post_batch_wait_seconds,
+            rss_average_window_seconds=args.rss_average_window_seconds,
+            residual_threshold_mib=args.dup_residual_threshold_mib,
+            end_latency_threshold_seconds=args.bulk_session_end_latency_threshold_seconds,
+        )
+        report["tests"].append(test1b)
+
         bulk25_start = args.seed_count
         bulk1000_start = args.seed_count + 1000
         test2a = run_bulk_subtest(
@@ -576,6 +841,24 @@ def main() -> int:
             residual_threshold_mib=args.bulk_residual_threshold_mib,
         )
         report["tests"].append(test2b)
+
+        bulk_session_new_start = args.seed_count + 2000
+        test2b_session = run_test2b_bulk_session_new(
+            client,
+            sampler,
+            source_instance_id=args.source_instance,
+            tag=args.tag,
+            start_index=bulk_session_new_start,
+            count=1000,
+            batch_size=25,
+            baseline_mib=baseline_mib,
+            container_name=container_name,
+            post_batch_wait_seconds=args.post_batch_wait_seconds,
+            rss_average_window_seconds=args.rss_average_window_seconds,
+            peak_threshold_mib=args.bulk_peak_threshold_mib,
+            residual_threshold_mib=args.bulk_residual_threshold_mib,
+        )
+        report["tests"].append(test2b_session)
 
         test3 = run_test3_slope(
             client,
@@ -631,8 +914,13 @@ def print_summary(report: dict[str, Any]) -> None:
     if report.get("fatal_error"):
         log(f"fatal_error: {report['fatal_error']}")
     for test in report.get("tests", []):
-        status = "PASS" if test.get("passed") else "FAIL"
+        if test.get("skipped"):
+            status = "SKIP"
+        else:
+            status = "PASS" if test.get("passed") else "FAIL"
         log(f"  [{status}] {test.get('name')}")
+        if test.get("skipped"):
+            log(f"         reason: {test.get('skip_reason')}")
     if "peak_mib_overall" in report:
         log(f"peak RSS observed (overall): {report['peak_mib_overall']:.1f}MiB")
     log("=" * 72)
