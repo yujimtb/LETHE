@@ -113,6 +113,13 @@ impl CorpusIndexSource for LockedCorpusIndexSource {
     ) -> StorageResult<Vec<StoredObservation>> {
         self.lock()?.observation_page(after_append_seq, limit)
     }
+
+    fn observations_for_privacy_key(
+        &self,
+        privacy_key: &str,
+    ) -> StorageResult<Vec<StoredObservation>> {
+        self.lock()?.observations_for_privacy_key(privacy_key)
+    }
 }
 
 impl SearchIndexManager {

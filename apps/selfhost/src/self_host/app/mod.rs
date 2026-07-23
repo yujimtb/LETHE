@@ -42,7 +42,8 @@ use lethe_core::domain::{
     ActorRef, AuthorityModel, BlobRef, CaptureModel, EntityRef, FailureClass, IngestResult,
     MAX_CLOCK_SKEW, Observation, ObservationId, ObserverRef, ProjectionHealth, ProjectionRef,
     ProjectionStatus, ReadMode, SchemaRef, SemVer, SourceSystemRef, SupplementalId,
-    SupplementalRecord,
+    SupplementalRecord, consent_decision_from_observation, consent_decision_keys,
+    consent_decision_order as shared_consent_decision_order,
 };
 use lethe_derivation_gemini::{GeminiSlideAnalyzer, SlideAnalysisProjector};
 use lethe_engine::identity::projector::IdentityProjector;
@@ -981,6 +982,11 @@ trait ComponentProjectionLookup {
         observation_id: &ObservationId,
     ) -> Result<Option<StoredObservation>, SelfHostError>;
 
+    fn observations_for_privacy_key(
+        &self,
+        privacy_key: &str,
+    ) -> Result<Vec<StoredObservation>, SelfHostError>;
+
     fn person_message_items(&self, owner_key: &str) -> Result<Vec<ProjectionItem>, SelfHostError>;
 }
 
@@ -994,6 +1000,13 @@ impl ComponentProjectionLookup for StorageComponentProjectionLookup<'_> {
         observation_id: &ObservationId,
     ) -> Result<Option<StoredObservation>, SelfHostError> {
         Ok(self.storage.observation_by_id(observation_id)?)
+    }
+
+    fn observations_for_privacy_key(
+        &self,
+        privacy_key: &str,
+    ) -> Result<Vec<StoredObservation>, SelfHostError> {
+        Ok(self.storage.observations_for_privacy_key(privacy_key)?)
     }
 
     fn person_message_items(&self, owner_key: &str) -> Result<Vec<ProjectionItem>, SelfHostError> {
@@ -2506,7 +2519,7 @@ impl CompactProjectionState {
 fn consent_decision_order(
     decision: &CompactConsentDecision,
 ) -> (DateTime<Utc>, DateTime<Utc>, &str) {
-    (
+    shared_consent_decision_order(
         decision.published,
         decision.recorded_at,
         decision.observation_id.as_str(),
@@ -2865,6 +2878,25 @@ fn apply_compact_incremental_delta_with_sequences(
         &core.canonical_observation_fingerprint,
         appended_observations,
     )?;
+    let mut reconsent_observations = BTreeMap::new();
+    for observation in appended_observations {
+        let Some(decision) = consent_decision_from_observation(observation)
+            .filter(|decision| decision.status == "unrestricted")
+        else {
+            continue;
+        };
+        for privacy_key in consent_decision_keys(&decision) {
+            for stored in lookup.observations_for_privacy_key(&privacy_key)? {
+                reconsent_observations
+                    .entry(stored.observation.id.as_str().to_owned())
+                    .or_insert(stored.observation);
+            }
+        }
+    }
+    core.communication_projection.remember_observations(
+        &reconsent_observations.into_values().collect::<Vec<_>>(),
+        &core.supplemental_projection_cache.reply_slo,
+    );
     let compact_apply = core
         .compact_state
         .apply_observation_page(appended_observations)?;

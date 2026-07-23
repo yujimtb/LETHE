@@ -18,10 +18,11 @@ use lethe_api::api::grep::GrepRequest;
 use lethe_core::domain::supplemental::InputAnchorSet;
 
 use super::{
-    AppCore, AppService, GoogleSourceRuntime, ImportOutcome, SearchJobStatus, SelfHostError,
-    SlackSourceRuntime, classify_slack_ingress, discovered_slack_threads,
-    extract_slide_text_fragments, infer_profile_name_from_fragments, latest_revision_to_capture,
-    namespace_draft, non_empty_state, ranked_self_intro_slide_indices, thread_root_ts,
+    AppCore, AppService, CompactProjectionState, GoogleSourceRuntime, ImportOutcome,
+    SearchJobStatus, SelfHostError, SlackSourceRuntime, classify_slack_ingress,
+    discovered_slack_threads, extract_slide_text_fragments, infer_profile_name_from_fragments,
+    latest_revision_to_capture, namespace_draft, non_empty_state, ranked_self_intro_slide_indices,
+    thread_root_ts,
 };
 use crate::self_host::config::{
     ApiTokenConfig, CorpusProjectionConfig, FreshnessConfig, GoogleConfig, JsonWebKey,
@@ -32,10 +33,13 @@ use crate::self_host::google::HttpGoogleSlidesClient;
 use crate::self_host::slack::HttpSlackClient;
 use lethe_core::domain::{
     ActorRef, AuthorityModel, CaptureModel, EntityRef, IdempotencyKey, IngestResult, Mutability,
-    Observation, ObserverRef, ProjectionRef, SchemaRef, SemVer, SourceSystemRef, SupplementalId,
-    SupplementalRecord,
+    Observation, ObservationId, ObserverRef, ProjectionRef, SchemaRef, SemVer, SourceSystemRef,
+    SupplementalId, SupplementalRecord,
 };
 use lethe_derivation_gemini::GeminiSlideAnalyzer;
+use lethe_engine::lake::ConsentDecisionResolver;
+use lethe_policy::governance::types::ConsentStatus;
+use lethe_projection_corpus::PrivacyFilter;
 use lethe_runtime::runtime::partition::RoutingKeyOrder;
 use lethe_storage_api::{
     OperationalAppendOutcome, OperationalAppendRequest, SlackThreadKey, StoredObservation,
@@ -52,6 +56,49 @@ fn non_empty_state_filters_blank_values() {
         non_empty_state(Some("1234567890.123456".to_string())).as_deref(),
         Some("1234567890.123456")
     );
+}
+
+#[test]
+fn capture_gate_and_projection_use_identical_latest_consent_ordering() {
+    let target = Observation {
+        id: Observation::new_id(),
+        schema: SchemaRef::new("schema:claude-message"),
+        schema_version: SemVer::new("1.0.0"),
+        observer: ObserverRef::new("obs:test"),
+        source_system: Some(SourceSystemRef::new("sys:claude-ai")),
+        actor: None,
+        authority_model: AuthorityModel::LakeAuthoritative,
+        capture_model: CaptureModel::Event,
+        subject: EntityRef::new("person:1"),
+        target: None,
+        payload: serde_json::json!({"text": "consent parity", "email": "person-1"}),
+        attachments: Vec::new(),
+        published: "2026-01-01T00:00:00Z".parse().unwrap(),
+        recorded_at: "2026-01-01T00:00:01Z".parse().unwrap(),
+        consent: None,
+        idempotency_key: IdempotencyKey::new("parity-target"),
+        meta: serde_json::json!({}),
+    };
+    let decision = |id: &str, status: &str, published: &str| {
+        let mut observation = target.clone();
+        observation.id = ObservationId::new(id);
+        observation.schema = SchemaRef::new("schema:consent-decision");
+        observation.payload = serde_json::json!({
+            "status": status,
+            "identifier": "person-1",
+        });
+        observation.published = published.parse().unwrap();
+        observation.recorded_at = observation.published + chrono::Duration::seconds(1);
+        observation
+    };
+    let newest_unrestricted = decision("consent:new", "unrestricted", "2026-01-03T00:00:00Z");
+    let late_old_opt_out = decision("consent:old", "opted_out", "2026-01-02T00:00:00Z");
+    let observations = vec![target.clone(), newest_unrestricted, late_old_opt_out];
+    let compact = CompactProjectionState::build(&observations).unwrap();
+    let capture_status = compact.resolve(&target.subject, &["person-1".to_owned()], None);
+    let projection = PrivacyFilter::from_observations(&observations);
+    assert_eq!(capture_status, ConsentStatus::Unrestricted);
+    assert!(projection.visible(&target));
 }
 
 #[test]
@@ -2203,6 +2250,21 @@ impl super::ComponentProjectionLookup for TestComponentProjectionLookup {
             .borrow_mut()
             .push(observation_id.as_str().to_owned());
         Ok(self.observations.get(observation_id.as_str()).cloned())
+    }
+
+    fn observations_for_privacy_key(
+        &self,
+        privacy_key: &str,
+    ) -> Result<Vec<lethe_storage_api::StoredObservation>, SelfHostError> {
+        Ok(self
+            .observations
+            .values()
+            .filter(|stored| {
+                lethe_core::domain::observation_privacy_keys(&stored.observation)
+                    .contains(privacy_key)
+            })
+            .cloned()
+            .collect())
     }
 
     fn person_message_items(

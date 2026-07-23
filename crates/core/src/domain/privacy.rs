@@ -1,8 +1,85 @@
 //! Privacy control values shared by the append-only lake and projections.
 
+use std::collections::BTreeSet;
+
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::{Observation, ObservationId};
+
+/// The consent decision materialized by projections and the capture gate.
+///
+/// Consent is an append-only ledger.  The order is deliberately independent
+/// of append order so that a late-arriving old decision cannot replace a newer
+/// published decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsentDecision {
+    pub observation_id: ObservationId,
+    pub subject: String,
+    pub identifier: Option<String>,
+    pub status: String,
+    pub published: DateTime<Utc>,
+    pub recorded_at: DateTime<Utc>,
+}
+
+/// The single ordering rule shared by capture and every privacy projection.
+pub fn consent_decision_order(
+    published: DateTime<Utc>,
+    recorded_at: DateTime<Utc>,
+    observation_id: &str,
+) -> (DateTime<Utc>, DateTime<Utc>, &str) {
+    (published, recorded_at, observation_id)
+}
+
+pub fn consent_decision_from_observation(observation: &Observation) -> Option<ConsentDecision> {
+    if observation.schema.as_str() != "schema:consent-decision" {
+        return None;
+    }
+    let status = observation
+        .payload
+        .get("status")
+        .and_then(serde_json::Value::as_str)?;
+    Some(ConsentDecision {
+        observation_id: observation.id.clone(),
+        subject: observation.subject.as_str().to_owned(),
+        identifier: observation
+            .payload
+            .get("identifier")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        status: status.to_owned(),
+        published: observation.published,
+        recorded_at: observation.recorded_at,
+    })
+}
+
+pub fn consent_decision_keys(decision: &ConsentDecision) -> BTreeSet<String> {
+    let mut keys = BTreeSet::from([decision.subject.clone()]);
+    if let Some(identifier) = &decision.identifier {
+        keys.insert(identifier.clone());
+    }
+    keys
+}
+
+/// Return the subject and identifier values whose latest consent can govern
+/// an observation.  The result is unique and stable for reverse indexes.
+pub fn observation_privacy_keys(observation: &Observation) -> BTreeSet<String> {
+    let mut keys = BTreeSet::from([observation.subject.as_str().to_owned()]);
+    for value in [
+        observation.meta.get("communication_sender_id"),
+        observation.payload.get("identifier"),
+        observation.payload.get("user_id"),
+        observation.payload.get("from"),
+        observation.payload.get("author_id"),
+        observation.payload.get("email"),
+    ] {
+        if let Some(value) = value.and_then(serde_json::Value::as_str) {
+            keys.insert(value.to_owned());
+        }
+    }
+    keys
+}
 
 /// The canonical typed target carried by a retraction observation.
 ///

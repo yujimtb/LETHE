@@ -3,7 +3,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use chrono::{DateTime, Utc};
-use lethe_core::domain::{Observation, ProjectionRef, RetractionTarget};
+use lethe_core::domain::{
+    ConsentDecision, Observation, ProjectionRef, RetractionTarget,
+    consent_decision_from_observation, consent_decision_order, observation_privacy_keys,
+};
 use lethe_engine::projection::runner::Projector;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -599,10 +602,10 @@ impl CorpusProjector {
 #[derive(Debug, Default)]
 pub struct CorpusProjectionState {
     observations: BTreeMap<String, Observation>,
+    observation_ids_by_privacy_key: BTreeMap<String, BTreeSet<String>>,
     records: BTreeMap<String, CorpusRecord>,
     record_observation_ids: BTreeMap<String, String>,
     record_source_object_ids: BTreeMap<String, String>,
-    record_privacy_keys: BTreeMap<String, BTreeSet<String>>,
     privacy: PrivacyFilter,
 }
 
@@ -615,6 +618,12 @@ impl CorpusProjectionState {
         for observation in observations {
             self.observations
                 .insert(observation.id.as_str().to_owned(), observation.clone());
+            for privacy_key in observation_privacy_keys(observation) {
+                self.observation_ids_by_privacy_key
+                    .entry(privacy_key)
+                    .or_default()
+                    .insert(observation.id.as_str().to_owned());
+            }
 
             if let Some(value) = observation.meta.get("retracts") {
                 match RetractionTarget::from_value(value) {
@@ -628,16 +637,8 @@ impl CorpusProjectionState {
             }
 
             if observation.schema.as_str() == "schema:consent-decision" {
-                self.privacy.apply_consent(observation);
-                if self.privacy.is_opted_out(observation) {
-                    self.remove_records_for_privacy_key(observation.subject.as_str());
-                    if let Some(identifier) = observation
-                        .payload
-                        .get("identifier")
-                        .and_then(serde_json::Value::as_str)
-                    {
-                        self.remove_records_for_privacy_key(identifier);
-                    }
+                for privacy_key in self.privacy.apply_consent(observation) {
+                    self.rematerialize_privacy_key(projector, &privacy_key);
                 }
                 continue;
             }
@@ -672,21 +673,6 @@ impl CorpusProjectionState {
             self.record_source_object_ids
                 .insert(record_id.clone(), source_object_id.to_owned());
         }
-        self.record_privacy_keys.insert(
-            record_id.clone(),
-            record
-                .metadata
-                .get("privacy_keys")
-                .and_then(serde_json::Value::as_array)
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(serde_json::Value::as_str)
-                        .map(str::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default(),
-        );
         self.records.insert(record_id, record);
     }
 
@@ -694,7 +680,6 @@ impl CorpusProjectionState {
         self.records.remove(record_id);
         self.record_observation_ids.remove(record_id);
         self.record_source_object_ids.remove(record_id);
-        self.record_privacy_keys.remove(record_id);
     }
 
     fn remove_records_for_observation(&mut self, observation_id: &str) {
@@ -730,29 +715,52 @@ impl CorpusProjectionState {
         }
     }
 
-    fn remove_records_for_privacy_key(&mut self, privacy_key: &str) {
-        let record_ids = self
-            .record_privacy_keys
-            .iter()
-            .filter(|(_, keys)| keys.contains(privacy_key))
-            .map(|(record_id, _)| record_id.clone())
-            .collect::<Vec<_>>();
-        for record_id in record_ids {
-            self.remove_record(&record_id);
+    fn rematerialize_privacy_key(&mut self, projector: &CorpusProjector, privacy_key: &str) {
+        let observation_ids = self
+            .observation_ids_by_privacy_key
+            .get(privacy_key)
+            .cloned()
+            .unwrap_or_default();
+        for observation_id in observation_ids {
+            self.remove_records_for_observation(&observation_id);
+            let Some(observation) = self.observations.get(&observation_id).cloned() else {
+                continue;
+            };
+            if !self.privacy.visible(&observation) {
+                continue;
+            }
+            for record in projector.project_observation(&observation, &HashSet::new()) {
+                self.insert_record(record);
+            }
         }
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PrivacyFilter {
     retracted_observation_ids: BTreeSet<String>,
     retracted_source_object_ids: BTreeSet<String>,
-    opted_out_subjects: BTreeSet<String>,
-    opted_out_identifiers: BTreeSet<String>,
+    consent_by_subject: BTreeMap<String, ConsentDecision>,
+    consent_by_identifier: BTreeMap<String, ConsentDecision>,
     invalid_retraction: bool,
 }
 
 impl PrivacyFilter {
+    pub fn from_materialized_state(
+        consent_by_subject: &BTreeMap<String, ConsentDecision>,
+        consent_by_identifier: &BTreeMap<String, ConsentDecision>,
+        retracted_observation_ids: &BTreeSet<String>,
+        retracted_source_object_ids: &BTreeSet<String>,
+    ) -> Self {
+        Self {
+            retracted_observation_ids: retracted_observation_ids.clone(),
+            retracted_source_object_ids: retracted_source_object_ids.clone(),
+            consent_by_subject: consent_by_subject.clone(),
+            consent_by_identifier: consent_by_identifier.clone(),
+            invalid_retraction: false,
+        }
+    }
+
     pub fn from_observations(observations: &[Observation]) -> Self {
         let mut fold = Self::default();
         fold.apply_observations(observations);
@@ -781,33 +789,30 @@ impl PrivacyFilter {
         }
     }
 
-    fn apply_consent(&mut self, observation: &Observation) {
-        if observation.schema.as_str() == "schema:consent-decision"
-            && observation
-                .payload
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                == Some("opted_out")
-        {
-            self.opted_out_subjects
-                .insert(observation.subject.as_str().to_owned());
-            if let Some(identifier) = observation
-                .payload
-                .get("identifier")
-                .and_then(serde_json::Value::as_str)
-            {
-                self.opted_out_identifiers.insert(identifier.to_owned());
-            }
+    /// Apply a consent ledger entry and return only keys whose latest entry
+    /// changed.  Older decisions arriving late are intentionally ignored.
+    pub fn apply_consent(&mut self, observation: &Observation) -> BTreeSet<String> {
+        let Some(decision) = consent_decision_from_observation(observation) else {
+            return BTreeSet::new();
+        };
+        let mut changed = BTreeSet::new();
+        if update_latest_consent(
+            &mut self.consent_by_subject,
+            decision.subject.clone(),
+            decision.clone(),
+        ) {
+            changed.insert(decision.subject.clone());
         }
-    }
-
-    fn is_opted_out(&self, observation: &Observation) -> bool {
-        observation.schema.as_str() == "schema:consent-decision"
-            && observation
-                .payload
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                == Some("opted_out")
+        if let Some(identifier) = decision.identifier.clone()
+            && update_latest_consent(
+                &mut self.consent_by_identifier,
+                identifier.clone(),
+                decision,
+            )
+        {
+            changed.insert(identifier);
+        }
+        changed
     }
 
     pub fn visible(&self, observation: &Observation) -> bool {
@@ -833,29 +838,66 @@ impl PrivacyFilter {
         {
             return false;
         }
-        if self
-            .opted_out_subjects
-            .contains(observation.subject.as_str())
+        self.latest_consent(observation)
+            .is_none_or(|decision| decision.status != "opted_out")
+    }
+
+    pub fn latest_consent(&self, observation: &Observation) -> Option<&ConsentDecision> {
+        let identifiers = observation_identifiers(observation);
+        self.consent_by_subject
+            .get(observation.subject.as_str())
+            .into_iter()
+            .chain(
+                identifiers
+                    .iter()
+                    .filter_map(|identifier| self.consent_by_identifier.get(identifier)),
+            )
+            .max_by(|left, right| {
+                consent_decision_order(
+                    left.published,
+                    left.recorded_at,
+                    left.observation_id.as_str(),
+                )
+                .cmp(&consent_decision_order(
+                    right.published,
+                    right.recorded_at,
+                    right.observation_id.as_str(),
+                ))
+            })
+    }
+}
+
+fn update_latest_consent(
+    index: &mut BTreeMap<String, ConsentDecision>,
+    key: String,
+    decision: ConsentDecision,
+) -> bool {
+    match index.get(&key) {
+        Some(current)
+            if consent_decision_order(
+                current.published,
+                current.recorded_at,
+                current.observation_id.as_str(),
+            ) >= consent_decision_order(
+                decision.published,
+                decision.recorded_at,
+                decision.observation_id.as_str(),
+            ) =>
         {
-            return false;
+            false
         }
-        !observation_identifiers(observation)
-            .iter()
-            .any(|identifier| self.opted_out_identifiers.contains(identifier))
+        _ => {
+            index.insert(key, decision);
+            true
+        }
     }
 }
 
 fn observation_identifiers(observation: &Observation) -> Vec<String> {
-    [
-        observation.meta.get("communication_sender_id"),
-        observation.payload.get("user_id"),
-        observation.payload.get("from"),
-        observation.payload.get("author_id"),
-        observation.payload.get("email"),
-    ]
-    .into_iter()
-    .filter_map(|value| value.and_then(serde_json::Value::as_str).map(str::to_owned))
-    .collect()
+    observation_privacy_keys(observation)
+        .into_iter()
+        .filter(|key| key != observation.subject.as_str())
+        .collect()
 }
 
 impl Projector for CorpusProjector {
@@ -1501,6 +1543,17 @@ mod tests {
         }
     }
 
+    fn consent(subject: &str, status: &str, published: &str) -> Observation {
+        let mut observation = obs(
+            "schema:consent-decision",
+            serde_json::json!({"status": status, "identifier": "person-1"}),
+        );
+        observation.subject = EntityRef::new(subject);
+        observation.published = published.parse().unwrap();
+        observation.recorded_at = observation.published + chrono::Duration::seconds(1);
+        observation
+    }
+
     #[test]
     fn retraction_removes_prior_record_incrementally_and_keeps_canonical_target() {
         let projector = CorpusProjector::personal_all_text_config();
@@ -1559,6 +1612,56 @@ mod tests {
             .expect("on-demand privacy validation should pass");
         assert_eq!(report.observations_checked, 2);
         assert_eq!(report.records_checked, 0);
+    }
+
+    #[test]
+    fn consent_reconsent_restores_incrementally_and_late_old_decision_does_not_win() {
+        let projector = CorpusProjector::personal_all_text_config();
+        let mut target = obs(
+            "schema:claude-message",
+            serde_json::json!({"text": "restored secret", "email": "person-1"}),
+        );
+        target.subject = EntityRef::new("person:1");
+        let opt_out = consent("person:1", "opted_out", "2026-01-02T00:00:00Z");
+        let reconsent = consent("person:1", "unrestricted", "2026-01-03T00:00:00Z");
+        let late_old_opt_out = consent("person:1", "opted_out", "2026-01-02T00:00:00Z");
+
+        let mut state = CorpusProjectionState::default();
+        assert_eq!(
+            state.fold_observations(&projector, &[target.clone()]).len(),
+            1
+        );
+        assert!(state.fold_observations(&projector, &[opt_out]).is_empty());
+        assert_eq!(state.fold_observations(&projector, &[reconsent]).len(), 1);
+        assert_eq!(
+            state
+                .fold_observations(&projector, &[late_old_opt_out])
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn retraction_remains_permanently_shielded_after_reconsent() {
+        let projector = CorpusProjector::personal_all_text_config();
+        let mut target = obs(
+            "schema:claude-message",
+            serde_json::json!({"text": "never restored"}),
+        );
+        target.subject = EntityRef::new("person:1");
+        target.meta["object_id"] = serde_json::json!("claude:message:permanent");
+        let mut retraction = obs(
+            "schema:claude-message",
+            serde_json::json!({"text": "retraction"}),
+        );
+        retraction.meta["retracts"] = serde_json::json!({
+            "source_object_id": "claude:message:permanent"
+        });
+        let reconsent = consent("person:1", "unrestricted", "2026-01-03T00:00:00Z");
+
+        let mut state = CorpusProjectionState::default();
+        state.fold_observations(&projector, &[target, retraction]);
+        assert!(state.fold_observations(&projector, &[reconsent]).is_empty());
     }
 
     #[test]

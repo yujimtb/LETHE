@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use lethe_core::domain::{
-    Observation, ObservationId, ProjectionRef, RetractionTarget, SupplementalId, SupplementalRecord,
+    ConsentDecision, Observation, ObservationId, ProjectionRef, RetractionTarget, SupplementalId,
+    SupplementalRecord, consent_decision_from_observation, consent_decision_order,
+    observation_privacy_keys,
 };
 use lethe_engine::projection::runner::Projector;
 use lethe_projection_claim_queue::{
@@ -720,6 +722,8 @@ pub struct CommunicationFact {
 pub struct CommunicationProjectionState {
     facts_by_thread: BTreeMap<String, BTreeMap<String, CommunicationFact>>,
     observation_keys: BTreeMap<String, CommunicationThreadKey>,
+    #[serde(skip)]
+    observations: BTreeMap<String, Observation>,
     #[serde(default)]
     source_object_ids: BTreeMap<String, String>,
     #[serde(default)]
@@ -729,9 +733,11 @@ pub struct CommunicationProjectionState {
     #[serde(default)]
     retracted_source_object_ids: BTreeSet<String>,
     #[serde(default)]
-    opted_out_subjects: BTreeSet<String>,
+    consent_by_subject: BTreeMap<String, ConsentDecision>,
     #[serde(default)]
-    opted_out_sender_ids: BTreeSet<String>,
+    consent_by_identifier: BTreeMap<String, ConsentDecision>,
+    #[serde(default)]
+    observation_ids_by_privacy_key: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl CommunicationProjectionState {
@@ -778,23 +784,8 @@ impl CommunicationProjectionState {
         let mut delta = Vec::new();
         for observation in observations {
             if observation.schema.as_str() == "schema:consent-decision" {
-                if observation
-                    .payload
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("opted_out")
-                {
-                    let subject = observation.subject.as_str().to_owned();
-                    self.opted_out_subjects.insert(subject.clone());
-                    self.remove_privacy_matches(&subject, None);
-                    if let Some(identifier) = observation
-                        .payload
-                        .get("identifier")
-                        .and_then(serde_json::Value::as_str)
-                    {
-                        self.opted_out_sender_ids.insert(identifier.to_owned());
-                        self.remove_privacy_matches(&subject, Some(identifier));
-                    }
+                for privacy_key in self.apply_consent(observation) {
+                    self.rematerialize_privacy_key(&privacy_key, join_index, &mut delta);
                 }
                 continue;
             }
@@ -822,60 +813,10 @@ impl CommunicationProjectionState {
                 }
                 continue;
             }
-            let Some(fact) = communication_fact(observation, join_index) else {
-                continue;
-            };
-            let observation_id = fact.incoming_observation_id.as_str().to_owned();
-            self.observation_subjects.insert(
-                observation_id.clone(),
-                observation.subject.as_str().to_owned(),
-            );
-            if self
-                .opted_out_subjects
-                .contains(observation.subject.as_str())
-                || self.opted_out_sender_ids.contains(fact.sender_id.as_str())
-            {
-                self.remove_observation(&observation_id);
-                continue;
+            if communication_fact(observation, join_index).is_some() {
+                self.remember_observation(observation);
             }
-            if self.retracted_observation_ids.contains(&observation_id) {
-                continue;
-            }
-            if let Some(source_object_id) = observation
-                .meta
-                .get("object_id")
-                .and_then(serde_json::Value::as_str)
-            {
-                self.source_object_ids
-                    .insert(observation_id.clone(), source_object_id.to_owned());
-                if self.retracted_source_object_ids.contains(source_object_id) {
-                    continue;
-                }
-            }
-            let key = CommunicationThreadKey {
-                channel_id: fact.channel_id.clone(),
-                thread_ref: fact.thread_ref.clone(),
-            };
-            let storage_key = communication_thread_storage_key(&key);
-            if let Some(previous_key) = self
-                .observation_keys
-                .insert(observation_id.clone(), key.clone())
-                && previous_key != key
-                && let Some(facts) = self
-                    .facts_by_thread
-                    .get_mut(&communication_thread_storage_key(&previous_key))
-            {
-                facts.remove(&observation_id);
-                if facts.is_empty() {
-                    self.facts_by_thread
-                        .remove(&communication_thread_storage_key(&previous_key));
-                }
-            }
-            self.facts_by_thread
-                .entry(storage_key)
-                .or_default()
-                .insert(observation_id, fact.clone());
-            delta.push(reply_latency_from_fact(&fact, Utc::now()));
+            self.materialize_observation(observation, join_index, &mut delta);
         }
         sort_reply_slo_rows(&mut delta);
         let overdue = delta
@@ -889,6 +830,161 @@ impl CommunicationProjectionState {
         }
     }
 
+    /// Remember canonical observations without materializing them.  This is
+    /// used by the consumer lane when a persisted state receives a
+    /// re-consent and must restore previously shielded communication facts.
+    pub fn remember_observations(
+        &mut self,
+        observations: &[Observation],
+        join_index: &ReplySloJoinIndex,
+    ) {
+        for observation in observations {
+            if observation.schema.as_str() == "schema:consent-decision"
+                || observation.meta.get("retracts").is_some()
+                || communication_fact(observation, join_index).is_none()
+            {
+                continue;
+            }
+            self.remember_observation(observation);
+        }
+    }
+
+    fn remember_observation(&mut self, observation: &Observation) {
+        let observation_id = observation.id.as_str().to_owned();
+        self.observations
+            .insert(observation_id.clone(), observation.clone());
+        self.observation_subjects.insert(
+            observation_id.clone(),
+            observation.subject.as_str().to_owned(),
+        );
+        if let Some(source_object_id) = observation
+            .meta
+            .get("object_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            self.source_object_ids
+                .insert(observation_id.clone(), source_object_id.to_owned());
+        }
+        for privacy_key in observation_privacy_keys(observation) {
+            self.observation_ids_by_privacy_key
+                .entry(privacy_key)
+                .or_default()
+                .insert(observation_id.clone());
+        }
+    }
+
+    fn apply_consent(&mut self, observation: &Observation) -> BTreeSet<String> {
+        let Some(decision) = consent_decision_from_observation(observation) else {
+            return BTreeSet::new();
+        };
+        let mut changed = BTreeSet::new();
+        if update_latest_consent(
+            &mut self.consent_by_subject,
+            decision.subject.clone(),
+            decision.clone(),
+        ) {
+            changed.insert(decision.subject.clone());
+        }
+        if let Some(identifier) = decision.identifier.clone()
+            && update_latest_consent(
+                &mut self.consent_by_identifier,
+                identifier.clone(),
+                decision,
+            )
+        {
+            changed.insert(identifier);
+        }
+        changed
+    }
+
+    fn materialize_observation(
+        &mut self,
+        observation: &Observation,
+        join_index: &ReplySloJoinIndex,
+        delta: &mut Vec<ReplyLatency>,
+    ) {
+        let Some(fact) = communication_fact(observation, join_index) else {
+            return;
+        };
+        let observation_id = fact.incoming_observation_id.as_str().to_owned();
+        self.remove_observation(&observation_id);
+        if !self.visible(observation) {
+            return;
+        }
+        let key = CommunicationThreadKey {
+            channel_id: fact.channel_id.clone(),
+            thread_ref: fact.thread_ref.clone(),
+        };
+        let storage_key = communication_thread_storage_key(&key);
+        self.observation_keys.insert(observation_id.clone(), key);
+        self.facts_by_thread
+            .entry(storage_key)
+            .or_default()
+            .insert(observation_id, fact.clone());
+        delta.push(reply_latency_from_fact(&fact, Utc::now()));
+    }
+
+    fn rematerialize_privacy_key(
+        &mut self,
+        privacy_key: &str,
+        join_index: &ReplySloJoinIndex,
+        delta: &mut Vec<ReplyLatency>,
+    ) {
+        let observation_ids = self
+            .observation_ids_by_privacy_key
+            .get(privacy_key)
+            .cloned()
+            .unwrap_or_default();
+        for observation_id in observation_ids {
+            let Some(observation) = self.observations.get(&observation_id).cloned() else {
+                continue;
+            };
+            self.materialize_observation(&observation, join_index, delta);
+        }
+    }
+
+    fn visible(&self, observation: &Observation) -> bool {
+        if self
+            .retracted_observation_ids
+            .contains(observation.id.as_str())
+        {
+            return false;
+        }
+        if observation
+            .meta
+            .get("object_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| self.retracted_source_object_ids.contains(id))
+        {
+            return false;
+        }
+        let identifiers = observation_privacy_keys(observation)
+            .into_iter()
+            .filter(|key| key != observation.subject.as_str())
+            .collect::<Vec<_>>();
+        self.consent_by_subject
+            .get(observation.subject.as_str())
+            .into_iter()
+            .chain(
+                identifiers
+                    .iter()
+                    .filter_map(|identifier| self.consent_by_identifier.get(identifier)),
+            )
+            .max_by(|left, right| {
+                consent_decision_order(
+                    left.published,
+                    left.recorded_at,
+                    left.observation_id.as_str(),
+                )
+                .cmp(&consent_decision_order(
+                    right.published,
+                    right.recorded_at,
+                    right.observation_id.as_str(),
+                ))
+            })
+            .is_none_or(|decision| decision.status != "opted_out")
+    }
+
     fn remove_observation(&mut self, observation_id: &str) {
         if let Some(key) = self.observation_keys.remove(observation_id)
             && let Some(facts) = self
@@ -900,28 +996,6 @@ impl CommunicationProjectionState {
                 self.facts_by_thread
                     .remove(&communication_thread_storage_key(&key));
             }
-        }
-        self.source_object_ids.remove(observation_id);
-        self.observation_subjects.remove(observation_id);
-    }
-
-    fn remove_privacy_matches(&mut self, subject: &str, sender_id: Option<&str>) {
-        let mut observation_ids = self
-            .observation_subjects
-            .iter()
-            .filter(|(_, value)| value.as_str() == subject)
-            .map(|(observation_id, _)| observation_id.clone())
-            .collect::<BTreeSet<_>>();
-        if let Some(sender_id) = sender_id {
-            observation_ids.extend(self.facts_by_thread.values().flat_map(|facts| {
-                facts
-                    .iter()
-                    .filter(|(_, fact)| fact.sender_id == sender_id)
-                    .map(|(observation_id, _)| observation_id.clone())
-            }));
-        }
-        for observation_id in observation_ids {
-            self.remove_observation(&observation_id);
         }
     }
 
@@ -988,6 +1062,32 @@ impl CommunicationProjectionState {
 
     pub fn is_empty(&self) -> bool {
         self.observation_keys.is_empty()
+    }
+}
+
+fn update_latest_consent(
+    index: &mut BTreeMap<String, ConsentDecision>,
+    key: String,
+    decision: ConsentDecision,
+) -> bool {
+    match index.get(&key) {
+        Some(current)
+            if consent_decision_order(
+                current.published,
+                current.recorded_at,
+                current.observation_id.as_str(),
+            ) >= consent_decision_order(
+                decision.published,
+                decision.recorded_at,
+                decision.observation_id.as_str(),
+            ) =>
+        {
+            false
+        }
+        _ => {
+            index.insert(key, decision);
+            true
+        }
     }
 }
 
@@ -1518,6 +1618,19 @@ mod tests {
                 "reply_due_at": due_at,
             }
         });
+        observation
+    }
+
+    fn consent_observation(subject: &str, status: &str, published: DateTime<Utc>) -> Observation {
+        let mut observation = observation("sys:consent", published);
+        observation.id = ObservationId::new(format!("consent:{status}:{}", published.timestamp()));
+        observation.subject = EntityRef::new(subject);
+        observation.schema = SchemaRef::new("schema:consent-decision");
+        observation.payload = serde_json::json!({
+            "status": status,
+            "identifier": "sender@example.test",
+        });
+        observation.recorded_at = published + chrono::Duration::seconds(1);
         observation
     }
 
@@ -2265,6 +2378,41 @@ mod tests {
         let mut state = CommunicationProjectionState::default();
         let join_index = ReplySloJoinIndex::default();
         state.fold_observations(&[target, consent], &join_index);
+        assert!(state.is_empty());
+    }
+
+    #[test]
+    fn communication_reconsent_restores_incrementally_and_ignores_late_old_decision() {
+        let mut target = communication_observation("obs:target", "chan:mail", at(1), at(8));
+        target.subject = EntityRef::new("person:1");
+        let opt_out = consent_observation("person:1", "opted_out", at(2));
+        let reconsent = consent_observation("person:1", "unrestricted", at(3));
+        let late_old_opt_out = consent_observation("person:1", "opted_out", at(2));
+        let join_index = ReplySloJoinIndex::default();
+        let mut state = CommunicationProjectionState::default();
+
+        state.fold_observations(&[target, opt_out], &join_index);
+        assert!(state.is_empty());
+        state.fold_observations(&[reconsent], &join_index);
+        assert_eq!(state.len(), 1);
+        state.fold_observations(&[late_old_opt_out], &join_index);
+        assert_eq!(state.len(), 1);
+    }
+
+    #[test]
+    fn communication_retraction_is_not_reversed_by_reconsent() {
+        let mut target = communication_observation("obs:target", "chan:mail", at(1), at(8));
+        target.subject = EntityRef::new("person:1");
+        target.meta["object_id"] = serde_json::json!("mail:permanent");
+        let mut retraction = communication_observation("obs:retract", "chan:mail", at(2), at(9));
+        retraction.meta["retracts"] = serde_json::json!({
+            "source_object_id": "mail:permanent"
+        });
+        let reconsent = consent_observation("person:1", "unrestricted", at(3));
+        let join_index = ReplySloJoinIndex::default();
+        let mut state = CommunicationProjectionState::default();
+
+        state.fold_observations(&[target, retraction, reconsent], &join_index);
         assert!(state.is_empty());
     }
 

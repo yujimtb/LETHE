@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
+use lethe_core::domain::ConsentDecision;
 use serde::{Deserialize, Serialize};
 use tantivy::schema::{
     FAST, Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions,
 };
 
-pub const INDEX_FORMAT_VERSION: u32 = 2;
+pub const INDEX_FORMAT_VERSION: u32 = 3;
 pub const NGRAM_TOKENIZER: &str = "lethe_ngram_1_3_v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -22,6 +23,10 @@ pub struct IndexCommitMetadata {
     pub record_count: u64,
     pub source_type_counts: BTreeMap<String, u64>,
     pub linked_form_sheet_ids: Vec<String>,
+    pub consent_by_subject: BTreeMap<String, ConsentDecision>,
+    pub consent_by_identifier: BTreeMap<String, ConsentDecision>,
+    pub retracted_observation_ids: Vec<String>,
+    pub retracted_source_object_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +157,10 @@ mod tests {
             record_count: 7,
             source_type_counts: BTreeMap::from([("slack".to_owned(), 7)]),
             linked_form_sheet_ids: vec!["sheet-1".to_owned()],
+            consent_by_subject: BTreeMap::new(),
+            consent_by_identifier: BTreeMap::new(),
+            retracted_observation_ids: Vec::new(),
+            retracted_source_object_ids: Vec::new(),
         };
         let round_trip: IndexCommitMetadata =
             serde_json::from_str(&serde_json::to_string(&metadata).unwrap()).unwrap();

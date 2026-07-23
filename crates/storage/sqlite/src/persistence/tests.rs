@@ -635,17 +635,45 @@ fn migration_ledger_records_current_schema_version() {
         .conn
         .query_row(
             "SELECT version FROM schema_migrations WHERE version = ?1",
-            [CURRENT_SCHEMA_VERSION],
+            [SCHEMA_VERSION_RECONSENT_PRIVACY_INDEX],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    assert_eq!(version, SCHEMA_VERSION_RECONSENT_PRIVACY_INDEX);
 
     let _ = fs::remove_dir_all(tmp);
 }
 
 #[test]
-fn schema_v12_converges_from_fresh_v9_and_v10_upgrade_paths() {
+fn reconsent_privacy_reverse_index_tracks_subject_and_identifier_keys() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    let mut observation = sample_observation();
+    observation.payload["email"] = serde_json::json!("person@example.test");
+    store.append_observation_idempotent(&observation).unwrap();
+
+    assert_eq!(
+        store
+            .observations_for_privacy_key("entity:test")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .observations_for_privacy_key("person@example.test")
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn schema_v13_converges_from_fresh_v9_and_v10_upgrade_paths() {
     let fresh_tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let fresh = SqlitePersistence::open(
         &fresh_tmp.join("test.sqlite3"),
@@ -668,8 +696,12 @@ fn schema_v12_converges_from_fresh_v9_and_v10_upgrade_paths() {
             "indexed_keyset_reads".to_owned(),
         ),
         (
-            CURRENT_SCHEMA_VERSION,
+            SCHEMA_VERSION_PRIVACY_PROJECTION,
             "privacy_projection_visibility".to_owned(),
+        ),
+        (
+            SCHEMA_VERSION_RECONSENT_PRIVACY_INDEX,
+            "reconsent_privacy_reverse_index".to_owned(),
         ),
     ];
     assert_eq!(migration_ledger(&fresh), current_ledger.clone());
@@ -757,8 +789,12 @@ fn schema_v12_converges_from_fresh_v9_and_v10_upgrade_paths() {
                 "indexed_keyset_reads".to_owned()
             ),
             (
-                CURRENT_SCHEMA_VERSION,
+                SCHEMA_VERSION_PRIVACY_PROJECTION,
                 "privacy_projection_visibility".to_owned(),
+            ),
+            (
+                SCHEMA_VERSION_RECONSENT_PRIVACY_INDEX,
+                "reconsent_privacy_reverse_index".to_owned(),
             ),
         ]
     );
@@ -770,7 +806,7 @@ fn schema_v12_converges_from_fresh_v9_and_v10_upgrade_paths() {
 }
 
 #[test]
-fn schema_v12_upgrades_true_v11_operational_event_shape() {
+fn schema_v13_upgrades_true_v11_operational_event_shape() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let database_path = tmp.join("operational.sqlite3");
     let blob_dir = tmp.join("blobs");

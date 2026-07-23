@@ -13,7 +13,7 @@ use sha2::Digest;
 
 use lethe_core::domain::{
     BlobRef, DataSpaceId, IdempotencyKey, Observation, ObservationId, OperationalEventId,
-    SupplementalId, SupplementalRecord,
+    SupplementalId, SupplementalRecord, observation_privacy_keys,
 };
 use lethe_runtime::runtime::partition::{
     PARTITION_EVENT_FAILOVER, PARTITION_EVENT_INITIALIZE, PARTITION_EVENT_RECOVER,
@@ -66,7 +66,8 @@ pub struct SqliteOperationalEventStore {
 const SCHEMA_VERSION_IDENTITY_LOOKUP_INDEX: i64 = 9;
 const SCHEMA_VERSION_LOCK_SPLIT_SCALARS: i64 = 10;
 const SCHEMA_VERSION_KEYSET_READS: i64 = 11;
-const CURRENT_SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION_PRIVACY_PROJECTION: i64 = 12;
+const SCHEMA_VERSION_RECONSENT_PRIVACY_INDEX: i64 = 13;
 const CANONICAL_JSON_META_KEY: &str = "canonical_json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -767,6 +768,50 @@ impl SqlitePersistence {
         .transpose()
     }
 
+    pub fn observations_for_privacy_key(
+        &self,
+        privacy_key: &str,
+    ) -> Result<Vec<StoredObservation>, PersistenceError> {
+        if privacy_key.trim().is_empty() {
+            return Err(PersistenceError::SchemaInvariant(
+                "privacy key must not be blank".to_owned(),
+            ));
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT reverse_index.append_seq, reverse_index.observation_id, observations.leaf_id,
+                    observations.observation_json
+             FROM observation_privacy_keys reverse_index
+             JOIN observations ON observations.id = reverse_index.observation_id
+             WHERE reverse_index.privacy_key = ?1
+             ORDER BY reverse_index.append_seq",
+        )?;
+        let rows = statement.query_map([privacy_key], |row| {
+            Ok((
+                row.get::<_, u64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (append_seq, observation_id, leaf_id, json) = row?;
+            let observation: Observation = serde_json::from_str(&json)?;
+            if observation.id.as_str() != observation_id {
+                return Err(PersistenceError::SchemaInvariant(format!(
+                    "privacy index observation id {} disagrees with payload {}",
+                    observation_id,
+                    observation.id.as_str()
+                )));
+            }
+            Ok(StoredObservation {
+                leaf_id,
+                append_seq,
+                observation,
+            })
+        })
+        .collect()
+    }
+
     pub fn leaf_positions(&self) -> Result<Vec<LeafPosition>, PersistenceError> {
         let tree = self.partition_tree_snapshot()?;
         let mut positions = Vec::new();
@@ -1055,6 +1100,33 @@ impl SqlitePersistence {
             END;
             ",
         )?;
+        transaction.execute("DELETE FROM observation_privacy_keys", [])?;
+        let rebuilt_privacy_rows = {
+            let mut statement = transaction.prepare(
+                "SELECT id, append_seq, observation_json
+                 FROM observations ORDER BY append_seq",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (observation_id, append_seq, json) in rebuilt_privacy_rows {
+            let observation: Observation = serde_json::from_str(&json)?;
+            for privacy_key in observation_privacy_keys(&observation) {
+                transaction.execute(
+                    "INSERT INTO observation_privacy_keys (
+                        privacy_key, observation_id, append_seq
+                     ) VALUES (?1, ?2, ?3)",
+                    params![privacy_key, observation_id, append_seq],
+                )?;
+            }
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -2654,6 +2726,14 @@ fn append_observations_in_transaction(
              WHERE singleton = 1",
             [append_seq],
         )?;
+        for privacy_key in observation_privacy_keys(observation) {
+            transaction.execute(
+                "INSERT INTO observation_privacy_keys (
+                    privacy_key, observation_id, append_seq
+                 ) VALUES (?1, ?2, ?3)",
+                params![privacy_key, observation.id.as_str(), append_seq],
+            )?;
+        }
         outcomes.push(DurableAppendOutcome::Appended(observation.id.clone()));
     }
     Ok(outcomes)
@@ -3143,6 +3223,13 @@ impl ObservationStorePort for SqlitePersistence {
 
     fn observation_by_id(&self, id: &ObservationId) -> StorageResult<Option<StoredObservation>> {
         SqlitePersistence::observation_by_id(self, id).map_err(storage_error)
+    }
+
+    fn observations_for_privacy_key(
+        &self,
+        privacy_key: &str,
+    ) -> StorageResult<Vec<StoredObservation>> {
+        SqlitePersistence::observations_for_privacy_key(self, privacy_key).map_err(storage_error)
     }
 
     fn leaf_positions(&self) -> StorageResult<Vec<LeafPosition>> {
