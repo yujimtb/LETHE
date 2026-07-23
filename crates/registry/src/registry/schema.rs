@@ -50,5 +50,7 @@ pub struct SchemaVersion {
     pub schema_id: SchemaRef,
     pub version: SemVer,
     pub payload_schema: serde_json::Value,
+    #[serde(default)]
+    pub source_contracts: Vec<SchemaSourceContract>,
     pub created_at: DateTime<Utc>,
 }

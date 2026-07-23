@@ -645,7 +645,7 @@ fn migration_ledger_records_current_schema_version() {
 }
 
 #[test]
-fn schema_v11_converges_from_fresh_v9_and_v10_upgrade_paths() {
+fn schema_v12_converges_from_fresh_v9_and_v10_upgrade_paths() {
     let fresh_tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let fresh = SqlitePersistence::open(
         &fresh_tmp.join("test.sqlite3"),
@@ -663,7 +663,14 @@ fn schema_v11_converges_from_fresh_v9_and_v10_upgrade_paths() {
             SCHEMA_VERSION_LOCK_SPLIT_SCALARS,
             "append_commit_lock_split_scalars".to_owned(),
         ),
-        (CURRENT_SCHEMA_VERSION, "indexed_keyset_reads".to_owned()),
+        (
+            SCHEMA_VERSION_KEYSET_READS,
+            "indexed_keyset_reads".to_owned(),
+        ),
+        (
+            CURRENT_SCHEMA_VERSION,
+            "privacy_projection_visibility".to_owned(),
+        ),
     ];
     assert_eq!(migration_ledger(&fresh), current_ledger.clone());
     drop(fresh);
@@ -745,7 +752,14 @@ fn schema_v11_converges_from_fresh_v9_and_v10_upgrade_paths() {
                 SCHEMA_VERSION_LOCK_SPLIT_SCALARS,
                 "append_commit_lock_split_scalars".to_owned(),
             ),
-            (CURRENT_SCHEMA_VERSION, "indexed_keyset_reads".to_owned()),
+            (
+                SCHEMA_VERSION_KEYSET_READS,
+                "indexed_keyset_reads".to_owned()
+            ),
+            (
+                CURRENT_SCHEMA_VERSION,
+                "privacy_projection_visibility".to_owned(),
+            ),
         ]
     );
     assert_eq!(v8.observation_stats().unwrap().count, 1);
@@ -756,7 +770,7 @@ fn schema_v11_converges_from_fresh_v9_and_v10_upgrade_paths() {
 }
 
 #[test]
-fn schema_v11_upgrades_true_v10_operational_event_shape() {
+fn schema_v12_upgrades_true_v11_operational_event_shape() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let database_path = tmp.join("operational.sqlite3");
     let blob_dir = tmp.join("blobs");
@@ -797,7 +811,9 @@ fn schema_v11_upgrades_true_v10_operational_event_shape() {
                 ALTER TABLE operational_events DROP COLUMN correlation_id;
                 ALTER TABLE operational_events DROP COLUMN causation_id;
                 ALTER TABLE operational_events DROP COLUMN actor_id;
-                DELETE FROM schema_migrations WHERE version = 11;
+                DROP INDEX projection_visible_blob_refs_subject_lookup;
+                ALTER TABLE projection_visible_blob_refs DROP COLUMN subject_key;
+                DELETE FROM schema_migrations WHERE version >= 11;
                 ",
             )
             .unwrap();
@@ -805,6 +821,16 @@ fn schema_v11_upgrades_true_v10_operational_event_shape() {
         assert!(!columns.contains("correlation_id"));
         assert!(!columns.contains("causation_id"));
         assert!(!columns.contains("actor_id"));
+        let visible_columns = seed
+            .persistence()
+            .conn
+            .prepare("PRAGMA table_info(projection_visible_blob_refs)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()
+            .unwrap();
+        assert!(!visible_columns.contains("subject_key"));
     }
 
     let upgraded =
@@ -813,6 +839,16 @@ fn schema_v11_upgrades_true_v10_operational_event_shape() {
     assert!(columns.contains("correlation_id"));
     assert!(columns.contains("causation_id"));
     assert!(columns.contains("actor_id"));
+    let visible_columns = upgraded
+        .persistence()
+        .conn
+        .prepare("PRAGMA table_info(projection_visible_blob_refs)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()
+        .unwrap();
+    assert!(visible_columns.contains("subject_key"));
     let scalar_values: (Option<String>, Option<String>, Option<String>) = upgraded
         .persistence()
         .conn
@@ -1312,12 +1348,20 @@ fn visible_blob_reference_index_tracks_projection_item_commit_atomically() {
             &projection,
             &serde_json::json!({"generation": 1}),
             &ProjectionItemCommit::Replace {
-                items: vec![ProjectionItem {
-                    item_key: "person-component:person-1".to_owned(),
-                    owner_key: "__person_components__".to_owned(),
-                    sort_key: "person-1".to_owned(),
-                    value: serde_json::json!({"image": blob_ref.as_str()}),
-                }],
+                items: vec![
+                    ProjectionItem {
+                        item_key: "person-component:person-1".to_owned(),
+                        owner_key: "__person_components__".to_owned(),
+                        sort_key: "person-1".to_owned(),
+                        value: serde_json::json!({"image": blob_ref.as_str()}),
+                    },
+                    ProjectionItem {
+                        item_key: "person-component:person-2".to_owned(),
+                        owner_key: "__person_components__".to_owned(),
+                        sort_key: "person-2".to_owned(),
+                        value: serde_json::json!({"image": blob_ref.as_str()}),
+                    },
+                ],
             },
         )
         .unwrap();
@@ -1325,6 +1369,37 @@ fn visible_blob_reference_index_tracks_projection_item_commit_atomically() {
         store
             .projection_blob_ref_visible(&projection, &blob_ref)
             .unwrap()
+    );
+    let subject_key: String = store
+        .conn
+        .query_row(
+            "SELECT subject_key FROM projection_visible_blob_refs
+             WHERE projection_id = ?1 AND blob_ref = ?2",
+            rusqlite::params![projection.as_str(), blob_ref.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(subject_key, "person-component:person-1");
+    let visible_subjects: Vec<String> = store
+        .conn
+        .prepare(
+            "SELECT subject_key FROM projection_visible_blob_refs
+             WHERE projection_id = ?1 AND blob_ref = ?2 ORDER BY subject_key",
+        )
+        .unwrap()
+        .query_map(
+            rusqlite::params![projection.as_str(), blob_ref.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect();
+    assert_eq!(
+        visible_subjects,
+        vec![
+            "person-component:person-1".to_owned(),
+            "person-component:person-2".to_owned()
+        ]
     );
 
     store
@@ -1344,10 +1419,20 @@ fn visible_blob_reference_index_tracks_projection_item_commit_atomically() {
         )
         .unwrap();
     assert!(
-        !store
+        store
             .projection_blob_ref_visible(&projection, &blob_ref)
             .unwrap()
     );
+    let remaining_subject: String = store
+        .conn
+        .query_row(
+            "SELECT subject_key FROM projection_visible_blob_refs
+             WHERE projection_id = ?1 AND blob_ref = ?2",
+            rusqlite::params![projection.as_str(), blob_ref.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining_subject, "person-component:person-2");
 
     let _ = fs::remove_dir_all(tmp);
 }

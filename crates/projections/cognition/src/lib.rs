@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use lethe_core::domain::{
-    Observation, ObservationId, ProjectionRef, SupplementalId, SupplementalRecord,
+    Observation, ObservationId, ProjectionRef, RetractionTarget, SupplementalId, SupplementalRecord,
 };
 use lethe_engine::projection::runner::Projector;
 use lethe_projection_claim_queue::{
@@ -720,6 +720,18 @@ pub struct CommunicationFact {
 pub struct CommunicationProjectionState {
     facts_by_thread: BTreeMap<String, BTreeMap<String, CommunicationFact>>,
     observation_keys: BTreeMap<String, CommunicationThreadKey>,
+    #[serde(default)]
+    source_object_ids: BTreeMap<String, String>,
+    #[serde(default)]
+    observation_subjects: BTreeMap<String, String>,
+    #[serde(default)]
+    retracted_observation_ids: BTreeSet<String>,
+    #[serde(default)]
+    retracted_source_object_ids: BTreeSet<String>,
+    #[serde(default)]
+    opted_out_subjects: BTreeSet<String>,
+    #[serde(default)]
+    opted_out_sender_ids: BTreeSet<String>,
 }
 
 impl CommunicationProjectionState {
@@ -765,10 +777,81 @@ impl CommunicationProjectionState {
     ) -> ReplySloProjection {
         let mut delta = Vec::new();
         for observation in observations {
+            if observation.schema.as_str() == "schema:consent-decision" {
+                if observation
+                    .payload
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("opted_out")
+                {
+                    let subject = observation.subject.as_str().to_owned();
+                    self.opted_out_subjects.insert(subject.clone());
+                    self.remove_privacy_matches(&subject, None);
+                    if let Some(identifier) = observation
+                        .payload
+                        .get("identifier")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        self.opted_out_sender_ids.insert(identifier.to_owned());
+                        self.remove_privacy_matches(&subject, Some(identifier));
+                    }
+                }
+                continue;
+            }
+            if let Some(value) = observation.meta.get("retracts") {
+                let Ok(target) = RetractionTarget::from_value(value) else {
+                    continue;
+                };
+                if let Some(observation_id) = target.observation_id {
+                    self.retracted_observation_ids
+                        .insert(observation_id.as_str().to_owned());
+                    self.remove_observation(observation_id.as_str());
+                }
+                if let Some(source_object_id) = target.source_object_id {
+                    self.retracted_source_object_ids
+                        .insert(source_object_id.clone());
+                    let target_ids = self
+                        .source_object_ids
+                        .iter()
+                        .filter(|(_, object_id)| *object_id == &source_object_id)
+                        .map(|(id, _)| id.clone())
+                        .collect::<Vec<_>>();
+                    for observation_id in target_ids {
+                        self.remove_observation(&observation_id);
+                    }
+                }
+                continue;
+            }
             let Some(fact) = communication_fact(observation, join_index) else {
                 continue;
             };
             let observation_id = fact.incoming_observation_id.as_str().to_owned();
+            self.observation_subjects.insert(
+                observation_id.clone(),
+                observation.subject.as_str().to_owned(),
+            );
+            if self
+                .opted_out_subjects
+                .contains(observation.subject.as_str())
+                || self.opted_out_sender_ids.contains(fact.sender_id.as_str())
+            {
+                self.remove_observation(&observation_id);
+                continue;
+            }
+            if self.retracted_observation_ids.contains(&observation_id) {
+                continue;
+            }
+            if let Some(source_object_id) = observation
+                .meta
+                .get("object_id")
+                .and_then(serde_json::Value::as_str)
+            {
+                self.source_object_ids
+                    .insert(observation_id.clone(), source_object_id.to_owned());
+                if self.retracted_source_object_ids.contains(source_object_id) {
+                    continue;
+                }
+            }
             let key = CommunicationThreadKey {
                 channel_id: fact.channel_id.clone(),
                 thread_ref: fact.thread_ref.clone(),
@@ -803,6 +886,42 @@ impl CommunicationProjectionState {
         ReplySloProjection {
             rows: delta,
             overdue,
+        }
+    }
+
+    fn remove_observation(&mut self, observation_id: &str) {
+        if let Some(key) = self.observation_keys.remove(observation_id)
+            && let Some(facts) = self
+                .facts_by_thread
+                .get_mut(&communication_thread_storage_key(&key))
+        {
+            facts.remove(observation_id);
+            if facts.is_empty() {
+                self.facts_by_thread
+                    .remove(&communication_thread_storage_key(&key));
+            }
+        }
+        self.source_object_ids.remove(observation_id);
+        self.observation_subjects.remove(observation_id);
+    }
+
+    fn remove_privacy_matches(&mut self, subject: &str, sender_id: Option<&str>) {
+        let mut observation_ids = self
+            .observation_subjects
+            .iter()
+            .filter(|(_, value)| value.as_str() == subject)
+            .map(|(observation_id, _)| observation_id.clone())
+            .collect::<BTreeSet<_>>();
+        if let Some(sender_id) = sender_id {
+            observation_ids.extend(self.facts_by_thread.values().flat_map(|facts| {
+                facts
+                    .iter()
+                    .filter(|(_, fact)| fact.sender_id == sender_id)
+                    .map(|(observation_id, _)| observation_id.clone())
+            }));
+        }
+        for observation_id in observation_ids {
+            self.remove_observation(&observation_id);
         }
     }
 
@@ -2115,6 +2234,38 @@ mod tests {
                 .status,
             ReplySloStatus::Overdue
         );
+    }
+
+    #[test]
+    fn communication_retraction_removes_target_in_incremental_fold() {
+        let mut target = communication_observation("obs:target", "chan:mail", at(1), at(8));
+        target.meta["object_id"] = serde_json::json!("gmail:message:target");
+        let mut retraction = communication_observation("obs:retract", "chan:mail", at(2), at(9));
+        retraction.meta["retracts"] = serde_json::json!({
+            "source_object_id": "gmail:message:target"
+        });
+        let mut state = CommunicationProjectionState::default();
+        let join_index = ReplySloJoinIndex::default();
+        state.fold_observations(&[target, retraction], &join_index);
+        assert!(state.is_empty());
+    }
+
+    #[test]
+    fn communication_opt_out_removes_subject_records_incrementally() {
+        let mut target = communication_observation("obs:target", "chan:mail", at(1), at(8));
+        target.subject = EntityRef::new("person:1");
+        let mut consent = observation("sys:lethe-governance", at(2));
+        consent.id = ObservationId::new("obs:consent");
+        consent.subject = EntityRef::new("person:1");
+        consent.schema = SchemaRef::new("schema:consent-decision");
+        consent.payload = serde_json::json!({
+            "status": "opted_out",
+            "identifier": "sender@example.test"
+        });
+        let mut state = CommunicationProjectionState::default();
+        let join_index = ReplySloJoinIndex::default();
+        state.fold_observations(&[target, consent], &join_index);
+        assert!(state.is_empty());
     }
 
     #[test]

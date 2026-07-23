@@ -215,6 +215,31 @@ pub enum AuditEventKind {
     Takedown,
     PhysicalDelete,
     PolicyDenial,
+    ConsentGate,
+    RetractionShield,
+    BlobAuthorization,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivacyAuditDecision {
+    Allow,
+    Deny,
+    Quarantine,
+    Shield,
+    Visible,
+}
+
+/// Common content contract for privacy decisions.  Durability and mirror
+/// semantics remain owned by the existing append/audit commit boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrivacyAuditDetail {
+    pub actor: ActorRef,
+    pub subject: String,
+    pub scope: String,
+    pub decision: PrivacyAuditDecision,
+    pub rule: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
 // ---------------------------------------------------------------------------

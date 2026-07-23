@@ -6,6 +6,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use chrono::{DateTime, Utc};
 use lethe_api::api::grep::{GrepError, GrepRecord, normalize};
+use lethe_core::domain::RetractionTarget;
 use lethe_projection_corpus::{CorpusProjector, CorpusRecord, linked_form_sheet_id};
 use lethe_storage_api::ObservationStats;
 use tantivy::collector::{Count, TopDocs};
@@ -24,6 +25,58 @@ const GENERATIONS_DIR: &str = "generations";
 const CURRENT_FILE: &str = "CURRENT";
 const CURRENT_TMP_FILE: &str = "CURRENT.tmp";
 pub const MIN_WRITER_HEAP_BYTES: usize = 15_000_000;
+
+fn invalidated_source_object_ids(
+    observations: &[lethe_storage_api::StoredObservation],
+) -> HashSet<String> {
+    let mut invalidated = HashSet::new();
+    for stored in observations {
+        if let Some(value) = stored.observation.meta.get("retracts")
+            && let Ok(target) = RetractionTarget::from_value(value)
+        {
+            if let Some(source_object_id) = target.source_object_id {
+                invalidated.insert(source_object_id);
+            }
+            if let Some(observation_id) = target.observation_id {
+                invalidated.insert(observation_id.as_str().to_owned());
+            }
+        }
+        if stored.observation.schema.as_str() == "schema:consent-decision"
+            && stored
+                .observation
+                .payload
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                == Some("opted_out")
+        {
+            invalidated.insert(stored.observation.subject.as_str().to_owned());
+            if let Some(identifier) = stored
+                .observation
+                .payload
+                .get("identifier")
+                .and_then(serde_json::Value::as_str)
+            {
+                invalidated.insert(identifier.to_owned());
+            }
+        }
+    }
+    invalidated
+}
+
+fn record_is_invalidated(record: &CorpusRecord, invalidated: &HashSet<String>) -> bool {
+    let mut keys = record
+        .metadata
+        .get("privacy_keys")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flat_map(|values| values.iter().filter_map(serde_json::Value::as_str));
+    record
+        .metadata
+        .get("source_object_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| invalidated.contains(id))
+        || keys.any(|key| invalidated.contains(key))
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
@@ -184,11 +237,13 @@ impl IndexRoot {
             if page.is_empty() {
                 break;
             }
+            let invalidated = invalidated_source_object_ids(&page);
             let records = page
                 .iter()
                 .flat_map(|stored| {
                     projector.project_observation(&stored.observation, &linked_sheet_ids)
                 })
+                .filter(|record| !record_is_invalidated(record, &invalidated))
                 .collect::<Vec<_>>();
             observation_count = observation_count
                 .checked_add(page.len() as u64)
@@ -198,7 +253,7 @@ impl IndexRoot {
             cursor = page.last().expect("non-empty page").append_seq;
             index.apply_delta(
                 &records,
-                &HashSet::new(),
+                &invalidated,
                 &linked_sheet_ids,
                 cursor,
                 observation_count,
@@ -714,11 +769,14 @@ impl PersistentCorpusIndex {
                     newly_linked.insert(sheet_id);
                 }
             }
+            let mut invalidated = invalidated_source_object_ids(&page);
+            invalidated.extend(newly_linked.iter().cloned());
             let records = page
                 .iter()
                 .flat_map(|stored| {
                     projector.project_observation(&stored.observation, &linked_sheet_ids)
                 })
+                .filter(|record| !record_is_invalidated(record, &invalidated))
                 .collect::<Vec<_>>();
             let last_append_seq = page.last().expect("non-empty page").append_seq;
             let observation_count = metadata
@@ -729,7 +787,7 @@ impl PersistentCorpusIndex {
                 })?;
             self.apply_delta_locked(
                 &records,
-                &newly_linked,
+                &invalidated,
                 &linked_sheet_ids,
                 last_append_seq,
                 observation_count,
@@ -854,6 +912,8 @@ impl PersistentCorpusIndex {
         self.reader.reload()?;
         *published_metadata = metadata;
         drop(published_metadata);
+        self.validate_record_count()?;
+        self.validate_incremental_privacy(invalidated_source_object_ids)?;
         Ok(())
     }
 
@@ -903,6 +963,18 @@ impl PersistentCorpusIndex {
             )));
         }
         Ok(())
+    }
+
+    fn validate_incremental_privacy(
+        &self,
+        invalidated_source_object_ids: &HashSet<String>,
+    ) -> Result<(), IndexError> {
+        self.visit_source_object_records(invalidated_source_object_ids, |record| {
+            Err(IndexError::IncompatibleMetadata(format!(
+                "incremental privacy fold left shielded record {} reachable",
+                record.record_id
+            )))
+        })
     }
 
     fn writer_lock(&self) -> Result<MutexGuard<'_, IndexWriter<TantivyDocument>>, IndexError> {
@@ -973,6 +1045,15 @@ impl PersistentCorpusIndex {
             .and_then(serde_json::Value::as_str)
         {
             document.add_text(self.fields.source_object_id, value);
+        }
+        if let Some(values) = record
+            .metadata
+            .get("privacy_keys")
+            .and_then(serde_json::Value::as_array)
+        {
+            for value in values.iter().filter_map(serde_json::Value::as_str) {
+                document.add_text(self.fields.source_object_id, value);
+            }
         }
         if let Some(value) = record
             .metadata
@@ -1475,6 +1556,72 @@ mod tests {
         index.catch_up(&store, &projector, 1).unwrap();
         assert_eq!(index.record_count().unwrap(), 2);
         assert_eq!(index.metadata().unwrap().observation_count, 2);
+        drop(index);
+        drop(store);
+        fs::remove_dir_all(root_path).unwrap();
+    }
+
+    #[test]
+    fn catch_up_hides_retracted_and_opted_out_personal_records() {
+        let root_path = temp_root();
+        let db = root_path.join("lethe.sqlite3");
+        let blobs = root_path.join("blobs");
+        let index_path = root_path.join("index");
+        let store = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+        let mut target = observation(
+            "target",
+            "schema:slack-message",
+            serde_json::json!({
+                "text": "privacy needle",
+                "channel_name": "123_event",
+                "user_id": "person-1"
+            }),
+        );
+        target.meta["object_id"] = serde_json::json!("slack:message:target");
+        store.append_observation_idempotent(&target).unwrap();
+
+        let projector = CorpusProjector::personal_all_text_config();
+        let root = IndexRoot::new(&index_path, MIN_WRITER_HEAP_BYTES, "cfg").unwrap();
+        let (generation, built_index) = root.rebuild_from_store(&store, &projector, 10).unwrap();
+        let index = root.publish(&generation, built_index).unwrap().index;
+        assert_eq!(index.record_count().unwrap(), 1);
+
+        let mut retraction = observation(
+            "retract",
+            "schema:slack-message",
+            serde_json::json!({"text": "delete"}),
+        );
+        retraction.meta["retracts"] = serde_json::json!({
+            "source_object_id": "slack:message:target"
+        });
+        store.append_observation_idempotent(&retraction).unwrap();
+        index.catch_up(&store, &projector, 10).unwrap();
+        assert_eq!(index.record_count().unwrap(), 0);
+
+        let mut second = observation(
+            "second",
+            "schema:slack-message",
+            serde_json::json!({
+                "text": "consent needle",
+                "channel_name": "123_event",
+                "user_id": "person-2"
+            }),
+        );
+        second.subject = EntityRef::new("person:2");
+        store.append_observation_idempotent(&second).unwrap();
+        index.catch_up(&store, &projector, 10).unwrap();
+        assert_eq!(index.record_count().unwrap(), 1);
+
+        let mut consent = observation(
+            "consent",
+            "schema:consent-decision",
+            serde_json::json!({"status": "opted_out", "identifier": "person-2"}),
+        );
+        consent.subject = EntityRef::new("person:2");
+        store.append_observation_idempotent(&consent).unwrap();
+        index.catch_up(&store, &projector, 10).unwrap();
+        assert_eq!(index.record_count().unwrap(), 0);
+
         drop(index);
         drop(store);
         fs::remove_dir_all(root_path).unwrap();

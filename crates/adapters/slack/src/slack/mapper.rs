@@ -78,8 +78,9 @@ impl<C: SlackClient> SlackAdapter<C> {
         });
 
         if msg.message_type == SlackMessageType::Delete {
-            meta["retracts"] =
-                serde_json::json!(format!("message:slack:{}-{}", msg.channel_id, msg.ts));
+            meta["retracts"] = serde_json::json!({
+                "source_object_id": identity.object_id,
+            });
         }
 
         let mut payload = serde_json::json!({
@@ -448,7 +449,10 @@ mod tests {
                 .starts_with("slack:channel:C01ABC:ts:1234567890.123456:")
         );
         assert_eq!(draft.payload["message_type"], "delete");
-        assert!(draft.meta["retracts"].is_string());
+        assert_eq!(
+            draft.meta["retracts"]["source_object_id"],
+            "channel:C01ABC:ts:1234567890.123456"
+        );
     }
 
     #[test]

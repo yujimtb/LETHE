@@ -18,7 +18,7 @@ use super::supplemental_kind::{
 };
 use super::{
     ChannelKind, ChannelRecord, EntityType, ObservationSchema, Observer, ProjectionCatalogEntry,
-    SchemaVersion, SourceSystem,
+    SchemaSourceContract, SchemaVersion, SourceSystem,
 };
 
 /// In-memory registry that enforces all M02 invariants.
@@ -102,6 +102,7 @@ impl RegistryStore {
             schema_id: schema.id.clone(),
             version: schema.version.clone(),
             payload_schema: schema.payload_schema.clone(),
+            source_contracts: schema.source_contracts.clone(),
             created_at: chrono::Utc::now(),
         };
         self.schemas.insert(schema.id.0.clone(), schema);
@@ -114,6 +115,7 @@ impl RegistryStore {
         id: &SchemaRef,
         version: SemVer,
         payload_schema: serde_json::Value,
+        source_contracts: Vec<SchemaSourceContract>,
     ) -> Result<(), DomainError> {
         let current = self
             .schemas
@@ -132,6 +134,7 @@ impl RegistryStore {
             schema_id: id.clone(),
             version: version.clone(),
             payload_schema: payload_schema.clone(),
+            source_contracts: source_contracts.clone(),
             created_at: chrono::Utc::now(),
         };
         self.schema_versions.push(ver);
@@ -139,6 +142,7 @@ impl RegistryStore {
         if let Some(s) = self.schemas.get_mut(&id.0) {
             s.version = version;
             s.payload_schema = payload_schema;
+            s.source_contracts = source_contracts;
         }
         Ok(())
     }
@@ -152,6 +156,20 @@ impl RegistryStore {
             .iter()
             .filter(|v| v.schema_id == *id)
             .collect()
+    }
+
+    /// Return the frozen schema contract selected by the observation's
+    /// declared version.  Ingestion must never silently validate an old
+    /// observation with the registry's latest schema.
+    pub fn get_schema_at_version(
+        &self,
+        id: &SchemaRef,
+        version: &SemVer,
+    ) -> Option<&SchemaVersion> {
+        self.schema_versions
+            .iter()
+            .rev()
+            .find(|schema| schema.schema_id == *id && schema.version == *version)
     }
 
     pub fn list_schemas(&self) -> Vec<&ObservationSchema> {
@@ -668,11 +686,32 @@ mod tests {
                 &SchemaRef::new("schema:slack-message"),
                 SemVer::new("1.1.0"),
                 serde_json::json!({"type": "object", "properties": {}}),
+                vec![],
             )
             .unwrap();
 
         let versions = store.get_schema_versions(&SchemaRef::new("schema:slack-message"));
         assert_eq!(versions.len(), 2);
+        assert_eq!(
+            store
+                .get_schema_at_version(
+                    &SchemaRef::new("schema:slack-message"),
+                    &SemVer::new("1.0.0")
+                )
+                .expect("frozen v1 schema")
+                .payload_schema,
+            serde_json::json!({"type": "object"})
+        );
+        assert_eq!(
+            store
+                .get_schema_at_version(
+                    &SchemaRef::new("schema:slack-message"),
+                    &SemVer::new("1.1.0")
+                )
+                .expect("frozen v1.1 schema")
+                .payload_schema,
+            serde_json::json!({"type": "object", "properties": {}})
+        );
     }
 
     #[test]
@@ -703,6 +742,7 @@ mod tests {
                     "type": "object",
                     "required": ["id", "room"]
                 }),
+                vec![],
             )
             .unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));

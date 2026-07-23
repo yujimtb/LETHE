@@ -303,7 +303,8 @@ impl SqlitePersistence {
             self.schema_migration_recorded(SCHEMA_VERSION_IDENTITY_LOOKUP_INDEX)?;
         let lock_split_recorded =
             self.schema_migration_recorded(SCHEMA_VERSION_LOCK_SPLIT_SCALARS)?;
-        let keyset_reads_recorded = self.schema_migration_recorded(CURRENT_SCHEMA_VERSION)?;
+        let keyset_reads_recorded = self.schema_migration_recorded(SCHEMA_VERSION_KEYSET_READS)?;
+        let privacy_projection_recorded = self.schema_migration_recorded(CURRENT_SCHEMA_VERSION)?;
 
         if lock_split_recorded && !identity_lookup_recorded {
             return Err(PersistenceError::SchemaInvariant(
@@ -313,6 +314,11 @@ impl SqlitePersistence {
         if keyset_reads_recorded && !lock_split_recorded {
             return Err(PersistenceError::SchemaInvariant(
                 "schema migration v11 is recorded without prerequisite v10".to_owned(),
+            ));
+        }
+        if privacy_projection_recorded && !keyset_reads_recorded {
+            return Err(PersistenceError::SchemaInvariant(
+                "schema migration v12 is recorded without prerequisite v11".to_owned(),
             ));
         }
 
@@ -337,10 +343,23 @@ impl SqlitePersistence {
         }
 
         if keyset_reads_recorded {
-            self.require_schema_migration_name(CURRENT_SCHEMA_VERSION, "indexed_keyset_reads")?;
+            self.require_schema_migration_name(
+                SCHEMA_VERSION_KEYSET_READS,
+                "indexed_keyset_reads",
+            )?;
             self.require_keyset_read_schema_objects()?;
         } else {
             self.apply_keyset_reads_migration()?;
+        }
+
+        if privacy_projection_recorded {
+            self.require_schema_migration_name(
+                CURRENT_SCHEMA_VERSION,
+                "privacy_projection_visibility",
+            )?;
+            self.require_privacy_projection_schema_objects()?;
+        } else {
+            self.apply_privacy_projection_migration()?;
         }
 
         Ok(())
@@ -505,7 +524,40 @@ impl SqlitePersistence {
             END;
             ",
         )?;
-        record_schema_migration(&transaction, CURRENT_SCHEMA_VERSION, "indexed_keyset_reads")?;
+        record_schema_migration(
+            &transaction,
+            SCHEMA_VERSION_KEYSET_READS,
+            "indexed_keyset_reads",
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn apply_privacy_projection_migration(&self) -> Result<(), PersistenceError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let columns = table_columns(&transaction, "projection_visible_blob_refs")?;
+        if !columns.contains("subject_key") {
+            transaction.execute(
+                "ALTER TABLE projection_visible_blob_refs
+                 ADD COLUMN subject_key TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+            transaction.execute(
+                "UPDATE projection_visible_blob_refs
+                 SET subject_key = item_key
+                 WHERE subject_key = ''",
+                [],
+            )?;
+        }
+        transaction.execute_batch(
+            "CREATE INDEX IF NOT EXISTS projection_visible_blob_refs_subject_lookup
+             ON projection_visible_blob_refs (projection_id, subject_key, blob_ref);",
+        )?;
+        record_schema_migration(
+            &transaction,
+            CURRENT_SCHEMA_VERSION,
+            "privacy_projection_visibility",
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -640,8 +692,24 @@ impl SqlitePersistence {
         Ok(())
     }
 
+    fn require_privacy_projection_schema_objects(&self) -> Result<(), PersistenceError> {
+        self.require_schema_object("index", "projection_visible_blob_refs_subject_lookup")?;
+        let columns = self
+            .conn
+            .prepare("PRAGMA table_info(projection_visible_blob_refs)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+        if !columns.contains("subject_key") {
+            return Err(PersistenceError::SchemaInvariant(
+                "projection_visible_blob_refs column is missing: subject_key".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn migrate_existing_schema(&self) -> Result<(), PersistenceError> {
-        let current_version_recorded = self.schema_migration_recorded(CURRENT_SCHEMA_VERSION)?;
+        let current_version_recorded =
+            self.schema_migration_recorded(SCHEMA_VERSION_KEYSET_READS)?;
         let mut columns = self.observation_columns()?;
 
         let mut route_backfill_required = false;

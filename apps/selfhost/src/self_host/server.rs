@@ -20,8 +20,8 @@ use lethe_api::api::health::HealthResponse;
 use lethe_api::api::pagination::{
     KeysetCursorError, PaginationParams, decode_keyset_cursor, encode_keyset_cursor,
 };
-use lethe_core::domain::BlobRef;
 use lethe_core::domain::OperationalEventId;
+use lethe_core::domain::{BlobRef, ProjectionRef};
 use lethe_history::{
     HistoryError, HistoryImportCommand, HistoryImportResult, HistoryInventoryReport,
     HistoryInventoryRequest, HistoryQueryRequest, HistoryQueryResponse,
@@ -749,7 +749,9 @@ async fn projection_blob(
     let Some(blob_ref) = blob_ref_from_hash(&blob_hash) else {
         return Err(ApiError::not_found());
     };
-    let Some(bytes) = service.projection_blob_bytes(&blob_ref)? else {
+    let Some(bytes) =
+        service.projection_blob_bytes(&ProjectionRef::new(&projection_id), &blob_ref)?
+    else {
         return Err(ApiError::not_found());
     };
 

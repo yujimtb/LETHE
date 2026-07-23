@@ -1497,6 +1497,10 @@ fn ingest_draft_duplicate_is_decided_by_persistence_without_cache_append() {
                 "body": "persisted"
             }).to_string(),
             "source_container": "slack-test:C01ABC",
+            "communication_channel_kind": "slack",
+            "communication_channel_external_id": "C01ABC",
+            "communication_sender_id": "U1",
+            "communication_thread_ref": "slack:thread:dup-ts",
         }),
     };
     persistence
@@ -1535,6 +1539,10 @@ fn ingest_draft_duplicate_is_decided_by_persistence_without_cache_append() {
             }).to_string(),
             "source_container": "slack-test:C01ABC",
             "source_instance": "slack-test",
+            "communication_channel_kind": "slack",
+            "communication_channel_external_id": "C01ABC",
+            "communication_sender_id": "U1",
+            "communication_thread_ref": "slack:thread:dup-ts",
         }),
     };
 
