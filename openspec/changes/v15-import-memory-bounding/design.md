@@ -98,3 +98,15 @@ Alternatives: body を `Arc<Observation>` にして共有する方法も AppCore
 - before は旧 `refresh_capture_consent_snapshot` の単独 publish 呼出しを一時的に復元して同じテストを実行し、`1000件/1 request = 2`、`25件×40 request 直列 = 78` を測定した。測定用の一時変更は取り除き、最終コードには残していない。
 - SQLite の `CURRENT_SCHEMA_VERSION` は 14 のまま。v13 backfill は page/cursor 化したが、既存 DDL、migration ledger、schema semantics は変更していない。`v13_privacy_backfill_rolls_back_and_retries_from_first_page` で transaction rollback と先頭 page からの再実行も検証した。
 - 残課題は B3（AppCore の書込/読取分離と deep clone 全廃）であり、本 change では扱わない。RSS harness の実 corpus 判定は Linux container 実行、通常 CI は小規模 corpus と publish counter を使う。
+
+## v15.1 P0 follow-up: dup-only no-op と import 入口の snapshot 世代
+
+v15 の B3 non-goal のうち、sol 監査で import request ごとの deep clone が直接のメモリ根因と確定した範囲だけを後続修正する。v1/v2 import は `core_snapshot()` が返す `Arc<AppCore>` を `&AppCore` として読む。draft preparation は read-only であり、AppCore 全体を clone する必要がない。append 後の mutable state は既存の `core_lock()` と derived lane の短い区間だけで更新し、全体 clone を読み取り経路へ戻さない。
+
+副作用のゲートは audit event の有無ではなく、durable append の成功結果である `!request_appended_observations.is_empty()` に固定する。したがって duplicate、canonical collision、validation-only request は audit を記録しても stale 化、append consumer、publish、search catch-up、bulk target 更新を行わない。監査と materialization の経路を分離することで、監査要件を維持したまま dup-only の世代を不変にする。
+
+bulk session の begin は session state の永続化と監査だけを行い、stale 化・publish をしない。最初の実 append で stale state を一度 publish し、通常 observation の後続 append は session end または background rebuild の install+publish 境界へ寄せる。例外は新しい consent decision を後続 request の capture resolver が読む必要がある場合で、その request だけ live compact state を更新して publish する。この例外は cross-request consent ordering を維持するために必要な最小境界であり、通常の duplicate/Slack/freshness append では発生しない。search index catch-up は既存の bulk 中可視性契約を維持するため実 append ごとに single-flight 起動するが、dup-only では起動しない。
+
+bulk end は `target_append_seq == base_append_seq` を no-op session として、rebuild・clone・publish・search catch-up なしで Ready を永続化する。実 append がある場合も background rebuild が install+publish 済みなら end 側は再 clone・再 publishしない。SQLite DDL、manifest/projection shape、v1/v2/429/per-item 契約は変更しない。
+
+import timing には `app_core_clone_ms`（この経路では常時 0）と `publish_clone_ms` を追加し、publish は旧 snapshot の `Arc::strong_count` を debug log に出す。`scripts/import_memory_harness.py` は対象 selfhost PID の `/proc/<pid>/status` を seed 収束後・dup-only 連投後に直接読み、`ingested=0/duplicates=batch`、後半傾き、最終差分を判定する。

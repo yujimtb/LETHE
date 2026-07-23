@@ -330,14 +330,14 @@ impl AppService {
 
     pub(super) fn refresh_materialized_snapshot(
         &self,
-        core: &mut AppCore,
+        core: &AppCore,
     ) -> Result<(), SelfHostError> {
         self.refresh_materialized_snapshot_with_reason(core, "recovery")
     }
 
     pub(super) fn refresh_materialized_snapshot_with_reason(
         &self,
-        core: &mut AppCore,
+        core: &AppCore,
         reason: &'static str,
     ) -> Result<(), SelfHostError> {
         if !matches!(reason, "migration" | "recovery" | "bootstrap") {
@@ -401,11 +401,10 @@ impl AppService {
         if let Err(error) = spawn_result {
             self.non_corpus_rebuild_in_flight
                 .store(false, std::sync::atomic::Ordering::Release);
-            let _derived_lane = self
-                .derived_projection_lane
-                .lock()
-                .map_err(|_| SelfHostError::LockPoisoned)?;
-            core.mark_non_corpus_materializations_stale();
+            tracing::error!(
+                error = %error,
+                "failed to spawn background non-corpus materialization"
+            );
             return Err(SelfHostError::Ingestion(format!(
                 "failed to spawn background non-corpus materialization: {error}"
             )));
@@ -413,7 +412,9 @@ impl AppService {
         Ok(())
     }
 
-    fn mark_live_core_non_corpus_materializations_stale(&self) -> Result<(), SelfHostError> {
+    pub(super) fn mark_live_core_non_corpus_materializations_stale(
+        &self,
+    ) -> Result<(), SelfHostError> {
         let _derived_lane = self
             .derived_projection_lane
             .lock()
@@ -975,7 +976,22 @@ impl AppService {
         self.core_snapshot.load_full()
     }
 
+    pub(super) fn publish_core_snapshot_for_import(
+        &self,
+        core: &AppCore,
+        timer: &mut super::ObservationImportTimer,
+    ) {
+        let started_at = std::time::Instant::now();
+        self.publish_core_snapshot(core);
+        timer.record_stage(super::ImportTimingStage::PublishClone, started_at.elapsed());
+    }
+
     pub(super) fn publish_core_snapshot(&self, core: &AppCore) {
+        let old_snapshot = self.core_snapshot.load_full();
+        tracing::debug!(
+            old_arc_strong_count = std::sync::Arc::strong_count(&old_snapshot),
+            "publishing AppCore snapshot"
+        );
         #[cfg(test)]
         self.publish_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

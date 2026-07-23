@@ -2272,6 +2272,8 @@ fn observation_import_timer_records_commit_stage_duration() {
     assert_eq!(timing.non_corpus_materialize_ms, 0);
     assert_eq!(timing.search_index_catch_up_ms, 0);
     assert_eq!(timing.audit_ms, 0);
+    assert_eq!(timing.app_core_clone_ms, 0);
+    assert_eq!(timing.publish_clone_ms, 0);
 }
 
 #[test]
@@ -3998,6 +4000,82 @@ fn normalized_non_corpus_manifest(mut value: serde_json::Value) -> serde_json::V
 }
 
 #[test]
+fn bulk_duplicate_only_session_is_a_true_no_op() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-bulk-duplicate-only-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let service = test_service(test_config(db, blobs), persistence);
+
+    let mut seed = wave2_slack_draft(0);
+    seed.meta.as_object_mut().unwrap().insert(
+        "object_id".to_owned(),
+        serde_json::json!("channel:C01ABC:ts:0000000000.000001"),
+    );
+    service
+        .ingest_observation_drafts(vec![seed], "slack-test")
+        .unwrap();
+    service.apply_identity_bridge_batch(32).unwrap();
+    wait_for_append_consumer(&service);
+    let session = service.begin_bulk_import_session().unwrap();
+    let before_snapshot = service.core_snapshot();
+    let before_publish_count = service.publish_count();
+    let before_rebuild_count = service
+        .non_corpus_rebuild_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    for index in 0..20 {
+        let report = if index % 2 == 0 {
+            service
+                .ingest_observation_drafts_with_session(
+                    vec![wave2_slack_draft(0)],
+                    "slack-test",
+                    Some(&session.session_id),
+                )
+                .unwrap()
+        } else {
+            service
+                .ingest_observation_drafts_v2_with_session(
+                    vec![v2_slack_draft(0, Utc::now())],
+                    "slack-test",
+                    Some(&session.session_id),
+                )
+                .unwrap()
+        };
+        assert_eq!(report.ingested, 0);
+        assert_eq!(report.duplicates, 1);
+    }
+
+    let completed = service
+        .end_bulk_import_session(&session.session_id)
+        .unwrap();
+    assert_eq!(completed.state, super::BulkImportSessionPhase::Ready);
+    assert_eq!(completed.base_append_seq, completed.target_append_seq);
+    assert!(Arc::ptr_eq(&before_snapshot, &service.core_snapshot()));
+    assert_eq!(service.publish_count(), before_publish_count);
+    assert_eq!(
+        service
+            .non_corpus_rebuild_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        before_rebuild_count
+    );
+    eprintln!(
+        "bulk dup-only 20 requests: publish_count={} rebuild_count={} state=ready",
+        service.publish_count(),
+        service
+            .non_corpus_rebuild_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+
+    drop(before_snapshot);
+    drop(service);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn bulk_import_session_defers_non_corpus_keeps_corpus_ready_and_rebuilds_once() {
     let bulk_root =
         std::env::temp_dir().join(format!("lethe-bulk-session-test-{}", uuid::Uuid::now_v7()));
@@ -4011,6 +4089,7 @@ fn bulk_import_session_defers_non_corpus_keeps_corpus_ready_and_rebuilds_once() 
 
     let session = bulk_service.begin_bulk_import_session().unwrap();
     assert_eq!(session.state, super::BulkImportSessionPhase::Deferred);
+    let publish_count_before_appends = bulk_service.publish_count();
     let health = bulk_service.health().unwrap();
     let bulk_dependency = health
         .dependencies
@@ -4064,6 +4143,12 @@ fn bulk_import_session_defers_non_corpus_keeps_corpus_ready_and_rebuilds_once() 
         );
     }
 
+    assert_eq!(
+        bulk_service.publish_count(),
+        publish_count_before_appends + 1,
+        "bulk appends publish stale state only at the first actual append"
+    );
+
     assert_eq!(bulk_service.core_lock().unwrap().observation_stats.count, 0);
     assert!(matches!(
         bulk_service.persons_response(
@@ -4095,6 +4180,7 @@ fn bulk_import_session_defers_non_corpus_keeps_corpus_ready_and_rebuilds_once() 
             .load(std::sync::atomic::Ordering::Relaxed),
         1
     );
+    assert!(bulk_service.publish_count() <= publish_count_before_appends + 2);
     assert_eq!(
         bulk_service
             .persons_response(
@@ -4198,7 +4284,7 @@ fn bulk_import_session_defers_non_corpus_keeps_corpus_ready_and_rebuilds_once() 
 }
 
 #[test]
-fn bulk_stale_publication_waits_for_derived_projection_lane() {
+fn bulk_first_append_stale_publication_waits_for_derived_projection_lane() {
     fn assert_waits_for_lane<F, T>(service: &AppService, operation: F) -> T
     where
         F: FnOnce(AppService) -> T + Send + 'static,
@@ -4242,8 +4328,9 @@ fn bulk_stale_publication_waits_for_derived_projection_lane() {
     let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
     let service = test_service(test_config(db, blobs), persistence);
 
-    let session =
-        assert_waits_for_lane(&service, |service| service.begin_bulk_import_session()).unwrap();
+    let lane = service.derived_projection_lane.lock().unwrap();
+    let session = service.begin_bulk_import_session().unwrap();
+    drop(lane);
     let legacy_session_id = session.session_id.clone();
     assert_waits_for_lane(&service, move |service| {
         service.ingest_observation_drafts_with_session(
@@ -4253,15 +4340,13 @@ fn bulk_stale_publication_waits_for_derived_projection_lane() {
         )
     })
     .unwrap();
-    let v2_session_id = session.session_id.clone();
-    assert_waits_for_lane(&service, move |service| {
-        service.ingest_observation_drafts_v2_with_session(
+    service
+        .ingest_observation_drafts_v2_with_session(
             vec![v2_slack_draft(1, Utc::now())],
             "slack-test",
-            Some(&v2_session_id),
+            Some(&session.session_id),
         )
-    })
-    .unwrap();
+        .unwrap();
 
     drop(service);
     let _ = std::fs::remove_dir_all(root);
@@ -4669,6 +4754,146 @@ fn import_publish_count_is_bounded_per_request_and_consumer_batch() {
     let serial_publishes = service.publish_count();
     eprintln!("publish_count(25x40 serial requests)={serial_publishes}");
     assert!(serial_publishes <= 43);
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn duplicate_only_imports_keep_snapshot_generation_and_counters_stable() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-duplicate-only-generation-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let service = test_service(test_config(db, blobs), persistence);
+
+    assert_eq!(
+        service
+            .ingest_observation_drafts(vec![freshness_only_draft("duplicate-only")], "dup-test")
+            .unwrap()
+            .ingested,
+        1
+    );
+    wait_for_append_consumer(&service);
+    let before_snapshot = service.core_snapshot();
+    let before_publish_count = service.publish_count();
+    let before_rebuild_count = service
+        .non_corpus_rebuild_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let before_audit_count = service
+        .persistence_lock()
+        .unwrap()
+        .audit_event_page(None, 1_000)
+        .unwrap()
+        .len();
+
+    for _ in 0..20 {
+        let report = service
+            .ingest_observation_drafts(vec![freshness_only_draft("duplicate-only")], "dup-test")
+            .unwrap();
+        assert_eq!(report.ingested, 0);
+        assert_eq!(report.duplicates, 1);
+    }
+
+    let after_snapshot = service.core_snapshot();
+    assert!(Arc::ptr_eq(&before_snapshot, &after_snapshot));
+    assert_eq!(service.publish_count(), before_publish_count);
+    assert_eq!(
+        service
+            .non_corpus_rebuild_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        before_rebuild_count
+    );
+    assert_eq!(
+        service
+            .persistence_lock()
+            .unwrap()
+            .audit_event_page(None, 1_000)
+            .unwrap()
+            .len(),
+        before_audit_count + 20
+    );
+    eprintln!(
+        "dup-only 20 requests: publish_count={} rebuild_count={} Arc::ptr_eq=true",
+        service.publish_count(),
+        service
+            .non_corpus_rebuild_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+
+    drop(after_snapshot);
+    drop(before_snapshot);
+    drop(service);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn published_snapshot_releases_old_generation() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-published-snapshot-weak-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let service = test_service(test_config(db, blobs), persistence);
+
+    let before = service.core_snapshot();
+    let old_generation = std::sync::Arc::downgrade(&before);
+    drop(before);
+    {
+        let core = service.core_lock().unwrap();
+        service.publish_core_snapshot(&core);
+    }
+    assert!(old_generation.upgrade().is_none());
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn mixed_import_keeps_append_side_effects_bounded_and_catches_up_search() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-mixed-import-side-effects-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let service = test_service(test_config(db, blobs), persistence);
+
+    service
+        .ingest_observation_drafts(vec![freshness_only_draft("mixed-existing")], "mixed-test")
+        .unwrap();
+    wait_for_append_consumer(&service);
+    let before_publish_count = service.publish_count();
+    let before_rebuild_count = service
+        .non_corpus_rebuild_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    let report = service
+        .ingest_observation_drafts(
+            vec![
+                freshness_only_draft("mixed-existing"),
+                freshness_only_draft("mixed-new"),
+            ],
+            "mixed-test",
+        )
+        .unwrap();
+    assert_eq!(report.ingested, 1);
+    assert_eq!(report.duplicates, 1);
+    wait_for_append_consumer(&service);
+    wait_for_search_index_high_water(&service, 2);
+    assert!(service.publish_count() <= before_publish_count + 1);
+    assert_eq!(
+        service
+            .non_corpus_rebuild_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        before_rebuild_count
+    );
 
     drop(service);
     let _ = std::fs::remove_dir_all(root);

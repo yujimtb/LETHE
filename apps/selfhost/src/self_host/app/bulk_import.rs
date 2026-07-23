@@ -211,15 +211,7 @@ impl AppService {
             persist_bulk_import_session(persistence.as_ref(), &session)?;
             session
         };
-        let _derived_lane = self
-            .derived_projection_lane
-            .lock()
-            .map_err(|_| SelfHostError::LockPoisoned)?;
-        let mut live_core = self.core_lock()?;
-        live_core.mark_non_corpus_materializations_stale();
-        self.publish_core_snapshot(&live_core);
         let report = session.report();
-        drop(live_core);
         self.emit_audit(
             "actor:self-host",
             AuditEventKind::WriteExecution,
@@ -243,7 +235,6 @@ impl AppService {
             });
         }
         let _operation = self.bulk_import_operation_lock()?;
-        let mut core = (*self.core_snapshot()).clone();
         let mut session = {
             let persistence = self.persistence_lock()?;
             let Some(mut session) = load_persisted_bulk_import_session(persistence.as_ref())?
@@ -266,32 +257,48 @@ impl AppService {
                 return Ok(session.report());
             }
             let stats = persistence.observation_stats()?;
-            match session.phase {
-                BulkImportSessionPhase::Deferred => {
-                    session.start_catch_up(stats, Utc::now())?;
-                    persist_bulk_import_session(persistence.as_ref(), &session)?;
-                }
-                BulkImportSessionPhase::CatchingUp => {
-                    if session.target_append_seq != stats.max_append_seq
-                        || session.target_observation_count != stats.count
-                    {
-                        return Err(SelfHostError::Ingestion(format!(
-                            "canonical observation high-water changed while bulk import session {} was catching up",
-                            session.session_id
-                        )));
+            if session.target_append_seq == session.base_append_seq {
+                session.complete(stats, Utc::now())?;
+                persist_bulk_import_session(persistence.as_ref(), &session)?;
+            } else {
+                match session.phase {
+                    BulkImportSessionPhase::Deferred => {
+                        session.start_catch_up(stats, Utc::now())?;
+                        persist_bulk_import_session(persistence.as_ref(), &session)?;
                     }
+                    BulkImportSessionPhase::CatchingUp => {
+                        if session.target_append_seq != stats.max_append_seq
+                            || session.target_observation_count != stats.count
+                        {
+                            return Err(SelfHostError::Ingestion(format!(
+                                "canonical observation high-water changed while bulk import session {} was catching up",
+                                session.session_id
+                            )));
+                        }
+                    }
+                    BulkImportSessionPhase::Ready => unreachable!(),
                 }
-                BulkImportSessionPhase::Ready => unreachable!(),
             }
             session
         };
 
-        let _derived_lane = self
-            .derived_projection_lane
-            .lock()
-            .map_err(|_| SelfHostError::LockPoisoned)?;
-        core.mark_non_corpus_materializations_stale();
-        drop(_derived_lane);
+        if session.phase == BulkImportSessionPhase::Ready {
+            let report = session.report();
+            self.emit_audit(
+                "actor:self-host",
+                AuditEventKind::WriteExecution,
+                serde_json::json!({
+                    "mode": "bulk_import_session_end",
+                    "session_id": report.session_id,
+                    "target_append_seq": report.target_append_seq,
+                    "target_observation_count": report.target_observation_count,
+                    "no_op": true,
+                }),
+            )?;
+            return Ok(report);
+        }
+
+        let core = self.core_snapshot();
         self.search_index.catch_up_after_append()?;
         let person_page_ref = ProjectionRef::new("proj:person-page");
         let non_corpus_ready = core.catalog.get(&person_page_ref).is_some_and(|entry| {
@@ -303,10 +310,8 @@ impl AppService {
             && core.observation_stats.max_append_seq == session.target_append_seq
             && core.observation_stats.count == session.target_observation_count;
         if !target_already_materialized {
-            self.refresh_materialized_snapshot(&mut core)?;
-            drop(core);
+            self.refresh_materialized_snapshot(&core)?;
             self.wait_for_non_corpus_rebuild()?;
-            core = (*self.core_snapshot()).clone();
         }
 
         let ready_result = (|| {
@@ -323,28 +328,10 @@ impl AppService {
             persist_bulk_import_session(self.persistence_lock()?.as_ref(), &session)
         })();
         if let Err(error) = ready_result {
-            let _derived_lane = self
-                .derived_projection_lane
-                .lock()
-                .map_err(|_| SelfHostError::LockPoisoned)?;
-            core.mark_non_corpus_materializations_stale();
-            let mut live_core = self.core_lock()?;
-            *live_core = core;
-            self.publish_core_snapshot(&live_core);
+            self.mark_live_core_non_corpus_materializations_stale()?;
             return Err(error);
         }
-        if target_already_materialized {
-            core.activate_non_corpus_projections();
-        }
-        let _derived_lane = self
-            .derived_projection_lane
-            .lock()
-            .map_err(|_| SelfHostError::LockPoisoned)?;
-        let mut live_core = self.core_lock()?;
-        *live_core = core;
-        self.publish_core_snapshot(&live_core);
         let report = session.report();
-        drop(live_core);
         self.emit_audit(
             "actor:self-host",
             AuditEventKind::WriteExecution,
@@ -356,6 +343,32 @@ impl AppService {
             }),
         )?;
         Ok(report)
+    }
+
+    pub(super) fn materialize_bulk_import_append(
+        &self,
+        session: &PersistedBulkImportSession,
+        observations: &[Observation],
+        timer: &mut ObservationImportTimer,
+    ) -> Result<(), SelfHostError> {
+        let first_append = session.target_append_seq == session.base_append_seq;
+        let contains_consent = observations
+            .iter()
+            .any(|observation| compact_consent_decision_from_observation(observation).is_some());
+        if first_append || contains_consent {
+            let _derived_lane = self
+                .derived_projection_lane
+                .lock()
+                .map_err(|_| SelfHostError::LockPoisoned)?;
+            let mut core = self.core_lock()?;
+            for observation in observations {
+                core.compact_state.capture_consent_decision(observation);
+            }
+            core.mark_non_corpus_materializations_stale();
+            self.publish_core_snapshot_for_import(&core, timer);
+        }
+        self.trigger_search_index_catch_up();
+        Ok(())
     }
 
     pub(super) fn bulk_import_session_for_append(

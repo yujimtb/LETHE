@@ -673,11 +673,14 @@ fn validate_projection_fold_declarations(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ImportTimingStage {
     LedgerAppend,
+    PublishClone,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ObservationImportTiming {
     ledger_append_ms: u64,
+    app_core_clone_ms: u64,
+    publish_clone_ms: u64,
     non_corpus_materialize_ms: u64,
     search_index_catch_up_ms: u64,
     audit_ms: u64,
@@ -704,6 +707,7 @@ impl ObservationImportTimer {
             .expect("observation import stage duration does not fit u64 milliseconds");
         match stage {
             ImportTimingStage::LedgerAppend => self.timing.ledger_append_ms = elapsed_ms,
+            ImportTimingStage::PublishClone => self.timing.publish_clone_ms = elapsed_ms,
         }
     }
 
@@ -784,6 +788,8 @@ impl ObservationImportTimingLog {
             "schema_names",
             "subject_kinds",
             "ledger_append_ms",
+            "app_core_clone_ms",
+            "publish_clone_ms",
             "non_corpus_materialize_ms",
             "non_corpus_materialize_mode",
             "non_corpus_classification",
@@ -824,6 +830,8 @@ impl ObservationImportTimingLog {
                 schema_names = %schema_names,
                 subject_kinds = %subject_kinds,
                 ledger_append_ms = self.timing.ledger_append_ms,
+                app_core_clone_ms = self.timing.app_core_clone_ms,
+                publish_clone_ms = self.timing.publish_clone_ms,
                 non_corpus_materialize_ms = self.timing.non_corpus_materialize_ms,
                 non_corpus_materialize_mode = materialization_mode,
                 non_corpus_classification = classification,
@@ -847,6 +855,8 @@ impl ObservationImportTimingLog {
                 schema_names = %schema_names,
                 subject_kinds = %subject_kinds,
                 ledger_append_ms = self.timing.ledger_append_ms,
+                app_core_clone_ms = self.timing.app_core_clone_ms,
+                publish_clone_ms = self.timing.publish_clone_ms,
                 non_corpus_materialize_ms = self.timing.non_corpus_materialize_ms,
                 non_corpus_materialize_mode = materialization_mode,
                 non_corpus_classification = classification,
@@ -6575,7 +6585,7 @@ impl AppService {
             )?;
 
             let _operation = self.bulk_import_operation_lock()?;
-            let mut core = (*self.core_snapshot()).clone();
+            let core = self.core_snapshot();
             let bulk_session = self.bulk_import_session_for_append(bulk_session_id)?;
 
             let mut report = ImportReport {
@@ -6598,7 +6608,7 @@ impl AppService {
                     break;
                 }
                 self.prepare_legacy_observation_draft_batch(
-                    &mut core,
+                    &core,
                     batch,
                     source_instance_id,
                     &mut timer,
@@ -6707,21 +6717,14 @@ impl AppService {
                 }
             }
 
-            let request_had_canonical_attempt = !audit_events.is_empty();
-            if request_had_canonical_attempt {
+            if !request_appended_observations.is_empty() {
                 if let Some(session) = bulk_session.clone() {
-                    self.record_deferred_bulk_import_append(session)?;
-                    let _derived_lane = self
-                        .derived_projection_lane
-                        .lock()
-                        .map_err(|_| SelfHostError::LockPoisoned)?;
-                    let mut core = self.core_lock()?;
-                    for observation in &request_appended_observations {
-                        core.compact_state.capture_consent_decision(observation);
-                    }
-                    core.mark_non_corpus_materializations_stale();
-                    self.publish_core_snapshot(&core);
-                    self.trigger_search_index_catch_up();
+                    self.record_deferred_bulk_import_append(session.clone())?;
+                    self.materialize_bulk_import_append(
+                        &session,
+                        &request_appended_observations,
+                        &mut timer,
+                    )?;
                     materialization_state = ImportMaterializationState::Deferred;
                 } else {
                     let classification =
@@ -6812,7 +6815,7 @@ impl AppService {
             let request_draft_count = drafts.len();
 
             let _operation = self.bulk_import_operation_lock()?;
-            let core = (*self.core_snapshot()).clone();
+            let core = self.core_snapshot();
             let bulk_session = self.bulk_import_session_for_append(bulk_session_id)?;
             let mut report = ImportReport {
                 ingested: 0,
@@ -7039,26 +7042,19 @@ impl AppService {
                 .filter(|result| result.outcome == ImportOutcome::Rejected)
                 .count();
 
-            let request_had_canonical_attempt = !audit_events.is_empty();
-            if request_had_canonical_attempt {
+            if !request_appended_observations.is_empty() {
                 if let Some(session) = bulk_session {
-                    if let Err(error) = self.record_deferred_bulk_import_append(session) {
+                    if let Err(error) = self.record_deferred_bulk_import_append(session.clone()) {
                         tracing::error!(
                             error = %error,
                             "v2 import deferred-materialization bookkeeping failed after durable append"
                         );
                     }
-                    let _derived_lane = self
-                        .derived_projection_lane
-                        .lock()
-                        .map_err(|_| SelfHostError::LockPoisoned)?;
-                    let mut core = self.core_lock()?;
-                    for observation in &request_appended_observations {
-                        core.compact_state.capture_consent_decision(observation);
-                    }
-                    core.mark_non_corpus_materializations_stale();
-                    self.publish_core_snapshot(&core);
-                    self.trigger_search_index_catch_up();
+                    self.materialize_bulk_import_append(
+                        &session,
+                        &request_appended_observations,
+                        &mut timer,
+                    )?;
                     materialization_state = ImportMaterializationState::Deferred;
                 } else {
                     let classification =
@@ -7095,7 +7091,7 @@ impl AppService {
     // draft independently in ingest_observation_drafts_v2_with_session.
     fn prepare_legacy_observation_draft_batch(
         &self,
-        core: &mut AppCore,
+        core: &AppCore,
         drafts: Vec<ObservationDraft>,
         source_instance_id: &str,
         timer: &mut ObservationImportTimer,
