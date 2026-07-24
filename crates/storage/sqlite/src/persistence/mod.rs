@@ -61,6 +61,7 @@ pub struct SqlitePersistence {
     secret_encryption_key: [u8; 32],
     routing_key_order: RoutingKeyOrder,
     partition_tree: ArcSwapOption<PartitionTree>,
+    schema_migrations_applied_on_open: bool,
 }
 
 pub struct SqliteOperationalEventStore {
@@ -129,17 +130,22 @@ impl SqlitePersistence {
         let conn = Connection::open(database_path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
-        let store = Self {
+        let mut store = Self {
             conn,
             blob_dir: blob_dir.to_path_buf(),
             secret_encryption_key: *secret_encryption_key,
             routing_key_order,
             partition_tree: ArcSwapOption::empty(),
+            schema_migrations_applied_on_open: false,
         };
-        store.init_schema()?;
+        store.schema_migrations_applied_on_open = store.init_schema()?;
         let partition_tree = store.rebuild_partition_tree_from_log()?;
         store.partition_tree.store(Some(Arc::new(partition_tree)));
         Ok(store)
+    }
+
+    pub fn schema_migrations_applied_on_open(&self) -> bool {
+        self.schema_migrations_applied_on_open
     }
 
     pub fn load_observations(&self) -> Result<Vec<Observation>, PersistenceError> {

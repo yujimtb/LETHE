@@ -72,6 +72,24 @@ Alternatives: body を `Arc<Observation>` にして共有する方法も AppCore
 
 `tests` または `scripts` に Linux 前提の harness を置く。N 件の synthetic Observation を生成し、idle RSS/VmHWM、bulk import 後の peak RSS/VmHWM、publish counter を記録し、`peak - idle <= constant + O(batch payload)` を機械判定する。N と batch/request 件数は引数化する。CI では小さい N と publish-count assertion を実行し、実 corpus の RSS 判定は Linux container job で行う。秘密・本番 endpoint は使用しない。
 
+### D7: boot migration outcome と manifest restore outcome を分離する
+
+v15.1 の boot 判定は `SqlitePersistence::open` が schema migration を実際に適用したかを返さず、`had_persisted_manifest` だけで background rebuild reason を選んでいた。そのため現行 manifest の restore が watermark/fingerprint/queue index 等で拒否された場合も、manifest が存在するというだけで `full_rebuild_reason="migration"` になった。さらに `current_materialized_snapshot` は legacy version、version 欠落・非数値、watermark/fingerprint 不一致をすべて `Ok(None)` に畳み、運用 log から復元失敗の根因を消していた。
+
+`SqlitePersistence` は open 中に legacy column migration または未記録 schema migration を実行したかを immutable flag として保持する。boot は最初に開いた canonical connection の flag だけを今回の migration outcome として使い、後続 read-pool connection の open を判定に混ぜない。既存 manifest を持つ boot でこの flag が true の場合だけ migration reason の full rebuild を強制する。manifest がなく初期 bootstrap する場合は bootstrap reason とする。
+
+manifest loader は `Restored(snapshot)` と `RebuildRequired(reason)` を区別する。legacy format（v15/v15.1 が受理してきた version 欠落・非数値の実 legacy shape を含む）、canonical watermark 不一致、supplemental fingerprint 不一致は具体値を含む reason を warning log に出して recovery rebuild へ送る。JSON object でない manifest、future version、現行 version の serde/invariant failure は安全な旧形式と断定できないため fail-fast する。現行 schema、現行 manifest、整合する keyed items の二回目 boot は restore のみで background rebuild を起動しない。
+
+### D8: background rebuild の writer lock slicing と fixed high-water tail handoff
+
+v15.1 の `run_background_materialized_rebuild` は `derived_projection_lane` を取った後、単一の `persistence_lock()` guard を `rebuild_materialized_snapshot_paged` の二巡、privacy repull、全 staging commit、target publish が終わるまで保持していた。通常 import は admission/cutover 検査で同じ writer mutex を最初に取得するため、durable append の計測開始前に rebuild 全時間を待った。これが総時間 460〜960 秒に対して `ledger_append_ms` が数十 ms のままになる未計測区間である。
+
+background rebuild 専用 storage adapter は各 `observation_page`、privacy page、supplemental anchor read、staging commit、count 検証、最終 atomic publish ごとに writer mutex を取得・解放する。canonical 二巡は開始時の `(count, max_append_seq)` を固定し、通常 page と privacy reverse-index page の双方で `append_seq <= target.max_append_seq` だけを fold する。append-only 順序により、後から追加された row を final page が余分に返しても target より後を切り落とせる。
+
+`derived_projection_lane` は base build と target install の間保持し、append consumer や supplemental publish が staging result と競合しないようにする。通常 import はこの lane を取得せず、page 間に canonical append と per-item response を完了して consumer を single-flight 起動できる。base rebuild 完了時に、開始後の append を理由として全件 rebuild を先頭からやり直さない。base snapshot とその high-water を install し、append-consumer cursor を base high-water に保存して lane を解放する。待機中 consumer が tail を append sequence 順に増分適用する。これにより固定 snapshot の整合性を保ちつつ、継続 import が full rebuild を永久に再試行させる v8 型 starvation を防ぐ。
+
+writer lock の最終 target publish は既存の staging→target atomic transaction のまま保つ。これを page 分割すると部分 target が観測されるため分割しない。page read/staging commit と最終 publish の lock wait/hold を log し、canonical page は page number・rows・総経過を記録する。import は bulk operation mutex 待ち、writer persistence mutex 待ち、Tokio `spawn_blocking` queue 待ちを別 field に加算し、ledger operation 自体の時間から mutex 待ちを除外する。
+
 ## Risks / Trade-offs
 
 - **[consumer の遅延中は通常 request の snapshot が stale]** → canonical append が成功した時点で response を返す既存非同期契約を維持し、consumer single-flight と health/error state を使う。
@@ -79,6 +97,8 @@ Alternatives: body を `Arc<Observation>` にして共有する方法も AppCore
 - **[re-consent repull の DB read が増える]** → privacy reverse index で対象 ID を絞り、page 単位に制限する。全 corpus の本文は保持しない。
 - **[manifest v10 の起動時 rebuild latency]** → format pre-guard で明確に rebuild に送り、rebuild は既存 page/cursor 経路を利用する。破損した旧型を部分的に読み込まない。
 - **[deep clone 自体は残る]** → B3 は次期候補として明示し、v15 は admission、publish 回数、resident body、migration page を bounded にする。
+- **[rebuild 中の target manifest は base high-water のまま一時的に canonical tail より遅れる]** → live catalog は rebuild 中 stale のままにし、base install 後は append consumer が persisted cursor から追う。crash 時も次回 boot の watermark 不一致が理由付き recovery rebuild になる。
+- **[最終 staging publish は全 item の atomic copy/delete を行う]** → 公開整合性のため単一 transaction を維持する。全 rebuild 時間の mutex 独占は除去し、この最終区間の hold time を明示 log と bounded-import test で監視する。
 
 ## Migration Plan
 
@@ -86,6 +106,7 @@ Alternatives: body を `Arc<Observation>` にして共有する方法も AppCore
 2. binary 起動時に SQLite schema を変更せず、persisted non-corpus manifest v10 以下を pre-deserialize guard で検出して page rebuild する。
 3. v1/v2 import の admission、publish boundary、search eviction を有効化する。
 4. rollback は code/config を同時に戻す。SQLite v13 migration は transaction が commit 済みなら再実行不要で、manifest v11 は旧 binary が newer format として fail-fast するため、旧 binary への rollback は同じ DB でサポートしない。
+5. v15.2 boot は schema migration applied flag、manifest restore outcome、background rebuild reason を別々に記録する。manifest/SQLite DDL の version は変更しない。
 
 ## Open Questions
 
@@ -98,6 +119,16 @@ Alternatives: body を `Arc<Observation>` にして共有する方法も AppCore
 - before は旧 `refresh_capture_consent_snapshot` の単独 publish 呼出しを一時的に復元して同じテストを実行し、`1000件/1 request = 2`、`25件×40 request 直列 = 78` を測定した。測定用の一時変更は取り除き、最終コードには残していない。
 - SQLite の `CURRENT_SCHEMA_VERSION` は 14 のまま。v13 backfill は page/cursor 化したが、既存 DDL、migration ledger、schema semantics は変更していない。`v13_privacy_backfill_rolls_back_and_retries_from_first_page` で transaction rollback と先頭 page からの再実行も検証した。
 - 残課題は B3（AppCore の書込/読取分離と deep clone 全廃）であり、本 change では扱わない。RSS harness の実 corpus 判定は Linux container 実行、通常 CI は小規模 corpus と publish counter を使う。
+
+## v15.2 Verification (2026-07-24)
+
+- 根本原因 A は、boot が schema migration の今回適用結果を持たず、`had_persisted_manifest` をそのまま `full_rebuild_reason="migration"` に変換していたこと、および manifest restore の legacy/watermark/fingerprint rejection を `Ok(None)` に畳んで理由を失っていたことである。
+- `current_schema_and_manifest_restore_without_second_boot_rebuild` は実 Observation を append/materialize して同じ SQLite を再 open し、二回目 boot の rebuild counter `0` と persisted projection restore を検証した。`schema_migration_applied_on_restart_forces_migration_rebuild` は v14 ledger を未適用状態へ戻した既存 DB を再 open し、今回 migration 適用後の rebuild counter `1`、reason `migration` を検証した。legacy manifest の既存 recovery 挙動も維持した。
+- 根本原因 B は、background rebuild が二巡全体を単一 writer `persistence_lock` guard 内で実行し、import が admission 検査で durable append timing より前に同じ mutex を待っていたことである。read page は read pool、staging write は page commit、target publish は atomic transaction 単位へ分割した。
+- `background_rebuild_allows_bounded_v2_import_and_hands_off_tail` は 40 行、page size 1、page 間 delay の background rebuild 中に単発 v2 import を実行し、5 秒未満の response、`ingested` per-item 結果、base 二巡ちょうど 80 page（全件 retry なし）、consumer 収束後 41 行の canonical/core/manifest watermark 一致を検証した。
+- `cargo fmt --all -- --check` と `cargo test --workspace` は成功した。workspace 集計は `721 passed / 0 failed / 3 ignored`、selfhost unit は `106 passed / 0 failed / 0 ignored` である。
+- SQLite DDL と `CURRENT_SCHEMA_VERSION=14`、non-corpus manifest shape と `NON_CORPUS_MATERIALIZATION_VERSION=11` は変更していない。`deploy/personal-lake/compose.yaml` の既存 `MALLOC_ARENA_MAX=1` を維持し、関連運用設計へ 16 GiB container の arena 制約を記録した。
+- 残課題は、提供された 568k fixture/16 GiB Linux container をこの worktree では再実行していないため、実規模の boot restore 所要時間、最終 atomic staging publish の最大 lock hold、VmHWM は同 fixture で再計測することである。ローカル synthetic test は correctness と 5 秒 response bound を担当する。
 
 ## v15.1 P0 follow-up: dup-only no-op と import 入口の snapshot 世代
 

@@ -27,3 +27,16 @@
 
 - [x] 6.1 [Implementer] `scripts/` または `tests/` に Linux container 用 synthetic corpus/RSS/VmHWM harness を追加し、N と bound を引数化する。受入: bound 超過時 non-zero、CI は小 N + publish counter 代替であることが記載される。
 - [x] 6.2 [Reviewer] `openspec/changes/v15-import-memory-bounding` の design/tasks と関連 README/config 運用文書を実装結果に合わせて更新し、cargo fmt と `cargo test --workspace` を実行する。受入: 変更ファイル、全テスト数、publish before/after 実測、manifest/schema 判断、残課題が記録される。
+
+## 7. v15.2 boot restore
+
+- [x] 7.1 [Implementer] SQLite open が今回実際に schema migration を適用したかを返し、boot の `full_rebuild_reason="migration"` をその結果に限定する。manifest restore の legacy/watermark/fingerprint rejection は理由を log し、不正な version/current shape は fail-fast にする。受入: 現行 DB+manifest の二回目 boot は rebuild 0、未適用 migration を作った再起動は rebuild 1/reason migration。
+
+## 8. v15.2 rebuild/import concurrency
+
+- [x] 8.1 [Implementer] background non-corpus rebuild の writer persistence mutex を page/read/commit 単位へ分割し、fixed high-water より後の append を base snapshot から除外する。base 完了後は全件 retry せず append-consumer cursor へ tail を handoff する。受入: 継続 append で starvation せず、既存 freshness/communication/row-store 整合テストが通る。
+- [x] 8.2 [Implementer] import timing に `bulk_operation_lock_wait_ms`、`persistence_lock_wait_ms`、`spawn_blocking_wait_ms`、rebuild に page/elapsed/lock hold log を追加する。background rebuild 中の単発 v2 import が synthetic test で5秒以内に応答し、consumer収束後の count/watermark が一致することを検証する。
+
+## 9. v15.2 検証と文書
+
+- [x] 9.1 [Reviewer] `docs/development/persistent-index-design.md` と本 change の Verification を実装結果へ更新し、`cargo fmt --all -- --check` と `cargo test --workspace` を実行する。受入: 根本原因A/B、変更ファイル、全テスト数、lock/watermark設計、残課題を記録する。

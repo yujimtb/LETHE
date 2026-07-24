@@ -710,6 +710,10 @@ fn migration_ledger_records_current_schema_version() {
     let db = tmp.join("test.sqlite3");
     let blob_dir = tmp.join("blobs");
     let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    assert!(
+        store.schema_migrations_applied_on_open(),
+        "fresh schema must report migrations applied by this open"
+    );
     let version: i64 = store
         .conn
         .query_row(
@@ -719,6 +723,14 @@ fn migration_ledger_records_current_schema_version() {
         )
         .unwrap();
     assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    drop(store);
+
+    let reopened = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    assert!(
+        !reopened.schema_migrations_applied_on_open(),
+        "current schema must not report historical migration records as newly applied"
+    );
+    drop(reopened);
 
     let _ = fs::remove_dir_all(tmp);
 }

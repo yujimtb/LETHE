@@ -1,20 +1,270 @@
 use super::*;
 
+struct BackgroundRebuildStorage<'a> {
+    service: &'a AppService,
+    started_at: Instant,
+    page_count: std::sync::atomic::AtomicU64,
+    max_lock_hold_ms: std::sync::atomic::AtomicU64,
+}
+
+struct BackgroundStorageSection<T> {
+    value: T,
+    lock_wait_ms: u64,
+    lock_hold_ms: u64,
+}
+
+impl<'a> BackgroundRebuildStorage<'a> {
+    fn new(service: &'a AppService) -> Self {
+        Self {
+            service,
+            started_at: Instant::now(),
+            page_count: std::sync::atomic::AtomicU64::new(0),
+            max_lock_hold_ms: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn duration_ms(duration: Duration) -> u64 {
+        u64::try_from(duration.as_millis())
+            .expect("background rebuild duration does not fit u64 milliseconds")
+    }
+
+    fn read<T>(
+        &self,
+        operation: &'static str,
+        access: impl FnOnce(&dyn StoragePorts) -> Result<T, StorageError>,
+    ) -> Result<BackgroundStorageSection<T>, SelfHostError> {
+        let wait_started_at = Instant::now();
+        let persistence = self.service.persistence_read_lock()?;
+        let lock_wait_ms = Self::duration_ms(wait_started_at.elapsed());
+        let hold_started_at = Instant::now();
+        let result = access(persistence.as_ref()).map_err(SelfHostError::Storage);
+        let lock_hold_ms = Self::duration_ms(hold_started_at.elapsed());
+        drop(persistence);
+        self.record_storage_section(operation, "read", lock_wait_ms, lock_hold_ms);
+        Ok(BackgroundStorageSection {
+            value: result?,
+            lock_wait_ms,
+            lock_hold_ms,
+        })
+    }
+
+    fn write<T>(
+        &self,
+        operation: &'static str,
+        access: impl FnOnce(&dyn StoragePorts) -> Result<T, StorageError>,
+    ) -> Result<BackgroundStorageSection<T>, SelfHostError> {
+        let wait_started_at = Instant::now();
+        let persistence = self.service.persistence_lock()?;
+        let lock_wait_ms = Self::duration_ms(wait_started_at.elapsed());
+        let hold_started_at = Instant::now();
+        let result = access(persistence.as_ref()).map_err(SelfHostError::Storage);
+        let lock_hold_ms = Self::duration_ms(hold_started_at.elapsed());
+        drop(persistence);
+        self.record_storage_section(operation, "writer", lock_wait_ms, lock_hold_ms);
+        Ok(BackgroundStorageSection {
+            value: result?,
+            lock_wait_ms,
+            lock_hold_ms,
+        })
+    }
+
+    fn record_storage_section(
+        &self,
+        operation: &'static str,
+        lock_kind: &'static str,
+        lock_wait_ms: u64,
+        lock_hold_ms: u64,
+    ) {
+        self.max_lock_hold_ms
+            .fetch_max(lock_hold_ms, std::sync::atomic::Ordering::Relaxed);
+        tracing::debug!(
+            operation,
+            persistence_lock_kind = lock_kind,
+            persistence_lock_wait_ms = lock_wait_ms,
+            persistence_lock_hold_ms = lock_hold_ms,
+            rebuild_elapsed_ms = Self::duration_ms(self.started_at.elapsed()),
+            "background non-corpus rebuild persistence section completed"
+        );
+    }
+
+    fn record_page(
+        &self,
+        page_kind: &'static str,
+        rows: usize,
+        lock_wait_ms: u64,
+        lock_hold_ms: u64,
+    ) {
+        let page_number = self
+            .page_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        #[cfg(test)]
+        self.service
+            .non_corpus_rebuild_page_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::debug!(
+            page_kind,
+            page_number,
+            rows,
+            elapsed_ms = Self::duration_ms(self.started_at.elapsed()),
+            persistence_lock_wait_ms = lock_wait_ms,
+            persistence_lock_hold_ms = lock_hold_ms,
+            "background non-corpus rebuild page completed"
+        );
+        if page_number == 1 || page_number % 100 == 0 {
+            tracing::info!(
+                page_count = page_number,
+                elapsed_ms = Self::duration_ms(self.started_at.elapsed()),
+                max_persistence_lock_hold_ms = self
+                    .max_lock_hold_ms
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                "background non-corpus rebuild progress"
+            );
+        }
+        #[cfg(test)]
+        if let Some(delay) = self.service.non_corpus_rebuild_page_delay {
+            std::thread::sleep(delay);
+        }
+    }
+
+    fn emit_completion(&self, target: ObservationStats, current: ObservationStats) {
+        tracing::info!(
+            page_count = self.page_count.load(std::sync::atomic::Ordering::Relaxed),
+            elapsed_ms = Self::duration_ms(self.started_at.elapsed()),
+            max_persistence_lock_hold_ms = self
+                .max_lock_hold_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            target_count = target.count,
+            target_append_seq = target.max_append_seq,
+            current_count = current.count,
+            current_append_seq = current.max_append_seq,
+            "background non-corpus materialization completed"
+        );
+    }
+}
+
+impl NonCorpusRebuildStorage for BackgroundRebuildStorage<'_> {
+    fn load_supplementals(&self) -> Result<Vec<SupplementalRecord>, SelfHostError> {
+        Ok(self
+            .read("load_supplementals", |storage| storage.load_supplementals())?
+            .value)
+    }
+
+    fn observation_stats(&self) -> Result<ObservationStats, SelfHostError> {
+        Ok(self
+            .read("observation_stats", |storage| storage.observation_stats())?
+            .value)
+    }
+
+    fn observation_page(
+        &self,
+        after_append_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredObservation>, SelfHostError> {
+        let section = self.read("observation_page", |storage| {
+            storage.observation_page(after_append_seq, limit)
+        })?;
+        self.record_page(
+            "canonical",
+            section.value.len(),
+            section.lock_wait_ms,
+            section.lock_hold_ms,
+        );
+        Ok(section.value)
+    }
+
+    fn observations_for_privacy_key_page(
+        &self,
+        privacy_key: &str,
+        after_append_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredObservation>, SelfHostError> {
+        let section = self.read("privacy_key_page", |storage| {
+            storage.observations_for_privacy_key_page(privacy_key, after_append_seq, limit)
+        })?;
+        self.record_page(
+            "privacy",
+            section.value.len(),
+            section.lock_wait_ms,
+            section.lock_hold_ms,
+        );
+        Ok(section.value)
+    }
+
+    fn observation_by_id(
+        &self,
+        id: &ObservationId,
+    ) -> Result<Option<StoredObservation>, SelfHostError> {
+        Ok(self
+            .read("observation_by_id", |storage| storage.observation_by_id(id))?
+            .value)
+    }
+
+    fn commit_projection_items(
+        &self,
+        projection: &ProjectionRef,
+        manifest: &serde_json::Value,
+        commit: &ProjectionItemCommit,
+    ) -> Result<(), SelfHostError> {
+        self.write("commit_projection_items", |storage| {
+            storage.commit_projection_items(projection, manifest, commit)
+        })?;
+        Ok(())
+    }
+
+    fn projection_item_count_by_owner(
+        &self,
+        projection: &ProjectionRef,
+        owner_key: &str,
+    ) -> Result<u64, SelfHostError> {
+        Ok(self
+            .read("projection_item_count_by_owner", |storage| {
+                storage.projection_item_count_by_owner(projection, owner_key)
+            })?
+            .value)
+    }
+
+    fn publish_projection_items_from_staging(
+        &self,
+        target: &ProjectionRef,
+        staging: &ProjectionRef,
+        manifest: &serde_json::Value,
+        expected_item_count: u64,
+    ) -> Result<(), SelfHostError> {
+        self.write("publish_projection_items_from_staging", |storage| {
+            storage.publish_projection_items_from_staging(
+                target,
+                staging,
+                manifest,
+                expected_item_count,
+            )
+        })?;
+        Ok(())
+    }
+
+    fn set_state(&self, key: &str, value: &str) -> Result<(), SelfHostError> {
+        self.write("set_state", |storage| storage.set_state(key, value))?;
+        Ok(())
+    }
+}
+
 impl AppService {
     pub fn mcp_oauth_config(&self) -> crate::self_host::config::McpOAuthConfig {
         self.config.mcp_oauth.clone()
     }
 
-    pub(super) fn enforce_cutover_admission(
+    pub(super) fn enforce_cutover_admission_for_import(
         &self,
         source_instance_id: &str,
         api_version: lethe_storage_api::CutoverApiVersion,
         generation: Option<u64>,
+        timer: &mut ObservationImportTimer,
     ) -> Result<(), SelfHostError> {
-        match self
-            .persistence_lock()?
-            .cutover_admit(source_instance_id, api_version, generation)
-        {
+        match self.persistence_lock_for_import(timer)?.cutover_admit(
+            source_instance_id,
+            api_version,
+            generation,
+        ) {
             Ok(()) => Ok(()),
             Err(StorageError::CutoverAdmissionDenied(detail)) => Err(SelfHostError::Auth(detail)),
             Err(error) => Err(SelfHostError::Storage(error)),
@@ -364,6 +614,11 @@ impl AppService {
         #[cfg(test)]
         self.non_corpus_rebuild_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        self.non_corpus_rebuild_reasons
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?
+            .push(reason);
         let service = self.clone();
         let freshness_thresholds = core.freshness_thresholds.clone();
         let channels = core
@@ -441,45 +696,53 @@ impl AppService {
             full_rebuild_reason = reason,
             "background non-corpus materialization started"
         );
-        loop {
-            let (materialized, stats) = {
-                let store = self.persistence_lock()?;
-                let supplementals = store.load_supplementals()?;
-                let stats = store.observation_stats()?;
-                let materialized = rebuild_materialized_snapshot_paged(
-                    store.as_ref(),
-                    &supplementals,
-                    freshness_thresholds,
-                    channels,
-                    stats,
-                    self.config.corpus.rebuild_page_size,
-                    Utc::now(),
-                )?;
-                (materialized, stats)
-            };
-            let current_stats = self.persistence_lock()?.observation_stats()?;
-            if current_stats != stats {
-                tracing::debug!(
-                    built_count = stats.count,
-                    current_count = current_stats.count,
-                    "background non-corpus rebuild observed a newer canonical high-water; retrying"
-                );
-                continue;
-            }
-            let mut core = self.core_lock()?;
-            if core.observation_stats.max_append_seq > stats.max_append_seq
-                || core.observation_stats.count > stats.count
-            {
-                continue;
-            }
-            core.install_materialized(materialized);
-            self.publish_core_snapshot(&core);
-            self.persistence_lock()?.set_state(
-                "append_consumer:person-page",
-                &stats.max_append_seq.to_string(),
-            )?;
-            return Ok(());
+        let storage = BackgroundRebuildStorage::new(self);
+        let supplementals = storage.load_supplementals()?;
+        let stats = storage.observation_stats()?;
+        let materialized = rebuild_materialized_snapshot_paged(
+            &storage,
+            &supplementals,
+            freshness_thresholds,
+            channels,
+            stats,
+            self.config.corpus.rebuild_page_size,
+            Utc::now(),
+        )?;
+        let mut core = self.core_lock()?;
+        if core.observation_stats.max_append_seq > stats.max_append_seq
+            || core.observation_stats.count > stats.count
+        {
+            return Err(SelfHostError::Ingestion(format!(
+                "resident non-corpus watermark {}/{} advanced beyond background rebuild target {}/{} while derived lane was held",
+                core.observation_stats.count,
+                core.observation_stats.max_append_seq,
+                stats.count,
+                stats.max_append_seq
+            )));
         }
+        core.install_materialized(materialized);
+        self.publish_core_snapshot(&core);
+        drop(core);
+        storage.set_state(
+            "append_consumer:person-page",
+            &stats.max_append_seq.to_string(),
+        )?;
+        let current_stats = storage.observation_stats()?;
+        if current_stats.count < stats.count || current_stats.max_append_seq < stats.max_append_seq
+        {
+            return Err(SelfHostError::Ingestion(format!(
+                "canonical watermark regressed from rebuild target {}/{} to {}/{}",
+                stats.count,
+                stats.max_append_seq,
+                current_stats.count,
+                current_stats.max_append_seq
+            )));
+        }
+        if current_stats != stats {
+            self.trigger_append_consumer();
+        }
+        storage.emit_completion(stats, current_stats);
+        Ok(())
     }
 
     pub(super) fn wait_for_non_corpus_rebuild(&self) -> Result<(), SelfHostError> {
@@ -1035,6 +1298,22 @@ impl AppService {
         self.persistence
             .lock()
             .map_err(|_| SelfHostError::LockPoisoned)
+    }
+
+    pub(super) fn persistence_lock_for_import<'a>(
+        &'a self,
+        timer: &mut ObservationImportTimer,
+    ) -> Result<std::sync::MutexGuard<'a, Box<dyn StoragePorts>>, SelfHostError> {
+        let wait_started_at = Instant::now();
+        let result = self
+            .persistence
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned);
+        timer.record_stage(
+            ImportTimingStage::PersistenceLockWait,
+            wait_started_at.elapsed(),
+        );
+        result
     }
 
     pub(super) fn persistence_read_lock(

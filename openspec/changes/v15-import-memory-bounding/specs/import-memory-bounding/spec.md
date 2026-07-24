@@ -147,3 +147,47 @@ Linux container 向け memory harness は synthetic corpus N 件生成、bulk im
 - **WHEN** harness を指定 N と batch payload で実行する
 - **THEN** idle/peak measurement と publish count を出力する
 - **AND** configured bound を超えた場合は non-zero exit になる
+
+### Requirement: Boot rebuild reason reflects an applied migration
+
+boot は SQLite を開いた今回の処理で schema migration が一つ以上実際に適用されたかを記録しなければならない。`full_rebuild_reason="migration"` はその記録が true の既存 materialization rebuild にだけ使用し、単に persisted manifest が存在した、migration 関数が呼ばれた、または snapshot 復元が拒否されたことを migration と分類してはならない。現行 schema と現行 manifest の再起動は persisted materialized snapshot を復元し、full rebuild を開始してはならない。
+
+snapshot の format version、canonical watermark、supplemental fingerprint のために安全な rebuild が必要な場合は、拒否理由を構造化 log に記録しなければならない。v15/v15.1 が受理してきた version 欠落・非数値の実 legacy manifest は理由付き recovery rebuild へ送る。JSON object でない manifest、未知の future version、現行 version の deserialize/invariant failure は fail-fast とし、silent rebuild へ送ってはならない。
+
+#### Scenario: 現行 DB と manifest の二回目 boot は snapshot を復元する
+
+- **WHEN** 実データ形状の Observation と現行 schema migration ledger、現行 non-corpus manifest を保存したプロセスを終了し、同じ DB を再度開く
+- **THEN** 二回目の boot は persisted materialized snapshot を復元する
+- **AND** background full rebuild counter は増えず、`full_rebuild_reason` も記録されない
+
+#### Scenario: 今回 migration を適用した boot は rebuild する
+
+- **WHEN** persisted materialization を持つ DB に未適用 schema migration があり、今回の open でその migration を適用する
+- **THEN** boot は background full rebuild を一回開始する
+- **AND** `full_rebuild_reason` は `migration` である
+
+#### Scenario: 復元拒否理由を失わない
+
+- **WHEN** legacy format、canonical watermark 不一致、または supplemental fingerprint 不一致の manifest を読む
+- **THEN** boot は manifest restore rejection の具体的理由を log に記録して recovery rebuild を開始する
+- **AND** その理由を schema migration と推測しない
+
+### Requirement: Background rebuild does not monopolize import persistence
+
+background non-corpus rebuild は固定した canonical `(count, max_append_seq)` high-water 以下だけを二巡し、SQLite writer mutex を一回の page read、page staging commit、または最終 atomic publish の区間だけ保持しなければならない。通常 import は page 間で writer mutex を取得して durable append と v1/v2 per-item 結果を完了できなければならない。
+
+rebuild 開始後の append は固定 high-water の snapshot に混入させてはならない。base snapshot の install と append-consumer cursor 保存後、既存 append consumer がより新しい tail を順序どおり増分 materialize する。新しい append を観測しただけで base 全件 rebuild を先頭から再試行してはならない。`derived_projection_lane` は base build/install と増分 consumer の同時 publish を防ぐため rebuild 中保持してよいが、通常 import response はこの lane を待たない。
+
+import timing は少なくとも `bulk_operation_lock_wait_ms`、`persistence_lock_wait_ms`、`spawn_blocking_wait_ms` を独立 field として出力しなければならない。background rebuild は page 数、総経過、各 writer mutex 保持区間を log に出さなければならない。
+
+#### Scenario: rebuild 中の単発 import 応答が有界である
+
+- **WHEN** 複数 page の background non-corpus rebuild が進行中に単発 v2 import を実行する
+- **THEN** import は synthetic test で 5 秒以内に durable append と per-item `ingested` 結果を返す
+- **AND** rebuild 完了後に append consumer が tail を反映し、canonical count と公開 materialization watermark が一致する
+
+#### Scenario: rebuild 中の append は base snapshot を汚染しない
+
+- **WHEN** rebuild の固定 high-water より後に Observation が append される
+- **THEN** base rebuild の各 canonical/privacy page は固定 high-water 以下だけを fold する
+- **AND** base を全件再試行せず、tail は append sequence 順の consumer に一度だけ渡される

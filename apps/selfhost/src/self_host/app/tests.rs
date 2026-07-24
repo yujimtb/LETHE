@@ -407,6 +407,126 @@ fn v10_manifest_shape_rebuilds_on_restart_without_body_cache() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[test]
+fn current_schema_and_manifest_restore_without_second_boot_rebuild() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-self-host-current-restore-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let config = test_config(db, blobs);
+
+    let service = AppService::bootstrap(config.clone()).unwrap();
+    service.wait_for_non_corpus_rebuild().unwrap();
+    let report = service
+        .ingest_observation_drafts(vec![wave2_slack_draft(41)], "slack-test")
+        .unwrap();
+    assert_eq!(report.ingested, 1);
+    wait_for_append_consumer(&service);
+    let first_manifest = service
+        .persistence_lock()
+        .unwrap()
+        .projection_records(&ProjectionRef::new("proj:person-page"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        first_manifest["format_version"],
+        super::NON_CORPUS_MATERIALIZATION_VERSION
+    );
+    drop(service);
+
+    let restarted = AppService::bootstrap(config).unwrap();
+    assert_eq!(
+        restarted
+            .non_corpus_rebuild_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a current schema and manifest must restore without a second-boot rebuild"
+    );
+    assert!(
+        restarted
+            .non_corpus_rebuild_reasons
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        restarted
+            .persons_response(
+                None,
+                None,
+                &lethe_api::api::pagination::PaginationParams::default(),
+            )
+            .unwrap()
+            .data["total"],
+        1
+    );
+
+    drop(restarted);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn schema_migration_applied_on_restart_forces_migration_rebuild() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-self-host-migration-rebuild-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let config = test_config(db.clone(), blobs);
+
+    let service = AppService::bootstrap(config.clone()).unwrap();
+    service.wait_for_non_corpus_rebuild().unwrap();
+    let report = service
+        .ingest_observation_drafts(vec![wave2_slack_draft(42)], "slack-test")
+        .unwrap();
+    assert_eq!(report.ingested, 1);
+    wait_for_append_consumer(&service);
+    drop(service);
+
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    assert_eq!(
+        connection
+            .execute("DELETE FROM schema_migrations WHERE version = 14", [])
+            .unwrap(),
+        1
+    );
+    drop(connection);
+
+    let restarted = AppService::bootstrap(config).unwrap();
+    assert_eq!(
+        restarted
+            .non_corpus_rebuild_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        restarted
+            .non_corpus_rebuild_reasons
+            .lock()
+            .unwrap()
+            .as_slice(),
+        ["migration"]
+    );
+    restarted.wait_for_non_corpus_rebuild().unwrap();
+    assert_eq!(
+        restarted
+            .persons_response(
+                None,
+                None,
+                &lethe_api::api::pagination::PaginationParams::default(),
+            )
+            .unwrap()
+            .data["total"],
+        1
+    );
+
+    drop(restarted);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn health_and_operational_read_do_not_occupy_async_worker_while_storage_is_locked() {
     let root = std::env::temp_dir().join(format!(
@@ -612,6 +732,9 @@ fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppSe
         non_corpus_rebuild_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         non_corpus_rebuild_error: Arc::new(Mutex::new(None)),
         non_corpus_rebuild_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        non_corpus_rebuild_reasons: Arc::new(Mutex::new(Vec::new())),
+        non_corpus_rebuild_page_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        non_corpus_rebuild_page_delay: None,
         publish_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         search_job_test_gate: None,
         search_job_test_fault: None,
@@ -1751,7 +1874,7 @@ fn materialized_snapshot_selection_is_versioned_strict_and_stats_bound() {
     let fingerprint = materialized.supplemental_fingerprint.clone();
     let value = materialized.manifest_value().unwrap();
 
-    assert!(
+    assert!(matches!(
         super::current_materialized_snapshot(
             &persistence,
             value.clone(),
@@ -1760,10 +1883,10 @@ fn materialized_snapshot_selection_is_versioned_strict_and_stats_bound() {
             0,
             0
         )
-        .unwrap()
-        .is_some()
-    );
-    assert!(
+        .unwrap(),
+        super::MaterializedSnapshotRestore::Restored(_)
+    ));
+    assert!(matches!(
         super::current_materialized_snapshot(
             &persistence,
             value.clone(),
@@ -1775,14 +1898,15 @@ fn materialized_snapshot_selection_is_versioned_strict_and_stats_bound() {
             0,
             0,
         )
-        .unwrap()
-        .is_none()
-    );
+        .unwrap(),
+        super::MaterializedSnapshotRestore::RebuildRequired { reason }
+            if reason.contains("canonical watermark")
+    ));
 
     let mut legacy_version = value.clone();
     legacy_version["format_version"] =
         serde_json::json!(super::NON_CORPUS_MATERIALIZATION_VERSION - 1);
-    assert!(
+    assert!(matches!(
         super::current_materialized_snapshot(
             &persistence,
             legacy_version,
@@ -1791,16 +1915,17 @@ fn materialized_snapshot_selection_is_versioned_strict_and_stats_bound() {
             0,
             0
         )
-        .unwrap()
-        .is_none()
-    );
+        .unwrap(),
+        super::MaterializedSnapshotRestore::RebuildRequired { reason }
+            if reason.contains("older than current")
+    ));
 
     let mut missing_version = value.clone();
     missing_version
         .as_object_mut()
         .unwrap()
         .remove("format_version");
-    assert!(
+    assert!(matches!(
         super::current_materialized_snapshot(
             &persistence,
             missing_version,
@@ -1809,13 +1934,14 @@ fn materialized_snapshot_selection_is_versioned_strict_and_stats_bound() {
             0,
             0
         )
-        .unwrap()
-        .is_none()
-    );
+        .unwrap(),
+        super::MaterializedSnapshotRestore::RebuildRequired { reason }
+            if reason.contains("has no format_version")
+    ));
 
     let mut non_numeric_version = value.clone();
     non_numeric_version["format_version"] = serde_json::json!("legacy");
-    assert!(
+    assert!(matches!(
         super::current_materialized_snapshot(
             &persistence,
             non_numeric_version,
@@ -1824,9 +1950,10 @@ fn materialized_snapshot_selection_is_versioned_strict_and_stats_bound() {
             0,
             0
         )
-        .unwrap()
-        .is_none()
-    );
+        .unwrap(),
+        super::MaterializedSnapshotRestore::RebuildRequired { reason }
+            if reason.contains("not an unsigned integer")
+    ));
 
     let mut future_version = value.clone();
     future_version["format_version"] =
@@ -2263,12 +2390,27 @@ fn non_corpus_delta_classification_uses_declared_incremental_folds_im03() {
 fn observation_import_timer_records_commit_stage_duration() {
     let mut timer = super::ObservationImportTimer::new();
     timer.record_stage(
+        super::ImportTimingStage::SpawnBlockingWait,
+        std::time::Duration::from_millis(7),
+    );
+    timer.record_stage(
+        super::ImportTimingStage::PersistenceLockWait,
+        std::time::Duration::from_millis(3),
+    );
+    timer.record_stage(
+        super::ImportTimingStage::PersistenceLockWait,
+        std::time::Duration::from_millis(5),
+    );
+    timer.record_stage(
         super::ImportTimingStage::LedgerAppend,
         std::time::Duration::from_millis(11),
     );
 
     let timing = timer.finish();
+    assert_eq!(timing.spawn_blocking_wait_ms, 7);
+    assert_eq!(timing.persistence_lock_wait_ms, 8);
     assert_eq!(timing.ledger_append_ms, 11);
+    assert!(timing.total_ms >= timing.spawn_blocking_wait_ms);
     assert_eq!(timing.non_corpus_materialize_ms, 0);
     assert_eq!(timing.search_index_catch_up_ms, 0);
     assert_eq!(timing.audit_ms, 0);
@@ -2282,6 +2424,9 @@ fn observation_import_timing_log_declares_required_fields() {
     for required in [
         "schema_names",
         "subject_kinds",
+        "bulk_operation_lock_wait_ms",
+        "persistence_lock_wait_ms",
+        "spawn_blocking_wait_ms",
         "ledger_append_ms",
         "non_corpus_materialize_ms",
         "non_corpus_materialize_mode",
@@ -4801,6 +4946,105 @@ fn read_lane_does_not_wait_for_writer_lane() {
     drop(writer_guard);
     reader.join().unwrap();
 
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn background_rebuild_allows_bounded_v2_import_and_hands_off_tail() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-rebuild-import-concurrency-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let published = chrono::DateTime::parse_from_rfc3339("2026-07-24T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    for index in 0..40 {
+        persistence
+            .persist_observation(&freshness_only_observation(
+                "schema:github-event",
+                "sys:github",
+                &format!("rebuild-seed-{index:03}"),
+                published + chrono::Duration::seconds(index),
+            ))
+            .unwrap();
+    }
+    let mut config = test_config(db, blobs);
+    config.corpus.rebuild_page_size = 1;
+    let mut service = test_service(config, persistence);
+    service.non_corpus_rebuild_page_delay = Some(std::time::Duration::from_millis(25));
+
+    let core = service.core_snapshot();
+    service
+        .refresh_materialized_snapshot_with_reason(&core, "recovery")
+        .unwrap();
+    drop(core);
+    for _ in 0..2_000 {
+        if service
+            .non_corpus_rebuild_page_count
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        service
+            .non_corpus_rebuild_in_flight
+            .load(std::sync::atomic::Ordering::Acquire),
+        "import must be issued while the background rebuild is still running"
+    );
+
+    let started_at = std::time::Instant::now();
+    let report = service
+        .ingest_observation_drafts_v2(vec![v2_slack_draft(9_999, Utc::now())], "slack-test")
+        .unwrap();
+    let response_elapsed = started_at.elapsed();
+    assert!(
+        response_elapsed < std::time::Duration::from_secs(5),
+        "v2 import waited {response_elapsed:?} during background rebuild"
+    );
+    assert_eq!(report.ingested, 1);
+    assert!(matches!(
+        report.results.as_slice(),
+        [ImportItemResult {
+            outcome: ImportOutcome::Ingested,
+            ..
+        }]
+    ));
+
+    service.wait_for_non_corpus_rebuild().unwrap();
+    wait_for_append_consumer(&service);
+    assert_eq!(
+        service
+            .non_corpus_rebuild_page_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        80,
+        "the fixed 40-row high-water must be read exactly twice without a full retry"
+    );
+    assert_eq!(
+        service
+            .persistence_lock()
+            .unwrap()
+            .observation_stats()
+            .unwrap()
+            .count,
+        41
+    );
+    assert_eq!(service.core_snapshot().observation_stats.count, 41);
+    let manifest = service
+        .persistence_lock()
+        .unwrap()
+        .projection_records(&ProjectionRef::new("proj:person-page"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(manifest["observation_count"], 41);
+    assert_eq!(manifest["last_append_seq"], 41);
+
+    drop(service);
     let _ = std::fs::remove_dir_all(root);
 }
 

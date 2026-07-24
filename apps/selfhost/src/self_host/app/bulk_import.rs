@@ -189,6 +189,22 @@ impl AppService {
             .map_err(|_| SelfHostError::LockPoisoned)
     }
 
+    pub(super) fn bulk_import_operation_lock_for_import<'a>(
+        &'a self,
+        timer: &mut ObservationImportTimer,
+    ) -> Result<std::sync::MutexGuard<'a, ()>, SelfHostError> {
+        let wait_started_at = Instant::now();
+        let result = self
+            .bulk_import_operation
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned);
+        timer.record_stage(
+            ImportTimingStage::BulkOperationLockWait,
+            wait_started_at.elapsed(),
+        );
+        result
+    }
+
     pub fn begin_bulk_import_session(&self) -> Result<BulkImportSessionReport, SelfHostError> {
         let _operation = self.bulk_import_operation_lock()?;
         let core = self.core_snapshot();
@@ -374,6 +390,7 @@ impl AppService {
     pub(super) fn bulk_import_session_for_append(
         &self,
         requested_session_id: Option<&str>,
+        timer: &mut ObservationImportTimer,
     ) -> Result<Option<PersistedBulkImportSession>, SelfHostError> {
         if requested_session_id.is_some_and(|session_id| session_id.trim().is_empty()) {
             return Err(SelfHostError::BulkImportSessionConflict {
@@ -381,7 +398,7 @@ impl AppService {
                 detail: "bulk import session id must not be blank".to_owned(),
             });
         }
-        let persistence = self.persistence_lock()?;
+        let persistence = self.persistence_lock_for_import(timer)?;
         let persisted = load_persisted_bulk_import_session(persistence.as_ref())?;
         match (persisted, requested_session_id) {
             (None, None) => Ok(None),
@@ -431,8 +448,9 @@ impl AppService {
     pub(super) fn record_deferred_bulk_import_append(
         &self,
         mut session: PersistedBulkImportSession,
+        timer: &mut ObservationImportTimer,
     ) -> Result<(), SelfHostError> {
-        let persistence = self.persistence_lock()?;
+        let persistence = self.persistence_lock_for_import(timer)?;
         let stats = persistence.observation_stats()?;
         session.update_target(stats, Utc::now())?;
         persist_bulk_import_session(persistence.as_ref(), &session)

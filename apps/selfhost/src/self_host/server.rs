@@ -610,12 +610,14 @@ async fn import_observation_drafts(
 ) -> Result<Json<ImportReport>, ApiError> {
     service.authorize_headers(&headers, "write:observations")?;
     let admission_generation = cutover_generation(&headers)?;
+    let spawn_blocking_started_at = std::time::Instant::now();
     let report = tokio::task::spawn_blocking(move || {
-        service.ingest_observation_drafts_with_admission_generation(
+        service.ingest_observation_drafts_with_admission_generation_and_spawn_wait(
             request.drafts,
             &request.source_instance_id,
             request.bulk_session_id.as_deref(),
             admission_generation,
+            spawn_blocking_started_at.elapsed(),
         )
     })
     .await
@@ -647,12 +649,14 @@ async fn import_observation_drafts_v2(
         }
     };
     let admission_generation = cutover_generation(&headers)?;
+    let spawn_blocking_started_at = std::time::Instant::now();
     let report = tokio::task::spawn_blocking(move || {
-        service.ingest_observation_drafts_v2_with_admission_generation(
+        service.ingest_observation_drafts_v2_with_admission_generation_and_spawn_wait(
             request.drafts,
             &request.source_instance_id,
             request.bulk_session_id.as_deref(),
             admission_generation,
+            spawn_blocking_started_at.elapsed(),
         )
     })
     .await
