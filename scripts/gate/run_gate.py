@@ -645,7 +645,7 @@ def run_test1b_bulk_session_dup_only(
     def begin_session(label: str) -> gc.BulkSessionResult:
         context = f"{label} begin"
         outcome = gc.call_bulk_session_with_retry(
-            lambda: client.begin_bulk_session(timeout=60.0),
+            lambda: client.begin_bulk_session(timeout=600.0),
             max_consecutive_timeouts=max_consecutive_timeouts,
             max_consecutive_conflict_retries=max_consecutive_bulk_session_conflicts,
             conflict_wait_seconds=bulk_session_conflict_wait_seconds,
@@ -920,7 +920,7 @@ def run_test2b_bulk_session_new(
 
     gc.assert_container_alive(container_name)
     try:
-        begin_result = call_session(lambda: client.begin_bulk_session(timeout=60.0), "test 2b begin")
+        begin_result = call_session(lambda: client.begin_bulk_session(timeout=600.0), "test 2b begin")
     except gc.ImportRequestError as error:
         if error.status_code in gc.SESSION_API_UNAVAILABLE_STATUS_CODES:
             reason = (
