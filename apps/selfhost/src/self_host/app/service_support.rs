@@ -1,5 +1,7 @@
 use super::*;
 
+const PROJECTION_GENERATION_CLEANUP_PAGE_SIZE: usize = 128;
+
 struct BackgroundRebuildStorage<'a> {
     service: &'a AppService,
     started_at: Instant,
@@ -76,6 +78,10 @@ impl<'a> BackgroundRebuildStorage<'a> {
         lock_hold_ms: u64,
     ) {
         self.max_lock_hold_ms
+            .fetch_max(lock_hold_ms, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        self.service
+            .non_corpus_rebuild_max_persistence_lock_hold_ms
             .fetch_max(lock_hold_ms, std::sync::atomic::Ordering::Relaxed);
         tracing::debug!(
             operation,
@@ -209,6 +215,9 @@ impl NonCorpusRebuildStorage for BackgroundRebuildStorage<'_> {
         self.write("commit_projection_items", |storage| {
             storage.commit_projection_items(projection, manifest, commit)
         })?;
+        if matches!(commit, ProjectionItemCommit::Replace { .. }) {
+            self.service.request_projection_generation_cleanup();
+        }
         Ok(())
     }
 
@@ -231,7 +240,11 @@ impl NonCorpusRebuildStorage for BackgroundRebuildStorage<'_> {
         manifest: &serde_json::Value,
         expected_item_count: u64,
     ) -> Result<(), SelfHostError> {
-        self.write("publish_projection_items_from_staging", |storage| {
+        #[cfg(test)]
+        if let Some(gate) = self.service.non_corpus_rebuild_before_publish_gate.as_ref() {
+            gate.block_before_publish();
+        }
+        let section = self.write("publish_projection_items_from_staging", |storage| {
             storage.publish_projection_items_from_staging(
                 target,
                 staging,
@@ -239,6 +252,14 @@ impl NonCorpusRebuildStorage for BackgroundRebuildStorage<'_> {
                 expected_item_count,
             )
         })?;
+        tracing::info!(
+            projection_item_count = expected_item_count,
+            persistence_lock_wait_ms = section.lock_wait_ms,
+            persistence_lock_hold_ms = section.lock_hold_ms,
+            elapsed_ms = Self::duration_ms(self.started_at.elapsed()),
+            "background non-corpus generation head published"
+        );
+        self.service.request_projection_generation_cleanup();
         Ok(())
     }
 
@@ -249,6 +270,114 @@ impl NonCorpusRebuildStorage for BackgroundRebuildStorage<'_> {
 }
 
 impl AppService {
+    pub(super) fn request_projection_generation_cleanup(&self) {
+        self.projection_generation_cleanup_requested
+            .store(true, std::sync::atomic::Ordering::Release);
+        if self
+            .projection_generation_cleanup_in_flight
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let service = self.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("lethe-projection-generation-cleanup".to_owned())
+            .spawn(move || service.run_projection_generation_cleanup())
+        {
+            self.projection_generation_cleanup_in_flight
+                .store(false, std::sync::atomic::Ordering::Release);
+            tracing::error!(
+                error = %error,
+                "failed to spawn retired projection generation cleanup"
+            );
+        }
+    }
+
+    fn run_projection_generation_cleanup(&self) {
+        loop {
+            self.projection_generation_cleanup_requested
+                .store(false, std::sync::atomic::Ordering::Release);
+            let cleanup_result = (|| -> Result<(), SelfHostError> {
+                let mut page_number = 0_u64;
+                loop {
+                    let wait_started_at = Instant::now();
+                    let persistence = self.persistence_lock()?;
+                    let lock_wait_ms =
+                        BackgroundRebuildStorage::duration_ms(wait_started_at.elapsed());
+                    let hold_started_at = Instant::now();
+                    let report = persistence.cleanup_retired_projection_generation(
+                        PROJECTION_GENERATION_CLEANUP_PAGE_SIZE,
+                    )?;
+                    let lock_hold_ms =
+                        BackgroundRebuildStorage::duration_ms(hold_started_at.elapsed());
+                    drop(persistence);
+                    if report.storage_projection_id.is_none() {
+                        return Ok(());
+                    }
+                    page_number = page_number.checked_add(1).ok_or_else(|| {
+                        SelfHostError::Ingestion(
+                            "projection generation cleanup page count overflow".to_owned(),
+                        )
+                    })?;
+                    tracing::info!(
+                        page_number,
+                        storage_projection_id = report.storage_projection_id.as_deref(),
+                        deleted_items = report.deleted_items,
+                        deleted_visible_blob_refs = report.deleted_visible_blob_refs,
+                        completed_generation = report.completed_generation,
+                        has_more = report.has_more,
+                        persistence_lock_wait_ms = lock_wait_ms,
+                        persistence_lock_hold_ms = lock_hold_ms,
+                        "retired projection generation cleanup page completed"
+                    );
+                    if !report.has_more {
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })();
+            if let Err(error) = cleanup_result {
+                tracing::error!(
+                    error = %error,
+                    "retired projection generation cleanup failed"
+                );
+            }
+
+            if self
+                .projection_generation_cleanup_requested
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                continue;
+            }
+            self.projection_generation_cleanup_in_flight
+                .store(false, std::sync::atomic::Ordering::Release);
+            if !self
+                .projection_generation_cleanup_requested
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                return;
+            }
+            if self
+                .projection_generation_cleanup_in_flight
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
     pub fn mcp_oauth_config(&self) -> crate::self_host::config::McpOAuthConfig {
         self.config.mcp_oauth.clone()
     }

@@ -1951,6 +1951,8 @@ pub struct AppService {
     search_index_catch_up_in_flight: Arc<std::sync::atomic::AtomicBool>,
     non_corpus_rebuild_in_flight: Arc<std::sync::atomic::AtomicBool>,
     non_corpus_rebuild_error: Arc<Mutex<Option<String>>>,
+    projection_generation_cleanup_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    projection_generation_cleanup_requested: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     non_corpus_rebuild_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
@@ -1960,11 +1962,62 @@ pub struct AppService {
     #[cfg(test)]
     non_corpus_rebuild_page_delay: Option<Duration>,
     #[cfg(test)]
+    non_corpus_rebuild_max_persistence_lock_hold_ms: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    non_corpus_rebuild_before_publish_gate: Option<Arc<NonCorpusRebuildPublishTestGate>>,
+    #[cfg(test)]
     publish_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     search_job_test_gate: Option<Arc<std::sync::Barrier>>,
     #[cfg(test)]
     search_job_test_fault: Option<SearchJobTestFault>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct NonCorpusRebuildPublishTestGate {
+    state: Mutex<NonCorpusRebuildPublishTestGateState>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct NonCorpusRebuildPublishTestGateState {
+    reached: bool,
+    released: bool,
+}
+
+#[cfg(test)]
+impl NonCorpusRebuildPublishTestGate {
+    fn block_before_publish(&self) {
+        let mut state = self.state.lock().expect("publish test gate poisoned");
+        state.reached = true;
+        self.changed.notify_all();
+        while !state.released {
+            state = self
+                .changed
+                .wait(state)
+                .expect("publish test gate poisoned while waiting");
+        }
+    }
+
+    fn wait_until_reached(&self, timeout: Duration) -> bool {
+        let state = self.state.lock().expect("publish test gate poisoned");
+        if state.reached {
+            return true;
+        }
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| !state.reached)
+            .expect("publish test gate poisoned while observing");
+        state.reached
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().expect("publish test gate poisoned");
+        state.released = true;
+        self.changed.notify_all();
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -6396,6 +6449,12 @@ impl AppService {
             search_index_catch_up_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             non_corpus_rebuild_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             non_corpus_rebuild_error: Arc::new(Mutex::new(None)),
+            projection_generation_cleanup_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
+            projection_generation_cleanup_requested: Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             #[cfg(test)]
             non_corpus_rebuild_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -6405,12 +6464,19 @@ impl AppService {
             #[cfg(test)]
             non_corpus_rebuild_page_delay: None,
             #[cfg(test)]
+            non_corpus_rebuild_max_persistence_lock_hold_ms: Arc::new(
+                std::sync::atomic::AtomicU64::new(0),
+            ),
+            #[cfg(test)]
+            non_corpus_rebuild_before_publish_gate: None,
+            #[cfg(test)]
             publish_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             search_job_test_gate: None,
             #[cfg(test)]
             search_job_test_fault: None,
         };
+        service.request_projection_generation_cleanup();
         if requires_background_rebuild {
             let _derived_lane = service
                 .derived_projection_lane

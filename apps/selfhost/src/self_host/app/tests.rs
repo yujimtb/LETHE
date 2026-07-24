@@ -19,10 +19,10 @@ use lethe_core::domain::supplemental::InputAnchorSet;
 
 use super::{
     AppCore, AppService, CompactProjectionState, GoogleSourceRuntime, ImportItemResult,
-    ImportOutcome, SearchJobStatus, SelfHostError, SlackSourceRuntime, classify_slack_ingress,
-    discovered_slack_threads, extract_slide_text_fragments, infer_profile_name_from_fragments,
-    latest_revision_to_capture, namespace_draft, non_empty_state, ranked_self_intro_slide_indices,
-    thread_root_ts,
+    ImportOutcome, NonCorpusRebuildPublishTestGate, SearchJobStatus, SelfHostError,
+    SlackSourceRuntime, classify_slack_ingress, discovered_slack_threads,
+    extract_slide_text_fragments, infer_profile_name_from_fragments, latest_revision_to_capture,
+    namespace_draft, non_empty_state, ranked_self_intro_slide_indices, thread_root_ts,
 };
 use crate::self_host::config::{
     ApiTokenConfig, CorpusProjectionConfig, FreshnessConfig, GoogleConfig, JsonWebKey,
@@ -484,15 +484,61 @@ fn schema_migration_applied_on_restart_forces_migration_rebuild() {
         .unwrap();
     assert_eq!(report.ingested, 1);
     wait_for_append_consumer(&service);
+    for _ in 0..2_000 {
+        if !service
+            .projection_generation_cleanup_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     drop(service);
 
     let connection = rusqlite::Connection::open(&db).unwrap();
-    assert_eq!(
-        connection
-            .execute("DELETE FROM schema_migrations WHERE version = 14", [])
-            .unwrap(),
-        1
-    );
+    connection
+        .execute_batch(
+            "
+            BEGIN IMMEDIATE;
+            DELETE FROM projection_visible_blob_refs
+            WHERE projection_id IN (
+                SELECT storage_projection_id FROM retired_projection_materializations
+            );
+            DELETE FROM projection_materialization_items
+            WHERE projection_id IN (
+                SELECT storage_projection_id FROM retired_projection_materializations
+            );
+            UPDATE projection_visible_blob_refs
+            SET projection_id = (
+                SELECT heads.projection_id
+                FROM projection_materialization_heads heads
+                WHERE heads.storage_projection_id =
+                      projection_visible_blob_refs.projection_id
+            )
+            WHERE EXISTS (
+                SELECT 1 FROM projection_materialization_heads heads
+                WHERE heads.storage_projection_id =
+                      projection_visible_blob_refs.projection_id
+            );
+            UPDATE projection_materialization_items
+            SET projection_id = (
+                SELECT heads.projection_id
+                FROM projection_materialization_heads heads
+                WHERE heads.storage_projection_id =
+                      projection_materialization_items.projection_id
+            )
+            WHERE EXISTS (
+                SELECT 1 FROM projection_materialization_heads heads
+                WHERE heads.storage_projection_id =
+                      projection_materialization_items.projection_id
+            );
+            DROP TABLE retired_projection_materializations;
+            DROP TABLE projection_materialization_heads;
+            DELETE FROM schema_migrations WHERE version = 15;
+            COMMIT;
+            ",
+        )
+        .unwrap();
     drop(connection);
 
     let restarted = AppService::bootstrap(config).unwrap();
@@ -732,14 +778,25 @@ fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppSe
         search_index_catch_up_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         non_corpus_rebuild_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         non_corpus_rebuild_error: Arc::new(Mutex::new(None)),
+        projection_generation_cleanup_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )),
+        projection_generation_cleanup_requested: Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )),
         non_corpus_rebuild_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         non_corpus_rebuild_reasons: Arc::new(Mutex::new(Vec::new())),
         non_corpus_rebuild_page_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         non_corpus_rebuild_page_delay: None,
+        non_corpus_rebuild_max_persistence_lock_hold_ms: Arc::new(
+            std::sync::atomic::AtomicU64::new(0),
+        ),
+        non_corpus_rebuild_before_publish_gate: None,
         publish_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         search_job_test_gate: None,
         search_job_test_fault: None,
     };
+    service.request_projection_generation_cleanup();
     service
         .persistence
         .lock()
@@ -4860,7 +4917,11 @@ fn person_message_item_sql_failure_marks_in_memory_projection_stale() {
         .execute_batch(
             "CREATE TRIGGER reject_person_message_item
              BEFORE INSERT ON projection_materialization_items
-             WHEN NEW.projection_id = 'proj:person-page'
+             WHEN NEW.projection_id = (
+                 SELECT storage_projection_id
+                 FROM projection_materialization_heads
+                 WHERE projection_id = 'proj:person-page'
+             )
              BEGIN
                  SELECT RAISE(FAIL, 'forced person message item failure');
              END;",
@@ -5044,6 +5105,99 @@ fn background_rebuild_allows_bounded_v2_import_and_hands_off_tail() {
         .unwrap();
     assert_eq!(manifest["observation_count"], 41);
     assert_eq!(manifest["last_append_seq"], 41);
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn large_background_rebuild_final_publish_allows_bounded_v1_import() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-rebuild-final-publish-import-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let published = chrono::DateTime::parse_from_rfc3339("2026-07-24T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    for index in 0..2_000 {
+        persistence
+            .persist_observation(&wave2_slack_observation(
+                "U-FINAL-PUBLISH",
+                "Final Publish",
+                Some("final-publish@example.test"),
+                &format!("{index:010}.000001"),
+                published + chrono::Duration::seconds(index),
+            ))
+            .unwrap();
+    }
+    let mut config = test_config(db, blobs);
+    config.corpus.rebuild_page_size = 128;
+    let mut service = test_service(config, persistence);
+    let publish_gate = Arc::new(NonCorpusRebuildPublishTestGate::default());
+    service.non_corpus_rebuild_before_publish_gate = Some(Arc::clone(&publish_gate));
+
+    let core = service.core_snapshot();
+    service
+        .refresh_materialized_snapshot_with_reason(&core, "recovery")
+        .unwrap();
+    drop(core);
+    assert!(
+        publish_gate.wait_until_reached(std::time::Duration::from_secs(30)),
+        "background rebuild did not reach final publish"
+    );
+    let staged_item_count = service
+        .persistence_read_lock()
+        .unwrap()
+        .projection_item_count(&ProjectionRef::new(
+            super::NON_CORPUS_REBUILD_STAGING_PROJECTION_ID,
+        ))
+        .unwrap();
+    assert!(
+        staged_item_count >= 4_000,
+        "large rebuild staged only {staged_item_count} projection items"
+    );
+
+    let import_service = service.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let import_thread = std::thread::spawn(move || {
+        let started_at = std::time::Instant::now();
+        let result = import_service.ingest_observation_drafts(
+            vec![freshness_only_draft("final-publish-concurrent-import")],
+            "final-publish-test",
+        );
+        sender.send((started_at.elapsed(), result)).unwrap();
+    });
+    let response = receiver.recv_timeout(std::time::Duration::from_secs(2));
+    publish_gate.release();
+    let (response_elapsed, report) =
+        response.expect("v1 import did not respond within two seconds during final publish");
+    let report = report.unwrap();
+    import_thread.join().unwrap();
+    assert!(
+        response_elapsed < std::time::Duration::from_secs(2),
+        "v1 import waited {response_elapsed:?} during final publish"
+    );
+    assert_eq!(report.ingested, 1);
+
+    service.wait_for_non_corpus_rebuild().unwrap();
+    assert!(
+        service
+            .non_corpus_rebuild_max_persistence_lock_hold_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+            < 2_000,
+        "final publish persistence lock exceeded the two-second bound"
+    );
+    assert_eq!(
+        service
+            .persistence_read_lock()
+            .unwrap()
+            .projection_item_count(&ProjectionRef::new("proj:person-page"))
+            .unwrap(),
+        staged_item_count
+    );
 
     drop(service);
     let _ = std::fs::remove_dir_all(root);
