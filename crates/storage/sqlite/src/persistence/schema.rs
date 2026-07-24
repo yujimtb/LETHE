@@ -310,12 +310,15 @@ impl SqlitePersistence {
             self.schema_migration_recorded(SCHEMA_VERSION_RECONSENT_PRIVACY_INDEX)?;
         let cutover_bridge_recorded =
             self.schema_migration_recorded(SCHEMA_VERSION_CUTOVER_BRIDGE)?;
+        let atomic_projection_head_recorded =
+            self.schema_migration_recorded(SCHEMA_VERSION_ATOMIC_PROJECTION_HEAD)?;
         let migration_applied = !identity_lookup_recorded
             || !lock_split_recorded
             || !keyset_reads_recorded
             || !privacy_projection_recorded
             || !reconsent_privacy_index_recorded
-            || !cutover_bridge_recorded;
+            || !cutover_bridge_recorded
+            || !atomic_projection_head_recorded;
 
         if lock_split_recorded && !identity_lookup_recorded {
             return Err(PersistenceError::SchemaInvariant(
@@ -340,6 +343,11 @@ impl SqlitePersistence {
         if cutover_bridge_recorded && !reconsent_privacy_index_recorded {
             return Err(PersistenceError::SchemaInvariant(
                 "schema migration v14 is recorded without prerequisite v13".to_owned(),
+            ));
+        }
+        if atomic_projection_head_recorded && !cutover_bridge_recorded {
+            return Err(PersistenceError::SchemaInvariant(
+                "schema migration v15 is recorded without prerequisite v14".to_owned(),
             ));
         }
 
@@ -401,6 +409,16 @@ impl SqlitePersistence {
             self.require_cutover_bridge_schema_objects()?;
         } else {
             self.apply_cutover_bridge_migration()?;
+        }
+
+        if atomic_projection_head_recorded {
+            self.require_schema_migration_name(
+                SCHEMA_VERSION_ATOMIC_PROJECTION_HEAD,
+                "atomic_projection_generation_head",
+            )?;
+            self.require_atomic_projection_head_schema_objects()?;
+        } else {
+            self.apply_atomic_projection_head_migration()?;
         }
 
         Ok(migration_applied)
@@ -696,6 +714,72 @@ impl SqlitePersistence {
         Ok(())
     }
 
+    fn apply_atomic_projection_head_migration(&self) -> Result<(), PersistenceError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let orphan_item_projection: Option<String> = transaction
+            .query_row(
+                "SELECT items.projection_id
+                 FROM projection_materialization_items items
+                 LEFT JOIN projection_materializations materializations
+                   ON materializations.projection_id = items.projection_id
+                 WHERE materializations.projection_id IS NULL
+                 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(projection_id) = orphan_item_projection {
+            return Err(PersistenceError::SchemaInvariant(format!(
+                "projection item generation {projection_id} has no materialization during v15 migration"
+            )));
+        }
+        let orphan_visible_projection: Option<String> = transaction
+            .query_row(
+                "SELECT visible.projection_id
+                 FROM projection_visible_blob_refs visible
+                 LEFT JOIN projection_materializations materializations
+                   ON materializations.projection_id = visible.projection_id
+                 WHERE materializations.projection_id IS NULL
+                 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(projection_id) = orphan_visible_projection {
+            return Err(PersistenceError::SchemaInvariant(format!(
+                "projection visible blob generation {projection_id} has no materialization during v15 migration"
+            )));
+        }
+        transaction.execute_batch(
+            "
+            CREATE TABLE projection_materialization_heads (
+                projection_id TEXT PRIMARY KEY CHECK (length(trim(projection_id)) > 0),
+                storage_projection_id TEXT NOT NULL UNIQUE
+                    CHECK (length(trim(storage_projection_id)) > 0)
+            );
+
+            CREATE TABLE retired_projection_materializations (
+                storage_projection_id TEXT PRIMARY KEY
+                    CHECK (length(trim(storage_projection_id)) > 0),
+                retired_at TEXT NOT NULL
+            );
+
+            INSERT INTO projection_materialization_heads (
+                projection_id, storage_projection_id
+            )
+            SELECT projection_id, projection_id
+            FROM projection_materializations;
+            ",
+        )?;
+        record_schema_migration(
+            &transaction,
+            SCHEMA_VERSION_ATOMIC_PROJECTION_HEAD,
+            "atomic_projection_generation_head",
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn apply_reconsent_privacy_index_migration(&self) -> Result<(), PersistenceError> {
         let transaction = self.conn.unchecked_transaction()?;
         transaction.execute_batch(
@@ -927,6 +1011,69 @@ impl SqlitePersistence {
             ("trigger", "cutover_transition_log_no_delete"),
         ] {
             self.require_schema_object(object_type, object_name)?;
+        }
+        Ok(())
+    }
+
+    fn require_atomic_projection_head_schema_objects(&self) -> Result<(), PersistenceError> {
+        for (object_type, object_name) in [
+            ("table", "projection_materialization_heads"),
+            ("table", "retired_projection_materializations"),
+        ] {
+            self.require_schema_object(object_type, object_name)?;
+        }
+        let missing_head: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT materializations.projection_id
+                 FROM projection_materializations materializations
+                 LEFT JOIN projection_materialization_heads heads
+                   ON heads.projection_id = materializations.projection_id
+                 WHERE heads.projection_id IS NULL
+                 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(projection_id) = missing_head {
+            return Err(PersistenceError::SchemaInvariant(format!(
+                "projection materialization {projection_id} has no active generation head"
+            )));
+        }
+        let head_without_manifest: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT heads.projection_id
+                 FROM projection_materialization_heads heads
+                 LEFT JOIN projection_materializations materializations
+                   ON materializations.projection_id = heads.projection_id
+                 WHERE materializations.projection_id IS NULL
+                 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(projection_id) = head_without_manifest {
+            return Err(PersistenceError::SchemaInvariant(format!(
+                "projection generation head {projection_id} has no materialization"
+            )));
+        }
+        let active_retired_generation: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT heads.storage_projection_id
+                 FROM projection_materialization_heads heads
+                 INNER JOIN retired_projection_materializations retired
+                   ON retired.storage_projection_id = heads.storage_projection_id
+                 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(storage_projection_id) = active_retired_generation {
+            return Err(PersistenceError::SchemaInvariant(format!(
+                "active projection generation {storage_projection_id} is also retired"
+            )));
         }
         Ok(())
     }

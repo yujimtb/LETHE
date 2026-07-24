@@ -150,6 +150,8 @@ fn replace_with_legacy_canonical_json_observations_table(
             "
             DROP INDEX IF EXISTS observations_leaf_append;
             DROP TABLE observations;
+            DROP TABLE retired_projection_materializations;
+            DROP TABLE projection_materialization_heads;
             DELETE FROM schema_migrations WHERE version >= 9;
             INSERT INTO schema_migrations (version, name, applied_at)
             VALUES (8, 'global_observation_identity_registry', '2026-07-22T00:00:00Z');
@@ -827,6 +829,8 @@ fn v13_privacy_backfill_streaming_matches_pre_migration_rows_across_pages() {
             DROP TABLE identity_bridge_candidates;
             DROP INDEX observation_privacy_keys_append;
             DROP TABLE observation_privacy_keys;
+            DROP TABLE retired_projection_materializations;
+            DROP TABLE projection_materialization_heads;
             DELETE FROM schema_migrations WHERE version >= 13;
             ",
         )
@@ -895,6 +899,8 @@ fn v13_privacy_backfill_rolls_back_and_retries_from_first_page() {
             DROP TABLE identity_bridge_candidates;
             DROP INDEX observation_privacy_keys_append;
             DROP TABLE observation_privacy_keys;
+            DROP TABLE retired_projection_materializations;
+            DROP TABLE projection_materialization_heads;
             DELETE FROM schema_migrations WHERE version >= 13;
             ",
         )
@@ -948,7 +954,7 @@ fn v13_privacy_backfill_rolls_back_and_retries_from_first_page() {
 }
 
 #[test]
-fn schema_v14_converges_from_fresh_v12_and_v13_upgrade_paths() {
+fn schema_v15_converges_from_fresh_v12_and_v13_upgrade_paths() {
     let fresh_tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let fresh = SqlitePersistence::open(
         &fresh_tmp.join("test.sqlite3"),
@@ -982,6 +988,10 @@ fn schema_v14_converges_from_fresh_v12_and_v13_upgrade_paths() {
             SCHEMA_VERSION_CUTOVER_BRIDGE,
             "v1_v2_cutover_bridge".to_owned(),
         ),
+        (
+            SCHEMA_VERSION_ATOMIC_PROJECTION_HEAD,
+            "atomic_projection_generation_head".to_owned(),
+        ),
     ];
     assert_eq!(migration_ledger(&fresh), current_ledger);
     drop(fresh);
@@ -1014,6 +1024,8 @@ fn schema_v14_converges_from_fresh_v12_and_v13_upgrade_paths() {
                 DROP TABLE identity_bridge_candidates;
                 DROP INDEX observation_privacy_keys_append;
                 DROP TABLE observation_privacy_keys;
+                DROP TABLE retired_projection_materializations;
+                DROP TABLE projection_materialization_heads;
                 DELETE FROM schema_migrations WHERE version >= 13;
                 ",
             )
@@ -1062,7 +1074,9 @@ fn schema_v14_converges_from_fresh_v12_and_v13_upgrade_paths() {
                 DROP TABLE identity_bridge_watermark;
                 DROP TABLE identity_bridge_gaps;
                 DROP TABLE identity_bridge_candidates;
-                DELETE FROM schema_migrations WHERE version = 14;
+                DROP TABLE retired_projection_materializations;
+                DROP TABLE projection_materialization_heads;
+                DELETE FROM schema_migrations WHERE version >= 14;
                 ",
             )
             .unwrap();
@@ -1080,6 +1094,98 @@ fn schema_v14_converges_from_fresh_v12_and_v13_upgrade_paths() {
     let _ = fs::remove_dir_all(fresh_tmp);
     let _ = fs::remove_dir_all(v12_tmp);
     let _ = fs::remove_dir_all(v13_tmp);
+}
+
+#[test]
+fn schema_v15_upgrades_true_v14_projection_shape_and_backfills_heads() {
+    let tmp = std::env::temp_dir().join(format!(
+        "lethe-v14-projection-upgrade-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let database_path = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let projection = lethe_core::domain::ProjectionRef::new("proj:v14-upgrade");
+    let expected_item = ProjectionItem {
+        item_key: "item-v14".to_owned(),
+        owner_key: "owner-v14".to_owned(),
+        sort_key: "001".to_owned(),
+        value: serde_json::json!({
+            "blob": format!("blob:sha256:{}", "b".repeat(64))
+        }),
+    };
+    {
+        let store = SqlitePersistence::open(&database_path, &blob_dir, &[7; 32]).unwrap();
+        store
+            .commit_projection_items(
+                &projection,
+                &serde_json::json!({"schema": 14}),
+                &ProjectionItemCommit::Replace {
+                    items: vec![expected_item.clone()],
+                },
+            )
+            .unwrap();
+        let storage_projection_id = active_storage_projection_id(&store.conn, &projection)
+            .unwrap()
+            .unwrap();
+        store.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE projection_materialization_items
+                 SET projection_id = ?1
+                 WHERE projection_id = ?2",
+                params![projection.as_str(), storage_projection_id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE projection_visible_blob_refs
+                 SET projection_id = ?1
+                 WHERE projection_id = ?2",
+                params![projection.as_str(), storage_projection_id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute_batch(
+                "
+                DROP TABLE retired_projection_materializations;
+                DROP TABLE projection_materialization_heads;
+                DELETE FROM schema_migrations WHERE version = 15;
+                COMMIT;
+                ",
+            )
+            .unwrap();
+    }
+
+    let upgraded = SqlitePersistence::open(&database_path, &blob_dir, &[7; 32]).unwrap();
+    assert!(upgraded.schema_migrations_applied_on_open());
+    assert_eq!(
+        active_storage_projection_id(&upgraded.conn, &projection)
+            .unwrap()
+            .as_deref(),
+        Some(projection.as_str())
+    );
+    assert_eq!(
+        upgraded
+            .projection_items_by_owner(&projection, "owner-v14")
+            .unwrap(),
+        vec![expected_item]
+    );
+    assert_eq!(
+        upgraded
+            .conn
+            .query_row(
+                "SELECT name FROM schema_migrations WHERE version = 15",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "atomic_projection_generation_head"
+    );
+
+    let _ = fs::remove_dir_all(tmp);
 }
 
 #[test]
@@ -1126,6 +1232,8 @@ fn schema_v13_upgrades_true_v11_operational_event_shape() {
                 ALTER TABLE operational_events DROP COLUMN actor_id;
                 DROP INDEX projection_visible_blob_refs_subject_lookup;
                 ALTER TABLE projection_visible_blob_refs DROP COLUMN subject_key;
+                DROP TABLE retired_projection_materializations;
+                DROP TABLE projection_materialization_heads;
                 DELETE FROM schema_migrations WHERE version >= 11;
                 ",
             )
@@ -1327,6 +1435,8 @@ fn schema_v8_backfill_keeps_oldest_cross_leaf_identity_duplicate() {
             DROP INDEX IF EXISTS observations_leaf_append;
             DROP TABLE observations;
             DROP TABLE observation_identity_registry;
+            DROP TABLE retired_projection_materializations;
+            DROP TABLE projection_materialization_heads;
             DELETE FROM schema_migrations WHERE version >= 9;
             INSERT INTO schema_migrations (version, name, applied_at)
             VALUES (8, 'global_observation_identity_registry', '2026-07-22T00:00:00Z');
@@ -1683,12 +1793,15 @@ fn visible_blob_reference_index_tracks_projection_item_commit_atomically() {
             .projection_blob_ref_visible(&projection, &blob_ref)
             .unwrap()
     );
+    let storage_projection_id = active_storage_projection_id(&store.conn, &projection)
+        .unwrap()
+        .unwrap();
     let subject_key: String = store
         .conn
         .query_row(
             "SELECT subject_key FROM projection_visible_blob_refs
              WHERE projection_id = ?1 AND blob_ref = ?2",
-            rusqlite::params![projection.as_str(), blob_ref.as_str()],
+            rusqlite::params![storage_projection_id, blob_ref.as_str()],
             |row| row.get(0),
         )
         .unwrap();
@@ -1701,7 +1814,7 @@ fn visible_blob_reference_index_tracks_projection_item_commit_atomically() {
         )
         .unwrap()
         .query_map(
-            rusqlite::params![projection.as_str(), blob_ref.as_str()],
+            rusqlite::params![storage_projection_id, blob_ref.as_str()],
             |row| row.get(0),
         )
         .unwrap()
@@ -1741,7 +1854,7 @@ fn visible_blob_reference_index_tracks_projection_item_commit_atomically() {
         .query_row(
             "SELECT subject_key FROM projection_visible_blob_refs
              WHERE projection_id = ?1 AND blob_ref = ?2",
-            rusqlite::params![projection.as_str(), blob_ref.as_str()],
+            rusqlite::params![storage_projection_id, blob_ref.as_str()],
             |row| row.get(0),
         )
         .unwrap();
@@ -2427,6 +2540,170 @@ fn projection_item_staging_pages_publish_atomically_and_consume_staging() {
 }
 
 #[test]
+fn projection_generation_publish_is_constant_size_and_cleanup_resumes_after_reopen() {
+    let tmp = std::env::temp_dir().join(format!(
+        "lethe-projection-generation-publish-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let target = lethe_core::domain::ProjectionRef::new("proj:generation-publish-target");
+    let staging = lethe_core::domain::ProjectionRef::new("proj:generation-publish-staging");
+    let store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    let item_count = 5_000_usize;
+    let old_items = (0..item_count)
+        .map(|index| {
+            projection_item(
+                &format!("old-{index:05}"),
+                "owner-old",
+                &format!("{index:05}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let staged_items = (0..item_count)
+        .map(|index| {
+            projection_item(
+                &format!("new-{index:05}"),
+                "owner-new",
+                &format!("{index:05}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    store
+        .commit_projection_items(
+            &target,
+            &serde_json::json!({"generation": 1}),
+            &ProjectionItemCommit::Replace { items: old_items },
+        )
+        .unwrap();
+    store
+        .commit_projection_items(
+            &staging,
+            &serde_json::json!({"generation": 2}),
+            &ProjectionItemCommit::Replace {
+                items: staged_items,
+            },
+        )
+        .unwrap();
+
+    let changes_before_publish = store.conn.total_changes();
+    let publish_started_at = std::time::Instant::now();
+    store
+        .publish_projection_items_from_staging(
+            &target,
+            &staging,
+            &serde_json::json!({"generation": 2, "item_count": item_count}),
+            item_count as u64,
+        )
+        .unwrap();
+    let publish_elapsed = publish_started_at.elapsed();
+    let publish_changes = store
+        .conn
+        .total_changes()
+        .checked_sub(changes_before_publish)
+        .unwrap();
+    assert!(
+        publish_changes < 32,
+        "generation-head publish changed {publish_changes} rows for {item_count} items"
+    );
+    assert!(
+        publish_elapsed < std::time::Duration::from_secs(2),
+        "generation-head publish took {publish_elapsed:?} for {item_count} items"
+    );
+    assert_eq!(
+        store.projection_item_count(&target).unwrap(),
+        item_count as u64
+    );
+    assert_eq!(store.projection_item_count(&staging).unwrap(), 0);
+    drop(store);
+
+    let reopened = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    assert_eq!(
+        reopened.projection_item_count(&target).unwrap(),
+        item_count as u64,
+        "the new generation must remain live before retired-row cleanup resumes"
+    );
+    let mut deleted_items = 0_u64;
+    loop {
+        let changes_before_page = reopened.conn.total_changes();
+        let report = reopened.cleanup_retired_projection_generation(128).unwrap();
+        let page_changes = reopened
+            .conn
+            .total_changes()
+            .checked_sub(changes_before_page)
+            .unwrap();
+        assert!(report.deleted_items <= 128);
+        assert!(report.deleted_visible_blob_refs <= 128);
+        assert!(
+            page_changes <= 258,
+            "cleanup page changed {page_changes} rows"
+        );
+        deleted_items += report.deleted_items;
+        if !report.has_more {
+            break;
+        }
+    }
+    assert_eq!(deleted_items, item_count as u64);
+    assert_eq!(
+        reopened.projection_item_count(&target).unwrap(),
+        item_count as u64
+    );
+    assert_eq!(
+        reopened
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM retired_projection_materializations",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    let small_target =
+        lethe_core::domain::ProjectionRef::new("proj:generation-publish-small-target");
+    let small_staging =
+        lethe_core::domain::ProjectionRef::new("proj:generation-publish-small-staging");
+    reopened
+        .commit_projection_items(
+            &small_target,
+            &serde_json::json!({"generation": 1}),
+            &ProjectionItemCommit::Replace {
+                items: vec![projection_item("old", "owner-old", "00000")],
+            },
+        )
+        .unwrap();
+    reopened
+        .commit_projection_items(
+            &small_staging,
+            &serde_json::json!({"generation": 2}),
+            &ProjectionItemCommit::Replace {
+                items: vec![projection_item("new", "owner-new", "00000")],
+            },
+        )
+        .unwrap();
+    let changes_before_small_publish = reopened.conn.total_changes();
+    reopened
+        .publish_projection_items_from_staging(
+            &small_target,
+            &small_staging,
+            &serde_json::json!({"generation": 2, "item_count": 1}),
+            1,
+        )
+        .unwrap();
+    let small_publish_changes = reopened
+        .conn
+        .total_changes()
+        .checked_sub(changes_before_small_publish)
+        .unwrap();
+    assert_eq!(
+        publish_changes, small_publish_changes,
+        "final publish mutations must be independent of projection item count"
+    );
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
 fn projection_item_staging_publish_preconditions_and_sql_failure_preserve_both_sides() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let db = tmp.join("test.sqlite3");
@@ -2507,9 +2784,8 @@ fn projection_item_staging_publish_preconditions_and_sql_failure_preserve_both_s
         .conn
         .execute_batch(
             "CREATE TRIGGER reject_staging_publish
-             BEFORE INSERT ON projection_materialization_items
-             WHEN NEW.projection_id = 'proj:item-publish-target'
-                  AND NEW.item_key = 'stage-b'
+             BEFORE UPDATE OF storage_projection_id ON projection_materialization_heads
+             WHEN OLD.projection_id = 'proj:item-publish-target'
              BEGIN
                  SELECT RAISE(ABORT, 'forced staging publish failure');
              END;",
@@ -3358,7 +3634,7 @@ fn cutover_state_fold_rejects_invalid_transition_log() {
 }
 
 #[test]
-fn schema_v14_upgrades_true_v13_cutover_shape() {
+fn schema_v15_upgrades_true_v13_cutover_shape() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let database_path = tmp.join("test.sqlite3");
     let blob_dir = tmp.join("blobs");
@@ -3381,7 +3657,9 @@ fn schema_v14_upgrades_true_v13_cutover_shape() {
                 DROP TABLE identity_bridge_watermark;
                 DROP TABLE identity_bridge_gaps;
                 DROP TABLE identity_bridge_candidates;
-                DELETE FROM schema_migrations WHERE version = 14;
+                DROP TABLE retired_projection_materializations;
+                DROP TABLE projection_materialization_heads;
+                DELETE FROM schema_migrations WHERE version >= 14;
                 ",
             )
             .unwrap();
@@ -3408,6 +3686,17 @@ fn schema_v14_upgrades_true_v13_cutover_shape() {
             )
             .unwrap(),
         "v1_v2_cutover_bridge"
+    );
+    assert_eq!(
+        reopened
+            .conn
+            .query_row(
+                "SELECT name FROM schema_migrations WHERE version = 15",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "atomic_projection_generation_head"
     );
     assert_eq!(reopened.identity_bridge_watermark().unwrap(), 0);
 

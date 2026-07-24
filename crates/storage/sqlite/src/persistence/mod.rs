@@ -31,7 +31,7 @@ use lethe_storage_api::{
     IdentityBridgeBatchReport, IdentityBridgeResolution, LeafPosition, ObservationStats,
     ObservationStore as ObservationStorePort, OperationalAppendOutcome, OperationalAppendRequest,
     OperationalEventFilter, OperationalEventStats, OperationalEventStore, PersistedSyncState,
-    ProjectionItem, ProjectionItemCommit, ProjectionLeafWatermark,
+    ProjectionGenerationCleanup, ProjectionItem, ProjectionItemCommit, ProjectionLeafWatermark,
     ProjectionMaterializer as ProjectionMaterializerPort,
     ProjectionWatermarkStore as ProjectionWatermarkStorePort, RehomeMode as PortRehomeMode,
     RuntimeStateStore as RuntimeStateStorePort, SlackThreadCatalogEntry,
@@ -75,8 +75,9 @@ const SCHEMA_VERSION_KEYSET_READS: i64 = 11;
 const SCHEMA_VERSION_PRIVACY_PROJECTION: i64 = 12;
 const SCHEMA_VERSION_RECONSENT_PRIVACY_INDEX: i64 = 13;
 const SCHEMA_VERSION_CUTOVER_BRIDGE: i64 = 14;
+const SCHEMA_VERSION_ATOMIC_PROJECTION_HEAD: i64 = 15;
 #[cfg(test)]
-const CURRENT_SCHEMA_VERSION: i64 = SCHEMA_VERSION_CUTOVER_BRIDGE;
+const CURRENT_SCHEMA_VERSION: i64 = SCHEMA_VERSION_ATOMIC_PROJECTION_HEAD;
 const CANONICAL_JSON_META_KEY: &str = "canonical_json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1459,7 +1460,9 @@ impl SqlitePersistence {
         projection: &lethe_core::domain::ProjectionRef,
         records: &serde_json::Value,
     ) -> Result<(), PersistenceError> {
+        validate_projection_key(projection)?;
         let transaction = self.conn.unchecked_transaction()?;
+        ensure_projection_generation(&transaction, projection)?;
         transaction.execute(
             "INSERT INTO projection_materializations (
                 projection_id, records_json, materialized_at
@@ -1512,6 +1515,43 @@ impl SqlitePersistence {
         let manifest_json = "{}";
         let materialized_at = chrono::Utc::now().to_rfc3339();
         let transaction = self.conn.unchecked_transaction()?;
+        let previous_storage_projection_id =
+            active_storage_projection_id(&transaction, projection)?;
+        let storage_projection_id = match commit {
+            ProjectionItemCommit::Replace { items } => {
+                let storage_projection_id = new_storage_projection_id(projection);
+                for item in items {
+                    insert_projection_item(&transaction, projection, &storage_projection_id, item)?;
+                }
+                if let Some(previous_storage_projection_id) =
+                    previous_storage_projection_id.as_deref()
+                {
+                    let updated = transaction.execute(
+                        "UPDATE projection_materialization_heads
+                         SET storage_projection_id = ?2
+                         WHERE projection_id = ?1",
+                        params![projection.as_str(), storage_projection_id],
+                    )?;
+                    if updated != 1 {
+                        return Err(PersistenceError::SchemaInvariant(format!(
+                            "projection generation head {} disappeared during replace",
+                            projection.as_str()
+                        )));
+                    }
+                    retire_projection_generation(&transaction, previous_storage_projection_id)?;
+                } else {
+                    insert_projection_generation_head(
+                        &transaction,
+                        projection,
+                        &storage_projection_id,
+                    )?;
+                }
+                storage_projection_id
+            }
+            ProjectionItemCommit::Delta { .. } => {
+                ensure_projection_generation(&transaction, projection)?
+            }
+        };
         transaction.execute(
             "INSERT INTO projection_materializations (
                 projection_id, records_json, materialized_at
@@ -1524,21 +1564,20 @@ impl SqlitePersistence {
         upsert_manifest_fields(&transaction, projection, manifest)?;
 
         match commit {
-            ProjectionItemCommit::Replace { items } => {
-                transaction.execute(
-                    "DELETE FROM projection_materialization_items WHERE projection_id = ?1",
-                    [projection.as_str()],
-                )?;
-                for item in items {
-                    insert_projection_item(&transaction, projection, item)?;
-                }
-            }
+            ProjectionItemCommit::Replace { .. } => {}
             ProjectionItemCommit::Delta {
                 inserts,
                 updates,
                 deletes,
             } => {
-                apply_projection_item_delta(&transaction, projection, inserts, updates, deletes)?;
+                apply_projection_item_delta(
+                    &transaction,
+                    projection,
+                    &storage_projection_id,
+                    inserts,
+                    updates,
+                    deletes,
+                )?;
             }
         }
         transaction.commit()?;
@@ -1588,8 +1627,16 @@ impl SqlitePersistence {
         let manifest_json = "{}";
         let materialized_at = chrono::Utc::now().to_rfc3339();
         let transaction = self.conn.unchecked_transaction()?;
+        let storage_projection_id = ensure_projection_generation(&transaction, projection)?;
         insert_new_supplemental(&transaction, record, &supplemental_json)?;
-        apply_projection_item_delta(&transaction, projection, inserts, updates, deletes)?;
+        apply_projection_item_delta(
+            &transaction,
+            projection,
+            &storage_projection_id,
+            inserts,
+            updates,
+            deletes,
+        )?;
         transaction.execute(
             "INSERT INTO projection_materializations (
                 projection_id, records_json, materialized_at
@@ -1622,30 +1669,21 @@ impl SqlitePersistence {
             ));
         }
 
-        let expected_insert_count = usize::try_from(expected_item_count).map_err(|_| {
-            PersistenceError::SchemaInvariant(
-                "projection item staging expected count does not fit usize".to_owned(),
-            )
-        })?;
         let manifest_json = "{}";
         let materialized_at = chrono::Utc::now().to_rfc3339();
         let transaction = self.conn.unchecked_transaction()?;
-        let staging_exists = transaction.query_row(
-            "SELECT EXISTS (
-                SELECT 1 FROM projection_materializations WHERE projection_id = ?1
-             )",
-            [staging.as_str()],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if !staging_exists {
+        let Some(staging_storage_projection_id) =
+            active_storage_projection_id(&transaction, staging)?
+        else {
             return Err(PersistenceError::SchemaInvariant(format!(
                 "projection item staging projection {} does not exist",
                 staging.as_str()
             )));
-        }
+        };
+        let target_storage_projection_id = active_storage_projection_id(&transaction, target)?;
         let actual_item_count = transaction.query_row(
             "SELECT COUNT(*) FROM projection_materialization_items WHERE projection_id = ?1",
-            [staging.as_str()],
+            [staging_storage_projection_id.as_str()],
             |row| row.get::<_, u64>(0),
         )?;
         if actual_item_count != expected_item_count {
@@ -1656,37 +1694,6 @@ impl SqlitePersistence {
         }
 
         transaction.execute(
-            "DELETE FROM projection_materialization_items WHERE projection_id = ?1",
-            [target.as_str()],
-        )?;
-        transaction.execute(
-            "DELETE FROM projection_visible_blob_refs WHERE projection_id = ?1",
-            [target.as_str()],
-        )?;
-        let inserted = transaction.execute(
-            "INSERT INTO projection_materialization_items (
-                projection_id, item_key, owner_key, sort_key, value_json
-             )
-             SELECT ?1, item_key, owner_key, sort_key, value_json
-             FROM projection_materialization_items
-             WHERE projection_id = ?2",
-            params![target.as_str(), staging.as_str()],
-        )?;
-        if inserted != expected_insert_count {
-            return Err(PersistenceError::SchemaInvariant(format!(
-                "projection item staging publish copied {inserted} items, expected {expected_item_count}"
-            )));
-        }
-        transaction.execute(
-            "INSERT INTO projection_visible_blob_refs (
-                projection_id, item_key, blob_ref, owner_key, consent_scope, subject_key
-             )
-             SELECT ?1, item_key, blob_ref, owner_key, consent_scope, subject_key
-             FROM projection_visible_blob_refs
-             WHERE projection_id = ?2",
-            params![target.as_str(), staging.as_str()],
-        )?;
-        transaction.execute(
             "INSERT INTO projection_materializations (
                 projection_id, records_json, materialized_at
              ) VALUES (?1, ?2, ?3)
@@ -1696,18 +1703,36 @@ impl SqlitePersistence {
             params![target.as_str(), manifest_json, materialized_at],
         )?;
         upsert_manifest_fields(&transaction, target, manifest)?;
-        let deleted_staging_items = transaction.execute(
-            "DELETE FROM projection_materialization_items WHERE projection_id = ?1",
+        let deleted_staging_head = transaction.execute(
+            "DELETE FROM projection_materialization_heads WHERE projection_id = ?1",
             [staging.as_str()],
         )?;
-        transaction.execute(
-            "DELETE FROM projection_visible_blob_refs WHERE projection_id = ?1",
-            [staging.as_str()],
-        )?;
-        if deleted_staging_items != expected_insert_count {
+        if deleted_staging_head != 1 {
             return Err(PersistenceError::SchemaInvariant(format!(
-                "projection item staging cleanup deleted {deleted_staging_items} items, expected {expected_item_count}"
+                "projection item staging publish did not consume generation head {}",
+                staging.as_str()
             )));
+        }
+        if let Some(target_storage_projection_id) = target_storage_projection_id.as_deref() {
+            let updated = transaction.execute(
+                "UPDATE projection_materialization_heads
+                 SET storage_projection_id = ?2
+                 WHERE projection_id = ?1",
+                params![target.as_str(), staging_storage_projection_id],
+            )?;
+            if updated != 1 {
+                return Err(PersistenceError::SchemaInvariant(format!(
+                    "projection item target generation head {} disappeared during publish",
+                    target.as_str()
+                )));
+            }
+            retire_projection_generation(&transaction, target_storage_projection_id)?;
+        } else {
+            insert_projection_generation_head(
+                &transaction,
+                target,
+                &staging_storage_projection_id,
+            )?;
         }
         let deleted_staging_manifest = transaction.execute(
             "DELETE FROM projection_materializations WHERE projection_id = ?1",
@@ -1727,6 +1752,104 @@ impl SqlitePersistence {
         Ok(())
     }
 
+    pub fn cleanup_retired_projection_generation(
+        &self,
+        limit: usize,
+    ) -> Result<ProjectionGenerationCleanup, PersistenceError> {
+        if limit == 0 {
+            return Err(PersistenceError::SchemaInvariant(
+                "projection generation cleanup limit must be greater than zero".to_owned(),
+            ));
+        }
+        let limit = i64::try_from(limit).map_err(|_| {
+            PersistenceError::SchemaInvariant(
+                "projection generation cleanup limit does not fit i64".to_owned(),
+            )
+        })?;
+        let transaction = self.conn.unchecked_transaction()?;
+        let storage_projection_id = transaction
+            .query_row(
+                "SELECT storage_projection_id
+                 FROM retired_projection_materializations
+                 ORDER BY retired_at, storage_projection_id
+                 LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(storage_projection_id) = storage_projection_id else {
+            transaction.commit()?;
+            return Ok(ProjectionGenerationCleanup {
+                storage_projection_id: None,
+                deleted_items: 0,
+                deleted_visible_blob_refs: 0,
+                completed_generation: false,
+                has_more: false,
+            });
+        };
+        let deleted_visible_blob_refs = transaction.execute(
+            "DELETE FROM projection_visible_blob_refs
+             WHERE rowid IN (
+                 SELECT rowid FROM projection_visible_blob_refs
+                 WHERE projection_id = ?1
+                 LIMIT ?2
+             )",
+            params![storage_projection_id, limit],
+        )?;
+        let deleted_items = transaction.execute(
+            "DELETE FROM projection_materialization_items
+             WHERE rowid IN (
+                 SELECT rowid FROM projection_materialization_items
+                 WHERE projection_id = ?1
+                 LIMIT ?2
+             )",
+            params![storage_projection_id, limit],
+        )?;
+        let generation_has_rows = transaction.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM projection_materialization_items WHERE projection_id = ?1
+             ) OR EXISTS (
+                 SELECT 1 FROM projection_visible_blob_refs WHERE projection_id = ?1
+             )",
+            [storage_projection_id.as_str()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        let completed_generation = !generation_has_rows;
+        if completed_generation {
+            let deleted = transaction.execute(
+                "DELETE FROM retired_projection_materializations
+                 WHERE storage_projection_id = ?1",
+                [storage_projection_id.as_str()],
+            )?;
+            if deleted != 1 {
+                return Err(PersistenceError::SchemaInvariant(format!(
+                    "retired projection generation {storage_projection_id} disappeared during cleanup"
+                )));
+            }
+        }
+        let has_more = transaction.query_row(
+            "SELECT EXISTS (SELECT 1 FROM retired_projection_materializations)",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        transaction.commit()?;
+        Ok(ProjectionGenerationCleanup {
+            storage_projection_id: Some(storage_projection_id),
+            deleted_items: u64::try_from(deleted_items).map_err(|_| {
+                PersistenceError::SchemaInvariant(
+                    "deleted projection item count does not fit u64".to_owned(),
+                )
+            })?,
+            deleted_visible_blob_refs: u64::try_from(deleted_visible_blob_refs).map_err(|_| {
+                PersistenceError::SchemaInvariant(
+                    "deleted visible blob ref count does not fit u64".to_owned(),
+                )
+            })?,
+            completed_generation,
+            has_more,
+        })
+    }
+
     pub fn projection_item_by_key(
         &self,
         projection: &lethe_core::domain::ProjectionRef,
@@ -1734,13 +1857,17 @@ impl SqlitePersistence {
     ) -> Result<Option<ProjectionItem>, PersistenceError> {
         validate_projection_key(projection)?;
         validate_item_key(item_key)?;
+        let Some(storage_projection_id) = active_storage_projection_id(&self.conn, projection)?
+        else {
+            return Ok(None);
+        };
         let row = self
             .conn
             .query_row(
                 "SELECT item_key, owner_key, sort_key, value_json
                  FROM projection_materialization_items
                  WHERE projection_id = ?1 AND item_key = ?2",
-                params![projection.as_str(), item_key],
+                params![storage_projection_id, item_key],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -1769,13 +1896,17 @@ impl SqlitePersistence {
     ) -> Result<Vec<ProjectionItem>, PersistenceError> {
         validate_projection_key(projection)?;
         validate_owner_key(owner_key)?;
+        let Some(storage_projection_id) = active_storage_projection_id(&self.conn, projection)?
+        else {
+            return Ok(Vec::new());
+        };
         let mut statement = self.conn.prepare(
             "SELECT item_key, owner_key, sort_key, value_json
              FROM projection_materialization_items
              WHERE projection_id = ?1 AND owner_key = ?2
              ORDER BY sort_key ASC, item_key ASC",
         )?;
-        let rows = statement.query_map(params![projection.as_str(), owner_key], |row| {
+        let rows = statement.query_map(params![storage_projection_id, owner_key], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -1813,6 +1944,10 @@ impl SqlitePersistence {
         for owner_key in owner_keys {
             validate_owner_key(owner_key)?;
         }
+        let Some(storage_projection_id) = active_storage_projection_id(&self.conn, projection)?
+        else {
+            return Ok(Vec::new());
+        };
         let placeholders = (0..owner_keys.len())
             .map(|index| format!("?{}", index + 2))
             .collect::<Vec<_>>()
@@ -1822,7 +1957,7 @@ impl SqlitePersistence {
              FROM projection_materialization_items
              WHERE projection_id = ?1 AND owner_key IN ({placeholders})"
         );
-        let mut values = vec![rusqlite::types::Value::Text(projection.as_str().to_owned())];
+        let mut values = vec![rusqlite::types::Value::Text(storage_projection_id)];
         values.extend(owner_keys.iter().cloned().map(rusqlite::types::Value::Text));
         if let Some(prefix) = item_key_prefix {
             sql.push_str(" AND item_key LIKE ?");
@@ -1877,12 +2012,16 @@ impl SqlitePersistence {
         blob_ref: &BlobRef,
     ) -> Result<bool, PersistenceError> {
         validate_projection_key(projection)?;
+        let Some(storage_projection_id) = active_storage_projection_id(&self.conn, projection)?
+        else {
+            return Ok(false);
+        };
         Ok(self.conn.query_row(
             "SELECT EXISTS (
                  SELECT 1 FROM projection_visible_blob_refs
                  WHERE projection_id = ?1 AND blob_ref = ?2
              )",
-            params![projection.as_str(), blob_ref.as_str()],
+            params![storage_projection_id, blob_ref.as_str()],
             |row| row.get(0),
         )?)
     }
@@ -1894,11 +2033,15 @@ impl SqlitePersistence {
     ) -> Result<u64, PersistenceError> {
         validate_projection_key(projection)?;
         validate_owner_key(owner_key)?;
+        let Some(storage_projection_id) = active_storage_projection_id(&self.conn, projection)?
+        else {
+            return Ok(0);
+        };
         self.conn
             .query_row(
                 "SELECT COUNT(*) FROM projection_materialization_items
                  WHERE projection_id = ?1 AND owner_key = ?2",
-                params![projection.as_str(), owner_key],
+                params![storage_projection_id, owner_key],
                 |row| row.get(0),
             )
             .map_err(PersistenceError::from)
@@ -1909,11 +2052,15 @@ impl SqlitePersistence {
         projection: &lethe_core::domain::ProjectionRef,
     ) -> Result<u64, PersistenceError> {
         validate_projection_key(projection)?;
+        let Some(storage_projection_id) = active_storage_projection_id(&self.conn, projection)?
+        else {
+            return Ok(0);
+        };
         self.conn
             .query_row(
                 "SELECT COUNT(*) FROM projection_materialization_items
                  WHERE projection_id = ?1",
-                [projection.as_str()],
+                [storage_projection_id],
                 |row| row.get(0),
             )
             .map_err(PersistenceError::from)
@@ -3150,21 +3297,103 @@ fn insert_new_supplemental(
     Ok(())
 }
 
+fn active_storage_projection_id(
+    connection: &rusqlite::Connection,
+    projection: &lethe_core::domain::ProjectionRef,
+) -> Result<Option<String>, PersistenceError> {
+    let storage_projection_id = connection
+        .query_row(
+            "SELECT storage_projection_id
+             FROM projection_materialization_heads
+             WHERE projection_id = ?1",
+            [projection.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let manifest_exists = connection.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM projection_materializations WHERE projection_id = ?1
+         )",
+        [projection.as_str()],
+        |row| row.get::<_, bool>(0),
+    )?;
+    match (storage_projection_id, manifest_exists) {
+        (Some(storage_projection_id), true) => Ok(Some(storage_projection_id)),
+        (None, false) => Ok(None),
+        (Some(_), false) => Err(PersistenceError::SchemaInvariant(format!(
+            "projection generation head {} has no materialization",
+            projection.as_str()
+        ))),
+        (None, true) => Err(PersistenceError::SchemaInvariant(format!(
+            "projection materialization {} has no active generation head",
+            projection.as_str()
+        ))),
+    }
+}
+
+fn new_storage_projection_id(projection: &lethe_core::domain::ProjectionRef) -> String {
+    format!(
+        "{}#generation:{}",
+        projection.as_str(),
+        uuid::Uuid::now_v7()
+    )
+}
+
+fn insert_projection_generation_head(
+    transaction: &rusqlite::Transaction<'_>,
+    projection: &lethe_core::domain::ProjectionRef,
+    storage_projection_id: &str,
+) -> Result<(), PersistenceError> {
+    transaction.execute(
+        "INSERT INTO projection_materialization_heads (
+            projection_id, storage_projection_id
+         ) VALUES (?1, ?2)",
+        params![projection.as_str(), storage_projection_id],
+    )?;
+    Ok(())
+}
+
+fn ensure_projection_generation(
+    transaction: &rusqlite::Transaction<'_>,
+    projection: &lethe_core::domain::ProjectionRef,
+) -> Result<String, PersistenceError> {
+    if let Some(storage_projection_id) = active_storage_projection_id(transaction, projection)? {
+        return Ok(storage_projection_id);
+    }
+    let storage_projection_id = new_storage_projection_id(projection);
+    insert_projection_generation_head(transaction, projection, &storage_projection_id)?;
+    Ok(storage_projection_id)
+}
+
+fn retire_projection_generation(
+    transaction: &rusqlite::Transaction<'_>,
+    storage_projection_id: &str,
+) -> Result<(), PersistenceError> {
+    transaction.execute(
+        "INSERT INTO retired_projection_materializations (
+            storage_projection_id, retired_at
+         ) VALUES (?1, ?2)",
+        params![storage_projection_id, chrono::Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
 fn apply_projection_item_delta(
     transaction: &rusqlite::Transaction<'_>,
     projection: &lethe_core::domain::ProjectionRef,
+    storage_projection_id: &str,
     inserts: &[ProjectionItem],
     updates: &[ProjectionItem],
     deletes: &[String],
 ) -> Result<(), PersistenceError> {
     for item_key in deletes {
-        delete_projection_item(transaction, projection, item_key)?;
+        delete_projection_item(transaction, projection, storage_projection_id, item_key)?;
     }
     for item in updates {
-        update_projection_item(transaction, projection, item)?;
+        update_projection_item(transaction, projection, storage_projection_id, item)?;
     }
     for item in inserts {
-        insert_new_projection_item(transaction, projection, item)?;
+        insert_new_projection_item(transaction, projection, storage_projection_id, item)?;
     }
     Ok(())
 }
@@ -3172,27 +3401,29 @@ fn apply_projection_item_delta(
 fn insert_projection_item(
     transaction: &rusqlite::Transaction<'_>,
     projection: &lethe_core::domain::ProjectionRef,
+    storage_projection_id: &str,
     item: &ProjectionItem,
 ) -> Result<(), PersistenceError> {
     transaction.execute(
         "INSERT INTO projection_materialization_items (
             projection_id, item_key, owner_key, sort_key, value_json
-         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
-            projection.as_str(),
+            storage_projection_id,
             item.item_key,
             item.owner_key,
             item.sort_key,
             serde_json::to_string(&item.value)?,
         ],
     )?;
-    replace_visible_blob_refs(transaction, projection, item)?;
+    replace_visible_blob_refs(transaction, projection, storage_projection_id, item)?;
     Ok(())
 }
 
 fn insert_new_projection_item(
     transaction: &rusqlite::Transaction<'_>,
     projection: &lethe_core::domain::ProjectionRef,
+    storage_projection_id: &str,
     item: &ProjectionItem,
 ) -> Result<(), PersistenceError> {
     let inserted = transaction.execute(
@@ -3201,7 +3432,7 @@ fn insert_new_projection_item(
          ) VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(projection_id, item_key) DO NOTHING",
         params![
-            projection.as_str(),
+            storage_projection_id,
             item.item_key,
             item.owner_key,
             item.sort_key,
@@ -3215,13 +3446,14 @@ fn insert_new_projection_item(
             projection.as_str()
         )));
     }
-    replace_visible_blob_refs(transaction, projection, item)?;
+    replace_visible_blob_refs(transaction, projection, storage_projection_id, item)?;
     Ok(())
 }
 
 fn update_projection_item(
     transaction: &rusqlite::Transaction<'_>,
     projection: &lethe_core::domain::ProjectionRef,
+    storage_projection_id: &str,
     item: &ProjectionItem,
 ) -> Result<(), PersistenceError> {
     let updated = transaction.execute(
@@ -3229,7 +3461,7 @@ fn update_projection_item(
          SET owner_key = ?3, sort_key = ?4, value_json = ?5
          WHERE projection_id = ?1 AND item_key = ?2",
         params![
-            projection.as_str(),
+            storage_projection_id,
             item.item_key,
             item.owner_key,
             item.sort_key,
@@ -3243,19 +3475,20 @@ fn update_projection_item(
             projection.as_str()
         )));
     }
-    replace_visible_blob_refs(transaction, projection, item)?;
+    replace_visible_blob_refs(transaction, projection, storage_projection_id, item)?;
     Ok(())
 }
 
 fn delete_projection_item(
     transaction: &rusqlite::Transaction<'_>,
     projection: &lethe_core::domain::ProjectionRef,
+    storage_projection_id: &str,
     item_key: &str,
 ) -> Result<(), PersistenceError> {
     let deleted = transaction.execute(
         "DELETE FROM projection_materialization_items
          WHERE projection_id = ?1 AND item_key = ?2",
-        params![projection.as_str(), item_key],
+        params![storage_projection_id, item_key],
     )?;
     if deleted != 1 {
         return Err(PersistenceError::SchemaInvariant(format!(
@@ -3266,7 +3499,7 @@ fn delete_projection_item(
     transaction.execute(
         "DELETE FROM projection_visible_blob_refs
          WHERE projection_id = ?1 AND item_key = ?2",
-        params![projection.as_str(), item_key],
+        params![storage_projection_id, item_key],
     )?;
     Ok(())
 }
@@ -3274,12 +3507,13 @@ fn delete_projection_item(
 fn replace_visible_blob_refs(
     transaction: &rusqlite::Transaction<'_>,
     projection: &lethe_core::domain::ProjectionRef,
+    storage_projection_id: &str,
     item: &ProjectionItem,
 ) -> Result<(), PersistenceError> {
     transaction.execute(
         "DELETE FROM projection_visible_blob_refs
          WHERE projection_id = ?1 AND item_key = ?2",
-        params![projection.as_str(), item.item_key],
+        params![storage_projection_id, item.item_key],
     )?;
     let consent_scope = format!(
         "projection:{}:owner:{}",
@@ -3292,9 +3526,9 @@ fn replace_visible_blob_refs(
         transaction.execute(
             "INSERT INTO projection_visible_blob_refs (
                 projection_id, item_key, blob_ref, owner_key, consent_scope, subject_key
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
-                projection.as_str(),
+                storage_projection_id,
                 item.item_key,
                 blob_ref,
                 item.owner_key,
@@ -3577,6 +3811,13 @@ impl ProjectionMaterializerPort for SqlitePersistence {
             expected_item_count,
         )
         .map_err(storage_error)
+    }
+
+    fn cleanup_retired_projection_generation(
+        &self,
+        limit: usize,
+    ) -> StorageResult<ProjectionGenerationCleanup> {
+        SqlitePersistence::cleanup_retired_projection_generation(self, limit).map_err(storage_error)
     }
 
     fn projection_item_by_key(

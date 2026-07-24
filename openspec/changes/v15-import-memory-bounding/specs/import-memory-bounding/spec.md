@@ -174,7 +174,7 @@ snapshot の format version、canonical watermark、supplemental fingerprint の
 
 ### Requirement: Background rebuild does not monopolize import persistence
 
-background non-corpus rebuild は固定した canonical `(count, max_append_seq)` high-water 以下だけを二巡し、SQLite writer mutex を一回の page read、page staging commit、または最終 atomic publish の区間だけ保持しなければならない。通常 import は page 間で writer mutex を取得して durable append と v1/v2 per-item 結果を完了できなければならない。
+background non-corpus rebuild は固定した canonical `(count, max_append_seq)` high-water 以下だけを二巡し、SQLite writer mutex を一回の page read、page staging commit、または最終 atomic publish の区間だけ保持しなければならない。最終 publish は projection item件数に比例するcopy/deleteを行わず、logical targetのactive generationを定数個のmetadata rowでatomicに切り替えなければならない。通常 import は page間およびretired generation cleanup page間でwriter mutexを取得してdurable appendとv1/v2 per-item結果を完了できなければならない。
 
 rebuild 開始後の append は固定 high-water の snapshot に混入させてはならない。base snapshot の install と append-consumer cursor 保存後、既存 append consumer がより新しい tail を順序どおり増分 materialize する。新しい append を観測しただけで base 全件 rebuild を先頭から再試行してはならない。`derived_projection_lane` は base build/install と増分 consumer の同時 publish を防ぐため rebuild 中保持してよいが、通常 import response はこの lane を待たない。
 
@@ -191,6 +191,19 @@ import timing は少なくとも `bulk_operation_lock_wait_ms`、`persistence_lo
 - **WHEN** rebuild の固定 high-water より後に Observation が append される
 - **THEN** base rebuild の各 canonical/privacy page は固定 high-water 以下だけを fold する
 - **AND** base を全件再試行せず、tail は append sequence 順の consumer に一度だけ渡される
+
+#### Scenario: 大きい staging の最終 publish は writer lock を件数比例で保持しない
+
+- **WHEN** 数千件のlive generationとstaging generationを持つrebuildが最終publishへ進む
+- **THEN** publishはstaging item countを検証してlogical targetのgeneration headだけをatomicに切り替える
+- **AND** publish transactionの変更row数とwriter lock holdはprojection item件数に比例しない
+- **AND** final publish phase中の単発v1 importはsynthetic testで2秒以内に応答する
+
+#### Scenario: publish/cleanup中のcrashから再開できる
+
+- **WHEN** generation head切替transactionの前後、またはretired generation cleanup pageの間にprocessが停止する
+- **THEN** 再open後のreaderは旧世代または新世代の完全な一方だけを参照する
+- **AND** durable retirement queueから残りの旧世代row cleanupを再開できる
 
 ### Requirement: Source sync cannot convoy normal import behind rebuild
 

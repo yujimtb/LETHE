@@ -572,6 +572,15 @@ pub enum ProjectionItemCommit {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionGenerationCleanup {
+    pub storage_projection_id: Option<String>,
+    pub deleted_items: u64,
+    pub deleted_visible_blob_refs: u64,
+    pub completed_generation: bool,
+    pub has_more: bool,
+}
+
 impl ProjectionItemCommit {
     pub fn validate(&self) -> StorageResult<()> {
         let mut operations = std::collections::BTreeMap::new();
@@ -925,6 +934,10 @@ pub trait ProjectionMaterializer: Send {
         manifest: &serde_json::Value,
         expected_item_count: u64,
     ) -> StorageResult<()>;
+    fn cleanup_retired_projection_generation(
+        &self,
+        limit: usize,
+    ) -> StorageResult<ProjectionGenerationCleanup>;
     fn projection_item_by_key(
         &self,
         projection: &ProjectionRef,

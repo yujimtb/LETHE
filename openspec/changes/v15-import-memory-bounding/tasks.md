@@ -45,3 +45,9 @@
 
 - [x] 10.1 [Implementer] source sync と supplemental write の bulk-session 排他を短い admission handshake へ分離し、`bulk_import_operation` を derived lane 待ち・source fetch・検索 catch-up・background rebuild 完了待ちの間は保持しない。bulk session end も CatchingUp 遷移後に mutex を解放し、最終 Ready 遷移時だけ再取得する。受入: 通常 v1/v2 import は sync/rebuild/search の完了を待たず durable append と結果応答まで進める。
 - [x] 10.2 [Implementer] 空 Google Slides source の sync が canonical 全件 scan を行わないようにし、background rebuild と空-source sync が同時進行中の単発 v1 import が synthetic test で5秒以内に応答することを検証する。`cargo fmt --all -- --check` と `cargo test --workspace` を実行し、設計・運用文書へ根本原因と全テスト数を記録する。
+
+## 11. v15.2.2 final atomic publish 有界化
+
+- [x] 11.1 [Implementer] SQLite schema v15 migrationでlogical projectionからphysical generationへのheadとdurable retirement queueを追加し、staging→live publishをitem copy/deleteからhead 1行のatomic切替へ置換する。base DDLへv15 objectを追加せず、真のv14形状からのbackfill/fail-fast invariantを検証する。
+- [x] 11.2 [Implementer] retired generationを短いpage transactionで回収するsingle-flight workerとwait/hold/row計器を追加する。publish/cleanupのcrash再開、5,000件publishの定数変更row上限、2,000 Observation rebuild final phase中のv1 import 2秒上限を回帰テストする。
+- [x] 11.3 [Reviewer] `cargo fmt --all -- --check` と `cargo test --workspace` を実行し、本designと永続index運用文書へ実測件数、テスト総数、crash safety、残課題を記録する。
