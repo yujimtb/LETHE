@@ -112,6 +112,10 @@ SQLite schema v15 は `projection_materialization_heads(logical projection_id ->
 
 旧世代は公開経路から外れた後、専用 single-flight worker が128 rowsずつ短い writer transaction で item とvisible-blob参照を削除する。各pageのwait/hold/削除件数をlogし、page間に1msの譲歩を置いてimportが割り込めるようにする。retirement rowは全row削除後にだけ消すため、任意pageの前後でcrashしても次bootのworkerが再開できる。publish直後のcrashでも旧世代はdurable queueに残り、新headの公開状態は変わらない。
 
+レビューで、公開readerが `active_storage_projection_id()` でheadを読んだ後、別のautocommit文でitem/blob rowを読む実装になっていることが判明した。二文は別SQLite snapshotなので、その間にA→Bのhead切替とAのcleanupが進むと、Aを解決済みのreaderが削除後のAを読み、空・部分結果またはblob visibilityの偽陰性を返せる。これは単一文でlogical IDを参照していたv15以前からの整合性回帰である。
+
+key 1件、owner全件、複数owner page、blob visibility、owner count、total countの6読取は、logical head・manifest存在・physical rowを一つのCTE/JOIN文で解決する。SQLiteの一文snapshotにより、publish/cleanupと並行しても各API呼出しは旧世代または新世代の完全な一方だけを見る。head/manifestの片側欠落は同じsnapshot内で検出してschema invariant errorとし、silent fallbackしない。`commit_projection_items(Replace)` が既存世代をretireする場合も、commit成功後に同じsingle-flight cleanup drainを要求する。
+
 ## Risks / Trade-offs
 
 - **[consumer の遅延中は通常 request の snapshot が stale]** → canonical append が成功した時点で response を返す既存非同期契約を維持し、consumer single-flight と health/error state を使う。
@@ -168,6 +172,13 @@ SQLite schema v15 は `projection_materialization_heads(logical projection_id ->
 - `large_background_rebuild_final_publish_allows_bounded_v1_import`は2,000 Slack Observationから4,000件以上のprojection itemをstagingし、final publish直前に単発v1 importが2秒以内で`ingested`を返すこと、rebuildの`max_persistence_lock_hold_ms < 2000`を検証した。
 - `cargo fmt --all -- --check`と`cargo test --workspace --quiet`は成功した。workspace集計は`726 passed / 0 failed / 3 ignored`、selfhost unitは`109 passed / 0 failed / 0 ignored`、SQLite storage unitは`69 passed / 0 failed / 0 ignored`である。non-corpus manifest shape/versionとv1/v2/429/per-item契約は変更していない。
 - 提供された568k fixture/16 GiB imageは本worktreeでは再実行していない。次の受入は同fixtureで`background non-corpus generation head published`のitem count/lock holdとcleanup page holdを採取することであり、旧890秒窓の実規模再測定を残す。
+
+## v15.2.2 generation read snapshot review Verification (2026-07-24)
+
+- 根本原因は、6本の公開readがlogical headを一文目で解決し、item/blob/countを別のautocommit文で読んでいたことである。Aを解決した直後にpublishがheadをBへ切り替え、cleanupがA rowを削除すると、二文目は新しいSQLite snapshotで削除途中のAを読み、空・部分結果またはblob visibilityの偽陰性を返せた。
+- 6本すべてをlogical head・manifest存在・physical rowを同時に読む単一CTE/JOIN文へ変更した。遅延transactionのfallbackは使わない。`BackgroundRebuildStorage::commit_projection_items(Replace)` の成功後にもcleanup single-flightを要求し、再利用されたstaging世代のretirementをpublish待ちにしない。
+- `projection_generation_reads_stay_complete_during_publish_and_cleanup` は64回のhead publish、1 row単位のretired cleanup、2接続のreaderを並行させる。各readerはkey、owner、複数owner page、blob visibility、owner count、total countを反復し、各呼出しが完全な16件またはtrueを返し、owner/page内で世代が混在しないことを検証する。
+- `cargo fmt --all -- --check` と `cargo test --workspace --quiet` は成功した。workspace集計は`727 passed / 0 failed / 3 ignored`、selfhost unitは`109 passed / 0 failed / 0 ignored`、SQLite storage unitは`70 passed / 0 failed / 0 ignored`である。
 
 ## v15.1 P0 follow-up: dup-only no-op と import 入口の snapshot 世代
 

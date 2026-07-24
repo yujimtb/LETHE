@@ -1620,6 +1620,107 @@ fn projection_item(item_key: &str, owner_key: &str, sort_key: &str) -> Projectio
     }
 }
 
+fn generation_projection_items(
+    generation: usize,
+    item_count: usize,
+    owner_key: &str,
+    blob_ref: &BlobRef,
+) -> Vec<ProjectionItem> {
+    (0..item_count)
+        .map(|index| ProjectionItem {
+            item_key: format!("item-{index:03}"),
+            owner_key: owner_key.to_owned(),
+            sort_key: format!("{index:03}"),
+            value: serde_json::json!({
+                "generation": generation,
+                "blob": blob_ref.as_str(),
+            }),
+        })
+        .collect()
+}
+
+fn assert_projection_snapshot_reads_are_complete(
+    store: &SqlitePersistence,
+    projection: &lethe_core::domain::ProjectionRef,
+    owner_key: &str,
+    blob_ref: &BlobRef,
+    item_count: usize,
+) {
+    let item = store
+        .projection_item_by_key(projection, "item-000")
+        .unwrap()
+        .expect("active generation lost item-000");
+    assert!(item.value["generation"].is_number());
+
+    let by_owner = store
+        .projection_items_by_owner(projection, owner_key)
+        .unwrap();
+    assert_eq!(
+        by_owner.len(),
+        item_count,
+        "owner read returned a partial generation"
+    );
+    assert_eq!(
+        by_owner
+            .iter()
+            .map(|item| {
+                item.value["generation"]
+                    .as_u64()
+                    .expect("owner item generation must be numeric")
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        1,
+        "owner read mixed physical generations"
+    );
+
+    let page = store
+        .projection_items_page(
+            projection,
+            &[owner_key.to_owned()],
+            Some("item-"),
+            None,
+            item_count + 1,
+        )
+        .unwrap();
+    assert_eq!(
+        page.len(),
+        item_count,
+        "multi-owner page returned a partial generation"
+    );
+    assert_eq!(
+        page.iter()
+            .map(|item| {
+                item.value["generation"]
+                    .as_u64()
+                    .expect("page item generation must be numeric")
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        1,
+        "multi-owner page mixed physical generations"
+    );
+
+    assert!(
+        store
+            .projection_blob_ref_visible(projection, blob_ref)
+            .unwrap(),
+        "visible blob lookup returned a false negative"
+    );
+    assert_eq!(
+        store
+            .projection_item_count_by_owner(projection, owner_key)
+            .unwrap(),
+        item_count as u64,
+        "owner count returned a partial generation"
+    );
+    assert_eq!(
+        store.projection_item_count(projection).unwrap(),
+        item_count as u64,
+        "projection count returned a partial generation"
+    );
+}
+
 #[test]
 fn projection_item_replace_reopens_with_owner_isolation_and_stable_order() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
@@ -2700,6 +2801,151 @@ fn projection_generation_publish_is_constant_size_and_cleanup_resumes_after_reop
         "final publish mutations must be independent of projection item count"
     );
 
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn projection_generation_reads_stay_complete_during_publish_and_cleanup() {
+    let tmp = std::env::temp_dir().join(format!(
+        "lethe-projection-generation-snapshot-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = tmp.join("test.sqlite3");
+    let blob_dir = tmp.join("blobs");
+    let target = lethe_core::domain::ProjectionRef::new("proj:generation-snapshot-target");
+    let staging = lethe_core::domain::ProjectionRef::new("proj:generation-snapshot-staging");
+    let owner_key = "owner-snapshot";
+    let blob_ref = BlobRef::new(format!("blob:sha256:{}", "b".repeat(64)));
+    let item_count = 16_usize;
+    let generation_count = 64_usize;
+    let writer = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    writer
+        .commit_projection_items(
+            &target,
+            &serde_json::json!({"generation": 0}),
+            &ProjectionItemCommit::Replace {
+                items: generation_projection_items(0, item_count, owner_key, &blob_ref),
+            },
+        )
+        .unwrap();
+
+    let reader_stores = [
+        SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap(),
+        SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap(),
+    ];
+    let cleanup_store = SqlitePersistence::open(&db, &blob_dir, &[7; 32]).unwrap();
+    let writer_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cleanup_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+    let start = std::sync::Arc::new(std::sync::Barrier::new(4));
+
+    let readers = reader_stores
+        .into_iter()
+        .map(|reader| {
+            let target = target.clone();
+            let blob_ref = blob_ref.clone();
+            let writer_done = std::sync::Arc::clone(&writer_done);
+            let cleanup_done = std::sync::Arc::clone(&cleanup_done);
+            let start = std::sync::Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                let mut read_iterations = 0_usize;
+                loop {
+                    assert_projection_snapshot_reads_are_complete(
+                        &reader, &target, owner_key, &blob_ref, item_count,
+                    );
+                    read_iterations += 1;
+                    if writer_done.load(std::sync::atomic::Ordering::Acquire)
+                        && cleanup_done.load(std::sync::atomic::Ordering::Acquire)
+                        && read_iterations >= 32
+                    {
+                        return read_iterations;
+                    }
+                    std::thread::yield_now();
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let cleanup_writer_done = std::sync::Arc::clone(&writer_done);
+    let cleanup_done_flag = std::sync::Arc::clone(&cleanup_done);
+    let cleanup_writer_lock = std::sync::Arc::clone(&writer_lock);
+    let cleanup_start = std::sync::Arc::clone(&start);
+    let cleaner = std::thread::spawn(move || {
+        cleanup_start.wait();
+        let result = (|| -> Result<u64, PersistenceError> {
+            let mut deleted_items = 0_u64;
+            loop {
+                let report = {
+                    let _writer_guard = cleanup_writer_lock.lock().unwrap();
+                    cleanup_store.cleanup_retired_projection_generation(1)?
+                };
+                deleted_items += report.deleted_items;
+                if cleanup_writer_done.load(std::sync::atomic::Ordering::Acquire)
+                    && !report.has_more
+                {
+                    return Ok(deleted_items);
+                }
+                std::thread::yield_now();
+            }
+        })();
+        cleanup_done_flag.store(true, std::sync::atomic::Ordering::Release);
+        result
+    });
+
+    start.wait();
+    let writer_result = (|| -> Result<(), PersistenceError> {
+        for generation in 1..=generation_count {
+            {
+                let _writer_guard = writer_lock.lock().unwrap();
+                writer.commit_projection_items(
+                    &staging,
+                    &serde_json::json!({"generation": generation}),
+                    &ProjectionItemCommit::Replace {
+                        items: generation_projection_items(
+                            generation, item_count, owner_key, &blob_ref,
+                        ),
+                    },
+                )?;
+            }
+            {
+                let _writer_guard = writer_lock.lock().unwrap();
+                writer.publish_projection_items_from_staging(
+                    &target,
+                    &staging,
+                    &serde_json::json!({
+                        "generation": generation,
+                        "item_count": item_count,
+                    }),
+                    item_count as u64,
+                )?;
+            }
+            std::thread::yield_now();
+        }
+        Ok(())
+    })();
+    writer_done.store(true, std::sync::atomic::Ordering::Release);
+
+    let deleted_items = cleaner.join().unwrap().unwrap();
+    let read_iterations = readers
+        .into_iter()
+        .map(|reader| reader.join().unwrap())
+        .sum::<usize>();
+    writer_result.unwrap();
+    assert_eq!(
+        deleted_items,
+        (generation_count * item_count) as u64,
+        "every retired target generation must be drained"
+    );
+    assert!(
+        read_iterations >= 64,
+        "readers must overlap generation publish and cleanup"
+    );
+    assert_projection_snapshot_reads_are_complete(
+        &writer, &target, owner_key, &blob_ref, item_count,
+    );
+
+    drop(writer);
     let _ = fs::remove_dir_all(tmp);
 }
 

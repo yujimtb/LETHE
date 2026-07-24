@@ -125,6 +125,8 @@ SQLite schema v15 は、projection manifest のlogical IDとitem/blob rowのphys
 
 切替前のlive generationは同じtransactionで `retired_projection_materializations` に登録する。公開readerはheadが指す一世代だけを参照し、single-flight cleanup workerが旧item/blob rowsを128件ずつ削除する。各cleanup pageはwriter lockを解放してから1ms譲歩し、wait/hold/削除件数をlogする。head切替transactionの前後でcrashしても旧/新の完全な一方だけが公開され、cleanup途中のcrashではdurable retirement rowが残るため次bootに再開する。manifestのないorphan row、head/manifest欠落、activeかつretiredの世代はsilent fallbackせずschema invariant errorにする。
 
+公開readerはheadを先に解決してから別のautocommit文でphysical rowを読んではならない。key、owner、複数owner page、blob visibility、owner count、total countは、logical head・manifest存在・physical rowを一つのCTE/JOIN文で読み、同一SQLite statement snapshotへ束ねる。これによりA→B切替後にcleanupがAを削除しても、一回のreadは完全なAまたは完全なBだけを返す。通常の `Replace` が既存世代をretireした場合もcommit成功後にcleanup single-flightを要求する。
+
 source sync と supplemental write は `non_bulk_projection_operation` で互いを直列化し、`bulk_import_operation` は persisted bulk session が inactive であることを確定する短い admission handshake の間だけ取得する。derived lane、source fetch、canonical scan、retention、materialization、検索 catch-up の間は bulk mutex を保持しない。background rebuild 中に sync が derived lane を待つ場合は `sync_wait_reason="background_non_corpus_rebuild"` と待機時間を log に残すが、通常 v1/v2 import は bulk mutex と SQLite page writer hold の短い区間だけで admission と durable append を完了し、投影 catch-up を非同期へ渡す。
 
 bulk session begin は non-bulk projection operation が進行中なら待たず `bulk_import_non_bulk_projection_active` conflict を返す。bulk session end は `CatchingUp` への遷移後に bulk mutex を解放して検索・background rebuild 完了を待ち、最終 watermark 検証と `Ready` 永続化の区間だけ再取得する。空の Google Slides runtime source では latest workspace observation 探索を即時に空集合として返し、source がない sync が canonical 全件を走査しない。
@@ -177,7 +179,7 @@ glibc の multi-arena 保持は page 処理の live bound とは別に RSS high-
 
 実装の contract は `lethe-search-index` の reference-engine 比較、順序 / cursor / snippet、upsert / catch-up / generation / checksum test、selfhost の lifecycle / corruption test、HTTP / MCP e2e で検証する。全体の検証コマンドは次である。
 
-v15.2.2 のローカル検証は、5,000件ずつのlive/stagingをpublishしてSQLite変更row数が32未満かつ1件publishと同数であること、再open後に128件pageでretired generation cleanupを再開できること、2,000 Slack Observationから4,000件以上をstagingしたfinal phase中の単発v1 importが2秒以内に応答することを含む。workspaceは`726 passed / 0 failed / 3 ignored`、selfhostは`109 passed / 0 failed`、SQLite storageは`69 passed / 0 failed`である。568k fixture/16 GiB imageの再実測は本番・外部接続を使わない別の受入工程とする。
+v15.2.2 のローカル検証は、5,000件ずつのlive/stagingをpublishしてSQLite変更row数が32未満かつ1件publishと同数であること、再open後に128件pageでretired generation cleanupを再開できること、2,000 Slack Observationから4,000件以上をstagingしたfinal phase中の単発v1 importが2秒以内に応答することを含む。さらに64回のhead publishと1 row cleanupを2 readerと並行させ、6読取が完全な旧世代または新世代だけを返すことを検証する。workspaceは`727 passed / 0 failed / 3 ignored`、selfhostは`109 passed / 0 failed`、SQLite storageは`70 passed / 0 failed`である。568k fixture/16 GiB imageの再実測は本番・外部接続を使わない別の受入工程とする。
 
 ```powershell
 cargo fmt --all -- --check

@@ -205,6 +205,13 @@ import timing は少なくとも `bulk_operation_lock_wait_ms`、`persistence_lo
 - **THEN** 再open後のreaderは旧世代または新世代の完全な一方だけを参照する
 - **AND** durable retirement queueから残りの旧世代row cleanupを再開できる
 
+#### Scenario: publish/cleanupと並行するreaderは一世代のsnapshotだけを返す
+
+- **WHEN** readerがlogical projectionのkey、owner、複数owner page、blob visibility、owner count、またはtotal countを読み、同時にgeneration head切替と旧世代cleanupが進む
+- **THEN** head解決とphysical row参照は同じSQLite statement snapshotで行われる
+- **AND** 各API呼出しは旧世代または新世代の完全な一方を返し、空・部分結果、世代混在、blob visibilityの偽陰性を返さない
+- **AND** headとmanifestの片側だけが存在する場合はschema invariantとしてfail-fastする
+
 ### Requirement: Source sync cannot convoy normal import behind rebuild
 
 source sync と supplemental write は bulk session が inactive であることを短い admission handshake で確定しなければならない。この handshake 後は `bulk_import_operation` mutex を解放し、derived projection lane の取得、source fetch、canonical scan、retention、materialization、検索 catch-up の間に保持してはならない。bulk session begin は進行中の non-bulk projection operation を待たず conflict として fail-fast にしなければならない。

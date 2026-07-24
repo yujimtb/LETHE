@@ -215,6 +215,9 @@ impl NonCorpusRebuildStorage for BackgroundRebuildStorage<'_> {
         self.write("commit_projection_items", |storage| {
             storage.commit_projection_items(projection, manifest, commit)
         })?;
+        if matches!(commit, ProjectionItemCommit::Replace { .. }) {
+            self.service.request_projection_generation_cleanup();
+        }
         Ok(())
     }
 

@@ -1857,36 +1857,27 @@ impl SqlitePersistence {
     ) -> Result<Option<ProjectionItem>, PersistenceError> {
         validate_projection_key(projection)?;
         validate_item_key(item_key)?;
-        let Some(storage_projection_id) = active_storage_projection_id(&self.conn, projection)?
-        else {
-            return Ok(None);
-        };
-        let row = self
-            .conn
-            .query_row(
-                "SELECT item_key, owner_key, sort_key, value_json
-                 FROM projection_materialization_items
-                 WHERE projection_id = ?1 AND item_key = ?2",
-                params![storage_projection_id, item_key],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                },
-            )
-            .optional()?;
-        row.map(|(item_key, owner_key, sort_key, value_json)| {
-            Ok(ProjectionItem {
-                item_key,
-                owner_key,
-                sort_key,
-                value: serde_json::from_str(&value_json)?,
-            })
-        })
-        .transpose()
+        let row = self.conn.query_row(
+            "WITH active AS (
+                 SELECT heads.storage_projection_id,
+                        EXISTS (
+                            SELECT 1 FROM projection_materializations
+                            WHERE projection_id = ?1
+                        ) AS manifest_exists
+                 FROM (SELECT 1)
+                 LEFT JOIN projection_materialization_heads heads
+                   ON heads.projection_id = ?1
+             )
+             SELECT active.storage_projection_id, active.manifest_exists,
+                    items.item_key, items.owner_key, items.sort_key, items.value_json
+             FROM active
+             LEFT JOIN projection_materialization_items items
+               ON items.projection_id = active.storage_projection_id
+              AND items.item_key = ?2",
+            params![projection.as_str(), item_key],
+            projection_snapshot_item_row,
+        )?;
+        Ok(projection_items_from_snapshot_rows(projection, std::iter::once(row))?.pop())
     }
 
     pub fn projection_items_by_owner(
@@ -1896,35 +1887,32 @@ impl SqlitePersistence {
     ) -> Result<Vec<ProjectionItem>, PersistenceError> {
         validate_projection_key(projection)?;
         validate_owner_key(owner_key)?;
-        let Some(storage_projection_id) = active_storage_projection_id(&self.conn, projection)?
-        else {
-            return Ok(Vec::new());
-        };
         let mut statement = self.conn.prepare(
-            "SELECT item_key, owner_key, sort_key, value_json
-             FROM projection_materialization_items
-             WHERE projection_id = ?1 AND owner_key = ?2
-             ORDER BY sort_key ASC, item_key ASC",
+            "WITH active AS (
+                 SELECT heads.storage_projection_id,
+                        EXISTS (
+                            SELECT 1 FROM projection_materializations
+                            WHERE projection_id = ?1
+                        ) AS manifest_exists
+                 FROM (SELECT 1)
+                 LEFT JOIN projection_materialization_heads heads
+                   ON heads.projection_id = ?1
+             )
+             SELECT active.storage_projection_id, active.manifest_exists,
+                    items.item_key, items.owner_key, items.sort_key, items.value_json
+             FROM active
+             LEFT JOIN projection_materialization_items items
+               ON items.projection_id = active.storage_projection_id
+              AND items.owner_key = ?2
+             ORDER BY items.sort_key ASC, items.item_key ASC",
         )?;
-        let rows = statement.query_map(params![storage_projection_id, owner_key], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
-        let mut items = Vec::new();
-        for row in rows {
-            let (item_key, owner_key, sort_key, value_json) = row?;
-            items.push(ProjectionItem {
-                item_key,
-                owner_key,
-                sort_key,
-                value: serde_json::from_str(&value_json)?,
-            });
-        }
-        Ok(items)
+        let rows = statement
+            .query_map(
+                params![projection.as_str(), owner_key],
+                projection_snapshot_item_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        projection_items_from_snapshot_rows(projection, rows)
     }
 
     pub fn projection_items_page(
@@ -1944,23 +1932,32 @@ impl SqlitePersistence {
         for owner_key in owner_keys {
             validate_owner_key(owner_key)?;
         }
-        let Some(storage_projection_id) = active_storage_projection_id(&self.conn, projection)?
-        else {
-            return Ok(Vec::new());
-        };
         let placeholders = (0..owner_keys.len())
             .map(|index| format!("?{}", index + 2))
             .collect::<Vec<_>>()
             .join(", ");
         let mut sql = format!(
-            "SELECT item_key, owner_key, sort_key, value_json
-             FROM projection_materialization_items
-             WHERE projection_id = ?1 AND owner_key IN ({placeholders})"
+            "WITH active AS (
+                 SELECT heads.storage_projection_id,
+                        EXISTS (
+                            SELECT 1 FROM projection_materializations
+                            WHERE projection_id = ?1
+                        ) AS manifest_exists
+                 FROM (SELECT 1)
+                 LEFT JOIN projection_materialization_heads heads
+                   ON heads.projection_id = ?1
+             )
+             SELECT active.storage_projection_id, active.manifest_exists,
+                    items.item_key, items.owner_key, items.sort_key, items.value_json
+             FROM active
+             LEFT JOIN projection_materialization_items items
+               ON items.projection_id = active.storage_projection_id
+              AND items.owner_key IN ({placeholders})"
         );
-        let mut values = vec![rusqlite::types::Value::Text(storage_projection_id)];
+        let mut values = vec![rusqlite::types::Value::Text(projection.as_str().to_owned())];
         values.extend(owner_keys.iter().cloned().map(rusqlite::types::Value::Text));
         if let Some(prefix) = item_key_prefix {
-            sql.push_str(" AND item_key LIKE ?");
+            sql.push_str(" AND items.item_key LIKE ?");
             values.push(rusqlite::types::Value::Text(format!("{prefix}%")));
         }
         if let Some(after_sort_key) = after_sort_key {
@@ -1970,40 +1967,34 @@ impl SqlitePersistence {
                         "projection item cursor boundary is invalid".to_owned(),
                     ));
                 }
-                sql.push_str(" AND (sort_key > ? OR (sort_key = ? AND item_key > ?))");
+                sql.push_str(
+                    " AND (
+                        items.sort_key > ?
+                        OR (items.sort_key = ? AND items.item_key > ?)
+                    )",
+                );
                 values.push(rusqlite::types::Value::Text(sort_key.to_owned()));
                 values.push(rusqlite::types::Value::Text(sort_key.to_owned()));
                 values.push(rusqlite::types::Value::Text(item_key.to_owned()));
             } else {
-                sql.push_str(" AND sort_key > ?");
+                sql.push_str(" AND items.sort_key > ?");
                 values.push(rusqlite::types::Value::Text(after_sort_key.to_owned()));
             }
         }
-        sql.push_str(" ORDER BY sort_key ASC, item_key ASC LIMIT ?");
+        sql.push_str(" ORDER BY items.sort_key ASC, items.item_key ASC LIMIT ?");
         values.push(rusqlite::types::Value::Integer(
             i64::try_from(limit).map_err(|_| {
                 PersistenceError::SchemaInvariant("projection item limit overflow".to_owned())
             })?,
         ));
         let mut statement = self.conn.prepare(&sql)?;
-        let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
-        rows.map(|row| {
-            let (item_key, owner_key, sort_key, value_json) = row?;
-            Ok(ProjectionItem {
-                item_key,
-                owner_key,
-                sort_key,
-                value: serde_json::from_str(&value_json)?,
-            })
-        })
-        .collect()
+        let rows = statement
+            .query_map(
+                rusqlite::params_from_iter(values),
+                projection_snapshot_item_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        projection_items_from_snapshot_rows(projection, rows)
     }
 
     pub fn projection_blob_ref_visible(
@@ -2012,18 +2003,42 @@ impl SqlitePersistence {
         blob_ref: &BlobRef,
     ) -> Result<bool, PersistenceError> {
         validate_projection_key(projection)?;
-        let Some(storage_projection_id) = active_storage_projection_id(&self.conn, projection)?
-        else {
-            return Ok(false);
-        };
-        Ok(self.conn.query_row(
-            "SELECT EXISTS (
-                 SELECT 1 FROM projection_visible_blob_refs
-                 WHERE projection_id = ?1 AND blob_ref = ?2
-             )",
-            params![storage_projection_id, blob_ref.as_str()],
-            |row| row.get(0),
-        )?)
+        let (storage_projection_id, manifest_exists, visible) = self.conn.query_row(
+            "WITH active AS (
+                 SELECT heads.storage_projection_id,
+                        EXISTS (
+                            SELECT 1 FROM projection_materializations
+                            WHERE projection_id = ?1
+                        ) AS manifest_exists
+                 FROM (SELECT 1)
+                 LEFT JOIN projection_materialization_heads heads
+                   ON heads.projection_id = ?1
+             )
+             SELECT active.storage_projection_id, active.manifest_exists,
+                    EXISTS (
+                        SELECT 1 FROM projection_visible_blob_refs visible
+                        WHERE visible.projection_id = active.storage_projection_id
+                          AND visible.blob_ref = ?2
+                    )
+             FROM active",
+            params![projection.as_str(), blob_ref.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
+        )?;
+        if projection_generation_snapshot_present(
+            projection,
+            storage_projection_id.as_deref(),
+            manifest_exists,
+        )? {
+            Ok(visible)
+        } else {
+            Ok(false)
+        }
     }
 
     pub fn projection_item_count_by_owner(
@@ -2033,18 +2048,41 @@ impl SqlitePersistence {
     ) -> Result<u64, PersistenceError> {
         validate_projection_key(projection)?;
         validate_owner_key(owner_key)?;
-        let Some(storage_projection_id) = active_storage_projection_id(&self.conn, projection)?
-        else {
-            return Ok(0);
-        };
-        self.conn
-            .query_row(
-                "SELECT COUNT(*) FROM projection_materialization_items
-                 WHERE projection_id = ?1 AND owner_key = ?2",
-                params![storage_projection_id, owner_key],
-                |row| row.get(0),
-            )
-            .map_err(PersistenceError::from)
+        let (storage_projection_id, manifest_exists, count) = self.conn.query_row(
+            "WITH active AS (
+                 SELECT heads.storage_projection_id,
+                        EXISTS (
+                            SELECT 1 FROM projection_materializations
+                            WHERE projection_id = ?1
+                        ) AS manifest_exists
+                 FROM (SELECT 1)
+                 LEFT JOIN projection_materialization_heads heads
+                   ON heads.projection_id = ?1
+             )
+             SELECT active.storage_projection_id, active.manifest_exists, COUNT(items.item_key)
+             FROM active
+             LEFT JOIN projection_materialization_items items
+               ON items.projection_id = active.storage_projection_id
+              AND items.owner_key = ?2
+             GROUP BY active.storage_projection_id, active.manifest_exists",
+            params![projection.as_str(), owner_key],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, u64>(2)?,
+                ))
+            },
+        )?;
+        if projection_generation_snapshot_present(
+            projection,
+            storage_projection_id.as_deref(),
+            manifest_exists,
+        )? {
+            Ok(count)
+        } else {
+            Ok(0)
+        }
     }
 
     pub fn projection_item_count(
@@ -2052,18 +2090,40 @@ impl SqlitePersistence {
         projection: &lethe_core::domain::ProjectionRef,
     ) -> Result<u64, PersistenceError> {
         validate_projection_key(projection)?;
-        let Some(storage_projection_id) = active_storage_projection_id(&self.conn, projection)?
-        else {
-            return Ok(0);
-        };
-        self.conn
-            .query_row(
-                "SELECT COUNT(*) FROM projection_materialization_items
-                 WHERE projection_id = ?1",
-                [storage_projection_id],
-                |row| row.get(0),
-            )
-            .map_err(PersistenceError::from)
+        let (storage_projection_id, manifest_exists, count) = self.conn.query_row(
+            "WITH active AS (
+                 SELECT heads.storage_projection_id,
+                        EXISTS (
+                            SELECT 1 FROM projection_materializations
+                            WHERE projection_id = ?1
+                        ) AS manifest_exists
+                 FROM (SELECT 1)
+                 LEFT JOIN projection_materialization_heads heads
+                   ON heads.projection_id = ?1
+             )
+             SELECT active.storage_projection_id, active.manifest_exists, COUNT(items.item_key)
+             FROM active
+             LEFT JOIN projection_materialization_items items
+               ON items.projection_id = active.storage_projection_id
+             GROUP BY active.storage_projection_id, active.manifest_exists",
+            [projection.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, u64>(2)?,
+                ))
+            },
+        )?;
+        if projection_generation_snapshot_present(
+            projection,
+            storage_projection_id.as_deref(),
+            manifest_exists,
+        )? {
+            Ok(count)
+        } else {
+            Ok(0)
+        }
     }
 
     pub fn projection_leaf_watermark(
@@ -3329,6 +3389,88 @@ fn active_storage_projection_id(
             projection.as_str()
         ))),
     }
+}
+
+type ProjectionSnapshotItemRow = (
+    Option<String>,
+    bool,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn projection_snapshot_item_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ProjectionSnapshotItemRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+    ))
+}
+
+fn projection_generation_snapshot_present(
+    projection: &lethe_core::domain::ProjectionRef,
+    storage_projection_id: Option<&str>,
+    manifest_exists: bool,
+) -> Result<bool, PersistenceError> {
+    match (storage_projection_id, manifest_exists) {
+        (Some(_), true) => Ok(true),
+        (None, false) => Ok(false),
+        (Some(_), false) => Err(PersistenceError::SchemaInvariant(format!(
+            "projection generation head {} has no materialization",
+            projection.as_str()
+        ))),
+        (None, true) => Err(PersistenceError::SchemaInvariant(format!(
+            "projection materialization {} has no active generation head",
+            projection.as_str()
+        ))),
+    }
+}
+
+fn projection_items_from_snapshot_rows(
+    projection: &lethe_core::domain::ProjectionRef,
+    rows: impl IntoIterator<Item = ProjectionSnapshotItemRow>,
+) -> Result<Vec<ProjectionItem>, PersistenceError> {
+    let mut saw_snapshot_status = false;
+    let mut items = Vec::new();
+    for (storage_projection_id, manifest_exists, item_key, owner_key, sort_key, value_json) in rows
+    {
+        saw_snapshot_status = true;
+        let snapshot_present = projection_generation_snapshot_present(
+            projection,
+            storage_projection_id.as_deref(),
+            manifest_exists,
+        )?;
+        match (snapshot_present, item_key, owner_key, sort_key, value_json) {
+            (true, Some(item_key), Some(owner_key), Some(sort_key), Some(value_json)) => {
+                items.push(ProjectionItem {
+                    item_key,
+                    owner_key,
+                    sort_key,
+                    value: serde_json::from_str(&value_json)?,
+                });
+            }
+            (_, None, None, None, None) => {}
+            _ => {
+                return Err(PersistenceError::SchemaInvariant(format!(
+                    "projection item snapshot row is partial for {}",
+                    projection.as_str()
+                )));
+            }
+        }
+    }
+    if !saw_snapshot_status {
+        return Err(PersistenceError::SchemaInvariant(format!(
+            "projection item snapshot query returned no status row for {}",
+            projection.as_str()
+        )));
+    }
+    Ok(items)
 }
 
 fn new_storage_projection_id(projection: &lethe_core::domain::ProjectionRef) -> String {
