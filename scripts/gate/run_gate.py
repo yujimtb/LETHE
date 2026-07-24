@@ -144,6 +144,40 @@ def parse_args() -> argparse.Namespace:
             "overall --ack-timeout-seconds budget, not this count"
         ),
     )
+    parser.add_argument(
+        "--max-consecutive-bulk-session-conflicts",
+        type=int,
+        default=10,
+        help=(
+            "test 1b/2b: number of consecutive HTTP 409 responses from "
+            "bulk-sessions begin/end whose error code is a known-transient "
+            "conflict (bulk_import_session_active, "
+            "bulk_import_non_bulk_projection_active — counted separately from "
+            "--max-consecutive-timeouts) before the gate aborts. Any other 409 "
+            "code fails immediately, not retried"
+        ),
+    )
+    parser.add_argument(
+        "--bulk-session-conflict-wait-seconds",
+        type=float,
+        default=1.5,
+        help=(
+            "fixed wait between retries of a known-transient bulk-session "
+            "409 conflict (these codes carry no server-provided retry_after, "
+            "unlike HTTP 429)"
+        ),
+    )
+    parser.add_argument(
+        "--warmup-settle-seconds",
+        type=float,
+        default=10.0,
+        help=(
+            "settle time before sampling pre-warmup RSS, ahead of the "
+            "dup-only warmup (100 x 2 batches) that runs before baseline is "
+            "sampled — absorbs one-time lazy-init cost so it isn't misread "
+            "as test 1 residual growth"
+        ),
+    )
     parser.add_argument("--baseline-settle-seconds", type=float, default=60.0)
     parser.add_argument("--stats-poll-interval-seconds", type=float, default=1.0)
     parser.add_argument(
@@ -399,6 +433,76 @@ def log_concurrency_event(context: str, event: dict[str, Any]) -> None:
     )
 
 
+def log_bulk_session_conflict_event(context: str, event: dict[str, Any]) -> None:
+    log(
+        f"{context}: HTTP 409 {event['conflict_code']} on attempt {event['attempt']} "
+        f"after {event['elapsed_seconds']:.1f}s; retrying (transient conflict)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Warmup: absorb one-time lazy-init cost before sampling baseline RSS
+#
+# Mirrors scripts/import_memory_harness.py's own "dup-only warmup twice,
+# then re-take baseline" design: the first import(s) into a fresh container
+# pay for one-time lazy initialization (search index / registry residency
+# etc., observed on the order of +1.5GiB) that is not part of any per-import
+# leak. Without a warmup, that one-time cost lands inside test 1's residual
+# window and gets misread as a leak. It cannot recur once paid, so warming
+# it up before baseline does not hide a real corpus-size-proportional leak
+# — that is what test 3's slope is for.
+# ---------------------------------------------------------------------------
+
+
+def run_warmup(
+    client: gc.ImportClient,
+    sampler: gc.DockerStatsSampler,
+    *,
+    source_instance_id: str,
+    tag: str,
+    start_index: int,
+    container_name: str,
+    settle_before_seconds: float,
+    rss_average_window_seconds: float,
+    max_consecutive_timeouts: int,
+    max_consecutive_concurrency_retries: int,
+) -> dict[str, Any]:
+    log("=== warmup: dup-only replay (100 x 2 batches) before baseline ===")
+    log(f"settling {settle_before_seconds:.0f}s to sample pre-warmup RSS ...")
+    time.sleep(settle_before_seconds)
+    gc.assert_container_alive(container_name)
+    rss_before_mib = sampler.average_recent(rss_average_window_seconds)
+
+    latencies, transient_events, concurrency_events = run_dup_only_batches(
+        client,
+        source_instance_id=source_instance_id,
+        tag=tag,
+        start_index=start_index,
+        batches=2,
+        batch_size=100,
+        container_name=container_name,
+        max_consecutive_timeouts=max_consecutive_timeouts,
+        max_consecutive_concurrency_retries=max_consecutive_concurrency_retries,
+    )
+
+    gc.assert_container_alive(container_name)
+    rss_after_mib = sampler.average_recent(rss_average_window_seconds)
+    one_time_init_delta_mib = rss_after_mib - rss_before_mib
+    log(
+        f"warmup done: rss_before={rss_before_mib:.1f}MiB rss_after={rss_after_mib:.1f}MiB "
+        f"one_time_init_delta={one_time_init_delta_mib:.1f}MiB "
+        f"(this is expected to be absorbed here, not counted against test 1's residual)"
+    )
+    return {
+        "batch_latencies_seconds": latencies,
+        "transient_events": transient_events,
+        "concurrency_limit_events": concurrency_events,
+        "rss_before_mib": rss_before_mib,
+        "rss_after_mib": rss_after_mib,
+        "one_time_init_delta_mib": one_time_init_delta_mib,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Test 1: dup-only replay
 # ---------------------------------------------------------------------------
@@ -530,12 +634,47 @@ def run_test1b_bulk_session_dup_only(
     end_latency_threshold_seconds: float,
     max_consecutive_timeouts: int,
     max_consecutive_concurrency_retries: int,
+    max_consecutive_bulk_session_conflicts: int,
+    bulk_session_conflict_wait_seconds: float,
 ) -> dict[str, Any]:
     log("=== test 1b: bulk session dup-only (begin -> 100 dup -> end, x4) ===")
 
+    session_transient_events: list[dict[str, Any]] = []
+    session_conflict_events: list[dict[str, Any]] = []
+
+    def begin_session(label: str) -> gc.BulkSessionResult:
+        context = f"{label} begin"
+        outcome = gc.call_bulk_session_with_retry(
+            lambda: client.begin_bulk_session(timeout=60.0),
+            max_consecutive_timeouts=max_consecutive_timeouts,
+            max_consecutive_conflict_retries=max_consecutive_bulk_session_conflicts,
+            conflict_wait_seconds=bulk_session_conflict_wait_seconds,
+            context=context,
+            on_transient=lambda event, context=context: log_transient_event(context, event),
+            on_conflict=lambda event, context=context: log_bulk_session_conflict_event(context, event),
+        )
+        session_transient_events.extend(outcome.transient_events)
+        session_conflict_events.extend(outcome.conflict_events)
+        return outcome.result
+
+    def end_session(session_id: str, label: str) -> gc.BulkSessionResult:
+        context = f"{label} end"
+        outcome = gc.call_bulk_session_with_retry(
+            lambda: client.end_bulk_session(session_id, timeout=1800.0),
+            max_consecutive_timeouts=max_consecutive_timeouts,
+            max_consecutive_conflict_retries=max_consecutive_bulk_session_conflicts,
+            conflict_wait_seconds=bulk_session_conflict_wait_seconds,
+            context=context,
+            on_transient=lambda event, context=context: log_transient_event(context, event),
+            on_conflict=lambda event, context=context: log_bulk_session_conflict_event(context, event),
+        )
+        session_transient_events.extend(outcome.transient_events)
+        session_conflict_events.extend(outcome.conflict_events)
+        return outcome.result
+
     gc.assert_container_alive(container_name)
     try:
-        first_begin = client.begin_bulk_session(timeout=60.0)
+        first_begin = begin_session("batch 1")
     except gc.ImportRequestError as error:
         if error.status_code in gc.SESSION_API_UNAVAILABLE_STATUS_CODES:
             reason = (
@@ -580,7 +719,7 @@ def run_test1b_bulk_session_dup_only(
         gc.assert_all_duplicate(import_result.counts, 100, context=context)
         import_latencies.append(import_result.elapsed_seconds)
 
-        end_result = client.end_bulk_session(session_id, timeout=1800.0)
+        end_result = end_session(session_id, f"batch {batch_num + 1}")
         end_durations.append(end_result.elapsed_seconds)
         session_states.append(end_result.state)
         if end_result.elapsed_seconds > end_latency_threshold_seconds:
@@ -595,7 +734,7 @@ def run_test1b_bulk_session_dup_only(
     run_one_batch(0, first_begin)
     for batch_num in range(1, 4):
         gc.assert_container_alive(container_name)
-        begin_result = client.begin_bulk_session(timeout=60.0)
+        begin_result = begin_session(f"batch {batch_num + 1}")
         run_one_batch(batch_num, begin_result)
 
     log(f"test 1b sending done; settling {post_batch_wait_seconds:.0f}s before residual RSS sample ...")
@@ -622,6 +761,8 @@ def run_test1b_bulk_session_dup_only(
         "import_batch_latencies_seconds": import_latencies,
         "import_transient_events": import_transient_events,
         "import_concurrency_limit_events": import_concurrency_events,
+        "session_call_transient_events": session_transient_events,
+        "session_call_conflict_events": session_conflict_events,
         "end_duration_seconds": end_durations,
         "session_states_after_end": session_states,
         "end_latency_threshold_seconds": end_latency_threshold_seconds,
@@ -755,12 +896,31 @@ def run_test2b_bulk_session_new(
     residual_threshold_mib: float,
     max_consecutive_timeouts: int,
     max_consecutive_concurrency_retries: int,
+    max_consecutive_bulk_session_conflicts: int,
+    bulk_session_conflict_wait_seconds: float,
 ) -> dict[str, Any]:
     log(f"=== test 2b: bulk session new import ({count} drafts, batch={batch_size}, session-wrapped) ===")
 
+    session_transient_events: list[dict[str, Any]] = []
+    session_conflict_events: list[dict[str, Any]] = []
+
+    def call_session(call: Any, label: str) -> gc.BulkSessionResult:
+        outcome = gc.call_bulk_session_with_retry(
+            call,
+            max_consecutive_timeouts=max_consecutive_timeouts,
+            max_consecutive_conflict_retries=max_consecutive_bulk_session_conflicts,
+            conflict_wait_seconds=bulk_session_conflict_wait_seconds,
+            context=label,
+            on_transient=lambda event, label=label: log_transient_event(label, event),
+            on_conflict=lambda event, label=label: log_bulk_session_conflict_event(label, event),
+        )
+        session_transient_events.extend(outcome.transient_events)
+        session_conflict_events.extend(outcome.conflict_events)
+        return outcome.result
+
     gc.assert_container_alive(container_name)
     try:
-        begin_result = client.begin_bulk_session(timeout=60.0)
+        begin_result = call_session(lambda: client.begin_bulk_session(timeout=60.0), "test 2b begin")
     except gc.ImportRequestError as error:
         if error.status_code in gc.SESSION_API_UNAVAILABLE_STATUS_CODES:
             reason = (
@@ -807,7 +967,9 @@ def run_test2b_bulk_session_new(
         latencies.append(result.elapsed_seconds)
         index = batch_end
 
-    end_result = client.end_bulk_session(session_id, timeout=1800.0)
+    end_result = call_session(
+        lambda: client.end_bulk_session(session_id, timeout=1800.0), "test 2b end"
+    )
     peak_mib = sampler.peak_since(marker)
     peak_over_baseline_mib = peak_mib - baseline_mib
     log(
@@ -840,6 +1002,8 @@ def run_test2b_bulk_session_new(
         "batch_latencies_seconds": latencies,
         "transient_events": transient_events,
         "concurrency_limit_events": concurrency_events,
+        "session_call_transient_events": session_transient_events,
+        "session_call_conflict_events": session_conflict_events,
         "peak_mib": peak_mib,
         "peak_over_baseline_mib": peak_over_baseline_mib,
         "peak_threshold_mib": peak_threshold_mib,
@@ -941,11 +1105,11 @@ def run_test3_slope(
 def main() -> int:
     args = parse_args()
 
-    if args.seed_count < 2000:
+    if args.seed_count < 2200:
         raise gc.GateError(
-            "--seed-count must be >= 2000 (test 1 and test 3 each consume 800 "
-            "distinct dup-sample indices, and test 1b consumes another 400, "
-            "all from the seeded range)"
+            "--seed-count must be >= 2200 (test 1 and test 3 each consume 800 "
+            "distinct dup-sample indices, test 1b consumes another 400, and "
+            "warmup consumes another 200, all from the seeded range)"
         )
 
     env = gc.read_env_file(args.env_file)
@@ -973,7 +1137,16 @@ def main() -> int:
             "probe_timeout_seconds": args.probe_timeout_seconds,
             "max_consecutive_timeouts": args.max_consecutive_timeouts,
             "max_consecutive_concurrency_retries": args.max_consecutive_concurrency_retries,
+            "max_consecutive_bulk_session_conflicts": args.max_consecutive_bulk_session_conflicts,
+            "bulk_session_conflict_wait_seconds": args.bulk_session_conflict_wait_seconds,
         },
+        "http_transport": (
+            "connection reuse disabled (every request sends Connection: close; "
+            "httpx keepalive pool size 0) as a workaround for an observed "
+            "Windows Docker Desktop loopback-proxy transport stall — a batch "
+            "with 349ms of server-side handler time was seen taking 241s to "
+            "return to the client with no server-side activity in between"
+        ),
         "phases": {},
         "tests": [],
         "passed": False,
@@ -1015,6 +1188,20 @@ def main() -> int:
         sampler = gc.DockerStatsSampler(container_name, args.stats_poll_interval_seconds)
         sampler.start()
 
+        warmup_info = run_warmup(
+            client,
+            sampler,
+            source_instance_id=args.source_instance,
+            tag=args.tag,
+            start_index=2000,
+            container_name=container_name,
+            settle_before_seconds=args.warmup_settle_seconds,
+            rss_average_window_seconds=args.rss_average_window_seconds,
+            max_consecutive_timeouts=args.max_consecutive_timeouts,
+            max_consecutive_concurrency_retries=args.max_consecutive_concurrency_retries,
+        )
+        report["phases"]["warmup"] = warmup_info
+
         log(f"settling {args.baseline_settle_seconds:.0f}s to sample baseline RSS ...")
         time.sleep(args.baseline_settle_seconds)
         gc.assert_container_alive(container_name)
@@ -1051,6 +1238,8 @@ def main() -> int:
             end_latency_threshold_seconds=args.bulk_session_end_latency_threshold_seconds,
             max_consecutive_timeouts=args.max_consecutive_timeouts,
             max_consecutive_concurrency_retries=args.max_consecutive_concurrency_retries,
+            max_consecutive_bulk_session_conflicts=args.max_consecutive_bulk_session_conflicts,
+            bulk_session_conflict_wait_seconds=args.bulk_session_conflict_wait_seconds,
         )
         report["tests"].append(test1b)
 
@@ -1113,6 +1302,8 @@ def main() -> int:
             residual_threshold_mib=args.bulk_residual_threshold_mib,
             max_consecutive_timeouts=args.max_consecutive_timeouts,
             max_consecutive_concurrency_retries=args.max_consecutive_concurrency_retries,
+            max_consecutive_bulk_session_conflicts=args.max_consecutive_bulk_session_conflicts,
+            bulk_session_conflict_wait_seconds=args.bulk_session_conflict_wait_seconds,
         )
         report["tests"].append(test2b_session)
 

@@ -80,8 +80,9 @@ python run_gate.py \
 `seed_gate_corpus.py` was run with — the dup-only tests reconstruct the
 exact same drafts by index, and the bulk-import tests need to know where
 the seeded index range ends so their "new" indices don't collide with it.
-`--seed-count` must be ≥ 2000: indices `[0, 800)` and `[800, 1600)` are the
-test 1 / test 3 dup samples, `[1600, 2000)` is the test 1b dup sample, and
+`--seed-count` must be ≥ 2200: indices `[0, 800)` and `[800, 1600)` are the
+test 1 / test 3 dup samples, `[1600, 2000)` is the test 1b dup sample,
+`[2000, 2200)` is the warmup dup sample (see "Warmup" below), and
 everything from `--seed-count` onward is used for fresh (never-seeded)
 indices by tests 2, 2b, and the ACK-latency probe — each in its own
 disjoint range, so a single `run_gate.py` invocation never collides with
@@ -98,10 +99,10 @@ health.
 Sequence: copy `--data-dir` to a scratch dir → `docker run -d --memory ...`
 → poll `/health` (up to 15 min) → poll single-item import ACK latency until
 it drops below 2s (up to 30 min; this waits out migration/index-rebuild
-convergence on container start) → 60s baseline RSS sample → test 1 → test
-1b → test 2 (batch=25 then batch=1000) → test 2b → test 3 → stop/remove
-container → delete scratch data dir → write `--report` JSON → print a
-PASS/FAIL summary.
+convergence on container start) → warmup (100 x 2 dup batches) → 60s
+baseline RSS sample → test 1 → test 1b → test 2 (batch=25 then batch=1000)
+→ test 2b → test 3 → stop/remove container → delete scratch data dir →
+write `--report` JSON → print a PASS/FAIL summary.
 
 Any single test failing exits 1 with `"passed": false` in the report. Tests
 1b and 2b are the exception: if the bulk-session API itself is unusable in
@@ -140,8 +141,39 @@ If `begin` fails with an auth/scope/routing-class HTTP status (401, 403,
 404, 405, 501 — see `gate_common.SESSION_API_UNAVAILABLE_STATUS_CODES`),
 the affected test is marked `"skipped": true` with a `"skip_reason"` in the
 report and a warning is printed to stdout — this does **not** fail the
-gate. Any other failure (e.g. a business-logic conflict such as a stray
-already-active session) is treated as a real test failure, not a skip.
+gate.
+
+Every `begin`/`end` call goes through the same transient-failure handling
+as import sends (see "Network resilience" below): a timeout / connection
+error / 5xx is retried up to `--max-consecutive-timeouts` times (observed
+in practice — a `begin` call can itself time out while
+`bulk_import_operation_lock` is briefly held by a concurrent end/import on
+the same session). Separately, an HTTP 409 whose error code is a
+known-transient conflict — `bulk_import_session_active` (most often an
+earlier, client-timed-out `begin`/`end` that actually succeeded
+server-side) or `bulk_import_non_bulk_projection_active` — is retried
+after a fixed `--bulk-session-conflict-wait-seconds` (these codes carry no
+server-provided `retry_after`, unlike HTTP 429) up to
+`--max-consecutive-bulk-session-conflicts` times. Any *other* 409 (e.g.
+`bulk_import_session_mismatch`, a real logic error) or other 4xx still
+fails immediately, not retried. Each test's report entry includes
+`session_call_transient_events` / `session_call_conflict_events` listing
+every retried `begin`/`end` attempt.
+
+### Warmup (before baseline)
+
+Mirrors `scripts/import_memory_harness.py`'s own "dup-only warmup twice,
+then re-take baseline" design. The first import(s) into a freshly booted
+container pay for one-time lazy initialization (search index / registry
+residency, etc. — observed on the order of +1.5GiB) that has nothing to do
+with any per-import leak. Without warming that up first, it lands inside
+test 1's residual window and gets misread as a leak. `run_gate.py` now
+sends 100 x 2 dup-only batches (indices `[2000, 2200)`) right after the
+ACK-convergence wait and *before* sampling baseline RSS, recording
+`rss_before_mib` / `rss_after_mib` / `one_time_init_delta_mib` in the
+report's `phases.warmup` for visibility. This cannot mask a real
+corpus-size-proportional leak (a one-time cost can't recur) — that class
+of bug is what test 3's slope continues to catch.
 
 ### Network resilience (timeouts are not crashes)
 
@@ -167,6 +199,24 @@ Every test's report entry includes a `transient_events` (or, for test 1b,
 `import_transient_events`) list recording each transient attempt's elapsed
 time, HTTP status (if any), and message, so a run that passed despite some
 retries is still visible in `--report`.
+
+#### Connection reuse is disabled (Windows Docker Desktop transport stalls)
+
+Observed in practice: a dup-only batch whose server-side handler logged
+349ms of actual work took the client 241 seconds to get a response for,
+with zero server-side log activity in that ~4-minute gap — i.e. the stall
+was in the transport layer, before the request ever reached the handler.
+The suspected cause is Windows Docker Desktop's loopback port proxy
+mishandling HTTP keep-alive connection reuse. Every request this script
+makes therefore forces a fresh connection: `Connection: close` is sent on
+every request (both the httpx and requests code paths), and when using
+httpx the client is additionally constructed with
+`httpx.Limits(max_keepalive_connections=0, max_connections=1)` so it never
+tries to pool a connection for reuse in the first place. The report's
+top-level `http_transport` field records that this workaround is active.
+The performance cost of a fresh loopback connection per request is
+negligible for this gate's purposes — correctness (not silently mistaking
+a transport stall for a memory/latency finding) is what matters here.
 
 #### The timeout → 429 orphan chain (and why raising `--probe-timeout-seconds` is correct, not lowering it)
 
@@ -216,11 +266,14 @@ raising it over lowering it if you suspect probes are giving up too eagerly.
 | `--bulk-session-end-latency-threshold-seconds` | 10 | test 1b: max acceptable `.../bulk-sessions/{id}/end` duration per batch |
 | `--max-consecutive-timeouts` | 3 | tests 1/1b/2/2b/3: consecutive transient failures (timeout/connection-error/5xx, NOT counting HTTP 429) on the same batch before the gate aborts |
 | `--max-consecutive-concurrency-retries` | 60 | tests 1/1b/2/2b/3: consecutive HTTP 429 `import_concurrency_limit` responses (retried honoring `retry_after`, counted separately from timeouts) on the same batch before the gate aborts. The ACK probe also retries 429s but is bounded only by `--ack-timeout-seconds`, not this count |
+| `--max-consecutive-bulk-session-conflicts` | 10 | tests 1b/2b: consecutive HTTP 409 responses from bulk-session begin/end with a known-transient conflict code (counted separately from `--max-consecutive-timeouts`) before the gate aborts |
+| `--bulk-session-conflict-wait-seconds` | 1.5 | fixed wait between retries of a known-transient bulk-session 409 conflict (no server-provided `retry_after` for these codes) |
 | `--probe-timeout-seconds` | 900 | per-request HTTP timeout for the ACK-convergence probe (not the test batches — those use their own per-call timeouts, see source). Raising this reduces orphaned server-side work, not the other way around — see "The timeout → 429 orphan chain" above |
 | `--health-timeout-seconds` | 900 (15 min) | max wait for `/health` to return 200 |
 | `--ack-timeout-seconds` | 1800 (30 min) | max wait for single-item import ACK latency to converge |
 | `--ack-latency-threshold-seconds` | 2.0 | the ACK latency convergence target |
-| `--baseline-settle-seconds` | 60 | idle time (and averaging window) before sampling baseline RSS |
+| `--warmup-settle-seconds` | 10 | settle time before sampling pre-warmup RSS, ahead of the dup-only warmup that runs before baseline is sampled |
+| `--baseline-settle-seconds` | 60 | idle time (and averaging window) before sampling baseline RSS, taken *after* warmup |
 | `--post-batch-wait-seconds` | 180 (3 min) | settle time before residual RSS sampling in tests 1 and 2 |
 | `--slope-settle-seconds` | 60 | settle time after each of test 3's 8 batches |
 | `--rss-average-window-seconds` | 15 | averaging window used when reading a residual/slope RSS point, to smooth `docker stats` sampling noise |
