@@ -908,6 +908,47 @@ def assert_all_ingested(counts: OutcomeCounts, expected: int, *, context: str) -
         )
 
 
+def assert_new_batch_outcome(
+    counts: OutcomeCounts, expected: int, *, attempts: int, context: str
+) -> int:
+    """Validate a batch of *new* (never-before-seeded) drafts, tolerant of
+    orphaned-retry duplicates.
+
+    send_drafts_with_retry retries a batch on transient failure (timeout /
+    connection-error / 5xx / 429), but the *previous* attempt's request can
+    have actually completed server-side while the client gave up on it
+    (the same orphan pattern as ImportConcurrencyLimitError) — the retry
+    then legitimately comes back `duplicate` for those items, not
+    `ingested`. Observed in practice: a 180s-timeout attempt whose retry
+    then saw ingested=0/duplicates=25 for a batch of indices that had
+    genuinely never been sent before.
+
+    Requires ``ingested + duplicates == expected`` and no
+    quarantined/rejected. A `duplicate` outcome is only accepted when
+    ``attempts > 1`` (a retry actually happened); a duplicate on the very
+    first attempt (no retry) is anomalous for a batch of indices that
+    should never have existed before — that indicates real seed/index
+    pollution, not an orphaned-retry artifact, and still fails.
+
+    Returns the number of items resolved as `duplicate`, for reporting as
+    ``retried_as_duplicates`` (0 on a normal all-`ingested` outcome).
+    """
+    assert_no_failures(counts, context=context)
+    if counts.ingested + counts.duplicates != expected:
+        raise GateError(
+            f"{context}: expected {expected} ingested+duplicate total, "
+            f"got ingested={counts.ingested} duplicates={counts.duplicates}"
+        )
+    if counts.duplicates > 0 and attempts == 1:
+        raise GateError(
+            f"{context}: {counts.duplicates} unexpected duplicate(s) on the "
+            f"first attempt (no retry occurred) for a batch of indices that "
+            f"should never have been seen before — this indicates real "
+            f"seed/index pollution, not an orphaned-retry artifact"
+        )
+    return counts.duplicates
+
+
 def assert_all_duplicate(counts: OutcomeCounts, expected: int, *, context: str) -> None:
     assert_no_failures(counts, context=context)
     if counts.duplicates != expected or counts.ingested != 0:
