@@ -115,7 +115,7 @@ this environment (see "Bulk-session tests" below), they report
 |---|---|---|---|
 | 1 | dup-only replay | 8 × 100 already-seeded drafts (all must come back `duplicate`) | any residual growth from resending pure duplicates — should be ~flat |
 | 1b | bulk session dup-only | 4 × (begin session → 100 already-seeded drafts → end session) | the pathology the sol audit traced this gate to: `.../bulk-sessions/{id}/end` runs a corpus/materialization rebuild (`bulk_import.rs::end_bulk_import_session`) that, pre-fix, scaled with corpus size even for a session that only ever imported duplicates — visible both as residual growth and as anomalously slow `end` calls (~26s/batch was the reported regression signature) |
-| 2 | new bulk import | 1000 fresh drafts, once at batch=25 and once at batch=1000 (all must come back `ingested`) | a large single request/response transient spike, or steady per-request growth that isn't 100% freed after the batch |
+| 2 | new bulk import | 1000 fresh drafts, once at batch=25 and once at batch=1000 (`ingested + duplicate` must total the batch — see "Retried-as-duplicate accounting" below) | a large single request/response transient spike, or steady per-request growth that isn't 100% freed after the batch |
 | 2b | bulk session new import | 1000 fresh drafts (batch=25) wrapped in a single begin/.../end bulk session | same peak/residual bounds as test 2, but exercised through the session-wrapped path that end-of-session rebuild goes through |
 | 3 | slope detection | 8 more × 100 dup batches, sampling RSS after each one and regressing batch-number vs. RSS | the actual v15 bug class: growth *proportional to how many import requests have been made*, invisible in single-batch peak/residual checks but visible as a positive slope |
 
@@ -254,6 +254,27 @@ convergence faster — it only orphans more in-flight requests, each of
 which can starve the next probe with 429 until it finishes server-side.**
 `--probe-timeout-seconds` defaults to 900 (15 min) for this reason; prefer
 raising it over lowering it if you suspect probes are giving up too eagerly.
+
+#### Retried-as-duplicate accounting (tests 2 / 2b)
+
+The same orphan pattern above applies to test 2/2b's "new" batches, not
+just the ACK probe: if a batch is retried by `send_drafts_with_retry`
+after a transient failure, the *previous* attempt's request can have
+actually completed server-side while the client gave up on it — the retry
+then legitimately comes back `duplicate` for those items, not `ingested`.
+Observed in a real run: `batch [568100,568125)` attempt 1 timed out after
+180s; attempt 2 got `ingested=0/duplicates=25`, and the gate died with
+"expected 25 ingested" even though nothing was actually wrong.
+
+Fix: a batch of "new" (never-before-seeded) drafts is now accepted when
+`ingested + duplicates == batch size` and there are no
+quarantined/rejected items — `assert_new_batch_outcome()` in
+`gate_common.py`. A `duplicate` outcome is only accepted when the batch
+was actually retried (`attempts > 1`); a `duplicate` on the very first
+attempt (no retry) is still a hard failure, since it means an index that
+should never have existed already did — real seed/index pollution, not an
+orphaned-retry artifact. Each test's report entry records the count of
+such orphan-retry duplicates as `retried_as_duplicates`.
 
 ## Threshold arguments (all overridable)
 

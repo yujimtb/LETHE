@@ -804,6 +804,7 @@ def run_bulk_subtest(
     latencies: list[float] = []
     transient_events: list[dict[str, Any]] = []
     concurrency_events: list[dict[str, Any]] = []
+    retried_as_duplicates = 0
     index = start_index
     end = start_index + count
     while index < end:
@@ -828,7 +829,9 @@ def run_bulk_subtest(
         result = outcome.result
         transient_events.extend(outcome.transient_events)
         concurrency_events.extend(outcome.concurrency_events)
-        gc.assert_all_ingested(result.counts, len(drafts), context=context)
+        retried_as_duplicates += gc.assert_new_batch_outcome(
+            result.counts, len(drafts), attempts=outcome.attempts, context=context
+        )
         total = total + result.counts
         latencies.append(result.elapsed_seconds)
         index = batch_end
@@ -836,7 +839,8 @@ def run_bulk_subtest(
     peak_mib = sampler.peak_since(marker)
     peak_over_baseline_mib = peak_mib - baseline_mib
     log(
-        f"{label} sending done ({total.ingested} ingested); "
+        f"{label} sending done ({total.ingested} ingested, "
+        f"{retried_as_duplicates} retried-as-duplicate); "
         f"settling {post_batch_wait_seconds:.0f}s before residual RSS sample ..."
     )
     time.sleep(post_batch_wait_seconds)
@@ -846,13 +850,13 @@ def run_bulk_subtest(
 
     peak_ok = peak_over_baseline_mib <= peak_threshold_mib
     residual_ok = residual_mib <= residual_threshold_mib
-    ingested_ok = total.ingested == count and total.duplicates == 0
+    ingested_ok = total.ingested + total.duplicates == count
     passed = peak_ok and residual_ok and ingested_ok
     log(
         f"{label} result: peak={peak_mib:.1f}MiB peak_over_baseline={peak_over_baseline_mib:.1f}MiB "
         f"(threshold={peak_threshold_mib:.1f}MiB) after={after_mib:.1f}MiB "
         f"residual={residual_mib:.1f}MiB (threshold={residual_threshold_mib:.1f}MiB) "
-        f"ingested={total.ingested}/{count} pass={passed}"
+        f"ingested={total.ingested}/{count} retried_as_duplicates={retried_as_duplicates} pass={passed}"
     )
     return {
         "name": f"bulk_new_{label}",
@@ -861,6 +865,7 @@ def run_bulk_subtest(
         "count": count,
         "ingested": total.ingested,
         "duplicates": total.duplicates,
+        "retried_as_duplicates": retried_as_duplicates,
         "batch_latencies_seconds": latencies,
         "transient_events": transient_events,
         "concurrency_limit_events": concurrency_events,
@@ -937,6 +942,7 @@ def run_test2b_bulk_session_new(
     latencies: list[float] = []
     transient_events: list[dict[str, Any]] = []
     concurrency_events: list[dict[str, Any]] = []
+    retried_as_duplicates = 0
     index = start_index
     end_index = start_index + count
     while index < end_index:
@@ -962,7 +968,9 @@ def run_test2b_bulk_session_new(
         result = outcome.result
         transient_events.extend(outcome.transient_events)
         concurrency_events.extend(outcome.concurrency_events)
-        gc.assert_all_ingested(result.counts, len(drafts), context=context)
+        retried_as_duplicates += gc.assert_new_batch_outcome(
+            result.counts, len(drafts), attempts=outcome.attempts, context=context
+        )
         total = total + result.counts
         latencies.append(result.elapsed_seconds)
         index = batch_end
@@ -973,7 +981,8 @@ def run_test2b_bulk_session_new(
     peak_mib = sampler.peak_since(marker)
     peak_over_baseline_mib = peak_mib - baseline_mib
     log(
-        f"test 2b sending+end done ({total.ingested} ingested, end={end_result.elapsed_seconds:.1f}s); "
+        f"test 2b sending+end done ({total.ingested} ingested, "
+        f"{retried_as_duplicates} retried-as-duplicate, end={end_result.elapsed_seconds:.1f}s); "
         f"settling {post_batch_wait_seconds:.0f}s before residual RSS sample ..."
     )
     time.sleep(post_batch_wait_seconds)
@@ -983,13 +992,13 @@ def run_test2b_bulk_session_new(
 
     peak_ok = peak_over_baseline_mib <= peak_threshold_mib
     residual_ok = residual_mib <= residual_threshold_mib
-    ingested_ok = total.ingested == count and total.duplicates == 0
+    ingested_ok = total.ingested + total.duplicates == count
     passed = peak_ok and residual_ok and ingested_ok
     log(
         f"test 2b result: peak={peak_mib:.1f}MiB peak_over_baseline={peak_over_baseline_mib:.1f}MiB "
         f"(threshold={peak_threshold_mib:.1f}MiB) after={after_mib:.1f}MiB "
         f"residual={residual_mib:.1f}MiB (threshold={residual_threshold_mib:.1f}MiB) "
-        f"ingested={total.ingested}/{count} pass={passed}"
+        f"ingested={total.ingested}/{count} retried_as_duplicates={retried_as_duplicates} pass={passed}"
     )
     return {
         "name": "bulk_session_new_batch25",
@@ -999,6 +1008,7 @@ def run_test2b_bulk_session_new(
         "count": count,
         "ingested": total.ingested,
         "duplicates": total.duplicates,
+        "retried_as_duplicates": retried_as_duplicates,
         "batch_latencies_seconds": latencies,
         "transient_events": transient_events,
         "concurrency_limit_events": concurrency_events,
