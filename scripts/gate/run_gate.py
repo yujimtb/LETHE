@@ -234,7 +234,26 @@ def parse_args() -> argparse.Namespace:
         help=(
             "test 1b: max acceptable POST .../bulk-sessions/{id}/end duration per "
             "batch. The regression this gate targets showed ~26s/batch; a fixed "
-            "session-end should stay in the single-digit seconds"
+            "session-end should stay in the single-digit seconds. This is for "
+            "test 1b's dup-only sessions specifically, which never trigger a "
+            "non-corpus rebuild — it does NOT apply to test 2b's end, see "
+            "--bulk-end-rebuild-timeout-seconds"
+        ),
+    )
+    parser.add_argument(
+        "--bulk-end-rebuild-timeout-seconds",
+        type=float,
+        default=3600.0,
+        help=(
+            "test 2b: dedicated budget (separate from --ack-timeout-seconds) for "
+            "POST .../bulk-sessions/{id}/end to complete, polling through HTTP 503 "
+            "projection_stale (server-documented: the non-corpus rebuild end() "
+            "triggers has not finished yet) at the server's own retry_after hint "
+            "(default 30s), with no consecutive-failure cap — unlike test 1b's "
+            "dup-only sessions, test 2b's end legitimately triggers a "
+            "corpus-scale rebuild (observed ~25-30min at 568k observations), so "
+            "the pass criterion here is end_rebuild_wait_seconds <= this budget, "
+            "not a fixed short latency"
         ),
     )
 
@@ -587,6 +606,14 @@ def log_bulk_session_conflict_event(context: str, event: dict[str, Any]) -> None
     log(
         f"{context}: HTTP 409 {event['conflict_code']} on attempt {event['attempt']} "
         f"after {event['elapsed_seconds']:.1f}s; retrying (transient conflict)"
+    )
+
+
+def log_projection_stale_event(context: str, event: dict[str, Any]) -> None:
+    log(
+        f"{context}: HTTP 503 projection_stale on attempt {event['attempt']} after "
+        f"{event['elapsed_seconds']:.1f}s; rebuild still in progress, polling again in "
+        f"{event['retry_after_seconds']:.1f}s"
     )
 
 
@@ -1053,6 +1080,7 @@ def run_test2b_bulk_session_new(
     max_consecutive_concurrency_retries: int,
     max_consecutive_bulk_session_conflicts: int,
     bulk_session_conflict_wait_seconds: float,
+    bulk_end_rebuild_timeout_seconds: float,
 ) -> dict[str, Any]:
     log(f"=== test 2b: bulk session new import ({count} drafts, batch={batch_size}, session-wrapped) ===")
 
@@ -1125,14 +1153,28 @@ def run_test2b_bulk_session_new(
         latencies.append(result.elapsed_seconds)
         index = batch_end
 
-    end_result = call_session(
-        lambda: client.end_bulk_session(session_id, timeout=1800.0), "test 2b end"
+    # Unlike test 1b's dup-only sessions, this end() legitimately triggers a
+    # corpus-scale non-corpus rebuild (observed ~25-30min at 568k
+    # observations) and is expected to poll through HTTP 503
+    # projection_stale for a long time — a fixed short latency threshold
+    # (test 1b's --bulk-session-end-latency-threshold-seconds) does not
+    # apply here; a dedicated budget does.
+    end_outcome = gc.wait_for_end_bulk_session_rebuild(
+        client,
+        session_id,
+        rebuild_timeout_seconds=bulk_end_rebuild_timeout_seconds,
+        context="test 2b end",
+        on_projection_stale=lambda event: log_projection_stale_event("test 2b end", event),
+        on_transient=lambda event: log_transient_event("test 2b end", event),
     )
+    end_result = end_outcome.result
     peak_mib = sampler.peak_since(marker)
     peak_over_baseline_mib = peak_mib - baseline_mib
     log(
         f"test 2b sending+end done ({total.ingested} ingested, "
-        f"{retried_as_duplicates} retried-as-duplicate, end={end_result.elapsed_seconds:.1f}s); "
+        f"{retried_as_duplicates} retried-as-duplicate, "
+        f"end_rebuild_wait={end_outcome.end_rebuild_wait_seconds:.1f}s over "
+        f"{end_outcome.attempts} attempt(s)); "
         f"settling {post_batch_wait_seconds:.0f}s before residual RSS sample ..."
     )
     time.sleep(post_batch_wait_seconds)
@@ -1143,12 +1185,19 @@ def run_test2b_bulk_session_new(
     peak_ok = peak_over_baseline_mib <= peak_threshold_mib
     residual_ok = residual_mib <= residual_threshold_mib
     ingested_ok = total.ingested + total.duplicates == count
-    passed = peak_ok and residual_ok and ingested_ok
+    # end_rebuild_wait_seconds can only ever be > bulk_end_rebuild_timeout_seconds
+    # if wait_for_end_bulk_session_rebuild already raised GateError instead of
+    # returning — this is an explicit, self-documenting restatement of that
+    # budget in the pass criteria, not a separate live check.
+    end_rebuild_ok = end_outcome.end_rebuild_wait_seconds <= bulk_end_rebuild_timeout_seconds
+    passed = peak_ok and residual_ok and ingested_ok and end_rebuild_ok
     log(
         f"test 2b result: peak={peak_mib:.1f}MiB peak_over_baseline={peak_over_baseline_mib:.1f}MiB "
         f"(threshold={peak_threshold_mib:.1f}MiB) after={after_mib:.1f}MiB "
         f"residual={residual_mib:.1f}MiB (threshold={residual_threshold_mib:.1f}MiB) "
-        f"ingested={total.ingested}/{count} retried_as_duplicates={retried_as_duplicates} pass={passed}"
+        f"ingested={total.ingested}/{count} retried_as_duplicates={retried_as_duplicates} "
+        f"end_rebuild_wait={end_outcome.end_rebuild_wait_seconds:.1f}s "
+        f"(threshold={bulk_end_rebuild_timeout_seconds:.0f}s) pass={passed}"
     )
     return {
         "name": "bulk_session_new_batch25",
@@ -1171,10 +1220,16 @@ def run_test2b_bulk_session_new(
         "after_mib": after_mib,
         "residual_mib": residual_mib,
         "residual_threshold_mib": residual_threshold_mib,
-        # informational only — this test's pass/fail uses the same
-        # peak/residual thresholds as test 2, per gate policy; only test 1b
-        # gates on session-end latency itself.
+        # test 2b's end is expected to trigger a corpus-scale rebuild — the
+        # pass criterion is end_rebuild_wait_seconds <=
+        # bulk_end_rebuild_timeout_seconds, not a fixed short latency (that
+        # is test 1b's dup-only-session criterion, unchanged).
         "end_duration_seconds": end_result.elapsed_seconds,
+        "end_rebuild_wait_seconds": end_outcome.end_rebuild_wait_seconds,
+        "end_rebuild_poll_count": end_outcome.attempts,
+        "end_rebuild_timeout_seconds": bulk_end_rebuild_timeout_seconds,
+        "end_rebuild_projection_stale_events": end_outcome.projection_stale_events,
+        "end_rebuild_transient_events": end_outcome.transient_events,
         "session_state_after_end": end_result.state,
     }
 
@@ -1294,6 +1349,7 @@ def main() -> int:
             "bulk_residual_threshold_mib": args.bulk_residual_threshold_mib,
             "slope_threshold_mib_per_batch": args.slope_threshold_mib_per_batch,
             "bulk_session_end_latency_threshold_seconds": args.bulk_session_end_latency_threshold_seconds,
+            "bulk_end_rebuild_timeout_seconds": args.bulk_end_rebuild_timeout_seconds,
             "probe_timeout_seconds": args.probe_timeout_seconds,
             "noop_session_retry_wait_seconds": args.noop_session_retry_wait_seconds,
             "max_consecutive_timeouts": args.max_consecutive_timeouts,
@@ -1466,6 +1522,7 @@ def main() -> int:
             max_consecutive_concurrency_retries=args.max_consecutive_concurrency_retries,
             max_consecutive_bulk_session_conflicts=args.max_consecutive_bulk_session_conflicts,
             bulk_session_conflict_wait_seconds=args.bulk_session_conflict_wait_seconds,
+            bulk_end_rebuild_timeout_seconds=args.bulk_end_rebuild_timeout_seconds,
         )
         report["tests"].append(test2b_session)
 

@@ -117,7 +117,7 @@ this environment (see "Bulk-session tests" below), they report
 | 1 | dup-only replay | 8 × 100 already-seeded drafts (all must come back `duplicate`) | any residual growth from resending pure duplicates — should be ~flat |
 | 1b | bulk session dup-only | 4 × (begin session → 100 already-seeded drafts → end session) | the pathology the sol audit traced this gate to: `.../bulk-sessions/{id}/end` runs a corpus/materialization rebuild (`bulk_import.rs::end_bulk_import_session`) that, pre-fix, scaled with corpus size even for a session that only ever imported duplicates — visible both as residual growth and as anomalously slow `end` calls (~26s/batch was the reported regression signature) |
 | 2 | new bulk import | 1000 fresh drafts, once at batch=25 and once at batch=1000 (`ingested + duplicate` must total the batch — see "Retried-as-duplicate accounting" below) | a large single request/response transient spike, or steady per-request growth that isn't 100% freed after the batch |
-| 2b | bulk session new import | 1000 fresh drafts (batch=25) wrapped in a single begin/.../end bulk session | same peak/residual bounds as test 2, but exercised through the session-wrapped path that end-of-session rebuild goes through |
+| 2b | bulk session new import | 1000 fresh drafts (batch=25) wrapped in a single begin/.../end bulk session | same peak/residual bounds as test 2, but exercised through the session-wrapped path that end-of-session rebuild goes through — `end` is expected to legitimately trigger a corpus-scale rebuild here (see "test 2b's end: a real rebuild, not a fixed latency" below) |
 | 3 | slope detection | 8 more × 100 dup batches, sampling RSS after each one and regressing batch-number vs. RSS | the actual v15 bug class: growth *proportional to how many import requests have been made*, invisible in single-batch peak/residual checks but visible as a positive slope |
 
 ### Bulk-session tests (1b / 2b)
@@ -136,7 +136,9 @@ returned `session_id` is then passed as `bulk_session_id` on
 signature if it exceeds `--bulk-session-end-latency-threshold-seconds`
 (default 10s — the regression this gate was written for reproduced at
 ~26s/batch); those violations are listed explicitly in the report's
-`end_latency_violations` field.
+`end_latency_violations` field. This threshold is specifically for test
+1b's dup-only sessions, which never trigger a non-corpus rebuild — it does
+**not** apply to test 2b's `end`; see the next section.
 
 If `begin` fails with an auth/scope/routing-class HTTP status (401, 403,
 404, 405, 501 — see `gate_common.SESSION_API_UNAVAILABLE_STATUS_CODES`),
@@ -159,7 +161,45 @@ server-provided `retry_after`, unlike HTTP 429) up to
 `bulk_import_session_mismatch`, a real logic error) or other 4xx still
 fails immediately, not retried. Each test's report entry includes
 `session_call_transient_events` / `session_call_conflict_events` listing
-every retried `begin`/`end` attempt.
+every retried `begin`/`end` attempt. This is the retry policy for test
+1b's `begin`/`end` and test 2b's `begin` — test 2b's `end` uses a
+different, dedicated policy; see the next section.
+
+#### Test 2b's `end`: a real rebuild, not a fixed latency
+
+Test 2b's `end` is expected to legitimately trigger a corpus-scale
+non-corpus rebuild (observed ~25-30min at 568k observations) —
+fundamentally unlike test 1b's dup-only sessions, where a fast `end` is
+itself the pass criterion. While that rebuild is running, `end` can
+return **HTTP 503 `projection_stale`** — the server's own documented
+response (`apps/selfhost/src/self_host/server.rs`'s mapping of
+`SelfHostError::ProjectionStale`, via
+`ErrorResponse::projection_stale` in `crates/api/src/api/envelope.rs`)
+for "the non-corpus rebuild this triggered hasn't finished within its own
+internal wait window yet" — not a failure. Treating that the same as a
+generic transient failure (capped at `--max-consecutive-timeouts`, default
+3) meant the gate gave up on a legitimate ~30-minute rebuild after about 3
+of the server's own ~60s polling windows — roughly 3 minutes.
+
+The fix: HTTP 503 with `error == "projection_stale"` is its own subtype
+(`gate_common.ProjectionStaleError`), polled at the server's own
+`retry_after` hint (always present for this code, default 30s) via a
+**dedicated function** (`gate_common.wait_for_end_bulk_session_rebuild`)
+with **no consecutive-failure cap** — only a dedicated budget,
+`--bulk-end-rebuild-timeout-seconds` (default 3600s = 1h, well above the
+observed ~25-30min), separate from `--ack-timeout-seconds`, bounds it. Any
+other transient failure (timeout/connection-error/other 5xx) during this
+same wait gets the same uncapped, budget-bounded polling; a hard 4xx or an
+unrecognized 409/503 reason still fails immediately, not retried. The
+report's `bulk_session_new_batch25` entry records the cumulative wait as
+`end_rebuild_wait_seconds`, the poll count as `end_rebuild_poll_count`,
+and every poll's detail in `end_rebuild_projection_stale_events` /
+`end_rebuild_transient_events`. The pass criterion for `end` here is
+simply `end_rebuild_wait_seconds <= --bulk-end-rebuild-timeout-seconds`
+(which, by construction, can only be false if
+`wait_for_end_bulk_session_rebuild` already raised instead of returning —
+it's an explicit, self-documenting restatement of that budget in the
+report, not a separate live check) — never a fixed short latency.
 
 ### Convergence is two gates, not one
 
@@ -324,7 +364,8 @@ such orphan-retry duplicates as `retried_as_duplicates`.
 | `--bulk-peak-threshold-mib` | 4096 (4 GiB) | test 2: `(peak RSS during the 1000-item send) − baseline` must be ≤ this, for both batch=25 and batch=1000 |
 | `--bulk-residual-threshold-mib` | 768 | test 2: `(RSS 3min after the 1000-item send) − baseline` must be ≤ this, for both sub-tests |
 | `--slope-threshold-mib-per-batch` | 8 | test 3: the linear-regression slope of (batch number → post-settle RSS) across 8 batches must be ≤ this MiB/batch |
-| `--bulk-session-end-latency-threshold-seconds` | 10 | test 1b: max acceptable `.../bulk-sessions/{id}/end` duration per batch |
+| `--bulk-session-end-latency-threshold-seconds` | 10 | test 1b: max acceptable `.../bulk-sessions/{id}/end` duration per batch (dup-only sessions only — not test 2b, see below) |
+| `--bulk-end-rebuild-timeout-seconds` | 3600 (1h) | test 2b: dedicated budget for `end` to complete while polling through HTTP 503 `projection_stale` (a legitimate corpus-scale rebuild, observed ~25-30min at 568k) — separate from `--ack-timeout-seconds`, no consecutive-retry cap |
 | `--max-consecutive-timeouts` | 3 | tests 1/1b/2/2b/3: consecutive transient failures (timeout/connection-error/5xx, NOT counting HTTP 429) on the same batch before the gate aborts |
 | `--max-consecutive-concurrency-retries` | 60 | tests 1/1b/2/2b/3: consecutive HTTP 429 `import_concurrency_limit` responses (retried honoring `retry_after`, counted separately from timeouts) on the same batch before the gate aborts. The ACK probe also retries 429s but is bounded only by `--ack-timeout-seconds`, not this count |
 | `--max-consecutive-bulk-session-conflicts` | 10 | tests 1b/2b: consecutive HTTP 409 responses from bulk-session begin/end with a known-transient conflict code (counted separately from `--max-consecutive-timeouts`) before the gate aborts |
