@@ -96,7 +96,7 @@ page read/staging commit と最終 publish の lock wait/hold を log し、cano
 
 空 source 構成にも増幅要因があった。`latest_workspace_slide_observations` は Google Slides runtime source が空でも canonical observation pages を終端まで走査していた。`sync_metrics.latency_ms` は derived lane 取得後から計測されるため、実測の約44.7秒はこの不要な568k row scan と整合する。
 
-source sync と supplemental write は、新しい non-bulk projection operation mutex で互いを直列化する。その guard を取った後、`bulk_import_operation` を短時間だけ取得して persisted bulk session が inactive であることを確認し、直ちに bulk mutex を解放する。operation guard は処理本体の間保持するため、bulk session begin は bulk mutex 下で operation mutexを `try_lock` し、進行中なら待たず conflict を返す。両 mutex の待機を同時に行わないため lock cycle は作らない。通常 import は non-bulk operation mutex を取得せず、sync が derived lane/rebuild/source fetch/search を待っていても bulk mutex の短い handshake 間以外は進行できる。
+source sync と supplemental write は、derived projection laneを取得した後にnon-bulk projection operation mutexを取得して互いを直列化する。そのguard下で`bulk_import_operation`を短時間だけ取得し、persisted bulk sessionがinactiveであることを確認して直ちにbulk mutexを解放する。derived lane待機中はどちらのoperation mutexも保持しない。operation guardは実処理の間保持するため、bulk session beginはbulk mutex下でoperation mutexを`try_lock`し、実行中なら待たずconflictを返す。通常importはnon-bulk operation mutexを取得しない。
 
 bulk session end も persisted phase を `CatchingUp` に遷移する短い区間だけ bulk mutex を保持し、search catch-up、background rebuild の起動・完了待ちはロック外で行う。最終 Ready 遷移時に mutex を再取得し、session id/phase/target watermark を persisted state から再検証する。同時 end が先に Ready へ進めた場合は persisted Ready report を返す。CatchingUp 中の append は既存 conflict 契約で fail-fast するため、ロック外待機によって session target が増えることはない。
 
@@ -116,6 +116,26 @@ SQLite schema v15 は `projection_materialization_heads(logical projection_id ->
 
 key 1件、owner全件、複数owner page、blob visibility、owner count、total countの6読取は、logical head・manifest存在・physical rowを一つのCTE/JOIN文で解決する。SQLiteの一文snapshotにより、publish/cleanupと並行しても各API呼出しは旧世代または新世代の完全な一方だけを見る。head/manifestの片側欠落は同じsnapshot内で検出してschema invariant errorとし、silent fallbackしない。`commit_projection_items(Replace)` が既存世代をretireする場合も、commit成功後に同じsingle-flight cleanup drainを要求する。
 
+### D11: rebuild進行中のsync cycleをskipし、lane waiterをnon-bulk operationから外す
+
+v15.2.1は`bulk_import_operation`の長期保持を解消したが、`sync_all`は`non_bulk_projection_operation`を取得してから`derived_projection_lane`を待っていた。background rebuildは二巡とinstallの全期間derived laneを保持するため、通常importは進めても、bulk session beginの`try_lock(non_bulk_projection_operation)`だけはrebuild全期間`bulk_import_non_bulk_projection_active`になった。568k schema v15移行bootで数十分409が続いた直接原因はこの残存lock順である。
+
+scheduled syncはoperation lock取得前に`non_corpus_rebuild_in_flight`をAcquire loadする。trueなら`sync_skip_reason="background_non_corpus_rebuild"`をinfo logへ出し、source fetch、cursor、health last sync、persisted sync stateを変更せず成功reportを返す。polling taskは一cycleをawaitしてから次intervalを待つため、queueを増殖させず次回scheduleで自然に追いつく。false確認直後にrebuildが開始するraceでも、syncはlaneを待つ間にnon-bulk admissionを占有しない。
+
+supplemental writeはユーザー操作なのでrebuildのderived lane待機自体はskipしない。lane取得後にnon-bulk operationとbulk-session handshakeを行い、active bulk sessionなら明示conflict、inactiveなら従来どおりsupplemental append・projection delta・auditを一transactionでcommitする。B/Dの循環排除はD12のtry-only admissionに従う。
+
+migration/recovery bootは公開catalogをstaleにしてからrebuildするが、bulk session begin自体はsession metadataとauditだけを永続化し、derived projectionを変更しない。このため`non_corpus_rebuild_in_flight=true`の間に限って`ProjectionStale`をbeginの拒否理由から除外する。in-flightでないstale catalog、active session、実行中non-bulk operationは従来どおりfail-fastする。bulk appendやsupplemental publishがderived laneを必要とする契約は変更しない。
+
+### D12: B→Dを唯一のblocking順序にし、D側admissionをtry-onlyにする
+
+D11の初回実装は、sync/supplementalがD=`derived_projection_lane`を取得し、N=`non_bulk_projection_operation`を取得した後、B=`bulk_import_operation`をblocking取得していた。一方v1/v2 bulk-session appendはBを保持してcanonical appendとpersisted target更新を行い、そのままfirst-append/consent materializationでDをblocking取得する。したがってsync/supplementalのD→BとimportのB→Dが通常運用でも循環した。
+
+blocking lock graphはB→Dへ固定する。v1/v2 bulk-session appendはBの下でsession照合、canonical append、persisted target watermark更新、first-append/consent materializationを直列化する。sync/supplementalはD→Nの後にBを`try_lock`するだけで、busyならNを解放する。syncはDも解放して`sync_skip_reason="bulk_import_operation_active"`でcycleをskipする。supplementalはD/Nを解放した後だけ1/2/4/8msで再試行し、最終tryもbusyなら`bulk_import_operation_active` conflictを返す。Dを保持したbackoffはimportがDを取得できず同じ循環を再生するため禁止する。beginのB→Nも既存`try_lock`のまま、background rebuild/append consumer/boot stale publishはDだけ、cutover操作はBだけ、bulk endはBをcatch-up/rebuild待機前に解放する。
+
+importのBをmaterialize前に解放する案は採用しない。`first_append`はB下で読んだpre-append sessionの`target_append_seq == base_append_seq`から決まる。Bはそのsession読取からcanonical append、target永続化、stale/consent publish完了まで保持されるため、最初の実appendだけがfirst-appendになり、後続requestは最初のstale公開前に応答できない。consent appendもcanonical append順と同じB/D直列順でcaptureされる。materialize前にBを解放すると、後続requestが更新済みtargetを読み、最初のstale公開より先に応答したり、後のconsentを先にpublishしたりできるため、session順序の論証が崩れる。persisted targetはmaterializeより先にdurable化され、失敗時にもcanonical high-waterとDeferred sessionが再開可能な既存crash safetyを維持する。
+
+skip成功と実sync完了を返値だけでも区別できるよう、`SyncReport`は`skipped: bool`と`last_sync_at: Option<DateTime>`を返す。実syncは`skipped=false`と今回のcompletion timestamp、skipは`skipped=true`とAppCoreに保存済みの直近timestamp（実績なしなら`None`）を返す。skipで`Utc::now()`を生成しない。HTTP admin syncはこのreportをそのままserializeし、polling taskはreportからfreshnessを更新せず、health/persisted sync stateだけを正とする。
+
 ## Risks / Trade-offs
 
 - **[consumer の遅延中は通常 request の snapshot が stale]** → canonical append が成功した時点で response を返す既存非同期契約を維持し、consumer single-flight と health/error state を使う。
@@ -125,7 +145,7 @@ key 1件、owner全件、複数owner page、blob visibility、owner count、tota
 - **[deep clone 自体は残る]** → B3 は次期候補として明示し、v15 は admission、publish 回数、resident body、migration page を bounded にする。
 - **[rebuild 中の target manifest は base high-water のまま一時的に canonical tail より遅れる]** → live catalog は rebuild 中 stale のままにし、base install 後は append consumer が persisted cursor から追う。crash 時も次回 boot の watermark 不一致が理由付き recovery rebuild になる。
 - **[旧 projection 世代の回収が publish 後まで残る]** → live head から外した世代だけを durable retirement queue に登録し、128 row pageで回収する。回収失敗は明示 error logに残し、次bootまたは次publishのsingle-flight workerで再開する。
-- **[sync 中は bulk session begin が待機せず conflict になる]** → source sync/supplemental の開始時に persisted session inactive を同一 handshake で確定し、normal import は継続可能にする。bulk session は non-bulk projection operation 完了後に明示的に再試行する。
+- **[実行中sync/supplementalとbulk session beginは排他]** → derived lane取得後の短いadmissionから処理完了までだけnon-bulk operationを保持する。B admissionはD保持中に待たず、syncはskip、supplementalは全guard解放後の上限付き再試行にする。rebuildによるlane待機やsync skip中はbulk beginを拒否しない。
 
 ## Migration Plan
 
@@ -179,6 +199,20 @@ key 1件、owner全件、複数owner page、blob visibility、owner count、tota
 - 6本すべてをlogical head・manifest存在・physical rowを同時に読む単一CTE/JOIN文へ変更した。遅延transactionのfallbackは使わない。`BackgroundRebuildStorage::commit_projection_items(Replace)` の成功後にもcleanup single-flightを要求し、再利用されたstaging世代のretirementをpublish待ちにしない。
 - `projection_generation_reads_stay_complete_during_publish_and_cleanup` は64回のhead publish、1 row単位のretired cleanup、2接続のreaderを並行させる。各readerはkey、owner、複数owner page、blob visibility、owner count、total countを反復し、各呼出しが完全な16件またはtrueを返し、owner/page内で世代が混在しないことを検証する。
 - `cargo fmt --all -- --check` と `cargo test --workspace --quiet` は成功した。workspace集計は`727 passed / 0 failed / 3 ignored`、selfhost unitは`109 passed / 0 failed / 0 ignored`、SQLite storage unitは`70 passed / 0 failed / 0 ignored`である。
+
+## v15.2.3 sync/rebuild non-bulk convoy Verification (2026-07-24)
+
+- 根本原因は、v15.2.1でbulk mutexを短いhandshakeへ分離した後も、`sync_all`がnon-bulk operationを先に取得してからbackground rebuild所有のderived laneを待っていたことである。通常importは進行できたが、bulk beginのnon-bulk `try_lock`だけがrebuild全期間409になった。
+- `background_rebuild_skips_source_sync_without_blocking_bulk_begin_and_next_sync_runs`は4件、page size 1、page delay 100msのstale projection rebuild中にsyncが1秒以内でskipし、`sync_skip_reason="background_non_corpus_rebuild"`をlogすること、last sync/persisted stateを進めないこと、bulk begin/endが成功することを検証した。rebuild完了後の次回syncはhealthとpersisted sync stateを更新する。
+- `supplemental_write_waits_for_derived_lane_without_holding_non_bulk_admission`はderived laneを保持してsupplemental writeを待たせ、その間もnon-bulk `try_lock`とbulk begin/endが成功することを検証した。lane解放後は通常のvalidationへ進む。
+- `cargo fmt --all -- --check`と`cargo test --workspace --quiet`は成功した。workspace集計は`728 passed / 0 failed / 3 ignored`、selfhost unitは`110 passed / 0 failed / 0 ignored`、SQLite storage unitは`70 passed / 0 failed / 0 ignored`である。SQLite DDL、manifest shape/version、v1/v2/429/per-item契約は変更していない。
+
+## v15.2.3 B/D deadlock review Verification (2026-07-24)
+
+- 根本原因は、sync/supplementalがD→Nの後にBをblocking取得する一方、bulk-session appendがBを保持したままfirst-append/consent materializationでDをblocking取得したB⇄D循環である。blocking順をB→Dへ固定し、D側のB admissionはtry-onlyへ変更した。B busy時はsyncが理由付きskip、supplementalがD/N解放後だけ1/2/4/8msで再試行し、上限到達時は明示conflictを返す。
+- `bulk_first_append_and_source_sync_complete_without_b_d_deadlock`は、test gateでconsentを含むfirst appendをB保持・persisted target更新後・D取得直前に停止し、syncを起動する。syncが1秒以内に`bulk_import_operation_active`でskipして以前のlast-syncを返すこと、gate解放後のappendが5秒以内に完了すること、publish一回、consent=`OptedOut`、session target=`base+1`を検証した。
+- Bをmaterialize前に解放しないため、session照合、canonical append、target watermark永続化、first stale/consent publishは同じB直列区間に残る。後続requestがfirst stale publishを追い越さず、consent capture順がcanonical append順と一致する。SQLite DDL、manifest、v1/v2 import、429、per-item分類は変更していない。
+- `cargo fmt --all -- --check`と最終`cargo test --workspace --quiet`は成功した。workspace集計は`729 passed / 0 failed / 3 ignored`、selfhost unitは`111 passed / 0 failed / 0 ignored`、SQLite storage unitは`70 passed / 0 failed / 0 ignored`である。workspace初回は既存のgeneration並行testが一度`database is locked`になったが、対象単独再実行とworkspace全体再実行はいずれも成功した。
 
 ## v15.1 P0 follow-up: dup-only no-op と import 入口の snapshot 世代
 

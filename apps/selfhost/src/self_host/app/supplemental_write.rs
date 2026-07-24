@@ -9,6 +9,13 @@ use lethe_registry::registry::{SupplementalKindError, SupplementalKindValidation
 
 use super::*;
 
+const BULK_IMPORT_ADMISSION_BACKOFFS: [std::time::Duration; 4] = [
+    std::time::Duration::from_millis(1),
+    std::time::Duration::from_millis(2),
+    std::time::Duration::from_millis(4),
+    std::time::Duration::from_millis(8),
+];
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct SupplementalWriteRequest {
     pub id: SupplementalId,
@@ -35,12 +42,28 @@ impl AppService {
         &self,
         request: SupplementalWriteRequest,
     ) -> Result<SupplementalRecord, SelfHostError> {
-        let _non_bulk_projection_operation =
-            self.non_bulk_projection_operation_lock("supplemental write")?;
-        let _derived_lane = self
-            .derived_projection_lane
-            .lock()
-            .map_err(|_| SelfHostError::LockPoisoned)?;
+        // Retry only after releasing D and N. Waiting for B while D is held
+        // would invert the bulk import append's B -> D ordering.
+        let mut backoffs = BULK_IMPORT_ADMISSION_BACKOFFS.into_iter();
+        let (_derived_lane, _non_bulk_projection_operation) = loop {
+            let derived_lane = self
+                .derived_projection_lane
+                .lock()
+                .map_err(|_| SelfHostError::LockPoisoned)?;
+            match self.try_non_bulk_projection_operation_lock("supplemental write")? {
+                Some(operation) => break (derived_lane, operation),
+                None => {
+                    drop(derived_lane);
+                    let Some(backoff) = backoffs.next() else {
+                        return Err(SelfHostError::BulkImportSessionConflict {
+                            code: "bulk_import_operation_active",
+                            detail: "supplemental write could not acquire import admission within the bounded retry window".to_owned(),
+                        });
+                    };
+                    std::thread::sleep(backoff);
+                }
+            }
+        };
         validate_supplemental_id(&request.id)?;
 
         let payload_bytes = serde_json::to_vec(&request.payload)?.len();

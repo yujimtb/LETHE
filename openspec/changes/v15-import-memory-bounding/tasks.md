@@ -56,3 +56,13 @@
 
 - [x] 12.1 [Implementer] projection item/key/owner/page/blob visibility/countの6読取をhead解決と同じSQLite statementへJOINし、head切替とretired generation cleanupの間にも旧世代または新世代の完全な一方だけを返す。Replace commitが世代をretireした場合もcleanup single-flightを要求する。
 - [x] 12.2 [Reviewer] publishと1-row cleanupを反復する並行testで6読取の空・部分結果を禁止し、`cargo fmt --all -- --check`と`cargo test --workspace --quiet`を実行して設計・検証件数を更新する。
+
+## 13. v15.2.3 sync/rebuild non-bulk convoy
+
+- [x] 13.1 [Implementer] `sync_all` はoperation lock取得前にbackground non-corpus rebuildが進行中なら理由付きlogを出してcycleを成功扱いでskipする。sync/supplementalはderived lane取得後にnon-bulk admissionを行い、lane待機中のbulk session beginをrebuild全期間conflictさせない。
+- [x] 13.2 [Reviewer] page-delay rebuild中のsync即時skip、同時bulk session begin成功、rebuild完了後の次回sync通常実行を一つの回帰testで検証する。OpenSpec/設計文書を更新し、`cargo fmt --all -- --check`と`cargo test --workspace --quiet`を実行する。
+
+## 14. v15.2.3 B/D deadlock review
+
+- [x] 14.1 [Implementer] bulk import append、sync、supplemental、background/append consumerを含むB=`bulk_import_operation`とD=`derived_projection_lane`の取得順を一意化し、first-append materialize直前の強制interleaveでも循環待ちを作らない。bulk sessionのfirst-append、consent capture、persisted target watermarkの整合性をdesignで論証し、sync skip reportは既存last-sync timestampを返す。
+- [x] 14.2 [Reviewer] bulk first-appendをB保持かつD取得直前で停止してsyncを起動するdeterministic regression testを追加し、両処理の有界完了、session state、materialization結果を検証する。OpenSpec/設計文書を更新し、`cargo fmt --all -- --check`と`cargo test --workspace --quiet`を実行する。

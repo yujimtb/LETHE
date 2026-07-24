@@ -13,6 +13,7 @@
 - v15.2 では boot ごとの schema migration 適用結果と materialized snapshot の復元判定を分離し、現行 manifest の再起動では保存 snapshot を復元する。復元を拒否する場合は理由を捨てずに記録する。
 - v15.2 では background non-corpus rebuild の SQLite writer mutex 保持を page/commit 単位へ分割する。rebuild 中の通常 import は canonical append と per-item 結果までを有界時間で返し、投影 tail は既存 append consumer が非同期に追跡する。
 - v15.2 follow-up では source sync/supplemental/bulk end が `bulk_import_operation` を保持したまま derived lane、検索 catch-up、background rebuild 完了を待つ convoy を除去する。空 Google Slides source の sync は canonical 全件 scan を行わない。
+- v15.2.3 では background rebuild 中の sync cycle を理由付きでskipし、sync/supplementalのderived lane待機中は `non_bulk_projection_operation` を保持しない。migration rebuild中のstale catalogでもbulk session beginだけは許可し、次回syncがrebuild完了後に通常実行する。
 
 ## Capabilities
 
