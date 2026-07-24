@@ -235,7 +235,16 @@ impl AppService {
             }
         };
         let core = self.core_snapshot();
-        self.ensure_projection_fresh(&core.catalog, "proj:person-page")?;
+        // Begin only persists session metadata. A known in-flight rebuild owns
+        // restoration of the stale projection before any derived publication.
+        match self.ensure_projection_fresh(&core.catalog, "proj:person-page") {
+            Ok(()) => {}
+            Err(SelfHostError::ProjectionStale(_))
+                if self
+                    .non_corpus_rebuild_in_flight
+                    .load(std::sync::atomic::Ordering::Acquire) => {}
+            Err(error) => return Err(error),
+        }
         let session = {
             let persistence = self.persistence_lock()?;
             if let Some(active) = load_persisted_bulk_import_session(persistence.as_ref())?

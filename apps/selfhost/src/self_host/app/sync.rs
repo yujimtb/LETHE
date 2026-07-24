@@ -3,31 +3,32 @@ use super::*;
 
 impl AppService {
     pub fn sync_all(&self) -> Result<SyncReport, SelfHostError> {
-        let _non_bulk_projection_operation =
-            self.non_bulk_projection_operation_lock("source sync")?;
-        let rebuild_was_in_flight = self
+        if self
             .non_corpus_rebuild_in_flight
-            .load(std::sync::atomic::Ordering::Acquire);
-        if rebuild_was_in_flight {
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             tracing::info!(
-                sync_wait_reason = "background_non_corpus_rebuild",
-                "source sync waiting for the derived projection lane without holding the bulk import operation lock"
+                sync_skip_reason = "background_non_corpus_rebuild",
+                "source sync cycle skipped because background non-corpus rebuild is in progress"
             );
+            return Ok(SyncReport {
+                slack_ingested: 0,
+                google_ingested: 0,
+                slide_analyses: 0,
+                duplicates: 0,
+                quarantined: 0,
+                dead_letters: Vec::new(),
+                last_sync_at: Utc::now(),
+            });
         }
-        let derived_lane_wait_started_at = std::time::Instant::now();
+        // Lane waiters are not active non-bulk operations yet. Acquire admission
+        // only after the lane so a rebuild race cannot reject bulk-session begin.
         let _derived_lane = self
             .derived_projection_lane
             .lock()
             .map_err(|_| SelfHostError::LockPoisoned)?;
-        if rebuild_was_in_flight {
-            tracing::info!(
-                sync_wait_reason = "background_non_corpus_rebuild",
-                derived_projection_lane_wait_ms =
-                    u64::try_from(derived_lane_wait_started_at.elapsed().as_millis())
-                        .expect("source sync derived lane wait does not fit u64 milliseconds"),
-                "source sync acquired the derived projection lane"
-            );
-        }
+        let _non_bulk_projection_operation =
+            self.non_bulk_projection_operation_lock("source sync")?;
         let started_at = std::time::Instant::now();
         let mut slack_ingested = 0usize;
         let mut google_ingested = 0usize;

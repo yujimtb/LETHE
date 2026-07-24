@@ -35,12 +35,14 @@ impl AppService {
         &self,
         request: SupplementalWriteRequest,
     ) -> Result<SupplementalRecord, SelfHostError> {
-        let _non_bulk_projection_operation =
-            self.non_bulk_projection_operation_lock("supplemental write")?;
+        // A user write must wait rather than skip, but the wait itself must not
+        // make bulk-session begin conflict for the whole rebuild.
         let _derived_lane = self
             .derived_projection_lane
             .lock()
             .map_err(|_| SelfHostError::LockPoisoned)?;
+        let _non_bulk_projection_operation =
+            self.non_bulk_projection_operation_lock("supplemental write")?;
         validate_supplemental_id(&request.id)?;
 
         let payload_bytes = serde_json::to_vec(&request.payload)?.len();

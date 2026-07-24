@@ -47,6 +47,45 @@ use lethe_storage_api::{
 use lethe_storage_sqlite::persistence::{SqliteOperationalEventStore, SqlitePersistence};
 use tower::ServiceExt;
 
+#[derive(Clone)]
+struct CapturedTracingWriter {
+    output: Arc<Mutex<Vec<u8>>>,
+}
+
+impl std::io::Write for CapturedTracingWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.output
+            .lock()
+            .map_err(|_| std::io::Error::other("captured tracing output lock poisoned"))?
+            .extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn capture_tracing_output<T>(operation: impl FnOnce() -> T) -> (T, String) {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let writer_output = Arc::clone(&output);
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(move || CapturedTracingWriter {
+            output: Arc::clone(&writer_output),
+        })
+        .finish();
+    let result = tracing::subscriber::with_default(subscriber, operation);
+    let captured = output.lock().unwrap().clone();
+    (
+        result,
+        String::from_utf8(captured).expect("captured tracing output must be UTF-8"),
+    )
+}
+
 #[test]
 fn non_empty_state_filters_blank_values() {
     assert_eq!(non_empty_state(None), None);
@@ -5204,9 +5243,9 @@ fn large_background_rebuild_final_publish_allows_bounded_v1_import() {
 }
 
 #[test]
-fn background_rebuild_and_source_sync_do_not_block_bounded_v1_import() {
+fn background_rebuild_skips_source_sync_without_blocking_bulk_begin_and_next_sync_runs() {
     let root = std::env::temp_dir().join(format!(
-        "lethe-rebuild-sync-import-concurrency-test-{}",
+        "lethe-rebuild-sync-skip-concurrency-test-{}",
         uuid::Uuid::now_v7()
     ));
     let db = root.join("lethe.sqlite3");
@@ -5230,8 +5269,11 @@ fn background_rebuild_and_source_sync_do_not_block_bounded_v1_import() {
     let mut service = test_service(config, persistence);
     service.slack_sources.clear();
     service.google_sources.clear();
-    service.non_corpus_rebuild_page_delay = Some(std::time::Duration::from_secs(1));
+    service.non_corpus_rebuild_page_delay = Some(std::time::Duration::from_millis(100));
 
+    service
+        .mark_live_core_non_corpus_materializations_stale()
+        .unwrap();
     let core = service.core_snapshot();
     service
         .refresh_materialized_snapshot_with_reason(&core, "recovery")
@@ -5254,70 +5296,84 @@ fn background_rebuild_and_source_sync_do_not_block_bounded_v1_import() {
         "sync and import must start while the background rebuild is running"
     );
 
-    let sync_service = service.clone();
-    let (sync_sender, sync_receiver) = std::sync::mpsc::channel();
-    let sync_thread = std::thread::spawn(move || {
-        sync_sender.send(sync_service.sync_all()).unwrap();
-    });
-    let mut sync_started = false;
-    for _ in 0..2_000 {
-        match service.non_bulk_projection_operation.try_lock() {
-            Ok(operation) => drop(operation),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                sync_started = true;
-                break;
-            }
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                panic!("non-bulk projection operation lock was poisoned")
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
+    assert!(service.core_snapshot().last_sync_at.is_none());
     assert!(
-        sync_started,
-        "source sync did not enter its projection operation"
+        service
+            .persistence_lock()
+            .unwrap()
+            .load_sync_state("all")
+            .unwrap()
+            .is_none()
     );
+
+    let skipped_sync_started_at = std::time::Instant::now();
+    let (skipped_sync, sync_log) = capture_tracing_output(|| service.sync_all());
+    let skipped_sync = skipped_sync.unwrap();
+    assert!(
+        skipped_sync_started_at.elapsed() < std::time::Duration::from_secs(1),
+        "source sync did not skip immediately during background rebuild"
+    );
+    assert_eq!(skipped_sync.slack_ingested, 0);
+    assert_eq!(skipped_sync.google_ingested, 0);
+    assert_eq!(skipped_sync.slide_analyses, 0);
+    assert!(skipped_sync.dead_letters.is_empty());
+    assert!(
+        sync_log.contains("\"sync_skip_reason\":\"background_non_corpus_rebuild\""),
+        "source sync skip reason was not logged: {sync_log}"
+    );
+    assert!(
+        sync_log.contains(
+            "source sync cycle skipped because background non-corpus rebuild is in progress"
+        ),
+        "source sync skip message was not logged: {sync_log}"
+    );
+    assert!(
+        service.core_snapshot().last_sync_at.is_none(),
+        "skipped sync must not advance health last_sync"
+    );
+    assert!(
+        service
+            .persistence_lock()
+            .unwrap()
+            .load_sync_state("all")
+            .unwrap()
+            .is_none(),
+        "skipped sync must not persist a completed sync state"
+    );
+
+    let session = service
+        .begin_bulk_import_session()
+        .expect("bulk session begin must succeed while sync skips an active rebuild");
+    assert_eq!(session.state, super::BulkImportSessionPhase::Deferred);
     assert!(
         service
             .non_corpus_rebuild_in_flight
             .load(std::sync::atomic::Ordering::Acquire),
-        "source sync must be waiting for the active background rebuild"
+        "bulk begin must complete before the background rebuild"
     );
-    let bulk_begin_started_at = std::time::Instant::now();
-    let bulk_begin_error = service.begin_bulk_import_session().unwrap_err();
-    assert!(
-        bulk_begin_started_at.elapsed() < std::time::Duration::from_secs(1),
-        "bulk session begin waited for source sync instead of failing fast"
+    assert_eq!(
+        service
+            .end_bulk_import_session(&session.session_id)
+            .unwrap()
+            .state,
+        super::BulkImportSessionPhase::Ready
     );
-    assert!(matches!(
-        bulk_begin_error,
-        SelfHostError::BulkImportSessionConflict {
-            code: "bulk_import_non_bulk_projection_active",
-            ..
-        }
-    ));
-
-    let started_at = std::time::Instant::now();
-    let report = service
-        .ingest_observation_drafts(
-            vec![freshness_only_draft("rebuild-sync-import")],
-            "sync-rebuild-test",
-        )
-        .unwrap();
-    let response_elapsed = started_at.elapsed();
-    assert!(
-        response_elapsed < std::time::Duration::from_secs(5),
-        "v1 import waited {response_elapsed:?} behind source sync during background rebuild"
-    );
-    assert_eq!(report.ingested, 1);
 
     service.wait_for_non_corpus_rebuild().unwrap();
-    sync_receiver
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("source sync did not finish after background rebuild")
+    let completed_sync = service.sync_all().unwrap();
+    let core = service.core_snapshot();
+    assert_eq!(core.last_sync_at, Some(completed_sync.last_sync_at));
+    let persisted_sync = service
+        .persistence_lock()
+        .unwrap()
+        .load_sync_state("all")
         .unwrap();
-    sync_thread.join().unwrap();
-    wait_for_append_consumer(&service);
+    assert_eq!(
+        persisted_sync
+            .expect("post-rebuild sync must persist completion state")
+            .completed_at,
+        completed_sync.last_sync_at
+    );
     assert_eq!(
         service
             .persistence_lock()
@@ -5325,9 +5381,71 @@ fn background_rebuild_and_source_sync_do_not_block_bounded_v1_import() {
             .observation_stats()
             .unwrap()
             .count,
-        5
+        4
     );
-    assert_eq!(service.core_snapshot().observation_stats.count, 5);
+    assert_eq!(service.core_snapshot().observation_stats.count, 4);
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn supplemental_write_waits_for_derived_lane_without_holding_non_bulk_admission() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-supplemental-derived-wait-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let service = test_service(test_config(db, blobs), persistence);
+    let lane = service.derived_projection_lane.lock().unwrap();
+    let write_service = service.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        sender
+            .send(
+                write_service.write_supplemental(super::SupplementalWriteRequest {
+                    id: SupplementalId::new("invalid-supplemental-id"),
+                    kind: "reply-draft@1".to_owned(),
+                    derived_from: InputAnchorSet::default(),
+                    payload: serde_json::json!({}),
+                    created_by: ActorRef::new("actor:test"),
+                    mutability: Mutability::AppendOnly,
+                    model_version: None,
+                    consent_metadata: None,
+                    lineage: None,
+                }),
+            )
+            .unwrap();
+    });
+    assert!(
+        receiver
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err(),
+        "supplemental write did not wait for the derived projection lane"
+    );
+    let non_bulk = service
+        .non_bulk_projection_operation
+        .try_lock()
+        .expect("waiting supplemental write must not hold non-bulk admission");
+    drop(non_bulk);
+    let session = service.begin_bulk_import_session().unwrap();
+    service
+        .end_bulk_import_session(&session.session_id)
+        .unwrap();
+    drop(lane);
+
+    assert!(matches!(
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("supplemental write did not resume after derived lane release"),
+        Err(SelfHostError::SupplementalValidation {
+            code: "invalid_supplemental_id",
+            ..
+        })
+    ));
+    writer.join().unwrap();
 
     drop(service);
     let _ = std::fs::remove_dir_all(root);
