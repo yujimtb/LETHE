@@ -90,6 +90,18 @@ background rebuild 専用 storage adapter は各 `observation_page`、privacy pa
 
 writer lock の最終 target publish は既存の staging→target atomic transaction のまま保つ。これを page 分割すると部分 target が観測されるため分割しない。page read/staging commit と最終 publish の lock wait/hold を log し、canonical page は page number・rows・総経過を記録する。import は bulk operation mutex 待ち、writer persistence mutex 待ち、Tokio `spawn_blocking` queue 待ちを別 field に加算し、ledger operation 自体の時間から mutex 待ちを除外する。
 
+### D9: bulk-session admission と long-running projection operation を分離する
+
+568k fixture では writer lock slicing 後も単発 v1 import が600秒で timeout した。直接原因は `sync_all` が `bulk_import_operation` を先に取得し、その guard を保持したまま `derived_projection_lane` を取得していたことである。background rebuild は base build/install の全期間 derived lane を保持するため、polling sync は bulk mutex を占有したまま rebuild 完了を待ち、後続 v1/v2 import は durable append より前の bulk mutex 取得で convoy した。import timing log は handler 終了時にだけ emit されるため、client timeout まで guard を取得できない request では timing 自体が残らなかった。
+
+空 source 構成にも増幅要因があった。`latest_workspace_slide_observations` は Google Slides runtime source が空でも canonical observation pages を終端まで走査していた。`sync_metrics.latency_ms` は derived lane 取得後から計測されるため、実測の約44.7秒はこの不要な568k row scan と整合する。
+
+source sync と supplemental write は、新しい non-bulk projection operation mutex で互いを直列化する。その guard を取った後、`bulk_import_operation` を短時間だけ取得して persisted bulk session が inactive であることを確認し、直ちに bulk mutex を解放する。operation guard は処理本体の間保持するため、bulk session begin は bulk mutex 下で operation mutexを `try_lock` し、進行中なら待たず conflict を返す。両 mutex の待機を同時に行わないため lock cycle は作らない。通常 import は non-bulk operation mutex を取得せず、sync が derived lane/rebuild/source fetch/search を待っていても bulk mutex の短い handshake 間以外は進行できる。
+
+bulk session end も persisted phase を `CatchingUp` に遷移する短い区間だけ bulk mutex を保持し、search catch-up、background rebuild の起動・完了待ちはロック外で行う。最終 Ready 遷移時に mutex を再取得し、session id/phase/target watermark を persisted state から再検証する。同時 end が先に Ready へ進めた場合は persisted Ready report を返す。CatchingUp 中の append は既存 conflict 契約で fail-fast するため、ロック外待機によって session target が増えることはない。
+
+cutover admission は import ごとに writer mutex を取得するが単一 SQL admission check の区間だけであり、background rebuild の page writer hold とだけ競合する。通常 v1/v2 import は bulk session id がない場合 derived lane を取得せず append consumer を非同期起動する。bulk session append の最初の stale publish/consent publish だけは既存契約上 derived lane を必要とする。polling task は一回の `spawn_blocking(sync_all)` を await してから sleep するため sync task は累積せず、background rebuild 自体も Tokio pool ではなく専用 `std::thread` で動く。したがって実測の600秒停止は cutover admission、通常 import の derived lane、spawn-blocking pool 枯渇ではなく、sync→bulk mutex→derived lane の convoy で説明できる。
+
 ## Risks / Trade-offs
 
 - **[consumer の遅延中は通常 request の snapshot が stale]** → canonical append が成功した時点で response を返す既存非同期契約を維持し、consumer single-flight と health/error state を使う。
@@ -99,6 +111,7 @@ writer lock の最終 target publish は既存の staging→target atomic transa
 - **[deep clone 自体は残る]** → B3 は次期候補として明示し、v15 は admission、publish 回数、resident body、migration page を bounded にする。
 - **[rebuild 中の target manifest は base high-water のまま一時的に canonical tail より遅れる]** → live catalog は rebuild 中 stale のままにし、base install 後は append consumer が persisted cursor から追う。crash 時も次回 boot の watermark 不一致が理由付き recovery rebuild になる。
 - **[最終 staging publish は全 item の atomic copy/delete を行う]** → 公開整合性のため単一 transaction を維持する。全 rebuild 時間の mutex 独占は除去し、この最終区間の hold time を明示 log と bounded-import test で監視する。
+- **[sync 中は bulk session begin が待機せず conflict になる]** → source sync/supplemental の開始時に persisted session inactive を同一 handshake で確定し、normal import は継続可能にする。bulk session は non-bulk projection operation 完了後に明示的に再試行する。
 
 ## Migration Plan
 
@@ -129,6 +142,13 @@ writer lock の最終 target publish は既存の staging→target atomic transa
 - `cargo fmt --all -- --check` と `cargo test --workspace` は成功した。workspace 集計は `721 passed / 0 failed / 3 ignored`、selfhost unit は `106 passed / 0 failed / 0 ignored` である。
 - SQLite DDL と `CURRENT_SCHEMA_VERSION=14`、non-corpus manifest shape と `NON_CORPUS_MATERIALIZATION_VERSION=11` は変更していない。`deploy/personal-lake/compose.yaml` の既存 `MALLOC_ARENA_MAX=1` を維持し、関連運用設計へ 16 GiB container の arena 制約を記録した。
 - 残課題は、提供された 568k fixture/16 GiB Linux container をこの worktree では再実行していないため、実規模の boot restore 所要時間、最終 atomic staging publish の最大 lock hold、VmHWM は同 fixture で再計測することである。ローカル synthetic test は correctness と 5 秒 response bound を担当する。
+
+## v15.2 sync convoy follow-up Verification (2026-07-24)
+
+- `background_rebuild_and_source_sync_do_not_block_bounded_v1_import` は4行、page size 1、page delay 1秒の background rebuild と、Slack/Google runtime source が空の `sync_all` を同時に開始する。sync が non-bulk projection operation を保持して derived lane 待ちへ入った状態で、bulk session begin が1秒以内に明示 conflict、単発 v1 import が5秒以内に `ingested` を返し、rebuild/sync/append consumer 収束後の canonical/core count 5を検証した。
+- `empty_google_source_latest_workspace_lookup_does_not_read_canonical_storage` は writer persistence mutex を意図的に保持した状態でも lookup が1秒以内に空集合を返すことを検証し、空 Google source の canonical page scan を禁止した。
+- `cargo fmt --all -- --check` と `cargo test --workspace` は成功した。workspace 集計は `723 passed / 0 failed / 3 ignored`、selfhost unit は `108 passed / 0 failed / 0 ignored` である。
+- SQLite DDL、`CURRENT_SCHEMA_VERSION=14`、non-corpus manifest shape/version、v1/v2/429/per-item 契約は変更していない。提供された568k fixture/16 GiB image はこの worktree では再実行していないため、実環境の v1 response、空-source sync latency、最終 lock hold は再計測対象として残る。
 
 ## v15.1 P0 follow-up: dup-only no-op と import 入口の snapshot 世代
 

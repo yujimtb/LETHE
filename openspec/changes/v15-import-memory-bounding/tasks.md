@@ -40,3 +40,8 @@
 ## 9. v15.2 検証と文書
 
 - [x] 9.1 [Reviewer] `docs/development/persistent-index-design.md` と本 change の Verification を実装結果へ更新し、`cargo fmt --all -- --check` と `cargo test --workspace` を実行する。受入: 根本原因A/B、変更ファイル、全テスト数、lock/watermark設計、残課題を記録する。
+
+## 10. v15.2 sync/rebuild/import convoy 解消
+
+- [x] 10.1 [Implementer] source sync と supplemental write の bulk-session 排他を短い admission handshake へ分離し、`bulk_import_operation` を derived lane 待ち・source fetch・検索 catch-up・background rebuild 完了待ちの間は保持しない。bulk session end も CatchingUp 遷移後に mutex を解放し、最終 Ready 遷移時だけ再取得する。受入: 通常 v1/v2 import は sync/rebuild/search の完了を待たず durable append と結果応答まで進める。
+- [x] 10.2 [Implementer] 空 Google Slides source の sync が canonical 全件 scan を行わないようにし、background rebuild と空-source sync が同時進行中の単発 v1 import が synthetic test で5秒以内に応答することを検証する。`cargo fmt --all -- --check` と `cargo test --workspace` を実行し、設計・運用文書へ根本原因と全テスト数を記録する。

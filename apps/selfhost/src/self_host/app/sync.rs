@@ -3,12 +3,31 @@ use super::*;
 
 impl AppService {
     pub fn sync_all(&self) -> Result<SyncReport, SelfHostError> {
-        let _bulk_import_operation = self.bulk_import_operation_lock()?;
+        let _non_bulk_projection_operation =
+            self.non_bulk_projection_operation_lock("source sync")?;
+        let rebuild_was_in_flight = self
+            .non_corpus_rebuild_in_flight
+            .load(std::sync::atomic::Ordering::Acquire);
+        if rebuild_was_in_flight {
+            tracing::info!(
+                sync_wait_reason = "background_non_corpus_rebuild",
+                "source sync waiting for the derived projection lane without holding the bulk import operation lock"
+            );
+        }
+        let derived_lane_wait_started_at = std::time::Instant::now();
         let _derived_lane = self
             .derived_projection_lane
             .lock()
             .map_err(|_| SelfHostError::LockPoisoned)?;
-        self.ensure_bulk_import_session_inactive("source sync")?;
+        if rebuild_was_in_flight {
+            tracing::info!(
+                sync_wait_reason = "background_non_corpus_rebuild",
+                derived_projection_lane_wait_ms =
+                    u64::try_from(derived_lane_wait_started_at.elapsed().as_millis())
+                        .expect("source sync derived lane wait does not fit u64 milliseconds"),
+                "source sync acquired the derived projection lane"
+            );
+        }
         let started_at = std::time::Instant::now();
         let mut slack_ingested = 0usize;
         let mut google_ingested = 0usize;
@@ -812,7 +831,7 @@ impl AppService {
         })
     }
 
-    fn latest_workspace_slide_observations(
+    pub(super) fn latest_workspace_slide_observations(
         &self,
     ) -> Result<HashMap<String, Observation>, SelfHostError> {
         let configured = self
@@ -826,6 +845,9 @@ impl AppService {
                     .map(|presentation_id| format!("{}:{presentation_id}", source.config.id))
             })
             .collect::<HashSet<_>>();
+        if configured.is_empty() {
+            return Ok(HashMap::new());
+        }
         let mut latest = HashMap::<String, Observation>::with_capacity(configured.len());
         let mut cursor = 0u64;
         loop {

@@ -697,6 +697,7 @@ fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppSe
         history_projection,
         derived_projection_lane: Arc::new(Mutex::new(())),
         bulk_import_operation: Arc::new(Mutex::new(())),
+        non_bulk_projection_operation: Arc::new(Mutex::new(())),
         import_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         search_index,
         search_jobs: Arc::new(Mutex::new(BTreeMap::new())),
@@ -5043,6 +5044,176 @@ fn background_rebuild_allows_bounded_v2_import_and_hands_off_tail() {
         .unwrap();
     assert_eq!(manifest["observation_count"], 41);
     assert_eq!(manifest["last_append_seq"], 41);
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn background_rebuild_and_source_sync_do_not_block_bounded_v1_import() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-rebuild-sync-import-concurrency-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let published = chrono::DateTime::parse_from_rfc3339("2026-07-24T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    for index in 0..4 {
+        persistence
+            .persist_observation(&freshness_only_observation(
+                "schema:github-event",
+                "sys:github",
+                &format!("rebuild-sync-seed-{index:03}"),
+                published + chrono::Duration::seconds(index),
+            ))
+            .unwrap();
+    }
+    let mut config = test_config(db, blobs);
+    config.corpus.rebuild_page_size = 1;
+    let mut service = test_service(config, persistence);
+    service.slack_sources.clear();
+    service.google_sources.clear();
+    service.non_corpus_rebuild_page_delay = Some(std::time::Duration::from_secs(1));
+
+    let core = service.core_snapshot();
+    service
+        .refresh_materialized_snapshot_with_reason(&core, "recovery")
+        .unwrap();
+    drop(core);
+    for _ in 0..2_000 {
+        if service
+            .non_corpus_rebuild_page_count
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        service
+            .non_corpus_rebuild_in_flight
+            .load(std::sync::atomic::Ordering::Acquire),
+        "sync and import must start while the background rebuild is running"
+    );
+
+    let sync_service = service.clone();
+    let (sync_sender, sync_receiver) = std::sync::mpsc::channel();
+    let sync_thread = std::thread::spawn(move || {
+        sync_sender.send(sync_service.sync_all()).unwrap();
+    });
+    let mut sync_started = false;
+    for _ in 0..2_000 {
+        match service.non_bulk_projection_operation.try_lock() {
+            Ok(operation) => drop(operation),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                sync_started = true;
+                break;
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                panic!("non-bulk projection operation lock was poisoned")
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        sync_started,
+        "source sync did not enter its projection operation"
+    );
+    assert!(
+        service
+            .non_corpus_rebuild_in_flight
+            .load(std::sync::atomic::Ordering::Acquire),
+        "source sync must be waiting for the active background rebuild"
+    );
+    let bulk_begin_started_at = std::time::Instant::now();
+    let bulk_begin_error = service.begin_bulk_import_session().unwrap_err();
+    assert!(
+        bulk_begin_started_at.elapsed() < std::time::Duration::from_secs(1),
+        "bulk session begin waited for source sync instead of failing fast"
+    );
+    assert!(matches!(
+        bulk_begin_error,
+        SelfHostError::BulkImportSessionConflict {
+            code: "bulk_import_non_bulk_projection_active",
+            ..
+        }
+    ));
+
+    let started_at = std::time::Instant::now();
+    let report = service
+        .ingest_observation_drafts(
+            vec![freshness_only_draft("rebuild-sync-import")],
+            "sync-rebuild-test",
+        )
+        .unwrap();
+    let response_elapsed = started_at.elapsed();
+    assert!(
+        response_elapsed < std::time::Duration::from_secs(5),
+        "v1 import waited {response_elapsed:?} behind source sync during background rebuild"
+    );
+    assert_eq!(report.ingested, 1);
+
+    service.wait_for_non_corpus_rebuild().unwrap();
+    sync_receiver
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("source sync did not finish after background rebuild")
+        .unwrap();
+    sync_thread.join().unwrap();
+    wait_for_append_consumer(&service);
+    assert_eq!(
+        service
+            .persistence_lock()
+            .unwrap()
+            .observation_stats()
+            .unwrap()
+            .count,
+        5
+    );
+    assert_eq!(service.core_snapshot().observation_stats.count, 5);
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn empty_google_source_latest_workspace_lookup_does_not_read_canonical_storage() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-empty-google-sync-scan-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    persistence
+        .persist_observation(&freshness_only_observation(
+            "schema:github-event",
+            "sys:github",
+            "empty-google-source-seed",
+            Utc::now(),
+        ))
+        .unwrap();
+    let mut service = test_service(test_config(db, blobs), persistence);
+    service.google_sources.clear();
+
+    let writer_guard = service.persistence.lock().unwrap();
+    let lookup_service = service.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let lookup_thread = std::thread::spawn(move || {
+        sender
+            .send(lookup_service.latest_workspace_slide_observations())
+            .unwrap();
+    });
+    let observations = receiver
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("empty Google source lookup attempted to read canonical storage")
+        .unwrap();
+    assert!(observations.is_empty());
+    drop(writer_guard);
+    lookup_thread.join().unwrap();
 
     drop(service);
     let _ = std::fs::remove_dir_all(root);

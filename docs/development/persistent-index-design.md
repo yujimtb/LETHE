@@ -121,6 +121,10 @@ background rebuild は開始時の canonical `(count, max_append_seq)` を固定
 
 base 完了時に canonical tail が増えていても full rebuild を先頭から繰り返さない。base snapshot を install し、`append_consumer:person-page` cursor を base high-water に保存した後、待機中または新規起動した append consumer が tail を append sequence 順に増分適用する。これにより fixed snapshot の整合性と crash recovery を維持しつつ、継続 import による全件 retry starvation を防ぐ。page ごとの `page_count`、経過、persistence lock wait/hold と、完了時の最大 hold を log に出す。
 
+source sync と supplemental write は `non_bulk_projection_operation` で互いを直列化し、`bulk_import_operation` は persisted bulk session が inactive であることを確定する短い admission handshake の間だけ取得する。derived lane、source fetch、canonical scan、retention、materialization、検索 catch-up の間は bulk mutex を保持しない。background rebuild 中に sync が derived lane を待つ場合は `sync_wait_reason="background_non_corpus_rebuild"` と待機時間を log に残すが、通常 v1/v2 import は bulk mutex と SQLite page writer hold の短い区間だけで admission と durable append を完了し、投影 catch-up を非同期へ渡す。
+
+bulk session begin は non-bulk projection operation が進行中なら待たず `bulk_import_non_bulk_projection_active` conflict を返す。bulk session end は `CatchingUp` への遷移後に bulk mutex を解放して検索・background rebuild 完了を待ち、最終 watermark 検証と `Ready` 永続化の区間だけ再取得する。空の Google Slides runtime source では latest workspace observation 探索を即時に空集合として返し、source がない sync が canonical 全件を走査しない。
+
 ReplySLO の二巡目では、全 supplemental S 件から `draft_id -> observation_id` と `observation_id -> earliest_sent_at` の hash join index をループ開始前に一度だけ構築し、全 Observation page で共有する。従来は N 件の Observation を page size P で処理するたびに supplemental 全件を走査していたため O((N/P)·S + N) だったが、現在の rebuild は期待計算量 O(S + N)、追加メモリ O(S) である。earliest sent は同一 observation に複数の send record がある場合も index 更新時に最小値を維持する。
 
 通常の canonical append は resident join index を参照して追加 Observation ΔN 件だけを ReplySLO row に変換し、既存行を再投影しないため期待計算量 O(ΔN) である。reply draft / send record の append は同じ index を O(1) で更新し、send record が影響する1 Observation row だけを upsert する。supplemental または projection の永続 commit が失敗した場合は専用 rollback token で index と supplemental store を元に戻し、全件再構築への silent fallback は行わない。
@@ -168,6 +172,8 @@ glibc の multi-arena 保持は page 処理の live bound とは別に RSS high-
 ## 検証と運用上の注意
 
 実装の contract は `lethe-search-index` の reference-engine 比較、順序 / cursor / snippet、upsert / catch-up / generation / checksum test、selfhost の lifecycle / corruption test、HTTP / MCP e2e で検証する。全体の検証コマンドは次である。
+
+v15.2 sync convoy follow-up のローカル検証は `background_rebuild_and_source_sync_do_not_block_bounded_v1_import` と `empty_google_source_latest_workspace_lookup_does_not_read_canonical_storage` を含み、workspace `723 passed / 0 failed / 3 ignored`、selfhost `108 passed / 0 failed / 0 ignored` である。568k fixture/16 GiB image の再実測は本番・外部接続を使わない別の受入工程とする。
 
 ```powershell
 cargo fmt --all -- --check
