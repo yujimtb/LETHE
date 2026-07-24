@@ -39,6 +39,15 @@ an explicit reason. Only a real HTTP 4xx or an unexpected outcome
 (rejected/quarantined counts, wrong ingested/duplicate totals) is a hard
 failure.
 
+Convergence itself is two gates, not one: after single-item ACK latency
+drops below --ack-latency-threshold-seconds, a no-op bulk session
+(begin -> end) must also succeed before any test starts. On v15.2+ a
+bounded-permit single import returns quickly regardless of whether a
+background non-corpus rebuild is still running, so fast ACK latency alone
+no longer implies the rebuild has finished; test 1b in particular drives
+bulk-sessions itself and would otherwise misread the rebuild's HTTP 409s
+as a test failure. See wait_for_convergence()'s docstring.
+
 Never pushes anywhere and never talks to a non-loopback host: the
 container is published on 127.0.0.1 only, and this script performs no
 outbound network calls other than to that container.
@@ -117,6 +126,21 @@ def parse_args() -> argparse.Namespace:
             "commonly 2) until they finish server-side, which can starve the "
             "next probe with HTTP 429 import_concurrency_limit. Prefer raising "
             "this over lowering it"
+        ),
+    )
+    parser.add_argument(
+        "--noop-session-retry-wait-seconds",
+        type=float,
+        default=3.0,
+        help=(
+            "wait between retries of the no-op bulk session (begin -> end) "
+            "convergence gate that runs after ACK latency converges, while it "
+            "gets HTTP 409 bulk_import_session_active / "
+            "bulk_import_non_bulk_projection_active (a background non-corpus "
+            "rebuild can still be in progress on v15.2+ even once ACK latency "
+            "is fast). No consecutive-retry cap applies here — only the "
+            "remaining --ack-timeout-seconds budget, shared with the ACK-"
+            "latency wait, bounds it"
         ),
     )
     parser.add_argument(
@@ -296,7 +320,7 @@ def wait_for_health(client: gc.ImportClient, timeout_seconds: float, container_n
     raise gc.GateError(f"/health did not return 200 within {timeout_seconds:.0f}s")
 
 
-def wait_for_ack_latency(
+def wait_for_convergence(
     client: gc.ImportClient,
     *,
     source_instance_id: str,
@@ -305,8 +329,30 @@ def wait_for_ack_latency(
     timeout_seconds: float,
     poll_interval_seconds: float,
     probe_timeout_seconds: float,
+    noop_session_retry_wait_seconds: float,
     container_name: str,
 ) -> dict[str, Any]:
+    """Wait for the container to be ready for the memory-gate tests.
+
+    Two conditions, gated in sequence against one shared
+    ``--ack-timeout-seconds`` budget:
+
+    1. Single-item import ACK latency drops below ``threshold_seconds``
+       (backlog catch-up convergence).
+    2. A no-op bulk session (begin -> immediately end) succeeds.
+
+    (2) exists because on v15.2+, a background non-corpus rebuild can
+    still be in progress even once (1) is satisfied — a bounded-permit
+    single import returns in ~0.5s regardless of whether that rebuild has
+    finished, so ACK latency alone stopped implying "rebuild done". If
+    tests start (in particular test 1b, which itself drives
+    bulk-sessions) while the background rebuild is still running, every
+    begin/end call gets HTTP 409 (bulk_import_non_bulk_projection_active /
+    bulk_import_session_active) for as long as the rebuild continues,
+    which used to be misread as a test failure rather than "not converged
+    yet". A no-op session's own begin/end succeeding is a direct signal
+    that whatever exclusivity the rebuild holds has cleared.
+    """
     log(
         f"waiting up to {timeout_seconds:.0f}s for single-item ACK latency "
         f"< {threshold_seconds:.1f}s (migration/index rebuild convergence); "
@@ -400,21 +446,125 @@ def wait_for_ack_latency(
         samples.append(result.elapsed_seconds)
         log(f"ack probe #{attempt}: {result.elapsed_seconds:.3f}s")
         if result.elapsed_seconds < threshold_seconds:
-            return {
-                "attempts": attempt,
-                "final_latency_seconds": result.elapsed_seconds,
-                "samples": samples,
-                "transient_events": transient_events,
-                "concurrency_limit_events": concurrency_events,
-            }
+            break
         time.sleep(poll_interval_seconds)
         advance_probe = True
-    raise gc.GateError(
-        f"single-item ACK latency did not drop below {threshold_seconds:.1f}s "
-        f"within {timeout_seconds:.0f}s (last successful sample="
-        f"{samples[-1] if samples else 'n/a'}, transient failures={len(transient_events)}, "
-        f"HTTP 429 import_concurrency_limit responses={len(concurrency_events)})"
+    else:
+        raise gc.GateError(
+            f"single-item ACK latency did not drop below {threshold_seconds:.1f}s "
+            f"within {timeout_seconds:.0f}s (last successful sample="
+            f"{samples[-1] if samples else 'n/a'}, transient failures={len(transient_events)}, "
+            f"HTTP 429 import_concurrency_limit responses={len(concurrency_events)})"
+        )
+
+    ack_attempts = attempt
+    ack_final_latency_seconds = samples[-1]
+
+    # --- Phase 2: no-op bulk session (begin -> end) must succeed -------
+    #
+    # Shares the same `deadline` as phase 1 above — it consumes whatever
+    # --ack-timeout-seconds budget phase 1 left, not a fresh budget.
+    log(
+        "ACK latency converged; waiting for a no-op bulk session "
+        "(begin -> end) to succeed as an additional convergence gate "
+        "(background non-corpus rebuild may still be in progress even "
+        "though single-item ACK is fast) ..."
     )
+    noop_started = time.monotonic()
+    noop_conflict_events: list[dict[str, Any]] = []
+    noop_transient_events: list[dict[str, Any]] = []
+    noop_session_id: str | None = None
+    noop_attempt = 0
+    while True:
+        gc.assert_container_alive(container_name)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise gc.GateError(
+                f"no-op bulk session (begin->end) did not succeed within the "
+                f"remaining --ack-timeout-seconds budget ({timeout_seconds:.0f}s "
+                f"total budget shared with ACK-latency convergence); "
+                f"{len(noop_conflict_events)} conflict retries, "
+                f"{len(noop_transient_events)} transient retries"
+            )
+        noop_attempt += 1
+        try:
+            if noop_session_id is None:
+                begin_timeout = max(min(60.0, remaining), 5.0)
+                begin_result = client.begin_bulk_session(timeout=begin_timeout)
+                noop_session_id = begin_result.session_id
+            end_timeout = max(min(1800.0, deadline - time.monotonic()), 5.0)
+            end_result = client.end_bulk_session(noop_session_id, timeout=end_timeout)
+        except gc.BulkSessionConflictError as error:
+            # bulk_import_session_active / bulk_import_non_bulk_projection_active
+            # while the background rebuild is still in progress. Deliberately
+            # no consecutive-failure cap here (unlike
+            # gate_common.call_bulk_session_with_retry elsewhere) — the whole
+            # point of this phase is to wait out a rebuild that can
+            # legitimately keep returning this 409 for a long time; only the
+            # shared time budget bounds it.
+            waited_so_far = time.monotonic() - noop_started
+            noop_conflict_events.append(
+                {
+                    "attempt": noop_attempt,
+                    "elapsed_seconds": error.elapsed_seconds,
+                    "conflict_code": error.conflict_code,
+                    "message": str(error),
+                }
+            )
+            wait_seconds = min(noop_session_retry_wait_seconds, max(remaining, 0.1))
+            log(
+                f"no-op bulk session attempt #{noop_attempt}: HTTP 409 "
+                f"{error.conflict_code}; retrying in {wait_seconds:.1f}s "
+                f"(waited {waited_so_far:.0f}s of {timeout_seconds:.0f}s shared budget)"
+            )
+            time.sleep(wait_seconds)
+            continue
+        except gc.TransientImportError as error:
+            # timeout / connection-error / 5xx — same "not converged yet"
+            # treatment as phase 1's ACK probe, not a hard failure. If this
+            # was a begin() timeout, noop_session_id stays None and the next
+            # loop retries begin(); if it was an end() timeout, the session
+            # id is kept and the next loop retries end() on the same session.
+            waited_so_far = time.monotonic() - noop_started
+            noop_transient_events.append(
+                {
+                    "attempt": noop_attempt,
+                    "elapsed_seconds": error.elapsed_seconds,
+                    "status_code": error.status_code,
+                    "message": str(error),
+                }
+            )
+            wait_seconds = min(poll_interval_seconds, max(remaining, 0.1))
+            log(
+                f"no-op bulk session attempt #{noop_attempt}: transient failure "
+                f"after {error.elapsed_seconds:.1f}s ({error}); not converged "
+                f"yet, continuing (waited {waited_so_far:.0f}s of "
+                f"{timeout_seconds:.0f}s shared budget)"
+            )
+            time.sleep(wait_seconds)
+            continue
+        break
+
+    noop_session_wait_seconds = time.monotonic() - noop_started
+    log(
+        f"no-op bulk session succeeded: session_id={noop_session_id} "
+        f"state={end_result.state} after {noop_session_wait_seconds:.1f}s "
+        f"(conflict retries={len(noop_conflict_events)}, "
+        f"transient retries={len(noop_transient_events)})"
+    )
+
+    return {
+        "attempts": ack_attempts,
+        "final_latency_seconds": ack_final_latency_seconds,
+        "samples": samples,
+        "transient_events": transient_events,
+        "concurrency_limit_events": concurrency_events,
+        "noop_session_wait_seconds": noop_session_wait_seconds,
+        "noop_session_id": noop_session_id,
+        "noop_session_state": end_result.state,
+        "noop_session_conflict_events": noop_conflict_events,
+        "noop_session_transient_events": noop_transient_events,
+    }
 
 
 def log_transient_event(context: str, event: dict[str, Any]) -> None:
@@ -1145,6 +1295,7 @@ def main() -> int:
             "slope_threshold_mib_per_batch": args.slope_threshold_mib_per_batch,
             "bulk_session_end_latency_threshold_seconds": args.bulk_session_end_latency_threshold_seconds,
             "probe_timeout_seconds": args.probe_timeout_seconds,
+            "noop_session_retry_wait_seconds": args.noop_session_retry_wait_seconds,
             "max_consecutive_timeouts": args.max_consecutive_timeouts,
             "max_consecutive_concurrency_retries": args.max_consecutive_concurrency_retries,
             "max_consecutive_bulk_session_conflicts": args.max_consecutive_bulk_session_conflicts,
@@ -1183,7 +1334,7 @@ def main() -> int:
         health_wait_seconds = wait_for_health(client, args.health_timeout_seconds, container_name)
         report["phases"]["health_wait_seconds"] = health_wait_seconds
 
-        ack_info = wait_for_ack_latency(
+        convergence_info = wait_for_convergence(
             client,
             source_instance_id=args.source_instance,
             tag=args.tag,
@@ -1191,9 +1342,10 @@ def main() -> int:
             timeout_seconds=args.ack_timeout_seconds,
             poll_interval_seconds=args.ack_poll_interval_seconds,
             probe_timeout_seconds=args.probe_timeout_seconds,
+            noop_session_retry_wait_seconds=args.noop_session_retry_wait_seconds,
             container_name=container_name,
         )
-        report["phases"]["ack_convergence"] = ack_info
+        report["phases"]["convergence"] = convergence_info
 
         sampler = gc.DockerStatsSampler(container_name, args.stats_poll_interval_seconds)
         sampler.start()

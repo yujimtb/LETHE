@@ -98,11 +98,12 @@ health.
 
 Sequence: copy `--data-dir` to a scratch dir → `docker run -d --memory ...`
 → poll `/health` (up to 15 min) → poll single-item import ACK latency until
-it drops below 2s (up to 30 min; this waits out migration/index-rebuild
-convergence on container start) → warmup (100 x 2 dup batches) → 60s
-baseline RSS sample → test 1 → test 1b → test 2 (batch=25 then batch=1000)
-→ test 2b → test 3 → stop/remove container → delete scratch data dir →
-write `--report` JSON → print a PASS/FAIL summary.
+it drops below 2s, then a no-op bulk session (begin -> end) until it
+succeeds (both gates share one `--ack-timeout-seconds` budget, up to 30
+min total; see "Convergence is two gates" below) → warmup (100 x 2 dup
+batches) → 60s baseline RSS sample → test 1 → test 1b → test 2 (batch=25
+then batch=1000) → test 2b → test 3 → stop/remove container → delete
+scratch data dir → write `--report` JSON → print a PASS/FAIL summary.
 
 Any single test failing exits 1 with `"passed": false` in the report. Tests
 1b and 2b are the exception: if the bulk-session API itself is unusable in
@@ -159,6 +160,45 @@ server-provided `retry_after`, unlike HTTP 429) up to
 fails immediately, not retried. Each test's report entry includes
 `session_call_transient_events` / `session_call_conflict_events` listing
 every retried `begin`/`end` attempt.
+
+### Convergence is two gates, not one
+
+`run_gate.py` waits for two conditions before any test starts, in
+sequence, sharing one `--ack-timeout-seconds` budget (`wait_for_convergence()`
+in `run_gate.py`):
+
+1. Single-item import ACK latency drops below
+   `--ack-latency-threshold-seconds` (backlog catch-up convergence — this
+   is the original gate).
+2. A no-op bulk session (`begin` immediately followed by `end`, no imports
+   in between) succeeds.
+
+(2) exists because on v15.2+, a background non-corpus rebuild can still be
+running even once (1) is satisfied: a bounded-permit single import
+returns in well under a second regardless of whether that rebuild has
+finished, so fast ACK latency stopped implying "rebuild done". Without
+(2), the gate would start test 1b — which itself drives bulk-sessions —
+while the rebuild is still in progress, and every `begin`/`end` call would
+get HTTP 409 (`bulk_import_non_bulk_projection_active` /
+`bulk_import_session_active`) for as long as the rebuild continues, which
+used to be misread as a test failure instead of "not converged yet".
+
+While waiting on (2), a 409 with a known-transient conflict code is
+retried after `--noop-session-retry-wait-seconds` (default 3s) —
+deliberately **without** the `--max-consecutive-bulk-session-conflicts`
+cap that applies elsewhere, since the entire point here is to wait out a
+rebuild that can legitimately keep returning this 409 for a long time;
+only the shared `--ack-timeout-seconds` budget (whatever (1) left of it)
+bounds it. A timeout/connection-error/5xx during `begin`/`end` gets the
+same "not converged yet, keep polling" treatment as the ACK probe, not a
+hard failure — if `begin` itself timed out, the next attempt retries
+`begin` (no session id was ever obtained); if `end` timed out, the next
+attempt retries `end` on the same session id (which is idempotent for
+this purpose). Once `begin`/`end` succeed, that session's id and final
+`state` (expected `"ready"`) are logged, and `report.phases.convergence`
+records `noop_session_wait_seconds`, `noop_session_id`,
+`noop_session_state`, `noop_session_conflict_events`, and
+`noop_session_transient_events`.
 
 ### Warmup (before baseline)
 
@@ -290,8 +330,9 @@ such orphan-retry duplicates as `retried_as_duplicates`.
 | `--max-consecutive-bulk-session-conflicts` | 10 | tests 1b/2b: consecutive HTTP 409 responses from bulk-session begin/end with a known-transient conflict code (counted separately from `--max-consecutive-timeouts`) before the gate aborts |
 | `--bulk-session-conflict-wait-seconds` | 1.5 | fixed wait between retries of a known-transient bulk-session 409 conflict (no server-provided `retry_after` for these codes) |
 | `--probe-timeout-seconds` | 900 | per-request HTTP timeout for the ACK-convergence probe (not the test batches — those use their own per-call timeouts, see source). Raising this reduces orphaned server-side work, not the other way around — see "The timeout → 429 orphan chain" above |
+| `--noop-session-retry-wait-seconds` | 3.0 | wait between retries of the no-op bulk session (begin -> end) convergence gate while it gets a known-transient HTTP 409 — no consecutive-retry cap, only the shared `--ack-timeout-seconds` budget bounds it — see "Convergence is two gates" above |
 | `--health-timeout-seconds` | 900 (15 min) | max wait for `/health` to return 200 |
-| `--ack-timeout-seconds` | 1800 (30 min) | max wait for single-item import ACK latency to converge |
+| `--ack-timeout-seconds` | 1800 (30 min) | max wait for single-item import ACK latency to converge, **and** for the subsequent no-op bulk session to succeed — one shared budget for both gates |
 | `--ack-latency-threshold-seconds` | 2.0 | the ACK latency convergence target |
 | `--warmup-settle-seconds` | 10 | settle time before sampling pre-warmup RSS, ahead of the dup-only warmup that runs before baseline is sampled |
 | `--baseline-settle-seconds` | 60 | idle time (and averaging window) before sampling baseline RSS, taken *after* warmup |
