@@ -5,7 +5,7 @@ use std::collections::HashSet;
 const OBSERVATION_SCHEMA_BACKFILL_BATCH_SIZE: i64 = 512;
 
 impl SqlitePersistence {
-    pub(super) fn init_schema(&self) -> Result<(), PersistenceError> {
+    pub(super) fn init_schema(&self) -> Result<bool, PersistenceError> {
         self.conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS observations (
@@ -281,8 +281,8 @@ impl SqlitePersistence {
             ));
         }
         self.ensure_partition_initialize()?;
-        self.migrate_existing_schema()?;
-        self.apply_schema_migrations()?;
+        let legacy_schema_migrated = self.migrate_existing_schema()?;
+        let versioned_schema_migrated = self.apply_schema_migrations()?;
         self.conn.execute_batch(
             "
             CREATE INDEX IF NOT EXISTS observations_leaf_append
@@ -295,10 +295,10 @@ impl SqlitePersistence {
              ) VALUES (1, 0, 0)",
             [],
         )?;
-        Ok(())
+        Ok(legacy_schema_migrated || versioned_schema_migrated)
     }
 
-    fn apply_schema_migrations(&self) -> Result<(), PersistenceError> {
+    fn apply_schema_migrations(&self) -> Result<bool, PersistenceError> {
         let identity_lookup_recorded =
             self.schema_migration_recorded(SCHEMA_VERSION_IDENTITY_LOOKUP_INDEX)?;
         let lock_split_recorded =
@@ -310,6 +310,12 @@ impl SqlitePersistence {
             self.schema_migration_recorded(SCHEMA_VERSION_RECONSENT_PRIVACY_INDEX)?;
         let cutover_bridge_recorded =
             self.schema_migration_recorded(SCHEMA_VERSION_CUTOVER_BRIDGE)?;
+        let migration_applied = !identity_lookup_recorded
+            || !lock_split_recorded
+            || !keyset_reads_recorded
+            || !privacy_projection_recorded
+            || !reconsent_privacy_index_recorded
+            || !cutover_bridge_recorded;
 
         if lock_split_recorded && !identity_lookup_recorded {
             return Err(PersistenceError::SchemaInvariant(
@@ -397,7 +403,7 @@ impl SqlitePersistence {
             self.apply_cutover_bridge_migration()?;
         }
 
-        Ok(())
+        Ok(migration_applied)
     }
 
     fn apply_identity_lookup_index_migration(&self) -> Result<(), PersistenceError> {
@@ -935,10 +941,11 @@ impl SqlitePersistence {
         Ok(())
     }
 
-    fn migrate_existing_schema(&self) -> Result<(), PersistenceError> {
+    fn migrate_existing_schema(&self) -> Result<bool, PersistenceError> {
         let current_version_recorded =
             self.schema_migration_recorded(SCHEMA_VERSION_KEYSET_READS)?;
         let mut columns = self.observation_columns()?;
+        let legacy_canonical_column_rebuilt = columns.contains(CANONICAL_JSON_META_KEY);
 
         let mut route_backfill_required = false;
         if !columns.contains("leaf_id") {
@@ -980,7 +987,10 @@ impl SqlitePersistence {
             columns = self.observation_columns()?;
         }
 
-        self.require_observation_columns(&columns)
+        self.require_observation_columns(&columns)?;
+        Ok(route_backfill_required
+            || canonical_digest_backfill_required
+            || legacy_canonical_column_rebuilt)
     }
 
     fn schema_migration_recorded(&self, version: i64) -> Result<bool, PersistenceError> {

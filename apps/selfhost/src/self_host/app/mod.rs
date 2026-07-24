@@ -672,12 +672,18 @@ fn validate_projection_fold_declarations(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ImportTimingStage {
+    BulkOperationLockWait,
+    PersistenceLockWait,
+    SpawnBlockingWait,
     LedgerAppend,
     PublishClone,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ObservationImportTiming {
+    bulk_operation_lock_wait_ms: u64,
+    persistence_lock_wait_ms: u64,
+    spawn_blocking_wait_ms: u64,
     ledger_append_ms: u64,
     app_core_clone_ms: u64,
     publish_clone_ms: u64,
@@ -706,6 +712,21 @@ impl ObservationImportTimer {
         let elapsed_ms = u64::try_from(elapsed.as_millis())
             .expect("observation import stage duration does not fit u64 milliseconds");
         match stage {
+            ImportTimingStage::BulkOperationLockWait => {
+                self.timing.bulk_operation_lock_wait_ms = self
+                    .timing
+                    .bulk_operation_lock_wait_ms
+                    .saturating_add(elapsed_ms);
+            }
+            ImportTimingStage::PersistenceLockWait => {
+                self.timing.persistence_lock_wait_ms = self
+                    .timing
+                    .persistence_lock_wait_ms
+                    .saturating_add(elapsed_ms);
+            }
+            ImportTimingStage::SpawnBlockingWait => {
+                self.timing.spawn_blocking_wait_ms = elapsed_ms;
+            }
             ImportTimingStage::LedgerAppend => self.timing.ledger_append_ms = elapsed_ms,
             ImportTimingStage::PublishClone => self.timing.publish_clone_ms = elapsed_ms,
         }
@@ -713,7 +734,8 @@ impl ObservationImportTimer {
 
     fn finish(mut self) -> ObservationImportTiming {
         self.timing.total_ms = u64::try_from(self.started_at.elapsed().as_millis())
-            .expect("observation import total duration does not fit u64 milliseconds");
+            .expect("observation import total duration does not fit u64 milliseconds")
+            .saturating_add(self.timing.spawn_blocking_wait_ms);
         self.timing
     }
 
@@ -787,6 +809,9 @@ impl ObservationImportTimingLog {
             "source_instance_id",
             "schema_names",
             "subject_kinds",
+            "bulk_operation_lock_wait_ms",
+            "persistence_lock_wait_ms",
+            "spawn_blocking_wait_ms",
             "ledger_append_ms",
             "app_core_clone_ms",
             "publish_clone_ms",
@@ -829,6 +854,9 @@ impl ObservationImportTimingLog {
                 source_instance_id = %self.source_instance_id,
                 schema_names = %schema_names,
                 subject_kinds = %subject_kinds,
+                bulk_operation_lock_wait_ms = self.timing.bulk_operation_lock_wait_ms,
+                persistence_lock_wait_ms = self.timing.persistence_lock_wait_ms,
+                spawn_blocking_wait_ms = self.timing.spawn_blocking_wait_ms,
                 ledger_append_ms = self.timing.ledger_append_ms,
                 app_core_clone_ms = self.timing.app_core_clone_ms,
                 publish_clone_ms = self.timing.publish_clone_ms,
@@ -854,6 +882,9 @@ impl ObservationImportTimingLog {
                 source_instance_id = %self.source_instance_id,
                 schema_names = %schema_names,
                 subject_kinds = %subject_kinds,
+                bulk_operation_lock_wait_ms = self.timing.bulk_operation_lock_wait_ms,
+                persistence_lock_wait_ms = self.timing.persistence_lock_wait_ms,
+                spawn_blocking_wait_ms = self.timing.spawn_blocking_wait_ms,
                 ledger_append_ms = self.timing.ledger_append_ms,
                 app_core_clone_ms = self.timing.app_core_clone_ms,
                 publish_clone_ms = self.timing.publish_clone_ms,
@@ -1921,6 +1952,12 @@ pub struct AppService {
     non_corpus_rebuild_error: Arc<Mutex<Option<String>>>,
     #[cfg(test)]
     non_corpus_rebuild_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    non_corpus_rebuild_reasons: Arc<Mutex<Vec<&'static str>>>,
+    #[cfg(test)]
+    non_corpus_rebuild_page_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    non_corpus_rebuild_page_delay: Option<Duration>,
     #[cfg(test)]
     publish_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
@@ -4782,8 +4819,147 @@ fn subtract_modulo_256(accumulator: &mut [u8; 32], value: &[u8; 32]) {
     }
 }
 
+trait NonCorpusRebuildStorage {
+    fn load_supplementals(&self) -> Result<Vec<SupplementalRecord>, SelfHostError>;
+    fn observation_stats(&self) -> Result<ObservationStats, SelfHostError>;
+    fn observation_page(
+        &self,
+        after_append_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredObservation>, SelfHostError>;
+    fn observations_for_privacy_key_page(
+        &self,
+        privacy_key: &str,
+        after_append_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredObservation>, SelfHostError>;
+    fn observation_by_id(
+        &self,
+        id: &ObservationId,
+    ) -> Result<Option<StoredObservation>, SelfHostError>;
+    fn commit_projection_items(
+        &self,
+        projection: &ProjectionRef,
+        manifest: &serde_json::Value,
+        commit: &ProjectionItemCommit,
+    ) -> Result<(), SelfHostError>;
+    fn projection_item_count_by_owner(
+        &self,
+        projection: &ProjectionRef,
+        owner_key: &str,
+    ) -> Result<u64, SelfHostError>;
+    fn publish_projection_items_from_staging(
+        &self,
+        target: &ProjectionRef,
+        staging: &ProjectionRef,
+        manifest: &serde_json::Value,
+        expected_item_count: u64,
+    ) -> Result<(), SelfHostError>;
+    fn set_state(&self, key: &str, value: &str) -> Result<(), SelfHostError>;
+}
+
+impl<T: StoragePorts + ?Sized> NonCorpusRebuildStorage for T {
+    fn load_supplementals(&self) -> Result<Vec<SupplementalRecord>, SelfHostError> {
+        Ok(lethe_storage_api::SupplementalStore::load_supplementals(
+            self,
+        )?)
+    }
+
+    fn observation_stats(&self) -> Result<ObservationStats, SelfHostError> {
+        Ok(lethe_storage_api::ObservationStore::observation_stats(
+            self,
+        )?)
+    }
+
+    fn observation_page(
+        &self,
+        after_append_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredObservation>, SelfHostError> {
+        Ok(lethe_storage_api::ObservationStore::observation_page(
+            self,
+            after_append_seq,
+            limit,
+        )?)
+    }
+
+    fn observations_for_privacy_key_page(
+        &self,
+        privacy_key: &str,
+        after_append_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredObservation>, SelfHostError> {
+        Ok(
+            lethe_storage_api::ObservationStore::observations_for_privacy_key_page(
+                self,
+                privacy_key,
+                after_append_seq,
+                limit,
+            )?,
+        )
+    }
+
+    fn observation_by_id(
+        &self,
+        id: &ObservationId,
+    ) -> Result<Option<StoredObservation>, SelfHostError> {
+        Ok(lethe_storage_api::ObservationStore::observation_by_id(
+            self, id,
+        )?)
+    }
+
+    fn commit_projection_items(
+        &self,
+        projection: &ProjectionRef,
+        manifest: &serde_json::Value,
+        commit: &ProjectionItemCommit,
+    ) -> Result<(), SelfHostError> {
+        Ok(
+            lethe_storage_api::ProjectionMaterializer::commit_projection_items(
+                self, projection, manifest, commit,
+            )?,
+        )
+    }
+
+    fn projection_item_count_by_owner(
+        &self,
+        projection: &ProjectionRef,
+        owner_key: &str,
+    ) -> Result<u64, SelfHostError> {
+        Ok(
+            lethe_storage_api::ProjectionMaterializer::projection_item_count_by_owner(
+                self, projection, owner_key,
+            )?,
+        )
+    }
+
+    fn publish_projection_items_from_staging(
+        &self,
+        target: &ProjectionRef,
+        staging: &ProjectionRef,
+        manifest: &serde_json::Value,
+        expected_item_count: u64,
+    ) -> Result<(), SelfHostError> {
+        Ok(
+            lethe_storage_api::ProjectionMaterializer::publish_projection_items_from_staging(
+                self,
+                target,
+                staging,
+                manifest,
+                expected_item_count,
+            )?,
+        )
+    }
+
+    fn set_state(&self, key: &str, value: &str) -> Result<(), SelfHostError> {
+        Ok(lethe_storage_api::RuntimeStateStore::set_state(
+            self, key, value,
+        )?)
+    }
+}
+
 fn for_each_observation_page(
-    persistence: &dyn StoragePorts,
+    persistence: &dyn NonCorpusRebuildStorage,
     stats: ObservationStats,
     page_size: usize,
     mut visit: impl FnMut(&[StoredObservation], &[Observation]) -> Result<(), SelfHostError>,
@@ -4819,18 +4995,23 @@ fn for_each_observation_page(
                 page.len()
             )));
         }
+        let bounded_page_len = page
+            .iter()
+            .take_while(|stored| stored.append_seq <= stats.max_append_seq)
+            .count();
+        let page = &page[..bounded_page_len];
+        if page.is_empty() {
+            return Err(SelfHostError::Ingestion(format!(
+                "canonical observation paging crossed fixed high-water {} after {seen} of {} rows",
+                stats.max_append_seq, stats.count
+            )));
+        }
 
         let mut observations = Vec::with_capacity(page.len());
-        for stored in &page {
+        for stored in page {
             if stored.append_seq <= after_append_seq {
                 return Err(SelfHostError::Ingestion(format!(
                     "canonical observation page is not strictly ordered after append sequence {after_append_seq}"
-                )));
-            }
-            if stored.append_seq > stats.max_append_seq {
-                return Err(SelfHostError::Ingestion(format!(
-                    "canonical observation page crossed fixed high-water {} at append sequence {}",
-                    stats.max_append_seq, stored.append_seq
                 )));
             }
             after_append_seq = stored.append_seq;
@@ -4847,7 +5028,7 @@ fn for_each_observation_page(
             }
             observations.push(stored.observation.clone());
         }
-        visit(&page, &observations)?;
+        visit(page, &observations)?;
     }
 
     if seen != stats.count || after_append_seq != stats.max_append_seq {
@@ -4860,7 +5041,7 @@ fn for_each_observation_page(
 }
 
 fn frontend_profiles_from_supplementals(
-    persistence: &dyn StoragePorts,
+    persistence: &dyn NonCorpusRebuildStorage,
     identity: &IdentityResolutionOutput,
     person_consents: &BTreeMap<String, ConsentStatus>,
     supplementals: &[lethe_core::domain::SupplementalRecord],
@@ -4970,7 +5151,7 @@ fn install_frontend_profiles(
 }
 
 fn rebuild_materialized_snapshot_paged(
-    persistence: &dyn StoragePorts,
+    persistence: &dyn NonCorpusRebuildStorage,
     supplementals: &[lethe_core::domain::SupplementalRecord],
     freshness_thresholds: &[FreshnessThreshold],
     channels: &[lethe_registry::registry::ChannelRecord],
@@ -5007,17 +5188,34 @@ fn rebuild_materialized_snapshot_paged(
                 if page.is_empty() {
                     break;
                 }
-                cursor = page.last().map(|stored| stored.append_seq).ok_or_else(|| {
-                    SelfHostError::Ingestion(
-                        "privacy reverse-index page unexpectedly empty".to_owned(),
-                    )
-                })?;
-                let observations = page
+                let bounded_page = page
+                    .iter()
+                    .take_while(|stored| stored.append_seq <= stats.max_append_seq)
+                    .collect::<Vec<_>>();
+                if bounded_page.is_empty() {
+                    break;
+                }
+                cursor = bounded_page
+                    .last()
+                    .map(|stored| stored.append_seq)
+                    .ok_or_else(|| {
+                        SelfHostError::Ingestion(
+                            "privacy reverse-index page unexpectedly empty".to_owned(),
+                        )
+                    })?;
+                let observations = bounded_page
                     .iter()
                     .map(|stored| stored.observation.clone())
                     .collect::<Vec<_>>();
                 communication_projection
                     .rematerialize_observations(&observations, &reply_slo_join_index);
+                if cursor == stats.max_append_seq
+                    || page
+                        .last()
+                        .is_some_and(|stored| stored.append_seq > stats.max_append_seq)
+                {
+                    break;
+                }
             }
         }
         for observation in observations {
@@ -5679,21 +5877,30 @@ fn current_materialized_snapshot(
     supplemental_fingerprint: &str,
     persisted_projection_item_count: u64,
     persisted_reply_slo_count: u64,
-) -> Result<Option<MaterializedProjectionSnapshot>, SelfHostError> {
+) -> Result<MaterializedSnapshotRestore, SelfHostError> {
     let object = value.as_object().ok_or_else(|| {
         SelfHostError::Ingestion(
             "proj:person-page materialization manifest is not a JSON object".to_owned(),
         )
     })?;
-    let Some(format_version) = object
-        .get("format_version")
-        .and_then(serde_json::Value::as_u64)
-    else {
-        return Ok(None);
+    let Some(raw_format_version) = object.get("format_version") else {
+        return Ok(MaterializedSnapshotRestore::RebuildRequired {
+            reason: "persisted legacy manifest has no format_version".to_owned(),
+        });
+    };
+    let Some(format_version) = raw_format_version.as_u64() else {
+        return Ok(MaterializedSnapshotRestore::RebuildRequired {
+            reason: "persisted legacy manifest format_version is not an unsigned integer"
+                .to_owned(),
+        });
     };
     let current_format_version = u64::from(NON_CORPUS_MATERIALIZATION_VERSION);
     if format_version < current_format_version {
-        return Ok(None);
+        return Ok(MaterializedSnapshotRestore::RebuildRequired {
+            reason: format!(
+                "persisted format {format_version} is older than current format {current_format_version}"
+            ),
+        });
     }
     if format_version > current_format_version {
         return Err(SelfHostError::Ingestion(format!(
@@ -5701,11 +5908,25 @@ fn current_materialized_snapshot(
         )));
     }
     let manifest: MaterializedProjectionManifest = serde_json::from_value(value)?;
-    if manifest.last_append_seq != stats.max_append_seq
-        || manifest.observation_count != stats.count
-        || manifest.supplemental_fingerprint != supplemental_fingerprint
+    if manifest.last_append_seq != stats.max_append_seq || manifest.observation_count != stats.count
     {
-        return Ok(None);
+        return Ok(MaterializedSnapshotRestore::RebuildRequired {
+            reason: format!(
+                "persisted canonical watermark count/append_seq={}/{} differs from storage {}/{}",
+                manifest.observation_count,
+                manifest.last_append_seq,
+                stats.count,
+                stats.max_append_seq
+            ),
+        });
+    }
+    if manifest.supplemental_fingerprint != supplemental_fingerprint {
+        return Ok(MaterializedSnapshotRestore::RebuildRequired {
+            reason: format!(
+                "persisted supplemental fingerprint {} differs from current {}",
+                manifest.supplemental_fingerprint, supplemental_fingerprint
+            ),
+        });
     }
     let base_projection_item_count = manifest
         .person_message_count
@@ -5871,7 +6092,13 @@ fn current_materialized_snapshot(
         pending_item_commit: None,
     };
     materialized.validate()?;
-    Ok(Some(materialized))
+    Ok(MaterializedSnapshotRestore::Restored(materialized))
+}
+
+#[derive(Debug)]
+enum MaterializedSnapshotRestore {
+    Restored(MaterializedProjectionSnapshot),
+    RebuildRequired { reason: String },
 }
 
 fn validate_persisted_supplemental_anchors(
@@ -5999,6 +6226,7 @@ impl AppService {
             &config.secret_encryption_key,
             config.routing_key_order,
         )?;
+        let schema_migrations_applied = persistence.schema_migrations_applied_on_open();
         let stats = persistence.observation_stats()?;
         let supplementals = persistence.load_supplementals()?;
         validate_persisted_supplemental_anchors(&persistence, &supplementals)?;
@@ -6011,14 +6239,23 @@ impl AppService {
         let persisted_manifest = persistence.projection_records(&person_page_ref)?;
         let had_persisted_manifest = persisted_manifest.is_some();
         let persisted_materialized = match persisted_manifest {
-            Some(value) => current_materialized_snapshot(
+            Some(value) => match current_materialized_snapshot(
                 &persistence,
                 value,
                 stats,
                 &supplemental_fingerprint,
                 persisted_projection_item_count,
                 persisted_reply_slo_count,
-            )?,
+            )? {
+                MaterializedSnapshotRestore::Restored(materialized) => Some(materialized),
+                MaterializedSnapshotRestore::RebuildRequired { reason } => {
+                    tracing::warn!(
+                        manifest_restore_rejection_reason = %reason,
+                        "persisted non-corpus materialization restore rejected"
+                    );
+                    None
+                }
+            },
             None => None,
         };
         let persisted_queue_item_count = persistence
@@ -6035,14 +6272,15 @@ impl AppService {
                 + materialized.snapshot.card_queue.cards.len();
             u64::try_from(expected).is_ok_and(|expected| persisted_queue_item_count < expected)
         });
-        let requires_background_rebuild = match persisted_materialized.as_ref() {
-            Some(materialized) => {
-                materialized.format_version < NON_CORPUS_MATERIALIZATION_VERSION
-                    || queue_index_missing
-            }
-            None => true,
-        };
-        let persisted_materialization_missing = persisted_materialized.is_none();
+        if queue_index_missing {
+            tracing::warn!(
+                manifest_restore_rejection_reason =
+                    "persisted queue projection item index is incomplete",
+                "persisted non-corpus materialization restore requires recovery"
+            );
+        }
+        let requires_background_rebuild =
+            schema_migrations_applied || persisted_materialized.is_none() || queue_index_missing;
         let materialized = match persisted_materialized {
             Some(materialized) => materialized,
             None => bootstrap_materialized_placeholder(stats, &supplementals, &config.channels)?,
@@ -6159,6 +6397,12 @@ impl AppService {
             #[cfg(test)]
             non_corpus_rebuild_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
+            non_corpus_rebuild_reasons: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            non_corpus_rebuild_page_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            non_corpus_rebuild_page_delay: None,
+            #[cfg(test)]
             publish_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             search_job_test_gate: None,
@@ -6166,22 +6410,24 @@ impl AppService {
             search_job_test_fault: None,
         };
         if requires_background_rebuild {
-            if persisted_materialization_missing {
-                let _derived_lane = service
-                    .derived_projection_lane
-                    .lock()
-                    .map_err(|_| SelfHostError::LockPoisoned)?;
-                let mut core = service.core_lock()?;
-                core.mark_non_corpus_materializations_stale();
-                service.publish_core_snapshot(&core);
-            }
+            let _derived_lane = service
+                .derived_projection_lane
+                .lock()
+                .map_err(|_| SelfHostError::LockPoisoned)?;
+            let mut core = service.core_lock()?;
+            core.mark_non_corpus_materializations_stale();
+            service.publish_core_snapshot(&core);
+            drop(core);
+            drop(_derived_lane);
             let mut core = service.core_lock()?;
             service.refresh_materialized_snapshot_with_reason(
                 &mut core,
-                if had_persisted_manifest {
+                if !had_persisted_manifest {
+                    "bootstrap"
+                } else if schema_migrations_applied {
                     "migration"
                 } else {
-                    "bootstrap"
+                    "recovery"
                 },
             )?;
         }
@@ -6560,9 +6806,27 @@ impl AppService {
         bulk_session_id: Option<&str>,
         admission_generation: Option<u64>,
     ) -> Result<ImportReport, SelfHostError> {
+        self.ingest_observation_drafts_with_admission_generation_and_spawn_wait(
+            drafts,
+            source_instance_id,
+            bulk_session_id,
+            admission_generation,
+            Duration::ZERO,
+        )
+    }
+
+    pub(super) fn ingest_observation_drafts_with_admission_generation_and_spawn_wait(
+        &self,
+        drafts: Vec<ObservationDraft>,
+        source_instance_id: &str,
+        bulk_session_id: Option<&str>,
+        admission_generation: Option<u64>,
+        spawn_blocking_wait: Duration,
+    ) -> Result<ImportReport, SelfHostError> {
         let context = ObservationImportContext::from_drafts(&drafts);
         let bulk_session_requested = bulk_session_id.is_some();
         let mut timer = ObservationImportTimer::new();
+        timer.record_stage(ImportTimingStage::SpawnBlockingWait, spawn_blocking_wait);
         let mut materialization_state = ImportMaterializationState::NotRun;
         let result = (|| {
             let _import_permit = self.try_acquire_import_permit()?;
@@ -6578,15 +6842,16 @@ impl AppService {
                     self.config.resource_limits.max_import_drafts
                 )));
             }
-            self.enforce_cutover_admission(
+            self.enforce_cutover_admission_for_import(
                 source_instance_id,
                 CutoverApiVersion::V1,
                 admission_generation,
+                &mut timer,
             )?;
 
-            let _operation = self.bulk_import_operation_lock()?;
+            let _operation = self.bulk_import_operation_lock_for_import(&mut timer)?;
             let core = self.core_snapshot();
-            let bulk_session = self.bulk_import_session_for_append(bulk_session_id)?;
+            let bulk_session = self.bulk_import_session_for_append(bulk_session_id, &mut timer)?;
 
             let mut report = ImportReport {
                 ingested: 0,
@@ -6635,9 +6900,9 @@ impl AppService {
             let outcomes = if prepared_observations.is_empty() {
                 Vec::new()
             } else {
+                let persistence = self.persistence_lock_for_import(&mut timer)?;
                 let stage_started_at = Instant::now();
-                let append_result = self
-                    .persistence_lock()?
+                let append_result = persistence
                     .append_observations_v1_with_admission(
                         source_instance_id,
                         admission_generation,
@@ -6719,7 +6984,7 @@ impl AppService {
 
             if !request_appended_observations.is_empty() {
                 if let Some(session) = bulk_session.clone() {
-                    self.record_deferred_bulk_import_append(session.clone())?;
+                    self.record_deferred_bulk_import_append(session.clone(), &mut timer)?;
                     self.materialize_bulk_import_append(
                         &session,
                         &request_appended_observations,
@@ -6794,9 +7059,27 @@ impl AppService {
         bulk_session_id: Option<&str>,
         admission_generation: Option<u64>,
     ) -> Result<ImportReport, SelfHostError> {
+        self.ingest_observation_drafts_v2_with_admission_generation_and_spawn_wait(
+            drafts,
+            source_instance_id,
+            bulk_session_id,
+            admission_generation,
+            Duration::ZERO,
+        )
+    }
+
+    pub(super) fn ingest_observation_drafts_v2_with_admission_generation_and_spawn_wait(
+        &self,
+        drafts: Vec<ObservationDraft>,
+        source_instance_id: &str,
+        bulk_session_id: Option<&str>,
+        admission_generation: Option<u64>,
+        spawn_blocking_wait: Duration,
+    ) -> Result<ImportReport, SelfHostError> {
         let context = ObservationImportContext::from_drafts(&drafts);
         let bulk_session_requested = bulk_session_id.is_some();
         let mut timer = ObservationImportTimer::new();
+        timer.record_stage(ImportTimingStage::SpawnBlockingWait, spawn_blocking_wait);
         let mut materialization_state = ImportMaterializationState::NotRun;
         let result = (|| {
             let _import_permit = self.try_acquire_import_permit()?;
@@ -6807,16 +7090,17 @@ impl AppService {
                     details: serde_json::json!({"field": "source_instance_id"}),
                 });
             }
-            self.enforce_cutover_admission(
+            self.enforce_cutover_admission_for_import(
                 source_instance_id,
                 CutoverApiVersion::V2,
                 admission_generation,
+                &mut timer,
             )?;
             let request_draft_count = drafts.len();
 
-            let _operation = self.bulk_import_operation_lock()?;
+            let _operation = self.bulk_import_operation_lock_for_import(&mut timer)?;
             let core = self.core_snapshot();
-            let bulk_session = self.bulk_import_session_for_append(bulk_session_id)?;
+            let bulk_session = self.bulk_import_session_for_append(bulk_session_id, &mut timer)?;
             let mut report = ImportReport {
                 ingested: 0,
                 duplicates: 0,
@@ -6937,8 +7221,9 @@ impl AppService {
             let outcomes = if append_input.is_empty() {
                 Vec::new()
             } else {
+                let persistence = self.persistence_lock_for_import(&mut timer)?;
                 let stage_started_at = Instant::now();
-                let append_result = self.persistence_lock()?.append_observations_v2_with_bridge(
+                let append_result = persistence.append_observations_v2_with_bridge(
                     source_instance_id,
                     admission_generation,
                     &append_input,
@@ -7044,7 +7329,9 @@ impl AppService {
 
             if !request_appended_observations.is_empty() {
                 if let Some(session) = bulk_session {
-                    if let Err(error) = self.record_deferred_bulk_import_append(session.clone()) {
+                    if let Err(error) =
+                        self.record_deferred_bulk_import_append(session.clone(), &mut timer)
+                    {
                         tracing::error!(
                             error = %error,
                             "v2 import deferred-materialization bookkeeping failed after durable append"
