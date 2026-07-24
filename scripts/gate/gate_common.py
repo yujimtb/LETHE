@@ -243,10 +243,36 @@ def corpus_message_id(index: int) -> str:
     return f"msg-{index:09d}"
 
 
+def near_now_published(offset_minutes: float = 2.0) -> datetime:
+    """A fixed "recent past" timestamp, independent of any corpus index.
+
+    For probes whose index is not a small, bounded corpus offset (e.g. the
+    ACK-convergence probe's ever-growing attempt counter), never derive
+    ``published`` from the index — see corpus_published()'s docstring for
+    why that goes wrong at large index values.
+    """
+    return datetime.now(timezone.utc) - timedelta(minutes=offset_minutes)
+
+
 def corpus_published(index: int) -> datetime:
-    # Always in the past regardless of index magnitude (MAX_CLOCK_SKEW is
-    # only violated by *future* timestamps), so no quarantine risk.
-    return CORPUS_BASE_TIME + timedelta(seconds=index)
+    """CORPUS_BASE_TIME + index seconds, clamped so it can never land in
+    the future.
+
+    This is only "safely in the past" while ``index`` stays within roughly
+    CORPUS_BASE_TIME's distance from now (a couple hundred million seconds
+    as of 2026) — the seeded corpus range and the small fixed offsets tests
+    2/3 add to --seed-count are well within that. It is *not* safe for an
+    unbounded/large index: e.g. the ACK-convergence probe's
+    900_000_000+attempt indices push CORPUS_BASE_TIME (2020-01-01) into the
+    2040s, which the server's clock-skew gate rejects with HTTP 400
+    ("published is too far in the future"). Callers with an unbounded index
+    space must pass an explicit published time instead (see
+    near_now_published() / build_corpus_draft(published_override=...)).
+    This clamp is a blanket safety net for every caller, audited or not.
+    """
+    candidate = CORPUS_BASE_TIME + timedelta(seconds=index)
+    safety_ceiling = datetime.now(timezone.utc) - timedelta(minutes=5)
+    return min(candidate, safety_ceiling)
 
 
 def build_corpus_draft(
@@ -255,14 +281,22 @@ def build_corpus_draft(
     source_instance_id: str,
     index: int,
     pad_bytes: int = DEFAULT_PAD_BYTES,
+    published_override: datetime | None = None,
 ) -> dict[str, Any]:
+    """Build a corpus draft for ``index``.
+
+    ``published_override``, when given, replaces the index-derived
+    timestamp entirely — required for callers whose index is not a small,
+    bounded corpus offset (see corpus_published()'s docstring).
+    """
+    published = published_override if published_override is not None else corpus_published(index)
     return build_discord_draft(
         source_instance_id=source_instance_id,
         channel_id=corpus_channel_id(tag),
         message_id=corpus_message_id(index),
         content_prefix="gate probe synthetic message",
         index=index,
-        published=corpus_published(index),
+        published=published,
         pad_bytes=pad_bytes,
         client_ref=str(index),
     )

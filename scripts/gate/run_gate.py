@@ -298,10 +298,17 @@ def wait_for_ack_latency(
             # Disjoint, effectively unbounded index space so ack probes
             # never collide with corpus or bulk-test indices.
             probe_index = 900_000_000 + attempt
+            # published is fixed to "now - 2min", independent of the (very
+            # large, ever-growing) probe index — deriving it from the index
+            # via corpus_published() would push it decades into the future
+            # for this index range and get rejected by the server's
+            # clock-skew gate (HTTP 400 "published is too far in the
+            # future"). See gate_common.corpus_published()'s docstring.
             draft = gc.build_corpus_draft(
                 tag=f"{tag}-ackprobe",
                 source_instance_id=source_instance_id,
                 index=probe_index,
+                published_override=gc.near_now_published(2.0),
             )
         try:
             result = client.send_drafts(
