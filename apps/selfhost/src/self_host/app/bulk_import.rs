@@ -205,8 +205,35 @@ impl AppService {
         result
     }
 
+    pub(super) fn non_bulk_projection_operation_lock<'a>(
+        &'a self,
+        operation_name: &'static str,
+    ) -> Result<std::sync::MutexGuard<'a, ()>, SelfHostError> {
+        let operation = self
+            .non_bulk_projection_operation
+            .lock()
+            .map_err(|_| SelfHostError::LockPoisoned)?;
+        let bulk_admission = self.bulk_import_operation_lock()?;
+        self.ensure_bulk_import_session_inactive(operation_name)?;
+        drop(bulk_admission);
+        Ok(operation)
+    }
+
     pub fn begin_bulk_import_session(&self) -> Result<BulkImportSessionReport, SelfHostError> {
         let _operation = self.bulk_import_operation_lock()?;
+        let _non_bulk_projection_admission = match self.non_bulk_projection_operation.try_lock() {
+            Ok(admission) => admission,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(SelfHostError::BulkImportSessionConflict {
+                    code: "bulk_import_non_bulk_projection_active",
+                    detail: "a source sync or supplemental projection write is in progress"
+                        .to_owned(),
+                });
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(SelfHostError::LockPoisoned);
+            }
+        };
         let core = self.core_snapshot();
         self.ensure_projection_fresh(&core.catalog, "proj:person-page")?;
         let session = {
@@ -250,7 +277,7 @@ impl AppService {
                 detail: "bulk import session id must not be blank".to_owned(),
             });
         }
-        let _operation = self.bulk_import_operation_lock()?;
+        let operation = self.bulk_import_operation_lock()?;
         let mut session = {
             let persistence = self.persistence_lock()?;
             let Some(mut session) = load_persisted_bulk_import_session(persistence.as_ref())?
@@ -297,6 +324,7 @@ impl AppService {
             }
             session
         };
+        drop(operation);
 
         if session.phase == BulkImportSessionPhase::Ready {
             let report = session.report();
@@ -330,24 +358,64 @@ impl AppService {
             self.wait_for_non_corpus_rebuild()?;
         }
 
-        let ready_result = (|| {
-            let stats = self.persistence_lock()?.observation_stats()?;
-            if stats.max_append_seq != session.target_append_seq
-                || stats.count != session.target_observation_count
-            {
-                return Err(SelfHostError::Ingestion(format!(
-                    "canonical observation high-water changed before bulk import session {} publication",
-                    session.session_id
-                )));
+        let ready_result = {
+            let _operation = self.bulk_import_operation_lock()?;
+            (|| {
+                let persistence = self.persistence_lock()?;
+                let Some(mut persisted) = load_persisted_bulk_import_session(persistence.as_ref())?
+                else {
+                    return Err(SelfHostError::BulkImportSessionConflict {
+                        code: "bulk_import_session_not_active",
+                        detail: "no bulk import session has been started".to_owned(),
+                    });
+                };
+                if persisted.session_id != session.session_id {
+                    return Err(SelfHostError::BulkImportSessionConflict {
+                        code: "bulk_import_session_mismatch",
+                        detail: format!(
+                            "bulk import session {} was replaced by {}",
+                            session.session_id, persisted.session_id
+                        ),
+                    });
+                }
+                if persisted.phase == BulkImportSessionPhase::Ready {
+                    return Ok((persisted, false));
+                }
+                if persisted.phase != BulkImportSessionPhase::CatchingUp
+                    || persisted.target_append_seq != session.target_append_seq
+                    || persisted.target_observation_count != session.target_observation_count
+                {
+                    return Err(SelfHostError::Ingestion(format!(
+                        "bulk import session {} changed while catch-up was running",
+                        session.session_id
+                    )));
+                }
+                let stats = persistence.observation_stats()?;
+                if stats.max_append_seq != persisted.target_append_seq
+                    || stats.count != persisted.target_observation_count
+                {
+                    return Err(SelfHostError::Ingestion(format!(
+                        "canonical observation high-water changed before bulk import session {} publication",
+                        persisted.session_id
+                    )));
+                }
+                persisted.complete(stats, Utc::now())?;
+                persist_bulk_import_session(persistence.as_ref(), &persisted)?;
+                Ok((persisted, true))
+            })()
+        };
+        let (completed_session, completed_here) = match ready_result {
+            Ok(result) => result,
+            Err(error) => {
+                self.mark_live_core_non_corpus_materializations_stale()?;
+                return Err(error);
             }
-            session.complete(stats, Utc::now())?;
-            persist_bulk_import_session(self.persistence_lock()?.as_ref(), &session)
-        })();
-        if let Err(error) = ready_result {
-            self.mark_live_core_non_corpus_materializations_stale()?;
-            return Err(error);
-        }
+        };
+        session = completed_session;
         let report = session.report();
+        if !completed_here {
+            return Ok(report);
+        }
         self.emit_audit(
             "actor:self-host",
             AuditEventKind::WriteExecution,

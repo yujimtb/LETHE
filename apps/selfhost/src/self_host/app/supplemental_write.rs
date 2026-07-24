@@ -35,12 +35,12 @@ impl AppService {
         &self,
         request: SupplementalWriteRequest,
     ) -> Result<SupplementalRecord, SelfHostError> {
-        let _bulk_import_operation = self.bulk_import_operation_lock()?;
+        let _non_bulk_projection_operation =
+            self.non_bulk_projection_operation_lock("supplemental write")?;
         let _derived_lane = self
             .derived_projection_lane
             .lock()
             .map_err(|_| SelfHostError::LockPoisoned)?;
-        self.ensure_bulk_import_session_inactive("supplemental write")?;
         validate_supplemental_id(&request.id)?;
 
         let payload_bytes = serde_json::to_vec(&request.payload)?.len();

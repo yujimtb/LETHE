@@ -12,6 +12,7 @@
 - Linux コンテナ向け RSS/VmHWM 受入ハーネスと、publish 回数・上限・re-consent・実 v10 manifest・migration 等価性の回帰テストを追加する。
 - v15.2 では boot ごとの schema migration 適用結果と materialized snapshot の復元判定を分離し、現行 manifest の再起動では保存 snapshot を復元する。復元を拒否する場合は理由を捨てずに記録する。
 - v15.2 では background non-corpus rebuild の SQLite writer mutex 保持を page/commit 単位へ分割する。rebuild 中の通常 import は canonical append と per-item 結果までを有界時間で返し、投影 tail は既存 append consumer が非同期に追跡する。
+- v15.2 follow-up では source sync/supplemental/bulk end が `bulk_import_operation` を保持したまま derived lane、検索 catch-up、background rebuild 完了を待つ convoy を除去する。空 Google Slides source の sync は canonical 全件 scan を行わない。
 
 ## Capabilities
 
@@ -26,7 +27,7 @@
 ## Impact
 
 - 主対象: `apps/selfhost/src/self_host/server.rs`、`apps/selfhost/src/self_host/config.rs`、`apps/selfhost/src/self_host/app/{mod.rs,service_support.rs,projection_api.rs}`、`crates/projections/cognition/src/lib.rs`、`crates/storage/sqlite/src/persistence/schema.rs`。
-- v15.2 追加対象: `apps/selfhost/src/self_host/app/bulk_import.rs`、`crates/storage/sqlite/src/persistence/{mod.rs,schema.rs,tests.rs}`。
+- v15.2 追加対象: `apps/selfhost/src/self_host/app/{bulk_import.rs,sync.rs,supplemental_write.rs}`、`crates/storage/sqlite/src/persistence/{mod.rs,schema.rs,tests.rs}`。
 - テスト/運用: selfhost app/API tests、cognition projection tests、SQLite migration tests、`scripts/` または `tests/` の memory harness。
 - System Laws: Append-Only Law、Replay Law、Filtering-before-Exposure Law を維持する。AppCore の書込/読取分離と deep clone 全廃は次期候補として残し、v15 では publish 回数と常駐複製を bounded にする。
 - SQLite DDL は変更しないため schema version は据え置く。manifest version の不一致は fail-fast 再構築に限定する。

@@ -191,3 +191,21 @@ import timing は少なくとも `bulk_operation_lock_wait_ms`、`persistence_lo
 - **WHEN** rebuild の固定 high-water より後に Observation が append される
 - **THEN** base rebuild の各 canonical/privacy page は固定 high-water 以下だけを fold する
 - **AND** base を全件再試行せず、tail は append sequence 順の consumer に一度だけ渡される
+
+### Requirement: Source sync cannot convoy normal import behind rebuild
+
+source sync と supplemental write は bulk session が inactive であることを短い admission handshake で確定しなければならない。この handshake 後は `bulk_import_operation` mutex を解放し、derived projection lane の取得、source fetch、canonical scan、retention、materialization、検索 catch-up の間に保持してはならない。bulk session begin は進行中の non-bulk projection operation を待たず conflict として fail-fast にしなければならない。
+
+bulk session end は persisted phase を `CatchingUp` に遷移した後、検索 catch-up と background rebuild の完了を待つ前に `bulk_import_operation` mutex を解放しなければならない。最終 watermark を検証して `Ready` にする短い永続化区間だけ mutex を再取得する。通常 import の admission、durable append、per-item 分類、response は source sync、検索 catch-up、background rebuild の完了を待ってはならない。
+
+#### Scenario: rebuild と空-source sync の進行中も v1 import が応答する
+
+- **WHEN** background non-corpus rebuild が derived projection lane を保持し、source が空の定期 sync cycle も開始されている
+- **THEN** 単発 v1 import は synthetic test で5秒以内に durable append と `ingested` 結果を返す
+- **AND** sync は `bulk_import_operation` を保持したまま derived lane または rebuild 完了を待たない
+
+#### Scenario: 空の Google Slides source は canonical scan を行わない
+
+- **WHEN** configured Google Slides runtime source が一件もない状態で source sync を実行する
+- **THEN** latest workspace slide observation の探索は空集合を即時返す
+- **AND** canonical observation pages を全件走査しない
