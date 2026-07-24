@@ -446,6 +446,31 @@ BULK_SESSION_RETRYABLE_CONFLICT_CODES = {
 }
 
 
+class ProjectionStaleError(TransientImportError):
+    """HTTP 503 ``projection_stale`` from a bulk-session ``end`` call.
+
+    Per apps/selfhost/src/self_host/server.rs's mapping of
+    ``SelfHostError::ProjectionStale`` (via
+    ``ErrorResponse::projection_stale``, crates/api/src/api/envelope.rs),
+    this is the server's documented response when the non-corpus
+    projection rebuild that ``end`` triggers has not finished within its
+    own internal wait window — not a failure. At corpus scale (observed
+    ~25-30min at 568k observations) this is *expected* to repeat for a
+    long time. It must never be capped the same way as a generic
+    transient failure (3 consecutive ~60s server-side windows is only
+    ~3 minutes — nowhere near enough for a legitimate multi-tens-of-
+    minutes rebuild) and must instead be polled at ``retry_after_seconds``
+    (server default 30s, always present for this specific error code)
+    against a dedicated budget.
+    """
+
+    def __init__(
+        self, message: str, *, elapsed_seconds: float, retry_after_seconds: float
+    ) -> None:
+        super().__init__(message, elapsed_seconds=elapsed_seconds, status_code=503)
+        self.retry_after_seconds = retry_after_seconds
+
+
 def _parse_error_code(body_text: str) -> str | None:
     """Read the ``error`` field from a JSON ErrorResponse body, if present."""
     try:
@@ -682,6 +707,18 @@ class ImportClient:
                     conflict_code=conflict_code,
                 )
             raise ImportRequestError(status_code, body_text)
+        if status_code == 503:
+            body_text = getattr(response, "text", "")
+            error_code = _parse_error_code(body_text)
+            if error_code == "projection_stale":
+                retry_after = _parse_retry_after_seconds(body_text, default_seconds=30.0)
+                raise ProjectionStaleError(
+                    f"HTTP 503 projection_stale after {elapsed:.1f}s "
+                    f"(retry_after={retry_after:.1f}s): {body_text[:300]}",
+                    elapsed_seconds=elapsed,
+                    retry_after_seconds=retry_after,
+                )
+            # any other 503 reason falls through to the generic >=500 handling
         if status_code >= 500:
             body_text = getattr(response, "text", "<no body>")
             raise TransientImportError(
@@ -889,6 +926,96 @@ def call_bulk_session_with_retry(
                     f"{context}: {timeout_streak} consecutive transient bulk-session "
                     f"call failures (timeout/connection-error/5xx), aborting: {error}"
                 ) from error
+
+
+@dataclass
+class EndBulkSessionRebuildOutcome:
+    """Result of wait_for_end_bulk_session_rebuild: the eventual success,
+    cumulative wait time, and every projection_stale/transient poll along
+    the way."""
+
+    result: BulkSessionResult
+    attempts: int
+    end_rebuild_wait_seconds: float
+    projection_stale_events: list[dict[str, Any]]
+    transient_events: list[dict[str, Any]]
+
+
+def wait_for_end_bulk_session_rebuild(
+    client: "ImportClient",
+    session_id: str,
+    *,
+    rebuild_timeout_seconds: float = 3600.0,
+    default_poll_seconds: float = 30.0,
+    context: str,
+    on_projection_stale: Any = None,
+    on_transient: Any = None,
+) -> EndBulkSessionRebuildOutcome:
+    """Poll ``POST .../bulk-sessions/{session_id}/end`` until it succeeds,
+    tolerant of HTTP 503 ``projection_stale`` — the corpus-scale non-corpus
+    rebuild ``end`` triggers is *expected* to still be running (observed
+    ~25-30min at 568k observations), unlike test 1b's dup-only sessions
+    where a fast `end` is the pass criterion.
+
+    Bounded by its own ``rebuild_timeout_seconds`` budget, separate from
+    --ack-timeout-seconds, with **no consecutive-failure cap** on either
+    ``ProjectionStaleError`` or generic ``TransientImportError`` — capping
+    this the same way as a normal transient failure (a handful of ~60s
+    server-side windows) is what caused the gate to give up on a
+    legitimate ~30min rebuild after about 3 minutes. Only the shared
+    budget bounds it; a non-transient failure (hard 4xx, or an
+    unrecognized 409/503 reason) still raises immediately, not retried.
+    """
+    deadline = time.monotonic() + rebuild_timeout_seconds
+    started = time.monotonic()
+    attempt = 0
+    projection_stale_events: list[dict[str, Any]] = []
+    transient_events: list[dict[str, Any]] = []
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise GateError(
+                f"{context}: end did not complete within "
+                f"--bulk-end-rebuild-timeout-seconds ({rebuild_timeout_seconds:.0f}s); "
+                f"{len(projection_stale_events)} projection_stale polls, "
+                f"{len(transient_events)} other transient failures"
+            )
+        attempt += 1
+        end_timeout = max(min(1800.0, remaining), 5.0)
+        try:
+            result = client.end_bulk_session(session_id, timeout=end_timeout)
+        except ProjectionStaleError as error:
+            event = {
+                "attempt": attempt,
+                "elapsed_seconds": error.elapsed_seconds,
+                "retry_after_seconds": error.retry_after_seconds,
+                "message": str(error),
+            }
+            projection_stale_events.append(event)
+            if on_projection_stale is not None:
+                on_projection_stale(event)
+            time.sleep(min(error.retry_after_seconds, max(remaining, 0.1)))
+            continue
+        except TransientImportError as error:
+            event = {
+                "attempt": attempt,
+                "elapsed_seconds": error.elapsed_seconds,
+                "status_code": error.status_code,
+                "message": str(error),
+            }
+            transient_events.append(event)
+            if on_transient is not None:
+                on_transient(event)
+            time.sleep(min(default_poll_seconds, max(remaining, 0.1)))
+            continue
+        end_rebuild_wait_seconds = time.monotonic() - started
+        return EndBulkSessionRebuildOutcome(
+            result=result,
+            attempts=attempt,
+            end_rebuild_wait_seconds=end_rebuild_wait_seconds,
+            projection_stale_events=projection_stale_events,
+            transient_events=transient_events,
+        )
 
 
 def assert_no_failures(counts: OutcomeCounts, *, context: str) -> None:
