@@ -409,6 +409,53 @@ class ImportConcurrencyLimitError(TransientImportError):
         self.retry_after_seconds = retry_after_seconds
 
 
+class BulkSessionConflictError(TransientImportError):
+    """HTTP 409 from a bulk-session begin/end call whose error code is a
+    known *transient* state, not a real usage error.
+
+    Confirmed codes (apps/selfhost/src/self_host/app/bulk_import.rs):
+    ``bulk_import_session_active`` — another session is open, which for our
+    own strictly-serialized begin/import/end usage most often means an
+    earlier ``begin`` whose *client* gave up on a timeout while the server
+    went on to create the session anyway (the same orphan pattern as HTTP
+    429 import_concurrency_limit — see ImportConcurrencyLimitError), or a
+    brief lock hold-over from the immediately preceding ``end``.
+    ``bulk_import_non_bulk_projection_active`` is included per a live-run
+    report of this exact 409 code from the bulk-session endpoints; its
+    construction site was not found in this checkout at the time this was
+    written; a background (non-bulk-session) projection rebuild being
+    briefly active is a plausible, transient cause consistent with its
+    name. If the server ever emits it with different casing/spelling this
+    allowlist needs a follow-up correction.
+
+    These codes carry no ``retry_after`` in the response body (unlike HTTP
+    429), so a short fixed wait is used instead. Retried up to a bounded
+    count, never treated as a hard 4xx failure — any *other* 409 code
+    (e.g. ``bulk_import_session_mismatch``, a real logic error) is not in
+    this set and still raises ImportRequestError immediately.
+    """
+
+    def __init__(self, message: str, *, elapsed_seconds: float, conflict_code: str) -> None:
+        super().__init__(message, elapsed_seconds=elapsed_seconds, status_code=409)
+        self.conflict_code = conflict_code
+
+
+BULK_SESSION_RETRYABLE_CONFLICT_CODES = {
+    "bulk_import_session_active",
+    "bulk_import_non_bulk_projection_active",
+}
+
+
+def _parse_error_code(body_text: str) -> str | None:
+    """Read the ``error`` field from a JSON ErrorResponse body, if present."""
+    try:
+        payload = json.loads(body_text)
+        value = payload.get("error") if isinstance(payload, dict) else None
+        return value if isinstance(value, str) else None
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
 def _parse_retry_after_seconds(body_text: str, default_seconds: float = 1.0) -> float:
     """Read ``retry_after`` (seconds) from a 429 response body, matching the
     server's ErrorResponse shape ({"error", "detail", "details",
@@ -470,25 +517,48 @@ class BulkSessionResult:
 SESSION_API_UNAVAILABLE_STATUS_CODES = {401, 403, 404, 405, 501}
 
 
+# Windows Docker Desktop's loopback port proxy has been observed to stall
+# HTTP keep-alive connection reuse at the transport layer: a request whose
+# server-side handler logged 349ms of actual work took 241s to return to
+# the client, with zero server-side activity for the intervening ~4
+# minutes — i.e. the stall was in transport, before the request ever
+# reached the handler. Every request therefore forces a fresh connection
+# (``Connection: close``, plus disabling httpx's keepalive pool outright)
+# rather than reusing one. The performance cost of a fresh TCP+TLS-less
+# loopback connection per request is negligible for this gate's purposes.
+_NO_KEEPALIVE_HEADERS = {"Connection": "close"}
+if _HTTP_BACKEND == "httpx":
+    _NO_KEEPALIVE_LIMITS = _httpx.Limits(  # type: ignore[union-attr]
+        max_keepalive_connections=0, max_connections=1
+    )
+
+
 def _http_post_json(
     url: str, json_body: dict[str, Any], headers: dict[str, str], timeout: float
 ) -> tuple[int, Any]:
+    request_headers = {**headers, **_NO_KEEPALIVE_HEADERS}
     if _HTTP_BACKEND == "httpx":
-        with _httpx.Client(timeout=timeout) as client:  # type: ignore[union-attr]
-            response = client.post(url, json=json_body, headers=headers)
+        with _httpx.Client(  # type: ignore[union-attr]
+            timeout=timeout, limits=_NO_KEEPALIVE_LIMITS
+        ) as client:
+            response = client.post(url, json=json_body, headers=request_headers)
             return response.status_code, response
     response = _requests.post(  # type: ignore[union-attr]
-        url, json=json_body, headers=headers, timeout=timeout
+        url, json=json_body, headers=request_headers, timeout=timeout
     )
     return response.status_code, response
 
 
 def _http_get(url: str, timeout: float) -> tuple[int, Any]:
     if _HTTP_BACKEND == "httpx":
-        with _httpx.Client(timeout=timeout) as client:  # type: ignore[union-attr]
-            response = client.get(url)
+        with _httpx.Client(  # type: ignore[union-attr]
+            timeout=timeout, limits=_NO_KEEPALIVE_LIMITS
+        ) as client:
+            response = client.get(url, headers=_NO_KEEPALIVE_HEADERS)
             return response.status_code, response
-    response = _requests.get(url, timeout=timeout)  # type: ignore[union-attr]
+    response = _requests.get(  # type: ignore[union-attr]
+        url, headers=_NO_KEEPALIVE_HEADERS, timeout=timeout
+    )
     return response.status_code, response
 
 
@@ -588,11 +658,37 @@ class ImportClient:
             "Authorization": f"Bearer {self._token}",
             "Content-Type": "application/json",
         }
+        request_timeout = timeout or self.default_timeout
         started = time.monotonic()
-        status_code, response = _http_post_json(
-            url, {}, headers, timeout or self.default_timeout
-        )
+        try:
+            status_code, response = _http_post_json(url, {}, headers, request_timeout)
+        except Exception as error:
+            elapsed = time.monotonic() - started
+            if _is_transient_network_error(error):
+                raise TransientImportError(
+                    f"{type(error).__name__} after {elapsed:.1f}s "
+                    f"(request timeout was {request_timeout:.1f}s): {error}",
+                    elapsed_seconds=elapsed,
+                ) from error
+            raise
         elapsed = time.monotonic() - started
+        if status_code == 409:
+            body_text = getattr(response, "text", "")
+            conflict_code = _parse_error_code(body_text)
+            if conflict_code in BULK_SESSION_RETRYABLE_CONFLICT_CODES:
+                raise BulkSessionConflictError(
+                    f"HTTP 409 {conflict_code} after {elapsed:.1f}s: {body_text[:300]}",
+                    elapsed_seconds=elapsed,
+                    conflict_code=conflict_code,
+                )
+            raise ImportRequestError(status_code, body_text)
+        if status_code >= 500:
+            body_text = getattr(response, "text", "<no body>")
+            raise TransientImportError(
+                f"HTTP {status_code} after {elapsed:.1f}s: {body_text[:300]}",
+                elapsed_seconds=elapsed,
+                status_code=status_code,
+            )
         if status_code != 200:
             body_text = getattr(response, "text", "<no body>")
             raise ImportRequestError(status_code, body_text)
@@ -701,6 +797,97 @@ def send_drafts_with_retry(
                 raise GateError(
                     f"{context}: {timeout_streak} consecutive transient import "
                     f"failures (timeout/connection-error/5xx), aborting: {error}"
+                ) from error
+
+
+@dataclass
+class BulkSessionRetryOutcome:
+    """Result of call_bulk_session_with_retry: the eventual success, plus a
+    record of any transient (timeout/connection/5xx) and retryable-409
+    attempts that preceded it."""
+
+    result: BulkSessionResult
+    attempts: int
+    transient_events: list[dict[str, Any]]
+    conflict_events: list[dict[str, Any]]
+
+
+def call_bulk_session_with_retry(
+    call: Any,
+    *,
+    max_consecutive_timeouts: int = 3,
+    max_consecutive_conflict_retries: int = 10,
+    conflict_wait_seconds: float = 1.5,
+    context: str,
+    on_transient: Any = None,
+    on_conflict: Any = None,
+) -> BulkSessionRetryOutcome:
+    """Call a zero-argument bulk-session begin/end closure, retrying on
+    transient failures.
+
+    Same two-independent-streak policy as send_drafts_with_retry:
+
+    - timeout / connection-error / 5xx: retried immediately, up to
+      ``max_consecutive_timeouts`` in a row.
+    - HTTP 409 with a known-transient conflict code (see
+      BulkSessionConflictError / BULK_SESSION_RETRYABLE_CONFLICT_CODES):
+      retried after a short fixed ``conflict_wait_seconds`` (these codes
+      carry no server-provided retry_after), up to
+      ``max_consecutive_conflict_retries`` in a row.
+
+    Each streak resets on any event of the *other* kind (or on success). A
+    409 with an unrecognized code, or any other non-2xx status, raises
+    ImportRequestError immediately from inside ``call()`` — never retried.
+    """
+    transient_events: list[dict[str, Any]] = []
+    conflict_events: list[dict[str, Any]] = []
+    timeout_streak = 0
+    conflict_streak = 0
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            result = call()
+            return BulkSessionRetryOutcome(
+                result=result,
+                attempts=attempt,
+                transient_events=transient_events,
+                conflict_events=conflict_events,
+            )
+        except BulkSessionConflictError as error:
+            conflict_streak += 1
+            timeout_streak = 0
+            event = {
+                "attempt": attempt,
+                "elapsed_seconds": error.elapsed_seconds,
+                "conflict_code": error.conflict_code,
+                "message": str(error),
+            }
+            conflict_events.append(event)
+            if on_conflict is not None:
+                on_conflict(event)
+            if conflict_streak >= max_consecutive_conflict_retries:
+                raise GateError(
+                    f"{context}: {conflict_streak} consecutive HTTP 409 "
+                    f"{error.conflict_code} responses, aborting: {error}"
+                ) from error
+            time.sleep(conflict_wait_seconds)
+        except TransientImportError as error:
+            timeout_streak += 1
+            conflict_streak = 0
+            event = {
+                "attempt": attempt,
+                "elapsed_seconds": error.elapsed_seconds,
+                "status_code": error.status_code,
+                "message": str(error),
+            }
+            transient_events.append(event)
+            if on_transient is not None:
+                on_transient(event)
+            if timeout_streak >= max_consecutive_timeouts:
+                raise GateError(
+                    f"{context}: {timeout_streak} consecutive transient bulk-session "
+                    f"call failures (timeout/connection-error/5xx), aborting: {error}"
                 ) from error
 
 
