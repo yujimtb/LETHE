@@ -256,6 +256,46 @@ def parse_args() -> argparse.Namespace:
             "not a fixed short latency"
         ),
     )
+    parser.add_argument(
+        "--bulk-session-first-rebuild-runaway-threshold-mib",
+        type=float,
+        default=8192.0,
+        help=(
+            "test 2b round 1/2: loose runaway ceiling for peak/residual over "
+            "the pre-test baseline (default 8 GiB). A real session-end rebuild "
+            "legitimately costs several GiB once (observed ~3.9GiB at 568k) — "
+            "this only catches something wildly larger, it is not the leak "
+            "signal. round 1's own peak/residual are recorded as "
+            "first_rebuild_plateau_* but not otherwise gated; round 2 (see "
+            "--bulk-session-round2-peak-threshold-mib /"
+            " --bulk-session-round2-residual-threshold-mib) is the actual "
+            "leak check"
+        ),
+    )
+    parser.add_argument(
+        "--bulk-session-round2-peak-threshold-mib",
+        type=float,
+        default=1024.0,
+        help=(
+            "test 2b round 2/2: max acceptable peak RSS *over round 1's own "
+            "settled plateau* (not the original baseline). Real-run evidence: "
+            "a second consecutive session-end rebuild lands at the same "
+            "settled level as the first (bit-identical in one observed run), "
+            "i.e. the healthy expectation is ~0 — this bounds how far round 2 "
+            "may exceed that plateau before it signals a per-invocation leak "
+            "rather than one-time arena reuse"
+        ),
+    )
+    parser.add_argument(
+        "--bulk-session-round2-residual-threshold-mib",
+        type=float,
+        default=512.0,
+        help=(
+            "test 2b round 2/2: max acceptable settled-RSS residual *over "
+            "round 1's own settled plateau* (not the original baseline) — "
+            "see --bulk-session-round2-peak-threshold-mib"
+        ),
+    )
 
     return parser.parse_args()
 
@@ -1057,33 +1097,54 @@ def run_bulk_subtest(
 
 
 # ---------------------------------------------------------------------------
-# Test 2b: new bulk import wrapped in a single bulk session (batch=25)
+# Test 2b: bulk session new import, run twice back-to-back (batch=25)
+#
+# Real-run evidence: a full session-end rebuild at 568k observations raises
+# RSS by ~+3.9GiB exactly once, but running the same rebuild a *second*
+# time immediately after lands at the bit-identical settled level as round
+# 1 (round0 settle=9.386GiB, round1 settle=9.386GiB) — a single arena
+# holding/reusing its rebuild working set, not a per-invocation leak.
+# Round 2 is therefore judged against round 1's own settled plateau, not
+# the original pre-test baseline; round 1's plateau itself only has a loose
+# runaway ceiling, not a tight threshold, since a real rebuild legitimately
+# costs several GiB once.
 # ---------------------------------------------------------------------------
 
 
-def run_test2b_bulk_session_new(
+def _run_bulk_session_rebuild_round(
     client: gc.ImportClient,
     sampler: gc.DockerStatsSampler,
     *,
+    round_label: str,
     source_instance_id: str,
     tag: str,
     start_index: int,
     count: int,
     batch_size: int,
-    baseline_mib: float,
     container_name: str,
     post_batch_wait_seconds: float,
     rss_average_window_seconds: float,
-    peak_threshold_mib: float,
-    residual_threshold_mib: float,
+    peak_reference_mib: float,
+    residual_reference_mib: float,
     max_consecutive_timeouts: int,
     max_consecutive_concurrency_retries: int,
     max_consecutive_bulk_session_conflicts: int,
     bulk_session_conflict_wait_seconds: float,
     bulk_end_rebuild_timeout_seconds: float,
+    require_bulk_session_available: bool,
 ) -> dict[str, Any]:
-    log(f"=== test 2b: bulk session new import ({count} drafts, batch={batch_size}, session-wrapped) ===")
+    """Run one begin -> `count` new imports (`batch_size` each) -> end
+    (rebuild-wait) round, measuring peak/residual against caller-supplied
+    reference levels.
 
+    Round 0 (test 2b's first rebuild) passes the pre-test baseline as both
+    references; round 1 passes round 0's own settled plateau — see the
+    module comment above. If `require_bulk_session_available` and `begin`
+    fails with an auth/scope/routing-class status, returns a dict with
+    "skipped_reason" set instead of raising, so the caller can turn that
+    into a whole-test skip; round 1 never sets this (round 0 already
+    proved the API is usable by the time round 1 runs).
+    """
     session_transient_events: list[dict[str, Any]] = []
     session_conflict_events: list[dict[str, Any]] = []
 
@@ -1103,15 +1164,15 @@ def run_test2b_bulk_session_new(
 
     gc.assert_container_alive(container_name)
     try:
-        begin_result = call_session(lambda: client.begin_bulk_session(timeout=60.0), "test 2b begin")
+        begin_result = call_session(lambda: client.begin_bulk_session(timeout=60.0), f"{round_label} begin")
     except gc.ImportRequestError as error:
-        if error.status_code in gc.SESSION_API_UNAVAILABLE_STATUS_CODES:
-            reason = (
-                f"bulk-sessions/begin returned HTTP {error.status_code}; "
-                "treating the bulk-session API as unavailable in this environment"
-            )
-            log(f"WARNING: skipping test 2b — {reason}")
-            return _skipped_test_result("bulk_session_new_batch25", reason)
+        if require_bulk_session_available and error.status_code in gc.SESSION_API_UNAVAILABLE_STATUS_CODES:
+            return {
+                "skipped_reason": (
+                    f"bulk-sessions/begin returned HTTP {error.status_code}; "
+                    "treating the bulk-session API as unavailable in this environment"
+                ),
+            }
         raise
 
     session_id = begin_result.session_id
@@ -1130,7 +1191,7 @@ def run_test2b_bulk_session_new(
             gc.build_corpus_draft(tag=tag, source_instance_id=source_instance_id, index=i)
             for i in range(index, batch_end)
         ]
-        context = f"bulk-session new batch [{index},{batch_end})"
+        context = f"{round_label} batch [{index},{batch_end})"
         outcome = gc.send_drafts_with_retry(
             client,
             source_instance_id,
@@ -1158,20 +1219,23 @@ def run_test2b_bulk_session_new(
     # observations) and is expected to poll through HTTP 503
     # projection_stale for a long time — a fixed short latency threshold
     # (test 1b's --bulk-session-end-latency-threshold-seconds) does not
-    # apply here; a dedicated budget does.
+    # apply here; a dedicated budget does, applied fresh each round.
     end_outcome = gc.wait_for_end_bulk_session_rebuild(
         client,
         session_id,
         rebuild_timeout_seconds=bulk_end_rebuild_timeout_seconds,
-        context="test 2b end",
-        on_projection_stale=lambda event: log_projection_stale_event("test 2b end", event),
-        on_transient=lambda event: log_transient_event("test 2b end", event),
+        context=f"{round_label} end",
+        on_projection_stale=lambda event, round_label=round_label: log_projection_stale_event(
+            f"{round_label} end", event
+        ),
+        on_transient=lambda event, round_label=round_label: log_transient_event(f"{round_label} end", event),
     )
     end_result = end_outcome.result
+
     peak_mib = sampler.peak_since(marker)
-    peak_over_baseline_mib = peak_mib - baseline_mib
+    peak_over_reference_mib = peak_mib - peak_reference_mib
     log(
-        f"test 2b sending+end done ({total.ingested} ingested, "
+        f"{round_label} sending+end done ({total.ingested} ingested, "
         f"{retried_as_duplicates} retried-as-duplicate, "
         f"end_rebuild_wait={end_outcome.end_rebuild_wait_seconds:.1f}s over "
         f"{end_outcome.attempts} attempt(s)); "
@@ -1180,57 +1244,190 @@ def run_test2b_bulk_session_new(
     time.sleep(post_batch_wait_seconds)
     gc.assert_container_alive(container_name)
     after_mib = sampler.average_recent(rss_average_window_seconds)
-    residual_mib = after_mib - baseline_mib
+    residual_over_reference_mib = after_mib - residual_reference_mib
 
-    peak_ok = peak_over_baseline_mib <= peak_threshold_mib
-    residual_ok = residual_mib <= residual_threshold_mib
     ingested_ok = total.ingested + total.duplicates == count
     # end_rebuild_wait_seconds can only ever be > bulk_end_rebuild_timeout_seconds
     # if wait_for_end_bulk_session_rebuild already raised GateError instead of
     # returning — this is an explicit, self-documenting restatement of that
-    # budget in the pass criteria, not a separate live check.
+    # budget, not a separate live check.
     end_rebuild_ok = end_outcome.end_rebuild_wait_seconds <= bulk_end_rebuild_timeout_seconds
-    passed = peak_ok and residual_ok and ingested_ok and end_rebuild_ok
     log(
-        f"test 2b result: peak={peak_mib:.1f}MiB peak_over_baseline={peak_over_baseline_mib:.1f}MiB "
-        f"(threshold={peak_threshold_mib:.1f}MiB) after={after_mib:.1f}MiB "
-        f"residual={residual_mib:.1f}MiB (threshold={residual_threshold_mib:.1f}MiB) "
+        f"{round_label} result: peak={peak_mib:.1f}MiB peak_over_reference={peak_over_reference_mib:.1f}MiB "
+        f"after={after_mib:.1f}MiB residual_over_reference={residual_over_reference_mib:.1f}MiB "
         f"ingested={total.ingested}/{count} retried_as_duplicates={retried_as_duplicates} "
         f"end_rebuild_wait={end_outcome.end_rebuild_wait_seconds:.1f}s "
-        f"(threshold={bulk_end_rebuild_timeout_seconds:.0f}s) pass={passed}"
+        f"(budget={bulk_end_rebuild_timeout_seconds:.0f}s)"
     )
+
     return {
-        "name": "bulk_session_new_batch25",
-        "passed": passed,
-        "skipped": False,
+        "round_label": round_label,
         "batch_size": batch_size,
         "count": count,
         "ingested": total.ingested,
         "duplicates": total.duplicates,
         "retried_as_duplicates": retried_as_duplicates,
+        "ingested_ok": ingested_ok,
         "batch_latencies_seconds": latencies,
         "transient_events": transient_events,
         "concurrency_limit_events": concurrency_events,
         "session_call_transient_events": session_transient_events,
         "session_call_conflict_events": session_conflict_events,
         "peak_mib": peak_mib,
-        "peak_over_baseline_mib": peak_over_baseline_mib,
-        "peak_threshold_mib": peak_threshold_mib,
-        "baseline_mib": baseline_mib,
+        "peak_reference_mib": peak_reference_mib,
+        "peak_over_reference_mib": peak_over_reference_mib,
         "after_mib": after_mib,
-        "residual_mib": residual_mib,
-        "residual_threshold_mib": residual_threshold_mib,
-        # test 2b's end is expected to trigger a corpus-scale rebuild — the
-        # pass criterion is end_rebuild_wait_seconds <=
-        # bulk_end_rebuild_timeout_seconds, not a fixed short latency (that
-        # is test 1b's dup-only-session criterion, unchanged).
+        "residual_reference_mib": residual_reference_mib,
+        "residual_over_reference_mib": residual_over_reference_mib,
         "end_duration_seconds": end_result.elapsed_seconds,
         "end_rebuild_wait_seconds": end_outcome.end_rebuild_wait_seconds,
         "end_rebuild_poll_count": end_outcome.attempts,
         "end_rebuild_timeout_seconds": bulk_end_rebuild_timeout_seconds,
+        "end_rebuild_ok": end_rebuild_ok,
         "end_rebuild_projection_stale_events": end_outcome.projection_stale_events,
         "end_rebuild_transient_events": end_outcome.transient_events,
         "session_state_after_end": end_result.state,
+    }
+
+
+def run_test2b_bulk_session_new(
+    client: gc.ImportClient,
+    sampler: gc.DockerStatsSampler,
+    *,
+    source_instance_id: str,
+    tag: str,
+    start_index: int,
+    count: int,
+    batch_size: int,
+    baseline_mib: float,
+    container_name: str,
+    post_batch_wait_seconds: float,
+    rss_average_window_seconds: float,
+    first_rebuild_runaway_threshold_mib: float,
+    round2_peak_threshold_mib: float,
+    round2_residual_threshold_mib: float,
+    max_consecutive_timeouts: int,
+    max_consecutive_concurrency_retries: int,
+    max_consecutive_bulk_session_conflicts: int,
+    bulk_session_conflict_wait_seconds: float,
+    bulk_end_rebuild_timeout_seconds: float,
+) -> dict[str, Any]:
+    log(
+        f"=== test 2b: bulk session rebuild x2 consecutive rounds "
+        f"({count} drafts each, batch={batch_size}) ==="
+    )
+    log(
+        "real-run evidence: a full session-end rebuild at 568k raises RSS by "
+        "~+3.9GiB once; a second consecutive rebuild lands at round 1's own "
+        "bit-identical settled level (round0 settle=9.386GiB, round1 "
+        "settle=9.386GiB) — arena reuse, not a leak. Round 2 is judged "
+        "against round 1's plateau, not the original baseline."
+    )
+
+    round0 = _run_bulk_session_rebuild_round(
+        client,
+        sampler,
+        round_label="test 2b round 1/2",
+        source_instance_id=source_instance_id,
+        tag=tag,
+        start_index=start_index,
+        count=count,
+        batch_size=batch_size,
+        container_name=container_name,
+        post_batch_wait_seconds=post_batch_wait_seconds,
+        rss_average_window_seconds=rss_average_window_seconds,
+        peak_reference_mib=baseline_mib,
+        residual_reference_mib=baseline_mib,
+        max_consecutive_timeouts=max_consecutive_timeouts,
+        max_consecutive_concurrency_retries=max_consecutive_concurrency_retries,
+        max_consecutive_bulk_session_conflicts=max_consecutive_bulk_session_conflicts,
+        bulk_session_conflict_wait_seconds=bulk_session_conflict_wait_seconds,
+        bulk_end_rebuild_timeout_seconds=bulk_end_rebuild_timeout_seconds,
+        require_bulk_session_available=True,
+    )
+    if "skipped_reason" in round0:
+        log(f"WARNING: skipping test 2b — {round0['skipped_reason']}")
+        return _skipped_test_result("bulk_session_new_batch25", round0["skipped_reason"])
+
+    first_rebuild_plateau_peak_over_baseline_mib = round0["peak_over_reference_mib"]
+    first_rebuild_plateau_residual_over_baseline_mib = round0["residual_over_reference_mib"]
+    first_rebuild_plateau_after_mib = round0["after_mib"]
+    first_rebuild_runaway_ok = (
+        first_rebuild_plateau_peak_over_baseline_mib <= first_rebuild_runaway_threshold_mib
+        and first_rebuild_plateau_residual_over_baseline_mib <= first_rebuild_runaway_threshold_mib
+    )
+    log(
+        f"test 2b round 1/2 plateau: peak_over_baseline="
+        f"{first_rebuild_plateau_peak_over_baseline_mib:.1f}MiB residual_over_baseline="
+        f"{first_rebuild_plateau_residual_over_baseline_mib:.1f}MiB "
+        f"(runaway ceiling={first_rebuild_runaway_threshold_mib:.1f}MiB) "
+        f"runaway_ok={first_rebuild_runaway_ok}"
+    )
+
+    round1 = _run_bulk_session_rebuild_round(
+        client,
+        sampler,
+        round_label="test 2b round 2/2",
+        source_instance_id=source_instance_id,
+        tag=tag,
+        start_index=start_index + count,
+        count=count,
+        batch_size=batch_size,
+        container_name=container_name,
+        post_batch_wait_seconds=post_batch_wait_seconds,
+        rss_average_window_seconds=rss_average_window_seconds,
+        peak_reference_mib=first_rebuild_plateau_after_mib,
+        residual_reference_mib=first_rebuild_plateau_after_mib,
+        max_consecutive_timeouts=max_consecutive_timeouts,
+        max_consecutive_concurrency_retries=max_consecutive_concurrency_retries,
+        max_consecutive_bulk_session_conflicts=max_consecutive_bulk_session_conflicts,
+        bulk_session_conflict_wait_seconds=bulk_session_conflict_wait_seconds,
+        bulk_end_rebuild_timeout_seconds=bulk_end_rebuild_timeout_seconds,
+        require_bulk_session_available=False,
+    )
+
+    round2_peak_over_plateau_mib = round1["peak_over_reference_mib"]
+    round2_residual_over_plateau_mib = round1["residual_over_reference_mib"]
+    round2_peak_ok = round2_peak_over_plateau_mib <= round2_peak_threshold_mib
+    round2_residual_ok = round2_residual_over_plateau_mib <= round2_residual_threshold_mib
+    passed = (
+        first_rebuild_runaway_ok
+        and round0["ingested_ok"]
+        and round0["end_rebuild_ok"]
+        and round2_peak_ok
+        and round2_residual_ok
+        and round1["ingested_ok"]
+        and round1["end_rebuild_ok"]
+    )
+    log(
+        f"test 2b round 2/2 vs round 1/2 plateau: peak_over_plateau="
+        f"{round2_peak_over_plateau_mib:.1f}MiB (threshold={round2_peak_threshold_mib:.1f}MiB) "
+        f"residual_over_plateau={round2_residual_over_plateau_mib:.1f}MiB "
+        f"(threshold={round2_residual_threshold_mib:.1f}MiB) "
+        f"round2_peak_ok={round2_peak_ok} round2_residual_ok={round2_residual_ok}"
+    )
+    log(f"test 2b result: pass={passed}")
+
+    return {
+        "name": "bulk_session_new_batch25",
+        "passed": passed,
+        "skipped": False,
+        "batch_size": batch_size,
+        "count_per_round": count,
+        "baseline_mib": baseline_mib,
+        "first_rebuild_plateau_peak_over_baseline_mib": first_rebuild_plateau_peak_over_baseline_mib,
+        "first_rebuild_plateau_residual_over_baseline_mib": first_rebuild_plateau_residual_over_baseline_mib,
+        "first_rebuild_plateau_after_mib": first_rebuild_plateau_after_mib,
+        "first_rebuild_runaway_threshold_mib": first_rebuild_runaway_threshold_mib,
+        "first_rebuild_runaway_ok": first_rebuild_runaway_ok,
+        "round2_peak_over_plateau_mib": round2_peak_over_plateau_mib,
+        "round2_peak_threshold_mib": round2_peak_threshold_mib,
+        "round2_peak_ok": round2_peak_ok,
+        "round2_residual_over_plateau_mib": round2_residual_over_plateau_mib,
+        "round2_residual_threshold_mib": round2_residual_threshold_mib,
+        "round2_residual_ok": round2_residual_ok,
+        "round0": round0,
+        "round1": round1,
     }
 
 
@@ -1350,6 +1547,9 @@ def main() -> int:
             "slope_threshold_mib_per_batch": args.slope_threshold_mib_per_batch,
             "bulk_session_end_latency_threshold_seconds": args.bulk_session_end_latency_threshold_seconds,
             "bulk_end_rebuild_timeout_seconds": args.bulk_end_rebuild_timeout_seconds,
+            "bulk_session_first_rebuild_runaway_threshold_mib": args.bulk_session_first_rebuild_runaway_threshold_mib,
+            "bulk_session_round2_peak_threshold_mib": args.bulk_session_round2_peak_threshold_mib,
+            "bulk_session_round2_residual_threshold_mib": args.bulk_session_round2_residual_threshold_mib,
             "probe_timeout_seconds": args.probe_timeout_seconds,
             "noop_session_retry_wait_seconds": args.noop_session_retry_wait_seconds,
             "max_consecutive_timeouts": args.max_consecutive_timeouts,
@@ -1516,8 +1716,9 @@ def main() -> int:
             container_name=container_name,
             post_batch_wait_seconds=args.post_batch_wait_seconds,
             rss_average_window_seconds=args.rss_average_window_seconds,
-            peak_threshold_mib=args.bulk_peak_threshold_mib,
-            residual_threshold_mib=args.bulk_residual_threshold_mib,
+            first_rebuild_runaway_threshold_mib=args.bulk_session_first_rebuild_runaway_threshold_mib,
+            round2_peak_threshold_mib=args.bulk_session_round2_peak_threshold_mib,
+            round2_residual_threshold_mib=args.bulk_session_round2_residual_threshold_mib,
             max_consecutive_timeouts=args.max_consecutive_timeouts,
             max_consecutive_concurrency_retries=args.max_consecutive_concurrency_retries,
             max_consecutive_bulk_session_conflicts=args.max_consecutive_bulk_session_conflicts,

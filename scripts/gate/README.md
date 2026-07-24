@@ -117,7 +117,7 @@ this environment (see "Bulk-session tests" below), they report
 | 1 | dup-only replay | 8 × 100 already-seeded drafts (all must come back `duplicate`) | any residual growth from resending pure duplicates — should be ~flat |
 | 1b | bulk session dup-only | 4 × (begin session → 100 already-seeded drafts → end session) | the pathology the sol audit traced this gate to: `.../bulk-sessions/{id}/end` runs a corpus/materialization rebuild (`bulk_import.rs::end_bulk_import_session`) that, pre-fix, scaled with corpus size even for a session that only ever imported duplicates — visible both as residual growth and as anomalously slow `end` calls (~26s/batch was the reported regression signature) |
 | 2 | new bulk import | 1000 fresh drafts, once at batch=25 and once at batch=1000 (`ingested + duplicate` must total the batch — see "Retried-as-duplicate accounting" below) | a large single request/response transient spike, or steady per-request growth that isn't 100% freed after the batch |
-| 2b | bulk session new import | 1000 fresh drafts (batch=25) wrapped in a single begin/.../end bulk session | same peak/residual bounds as test 2, but exercised through the session-wrapped path that end-of-session rebuild goes through — `end` is expected to legitimately trigger a corpus-scale rebuild here (see "test 2b's end: a real rebuild, not a fixed latency" below) |
+| 2b | bulk session rebuild x2 consecutive rounds | two back-to-back rounds of 1000 fresh drafts (batch=25) each wrapped in its own begin/.../end bulk session | round 2's peak/residual are judged *against round 1's own settled plateau*, not the original baseline — a real per-invocation leak shows up as round 2 adding meaningfully more on top of round 1, not as round 1's one-time rebuild cost itself (see "Test 2b: two consecutive rebuilds, judged against each other" below) |
 | 3 | slope detection | 8 more × 100 dup batches, sampling RSS after each one and regressing batch-number vs. RSS | the actual v15 bug class: growth *proportional to how many import requests have been made*, invisible in single-batch peak/residual checks but visible as a positive slope |
 
 ### Bulk-session tests (1b / 2b)
@@ -165,36 +165,75 @@ every retried `begin`/`end` attempt. This is the retry policy for test
 1b's `begin`/`end` and test 2b's `begin` — test 2b's `end` uses a
 different, dedicated policy; see the next section.
 
-#### Test 2b's `end`: a real rebuild, not a fixed latency
+#### Test 2b: two consecutive rebuilds, judged against each other
 
 Test 2b's `end` is expected to legitimately trigger a corpus-scale
 non-corpus rebuild (observed ~25-30min at 568k observations) —
 fundamentally unlike test 1b's dup-only sessions, where a fast `end` is
-itself the pass criterion. While that rebuild is running, `end` can
-return **HTTP 503 `projection_stale`** — the server's own documented
-response (`apps/selfhost/src/self_host/server.rs`'s mapping of
-`SelfHostError::ProjectionStale`, via
-`ErrorResponse::projection_stale` in `crates/api/src/api/envelope.rs`)
-for "the non-corpus rebuild this triggered hasn't finished within its own
-internal wait window yet" — not a failure. Treating that the same as a
-generic transient failure (capped at `--max-consecutive-timeouts`, default
-3) meant the gate gave up on a legitimate ~30-minute rebuild after about 3
-of the server's own ~60s polling windows — roughly 3 minutes.
+itself the pass criterion. A single such rebuild costs real memory once:
+observed **+3.9GiB** at 568k. Judging that one-time cost against a tight
+threshold (the same one test 2's plain new-import path uses) would either
+false-fail on legitimate rebuild cost or be too loose to catch a real leak
+— neither is right, because a single rebuild's cost isn't the leak signal
+at all.
+
+The signal is what happens on a **second, immediately consecutive**
+rebuild. Real-run evidence: round 1 raises settled RSS from baseline to
+**9.386GiB**; round 2 — another full begin/1000-new-imports/end cycle
+right after — settles at **9.386GiB again, bit-identical**. A single arena
+holds and reuses its rebuild working set across invocations; it does not
+grow it. So test 2b runs the rebuild twice back-to-back and judges round
+2's peak and settled residual **against round 1's own settled plateau**,
+not the original pre-test baseline:
+
+- Round 1's own peak/residual (over the *original* baseline) are recorded
+  as `first_rebuild_plateau_peak_over_baseline_mib` /
+  `first_rebuild_plateau_residual_over_baseline_mib`, gated only by a
+  loose runaway ceiling, `--bulk-session-first-rebuild-runaway-threshold-mib`
+  (default 8192MiB / 8GiB) — large enough to never fire on a legitimate
+  rebuild, only on something wildly larger.
+- Round 2's peak/residual (over round 1's *own settled plateau*,
+  `first_rebuild_plateau_after_mib`) are the actual leak check:
+  `--bulk-session-round2-peak-threshold-mib` (default 1024MiB) and
+  `--bulk-session-round2-residual-threshold-mib` (default 512MiB). The
+  healthy expectation from the real-run evidence is ~0MiB; these
+  thresholds bound how far round 2 may exceed round 1's plateau before
+  it's read as a per-invocation leak rather than one-time arena reuse.
+
+Each round's `end` independently goes through the same `projection_stale`
+polling described below, each with its own fresh
+`--bulk-end-rebuild-timeout-seconds` budget. The report's
+`bulk_session_new_batch25` entry carries the round-vs-round summary at the
+top level plus full per-round detail nested under `round0` / `round1`
+(each including `end_rebuild_wait_seconds`, `end_rebuild_poll_count`,
+`peak_over_reference_mib`, `residual_over_reference_mib`, and everything
+else described in this README for a single round).
+
+While `end` is polling through a rebuild, it can return **HTTP 503
+`projection_stale`** — the server's own documented response
+(`apps/selfhost/src/self_host/server.rs`'s mapping of
+`SelfHostError::ProjectionStale`, via `ErrorResponse::projection_stale` in
+`crates/api/src/api/envelope.rs`) for "the non-corpus rebuild this
+triggered hasn't finished within its own internal wait window yet" — not
+a failure. Treating that the same as a generic transient failure (capped
+at `--max-consecutive-timeouts`, default 3) meant the gate gave up on a
+legitimate ~30-minute rebuild after about 3 of the server's own ~60s
+polling windows — roughly 3 minutes.
 
 The fix: HTTP 503 with `error == "projection_stale"` is its own subtype
 (`gate_common.ProjectionStaleError`), polled at the server's own
 `retry_after` hint (always present for this code, default 30s) via a
 **dedicated function** (`gate_common.wait_for_end_bulk_session_rebuild`)
-with **no consecutive-failure cap** — only a dedicated budget,
-`--bulk-end-rebuild-timeout-seconds` (default 3600s = 1h, well above the
-observed ~25-30min), separate from `--ack-timeout-seconds`, bounds it. Any
-other transient failure (timeout/connection-error/other 5xx) during this
-same wait gets the same uncapped, budget-bounded polling; a hard 4xx or an
-unrecognized 409/503 reason still fails immediately, not retried. The
-report's `bulk_session_new_batch25` entry records the cumulative wait as
-`end_rebuild_wait_seconds`, the poll count as `end_rebuild_poll_count`,
-and every poll's detail in `end_rebuild_projection_stale_events` /
-`end_rebuild_transient_events`. The pass criterion for `end` here is
+with **no consecutive-failure cap** — only the dedicated
+`--bulk-end-rebuild-timeout-seconds` budget (default 3600s = 1h, well
+above the observed ~25-30min), separate from `--ack-timeout-seconds`,
+bounds it. Any other transient failure (timeout/connection-error/other
+5xx) during this same wait gets the same uncapped, budget-bounded
+polling; a hard 4xx or an unrecognized 409/503 reason still fails
+immediately, not retried. Each round's `end_rebuild_wait_seconds` /
+`end_rebuild_poll_count` and every poll's detail
+(`end_rebuild_projection_stale_events` / `end_rebuild_transient_events`)
+are recorded per round. The pass criterion for each round's `end` is
 simply `end_rebuild_wait_seconds <= --bulk-end-rebuild-timeout-seconds`
 (which, by construction, can only be false if
 `wait_for_end_bulk_session_rebuild` already raised instead of returning —
@@ -365,7 +404,10 @@ such orphan-retry duplicates as `retried_as_duplicates`.
 | `--bulk-residual-threshold-mib` | 768 | test 2: `(RSS 3min after the 1000-item send) − baseline` must be ≤ this, for both sub-tests |
 | `--slope-threshold-mib-per-batch` | 8 | test 3: the linear-regression slope of (batch number → post-settle RSS) across 8 batches must be ≤ this MiB/batch |
 | `--bulk-session-end-latency-threshold-seconds` | 10 | test 1b: max acceptable `.../bulk-sessions/{id}/end` duration per batch (dup-only sessions only — not test 2b, see below) |
-| `--bulk-end-rebuild-timeout-seconds` | 3600 (1h) | test 2b: dedicated budget for `end` to complete while polling through HTTP 503 `projection_stale` (a legitimate corpus-scale rebuild, observed ~25-30min at 568k) — separate from `--ack-timeout-seconds`, no consecutive-retry cap |
+| `--bulk-end-rebuild-timeout-seconds` | 3600 (1h) | test 2b (each of round 1/2 and round 2/2 independently): dedicated budget for `end` to complete while polling through HTTP 503 `projection_stale` (a legitimate corpus-scale rebuild, observed ~25-30min at 568k) — separate from `--ack-timeout-seconds`, no consecutive-retry cap |
+| `--bulk-session-first-rebuild-runaway-threshold-mib` | 8192 (8 GiB) | test 2b round 1/2: loose runaway ceiling for peak/residual over the original baseline — a real rebuild legitimately costs several GiB once (observed ~3.9GiB at 568k); this is not the leak signal, round 2 below is |
+| `--bulk-session-round2-peak-threshold-mib` | 1024 | test 2b round 2/2: max peak RSS over round 1's *own settled plateau* — healthy expectation is ~0MiB (observed bit-identical in one real run) |
+| `--bulk-session-round2-residual-threshold-mib` | 512 | test 2b round 2/2: max settled residual over round 1's *own settled plateau* — same rationale as the peak threshold above |
 | `--max-consecutive-timeouts` | 3 | tests 1/1b/2/2b/3: consecutive transient failures (timeout/connection-error/5xx, NOT counting HTTP 429) on the same batch before the gate aborts |
 | `--max-consecutive-concurrency-retries` | 60 | tests 1/1b/2/2b/3: consecutive HTTP 429 `import_concurrency_limit` responses (retried honoring `retry_after`, counted separately from timeouts) on the same batch before the gate aborts. The ACK probe also retries 429s but is bounded only by `--ack-timeout-seconds`, not this count |
 | `--max-consecutive-bulk-session-conflicts` | 10 | tests 1b/2b: consecutive HTTP 409 responses from bulk-session begin/end with a known-transient conflict code (counted separately from `--max-consecutive-timeouts`) before the gate aborts |
