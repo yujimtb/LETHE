@@ -18,11 +18,12 @@ use lethe_api::api::grep::GrepRequest;
 use lethe_core::domain::supplemental::InputAnchorSet;
 
 use super::{
-    AppCore, AppService, CompactProjectionState, GoogleSourceRuntime, ImportItemResult,
-    ImportOutcome, NonCorpusRebuildPublishTestGate, SearchJobStatus, SelfHostError,
-    SlackSourceRuntime, classify_slack_ingress, discovered_slack_threads,
-    extract_slide_text_fragments, infer_profile_name_from_fragments, latest_revision_to_capture,
-    namespace_draft, non_empty_state, ranked_self_intro_slide_indices, thread_root_ts,
+    AppCore, AppService, BulkImportMaterializeTestGate, CompactProjectionState,
+    GoogleSourceRuntime, ImportItemResult, ImportOutcome, NonCorpusRebuildPublishTestGate,
+    SearchJobStatus, SelfHostError, SlackSourceRuntime, classify_slack_ingress,
+    discovered_slack_threads, extract_slide_text_fragments, infer_profile_name_from_fragments,
+    latest_revision_to_capture, namespace_draft, non_empty_state, ranked_self_intro_slide_indices,
+    thread_root_ts,
 };
 use crate::self_host::config::{
     ApiTokenConfig, CorpusProjectionConfig, FreshnessConfig, GoogleConfig, JsonWebKey,
@@ -831,6 +832,7 @@ fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppSe
             std::sync::atomic::AtomicU64::new(0),
         ),
         non_corpus_rebuild_before_publish_gate: None,
+        bulk_import_before_materialize_gate: None,
         publish_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         search_job_test_gate: None,
         search_job_test_fault: None,
@@ -4725,6 +4727,126 @@ fn bulk_first_append_stale_publication_waits_for_derived_projection_lane() {
 }
 
 #[test]
+fn bulk_first_append_and_source_sync_complete_without_b_d_deadlock() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-bulk-sync-lock-order-test-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let mut service = test_service(test_config(db, blobs), persistence);
+    service.slack_sources.clear();
+    service.google_sources.clear();
+    let materialize_gate = Arc::new(BulkImportMaterializeTestGate::default());
+    service.bulk_import_before_materialize_gate = Some(Arc::clone(&materialize_gate));
+
+    let previous_sync = service.sync_all().unwrap();
+    assert!(!previous_sync.skipped);
+    let previous_last_sync_at = previous_sync.last_sync_at;
+    assert!(previous_last_sync_at.is_some());
+
+    let session = service.begin_bulk_import_session().unwrap();
+    let publish_count_before_append = service.publish_count();
+    let import_service = service.clone();
+    let import_session_id = session.session_id.clone();
+    let (import_sender, import_receiver) = std::sync::mpsc::channel();
+    let import_thread = std::thread::spawn(move || {
+        let started_at = std::time::Instant::now();
+        let result = import_service.ingest_observation_drafts_with_session(
+            vec![consent_decision_draft(
+                "bulk-lock-order-subject",
+                "bulk-lock-order-identifier",
+                "opted_out",
+            )],
+            "lock-order-test",
+            Some(&import_session_id),
+        );
+        import_sender.send((started_at.elapsed(), result)).unwrap();
+    });
+    assert!(
+        materialize_gate.wait_until_reached(std::time::Duration::from_secs(5)),
+        "bulk first append did not stop before derived lane acquisition"
+    );
+
+    let sync_service = service.clone();
+    let (sync_sender, sync_receiver) = std::sync::mpsc::channel();
+    let sync_thread = std::thread::spawn(move || {
+        let started_at = std::time::Instant::now();
+        let (result, log) = capture_tracing_output(|| sync_service.sync_all());
+        sync_sender
+            .send((started_at.elapsed(), result, log))
+            .unwrap();
+    });
+    let sync_result = sync_receiver.recv_timeout(std::time::Duration::from_secs(1));
+    materialize_gate.release();
+    let (sync_elapsed, skipped_sync, sync_log) =
+        sync_result.expect("source sync blocked on B while holding D");
+    let skipped_sync = skipped_sync.unwrap();
+    assert!(
+        sync_elapsed < std::time::Duration::from_secs(1),
+        "source sync took {sync_elapsed:?} while bulk append held B"
+    );
+    assert!(skipped_sync.skipped);
+    assert_eq!(skipped_sync.last_sync_at, previous_last_sync_at);
+    assert!(
+        sync_log.contains("\"sync_skip_reason\":\"bulk_import_operation_active\""),
+        "bulk-operation skip reason was not logged: {sync_log}"
+    );
+    sync_thread.join().unwrap();
+
+    let (import_elapsed, import_report) = import_receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("bulk first append did not resume after sync released D");
+    let import_report = import_report.unwrap();
+    import_thread.join().unwrap();
+    assert!(
+        import_elapsed < std::time::Duration::from_secs(5),
+        "bulk first append took {import_elapsed:?}"
+    );
+    assert_eq!(import_report.ingested, 1);
+    assert_eq!(
+        service.publish_count(),
+        publish_count_before_append + 1,
+        "the unique first append must publish stale/consent state exactly once"
+    );
+    assert_eq!(
+        service.core_snapshot().compact_state.resolve(
+            &EntityRef::new("person:bulk-lock-order-subject"),
+            &["bulk-lock-order-identifier".to_owned()],
+            None,
+        ),
+        ConsentStatus::OptedOut
+    );
+    assert_eq!(
+        service.core_snapshot().last_sync_at,
+        previous_last_sync_at,
+        "a skipped sync must not mask staleness with a new timestamp"
+    );
+    let persisted_sync = service
+        .persistence_lock()
+        .unwrap()
+        .load_sync_state("all")
+        .unwrap()
+        .expect("the completed pre-test sync must remain persisted");
+    assert_eq!(Some(persisted_sync.completed_at), previous_last_sync_at);
+
+    wait_for_search_index_high_water(&service, session.base_append_seq + 1);
+    let completed = service
+        .end_bulk_import_session(&session.session_id)
+        .unwrap();
+    assert_eq!(completed.state, super::BulkImportSessionPhase::Ready);
+    assert_eq!(completed.target_append_seq, session.base_append_seq + 1);
+    assert_eq!(
+        completed.target_observation_count,
+        session.target_observation_count + 1
+    );
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn active_bulk_session_rejects_supplemental_write_and_source_sync_without_advancing_state() {
     let root = std::env::temp_dir().join(format!(
         "lethe-bulk-session-guard-test-{}",
@@ -5317,6 +5439,8 @@ fn background_rebuild_skips_source_sync_without_blocking_bulk_begin_and_next_syn
     assert_eq!(skipped_sync.google_ingested, 0);
     assert_eq!(skipped_sync.slide_analyses, 0);
     assert!(skipped_sync.dead_letters.is_empty());
+    assert!(skipped_sync.skipped);
+    assert_eq!(skipped_sync.last_sync_at, None);
     assert!(
         sync_log.contains("\"sync_skip_reason\":\"background_non_corpus_rebuild\""),
         "source sync skip reason was not logged: {sync_log}"
@@ -5361,8 +5485,9 @@ fn background_rebuild_skips_source_sync_without_blocking_bulk_begin_and_next_syn
 
     service.wait_for_non_corpus_rebuild().unwrap();
     let completed_sync = service.sync_all().unwrap();
+    assert!(!completed_sync.skipped);
     let core = service.core_snapshot();
-    assert_eq!(core.last_sync_at, Some(completed_sync.last_sync_at));
+    assert_eq!(core.last_sync_at, completed_sync.last_sync_at);
     let persisted_sync = service
         .persistence_lock()
         .unwrap()
@@ -5372,7 +5497,9 @@ fn background_rebuild_skips_source_sync_without_blocking_bulk_begin_and_next_syn
         persisted_sync
             .expect("post-rebuild sync must persist completion state")
             .completed_at,
-        completed_sync.last_sync_at
+        completed_sync
+            .last_sync_at
+            .expect("completed sync must report its completion timestamp")
     );
     assert_eq!(
         service

@@ -205,18 +205,27 @@ impl AppService {
         result
     }
 
-    pub(super) fn non_bulk_projection_operation_lock<'a>(
+    /// Attempts the B admission handshake while the caller owns the derived
+    /// projection lane (D). B is never waited on from this direction: a busy B
+    /// releases N and returns `None`, so the only blocking B/D edge is B -> D.
+    pub(super) fn try_non_bulk_projection_operation_lock<'a>(
         &'a self,
         operation_name: &'static str,
-    ) -> Result<std::sync::MutexGuard<'a, ()>, SelfHostError> {
+    ) -> Result<Option<std::sync::MutexGuard<'a, ()>>, SelfHostError> {
         let operation = self
             .non_bulk_projection_operation
             .lock()
             .map_err(|_| SelfHostError::LockPoisoned)?;
-        let bulk_admission = self.bulk_import_operation_lock()?;
+        let bulk_admission = match self.bulk_import_operation.try_lock() {
+            Ok(admission) => admission,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(SelfHostError::LockPoisoned);
+            }
+        };
         self.ensure_bulk_import_session_inactive(operation_name)?;
         drop(bulk_admission);
-        Ok(operation)
+        Ok(Some(operation))
     }
 
     pub fn begin_bulk_import_session(&self) -> Result<BulkImportSessionReport, SelfHostError> {
@@ -444,6 +453,10 @@ impl AppService {
         observations: &[Observation],
         timer: &mut ObservationImportTimer,
     ) -> Result<(), SelfHostError> {
+        #[cfg(test)]
+        if let Some(gate) = &self.bulk_import_before_materialize_gate {
+            gate.block_before_materialize();
+        }
         let first_append = session.target_append_seq == session.base_append_seq;
         let contains_consent = observations
             .iter()

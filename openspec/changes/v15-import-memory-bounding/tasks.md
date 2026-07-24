@@ -61,3 +61,8 @@
 
 - [x] 13.1 [Implementer] `sync_all` はoperation lock取得前にbackground non-corpus rebuildが進行中なら理由付きlogを出してcycleを成功扱いでskipする。sync/supplementalはderived lane取得後にnon-bulk admissionを行い、lane待機中のbulk session beginをrebuild全期間conflictさせない。
 - [x] 13.2 [Reviewer] page-delay rebuild中のsync即時skip、同時bulk session begin成功、rebuild完了後の次回sync通常実行を一つの回帰testで検証する。OpenSpec/設計文書を更新し、`cargo fmt --all -- --check`と`cargo test --workspace --quiet`を実行する。
+
+## 14. v15.2.3 B/D deadlock review
+
+- [x] 14.1 [Implementer] bulk import append、sync、supplemental、background/append consumerを含むB=`bulk_import_operation`とD=`derived_projection_lane`の取得順を一意化し、first-append materialize直前の強制interleaveでも循環待ちを作らない。bulk sessionのfirst-append、consent capture、persisted target watermarkの整合性をdesignで論証し、sync skip reportは既存last-sync timestampを返す。
+- [x] 14.2 [Reviewer] bulk first-appendをB保持かつD取得直前で停止してsyncを起動するdeterministic regression testを追加し、両処理の有界完了、session state、materialization結果を検証する。OpenSpec/設計文書を更新し、`cargo fmt --all -- --check`と`cargo test --workspace --quiet`を実行する。

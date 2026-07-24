@@ -127,9 +127,13 @@ SQLite schema v15 は、projection manifest のlogical IDとitem/blob rowのphys
 
 公開readerはheadを先に解決してから別のautocommit文でphysical rowを読んではならない。key、owner、複数owner page、blob visibility、owner count、total countは、logical head・manifest存在・physical rowを一つのCTE/JOIN文で読み、同一SQLite statement snapshotへ束ねる。これによりA→B切替後にcleanupがAを削除しても、一回のreadは完全なAまたは完全なBだけを返す。通常の `Replace` が既存世代をretireした場合もcommit成功後にcleanup single-flightを要求する。
 
-source sync は background rebuild flag をoperation lockより先に検査し、進行中なら `sync_skip_reason="background_non_corpus_rebuild"` をlogしてcycleを成功扱いで即時skipする。skipはsource cursor、healthのlast sync、persisted sync stateを更新せず、次回scheduleがrebuild完了後に通常syncを行う。flag確認直後にrebuildが開始するraceでも、syncはderived laneを先に取得してから `non_bulk_projection_operation` とbulk-session handshakeを取得するため、lane待機中のbulk session beginを拒否しない。
+source sync は background rebuild flag をoperation lockより先に検査し、進行中なら `sync_skip_reason="background_non_corpus_rebuild"` をlogしてcycleを成功扱いで即時skipする。skipはsource cursor、healthのlast sync、persisted sync stateを更新せず、次回scheduleがrebuild完了後に通常syncを行う。flag確認直後にrebuildが開始するraceでも、syncはderived laneを先に待つため、lane待機中のbulk session beginを拒否しない。
 
-supplemental writeはユーザー操作なのでskipせずderived laneを待つが、同じderived→non-bulk→bulk handshake順により待機中はnon-bulk admissionを保持しない。lane取得後、active bulk sessionがあれば明示conflict、inactiveなら従来のatomic supplemental/projection commitへ進む。migration/recovery rebuild中のbulk session beginはmetadataのみを永続化するため、rebuild flagがtrueの間に限りstale projection catalogでも許可する。実行中sync/supplementalはnon-bulk guardで従来どおりbeginと排他する。
+bulk session appendはB=`bulk_import_operation`をsession照合、canonical append、persisted target更新、first-append/consent materializationのD=`derived_projection_lane`取得まで保持する。これによりfirst appendのstale公開前に後続requestが応答せず、consent capture順もcanonical append順と一致する。Bをmaterialize前に解放するとこの順序を証明できないため、blocking順はB→Dに固定する。
+
+sync/supplementalはD取得後にN=`non_bulk_projection_operation`を取得するが、Bは`try_lock`だけで検査する。busy時にsyncはD/Nを解放し、`sync_skip_reason="bulk_import_operation_active"`で即時skipする。supplemental writeはユーザー操作なのでrebuildのD待機自体はskipしないが、B busy時はD/Nを解放した後だけ1/2/4/8msで再試行し、最終tryもbusyなら`bulk_import_operation_active` conflictを返す。Dを保持したB待機またはbackoffは行わない。migration/recovery rebuild中のbulk session beginはmetadataのみを永続化するため、rebuild flagがtrueの間に限りstale projection catalogでも許可する。実行中sync/supplementalはnon-bulk guardで従来どおりbeginと排他する。
+
+`SyncReport`は`skipped`とoptional `last_sync_at`を返す。通常完了は今回のtimestamp、skipはAppCoreに保存済みの直近timestampを返し、実績がなければ`None`とする。skip時に`Utc::now()`を返して呼び出し側のfreshnessを偽装しない。admin sync endpointはreportをそのままserializeし、polling taskは返値でhealthを更新しない。
 
 bulk session begin は non-bulk projection operation が進行中なら待たず `bulk_import_non_bulk_projection_active` conflict を返す。bulk session end は `CatchingUp` への遷移後に bulk mutex を解放して検索・background rebuild 完了を待ち、最終 watermark 検証と `Ready` 永続化の区間だけ再取得する。空の Google Slides runtime source では latest workspace observation 探索を即時に空集合として返し、source がない sync が canonical 全件を走査しない。
 

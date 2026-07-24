@@ -164,7 +164,8 @@ pub struct SyncReport {
     pub duplicates: usize,
     pub quarantined: usize,
     pub dead_letters: Vec<DeadLetter>,
-    pub last_sync_at: DateTime<Utc>,
+    pub skipped: bool,
+    pub last_sync_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -1966,6 +1967,8 @@ pub struct AppService {
     #[cfg(test)]
     non_corpus_rebuild_before_publish_gate: Option<Arc<NonCorpusRebuildPublishTestGate>>,
     #[cfg(test)]
+    bulk_import_before_materialize_gate: Option<Arc<BulkImportMaterializeTestGate>>,
+    #[cfg(test)]
     publish_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     search_job_test_gate: Option<Arc<std::sync::Barrier>>,
@@ -2015,6 +2018,62 @@ impl NonCorpusRebuildPublishTestGate {
 
     fn release(&self) {
         let mut state = self.state.lock().expect("publish test gate poisoned");
+        state.released = true;
+        self.changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct BulkImportMaterializeTestGate {
+    state: Mutex<BulkImportMaterializeTestGateState>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct BulkImportMaterializeTestGateState {
+    reached: bool,
+    released: bool,
+}
+
+#[cfg(test)]
+impl BulkImportMaterializeTestGate {
+    fn block_before_materialize(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("bulk import materialize test gate poisoned");
+        state.reached = true;
+        self.changed.notify_all();
+        while !state.released {
+            state = self
+                .changed
+                .wait(state)
+                .expect("bulk import materialize test gate poisoned while waiting");
+        }
+    }
+
+    fn wait_until_reached(&self, timeout: Duration) -> bool {
+        let state = self
+            .state
+            .lock()
+            .expect("bulk import materialize test gate poisoned");
+        if state.reached {
+            return true;
+        }
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| !state.reached)
+            .expect("bulk import materialize test gate poisoned while observing");
+        state.reached
+    }
+
+    fn release(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("bulk import materialize test gate poisoned");
         state.released = true;
         self.changed.notify_all();
     }
@@ -6470,6 +6529,8 @@ impl AppService {
             #[cfg(test)]
             non_corpus_rebuild_before_publish_gate: None,
             #[cfg(test)]
+            bulk_import_before_materialize_gate: None,
+            #[cfg(test)]
             publish_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             search_job_test_gate: None,
@@ -6917,6 +6978,10 @@ impl AppService {
                 &mut timer,
             )?;
 
+            // B intentionally spans session lookup, canonical append, target
+            // persistence, and first-append/consent D publication. Releasing
+            // it before materialization would let later session requests
+            // overtake the unique stale/consent publication.
             let _operation = self.bulk_import_operation_lock_for_import(&mut timer)?;
             let core = self.core_snapshot();
             let bulk_session = self.bulk_import_session_for_append(bulk_session_id, &mut timer)?;
@@ -7166,6 +7231,8 @@ impl AppService {
             )?;
             let request_draft_count = drafts.len();
 
+            // Keep the same B -> D ordering and session publication boundary
+            // as v1; v2 per-item classification does not weaken that ordering.
             let _operation = self.bulk_import_operation_lock_for_import(&mut timer)?;
             let core = self.core_snapshot();
             let bulk_session = self.bulk_import_session_for_append(bulk_session_id, &mut timer)?;

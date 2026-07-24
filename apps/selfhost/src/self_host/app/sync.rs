@@ -11,24 +11,25 @@ impl AppService {
                 sync_skip_reason = "background_non_corpus_rebuild",
                 "source sync cycle skipped because background non-corpus rebuild is in progress"
             );
-            return Ok(SyncReport {
-                slack_ingested: 0,
-                google_ingested: 0,
-                slide_analyses: 0,
-                duplicates: 0,
-                quarantined: 0,
-                dead_letters: Vec::new(),
-                last_sync_at: Utc::now(),
-            });
+            return Ok(self.skipped_sync_report());
         }
-        // Lane waiters are not active non-bulk operations yet. Acquire admission
-        // only after the lane so a rebuild race cannot reject bulk-session begin.
+        // Lane waiters are not active non-bulk operations yet. B admission is a
+        // try-lock while D is held; a concurrent import must never form D -> B.
         let _derived_lane = self
             .derived_projection_lane
             .lock()
             .map_err(|_| SelfHostError::LockPoisoned)?;
         let _non_bulk_projection_operation =
-            self.non_bulk_projection_operation_lock("source sync")?;
+            match self.try_non_bulk_projection_operation_lock("source sync")? {
+                Some(operation) => operation,
+                None => {
+                    tracing::info!(
+                        sync_skip_reason = "bulk_import_operation_active",
+                        "source sync cycle skipped because an import operation is active"
+                    );
+                    return Ok(self.skipped_sync_report());
+                }
+            };
         let started_at = std::time::Instant::now();
         let mut slack_ingested = 0usize;
         let mut google_ingested = 0usize;
@@ -828,8 +829,22 @@ impl AppService {
             duplicates,
             quarantined,
             dead_letters,
-            last_sync_at,
+            skipped: false,
+            last_sync_at: Some(last_sync_at),
         })
+    }
+
+    fn skipped_sync_report(&self) -> SyncReport {
+        SyncReport {
+            slack_ingested: 0,
+            google_ingested: 0,
+            slide_analyses: 0,
+            duplicates: 0,
+            quarantined: 0,
+            dead_letters: Vec::new(),
+            skipped: true,
+            last_sync_at: self.core_snapshot().last_sync_at,
+        }
     }
 
     pub(super) fn latest_workspace_slide_observations(
