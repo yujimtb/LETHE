@@ -125,6 +125,12 @@ fixture-only credentials in `deploy/pre-nas-storage-test/test.env`, binds
 PostgreSQL and MinIO only to `127.0.0.1`, stores their data on tmpfs, and
 removes only the `lethe-pre-nas-storage-test` Compose project in `finally`.
 
+The repository Docker context is an explicit source allowlist. Under `deploy/`
+it admits only the two configuration files embedded by `lethe-selfhost` and
+the persistent-index benchmark Dockerfile. Runtime databases, rehearsal data,
+credentials, backups, and other ignored worktree artifacts cannot enter a
+container build context.
+
 It runs migrations; all PostgreSQL ports; MinIO signing, size, timeout, missing,
 and corrupt-object cases; transactional failure injection; conservative orphan
 GC; concurrent idempotency; SQLite/PostgreSQL normalized parity（source
