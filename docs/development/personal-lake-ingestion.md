@@ -741,7 +741,8 @@ cargo run -p lethe-import-claude-code -- `
   --archive-root=D:\userdata\docs\private\claude-source-archive `
   --source-instance=claude-code-personal `
   --base-url=$baseUrl `
-  --api-token-env=$apiTokenEnv
+  --api-token-env=$apiTokenEnv `
+  --batch-size=10000
 ```
 
 The importer maps only the coding-agent conversation backbone: user
@@ -749,6 +750,9 @@ instructions, assistant text, and tool-call metadata. Tool outputs,
 `toolUseResult`, command output, file contents, and raw tool argument bodies are
 excluded before canonical JSON is created. Tool metadata keeps safe references
 such as `file_path`, `path`, `pattern`, `glob`, `query`, and `url`.
+`--batch-size` is required and must be a positive value no greater than the
+personal lake `limits.max_import_drafts` setting. Configure both explicitly;
+the CLI does not guess the server limit.
 
 Re-running the same archive snapshot should report duplicates for unchanged
 Claude Code messages. The 2026-07-06 real archive E2E against a temporary lake
@@ -773,13 +777,17 @@ cargo run -p lethe-import-codex -- `
   --archive=D:\userdata\docs\private\claude-source-archive `
   --source-instance=codex-personal `
   --base-url=$baseUrl `
-  --api-token-env=$apiTokenEnv
+  --api-token-env=$apiTokenEnv `
+  --batch-size=10000
 ```
 
 The importer maps only the coding-agent conversation backbone: user text,
 assistant text, and tool-call metadata. Tool outputs and raw tool argument
 bodies are excluded before canonical JSON is created. Re-running the same
 archive snapshot should report duplicates for unchanged Codex messages.
+`--batch-size` is required and must be a positive value no greater than the
+personal lake `limits.max_import_drafts` setting. Configure both explicitly;
+the CLI does not guess the server limit.
 
 The 2026-07-06 production import used archive
 `D:\userdata\docs\private\claude-source-archive` and source instance

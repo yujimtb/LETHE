@@ -4,20 +4,21 @@ use std::path::PathBuf;
 use lethe_adapter_coding_agent::claude_code::ClaudeCodeImporter;
 use lethe_core::domain::SemVer;
 use lethe_selfhost::self_host::import_client::{
-    ImportApiConfig, ImportApiVersion, normalize_import_option_args, resolve_admission_generation,
-    resolve_api_version,
+    ImportApiConfig, ImportApiVersion, normalize_import_option_args, parse_import_batch_size,
+    resolve_admission_generation, resolve_api_version,
 };
 
 const HELP: &str = "\
 Import Claude Code archive JSONL files into LETHE through the online import API.
 
-Usage: lethe-import-claude-code --archive-root=<path> --source-instance=<id> --base-url=<url> --api-token-env=<name> [--api-version=<1|2>] [--admission-generation=<int>]
+Usage: lethe-import-claude-code --archive-root=<path> --source-instance=<id> --base-url=<url> --api-token-env=<name> --batch-size=<count> [--api-version=<1|2>] [--admission-generation=<int>]
 
 Required arguments:
   --archive-root=<path>     Archive working copy containing claude-code/
   --source-instance=<id>    Stable source instance id, for example claude-code-personal
   --base-url=<url>          LETHE internal API base URL
   --api-token-env=<name>    Environment variable that holds the API token
+  --batch-size=<count>      Positive drafts-per-request limit matching the server configuration
   --api-version=<1|2>      Import API version; defaults to 1
   --admission-generation=<int>
                             Required for API version 2; sent as the admission header
@@ -28,7 +29,7 @@ Required environment:
   LETHE_ADMISSION_GENERATION may provide --admission-generation.
 
 Example:
-  lethe-import-claude-code --archive-root=D:\\archive --source-instance=claude-code-personal --base-url=http://127.0.0.1:8080 --api-token-env=LETHE_API_WRITE_TOKEN
+  lethe-import-claude-code --archive-root=D:\\archive --source-instance=claude-code-personal --base-url=http://127.0.0.1:8080 --api-token-env=LETHE_API_WRITE_TOKEN --batch-size=10000
 ";
 
 fn main() {
@@ -68,7 +69,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         admission_generation: options.admission_generation,
     }
     .connect()?
-    .ingest_observation_drafts(batch.drafts, &options.source_instance)?;
+    .ingest_observation_drafts_batched(
+        batch.drafts,
+        &options.source_instance,
+        options.batch_size,
+    )?;
 
     println!(
         "claude-code import complete: ingested={}, duplicates={}, quarantined={}, files={}, lines={}, observed={}, skipped_malformed={}, skipped_unknown={}, excluded_known={}, excluded_tool_results={}",
@@ -95,6 +100,7 @@ struct CliOptions {
     source_instance: String,
     base_url: String,
     api_token_env: String,
+    batch_size: usize,
     api_version: ImportApiVersion,
     admission_generation: Option<u64>,
 }
@@ -106,6 +112,7 @@ fn parse_options(
     let mut source_instance = None;
     let mut base_url = None;
     let mut api_token_env = None;
+    let mut batch_size = None;
     let mut api_version = None;
     let mut admission_generation = None;
 
@@ -131,6 +138,11 @@ fn parse_options(
                 );
             }
             api_token_env = Some(raw.to_owned());
+        } else if let Some(raw) = arg.strip_prefix("--batch-size=") {
+            if raw.trim().is_empty() {
+                return Err("--batch-size must not be blank. Pass --batch-size=<count>.".into());
+            }
+            batch_size = Some(raw.to_owned());
         } else if let Some(raw) = arg.strip_prefix("--api-version=") {
             if raw.trim().is_empty() {
                 return Err("--api-version must not be blank. Pass --api-version=1 or 2.".into());
@@ -151,6 +163,13 @@ fn parse_options(
 
     let api_version = resolve_api_version(api_version.as_deref())?;
     let admission_generation = resolve_admission_generation(admission_generation.as_deref())?;
+    let batch_size = batch_size.ok_or_else(|| {
+        missing_argument(
+            "--batch-size=<count>",
+            "Pass a positive value no greater than the server limits.max_import_drafts.",
+        )
+    })?;
+    let batch_size = parse_import_batch_size(&batch_size)?;
     Ok(CliOptions {
         archive_root: archive_root.ok_or_else(|| {
             missing_argument(
@@ -173,6 +192,7 @@ fn parse_options(
                 "Pass --api-token-env=LETHE_API_WRITE_TOKEN and set that environment variable.",
             )
         })?,
+        batch_size,
         api_version,
         admission_generation,
     })
@@ -193,5 +213,31 @@ mod tests {
         assert!(HELP.contains("Import Claude Code"));
         assert!(HELP.contains("--archive-root=<path>"));
         assert!(HELP.contains("--api-token-env=<name>"));
+        assert!(HELP.contains("--batch-size=<count>"));
+    }
+
+    #[test]
+    fn options_require_an_explicit_positive_batch_size() {
+        let required = [
+            "--archive-root=D:\\archive",
+            "--source-instance=claude-code-personal",
+            "--base-url=http://127.0.0.1:8080",
+            "--api-token-env=LETHE_API_WRITE_TOKEN",
+            "--api-version=1",
+        ];
+        let error = match parse_options(required.into_iter().map(str::to_owned)) {
+            Ok(_) => panic!("missing --batch-size must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--batch-size=<count>"));
+
+        let options = parse_options(
+            required
+                .into_iter()
+                .chain(["--batch-size=10000"])
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(options.batch_size, 10_000);
     }
 }

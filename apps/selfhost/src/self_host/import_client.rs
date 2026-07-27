@@ -65,6 +65,8 @@ pub enum ImportClientError {
     MissingOptionValue(&'static str),
     #[error("admission generation must be a positive integer: {0}")]
     InvalidAdmissionGeneration(String),
+    #[error("import draft batch size must be a positive integer: {0}")]
+    InvalidBatchSize(String),
     #[error("admission generation is required when --api-version=2 is selected")]
     MissingAdmissionGeneration,
     #[error("v2 identity cannot be derived for draft {index}: {detail}")]
@@ -165,6 +167,16 @@ pub fn resolve_admission_generation(
     Ok(Some(generation))
 }
 
+pub fn parse_import_batch_size(value: &str) -> Result<usize, ImportClientError> {
+    let batch_size = value
+        .parse::<usize>()
+        .map_err(|_| ImportClientError::InvalidBatchSize(value.to_owned()))?;
+    if batch_size == 0 {
+        return Err(ImportClientError::InvalidBatchSize(value.to_owned()));
+    }
+    Ok(batch_size)
+}
+
 pub fn normalize_import_option_args(
     args: impl IntoIterator<Item = String>,
 ) -> Result<Vec<String>, ImportClientError> {
@@ -174,6 +186,7 @@ pub fn normalize_import_option_args(
         let option = match arg.as_str() {
             "--api-version" => Some("--api-version="),
             "--admission-generation" => Some("--admission-generation="),
+            "--batch-size" => Some("--batch-size="),
             _ => None,
         };
         let Some(option) = option else {
@@ -204,6 +217,35 @@ impl ImportApiClient {
         source_instance_id: &str,
     ) -> Result<ImportReport, ImportClientError> {
         self.send_observation_drafts(drafts, source_instance_id, None)
+    }
+
+    pub fn ingest_observation_drafts_batched(
+        &self,
+        drafts: Vec<ObservationDraft>,
+        source_instance_id: &str,
+        batch_size: usize,
+    ) -> Result<ImportReport, ImportClientError> {
+        if batch_size == 0 {
+            return Err(ImportClientError::InvalidBatchSize(batch_size.to_string()));
+        }
+        let mut drafts = drafts.into_iter();
+        let mut combined = ImportReport {
+            ingested: 0,
+            duplicates: 0,
+            quarantined: 0,
+            rejected: 0,
+            results: Vec::new(),
+            summary: ImportSummary::default(),
+        };
+        loop {
+            let batch = drafts.by_ref().take(batch_size).collect::<Vec<_>>();
+            if batch.is_empty() {
+                break;
+            }
+            let report = self.send_observation_drafts(batch, source_instance_id, None)?;
+            merge_import_report(&mut combined, report);
+        }
+        Ok(combined)
     }
 
     pub fn ingest_observation_drafts_in_session(
@@ -267,6 +309,18 @@ impl ImportApiClient {
             ImportApiVersion::V2 => finalize_v2_report(report, expected_result_count),
         }
     }
+}
+
+fn merge_import_report(combined: &mut ImportReport, mut report: ImportReport) {
+    combined.ingested += report.ingested;
+    combined.duplicates += report.duplicates;
+    combined.quarantined += report.quarantined;
+    combined.rejected += report.rejected;
+    combined.summary.ingested += report.summary.ingested;
+    combined.summary.duplicates += report.summary.duplicates;
+    combined.summary.quarantined += report.summary.quarantined;
+    combined.summary.rejected += report.summary.rejected;
+    combined.results.append(&mut report.results);
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -543,6 +597,7 @@ mod tests {
                 let reason = match status {
                     200 => "OK",
                     429 => "Too Many Requests",
+                    500 => "Internal Server Error",
                     other => panic!("unsupported status in test helper: {other}"),
                 };
                 let response = format!(
@@ -623,6 +678,97 @@ mod tests {
         );
         assert_eq!(body["drafts"][0]["idempotency_key"], original_key.as_str());
         assert_eq!(report.ingested, 1);
+    }
+
+    #[test]
+    fn batched_import_splits_requests_and_aggregates_reports() {
+        let _guard = env_lock();
+        set_test_token();
+        let (base_url, server) = spawn_http_responses(vec![
+            (
+                200,
+                serde_json::json!({
+                    "ingested": 1,
+                    "duplicates": 1,
+                    "quarantined": 0,
+                    "summary": {"ingested": 1, "duplicates": 1, "quarantined": 0, "rejected": 0}
+                })
+                .to_string(),
+            ),
+            (
+                200,
+                serde_json::json!({
+                    "ingested": 1,
+                    "duplicates": 0,
+                    "quarantined": 0,
+                    "summary": {"ingested": 1, "duplicates": 0, "quarantined": 0, "rejected": 0}
+                })
+                .to_string(),
+            ),
+        ]);
+
+        let report = test_config(base_url, ImportApiVersion::V1)
+            .connect()
+            .unwrap()
+            .ingest_observation_drafts_batched(adapter_drafts(3), "claude-personal", 2)
+            .unwrap();
+        let requests = server.join().unwrap();
+        let request_sizes = requests
+            .iter()
+            .map(|request| {
+                let body = request.split("\r\n\r\n").nth(1).unwrap();
+                serde_json::from_str::<Value>(body).unwrap()["drafts"]
+                    .as_array()
+                    .unwrap()
+                    .len()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(request_sizes, vec![2, 1]);
+        assert_eq!(report.ingested, 2);
+        assert_eq!(report.duplicates, 1);
+        assert_eq!(report.summary.ingested, 2);
+        assert_eq!(report.summary.duplicates, 1);
+    }
+
+    #[test]
+    fn batched_import_stops_after_the_first_failed_request() {
+        let _guard = env_lock();
+        set_test_token();
+        let (base_url, server) = spawn_http_responses(vec![
+            (
+                200,
+                serde_json::json!({
+                    "ingested": 1,
+                    "duplicates": 0,
+                    "quarantined": 0,
+                    "summary": {"ingested": 1, "duplicates": 0, "quarantined": 0, "rejected": 0}
+                })
+                .to_string(),
+            ),
+            (
+                500,
+                serde_json::json!({
+                    "error": "fixture_failure",
+                    "detail": "second batch failed"
+                })
+                .to_string(),
+            ),
+        ]);
+
+        let error = test_config(base_url, ImportApiVersion::V1)
+            .connect()
+            .unwrap()
+            .ingest_observation_drafts_batched(adapter_drafts(3), "claude-personal", 1)
+            .unwrap_err();
+        let requests = server.join().unwrap();
+
+        assert_eq!(requests.len(), 2, "the third batch must not be sent");
+        assert!(matches!(
+            error,
+            ImportClientError::Api { status, .. }
+                if status == reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
     }
 
     #[test]
@@ -813,14 +959,30 @@ mod tests {
             "--api-version".to_owned(),
             "2".to_owned(),
             "--admission-generation=7".to_owned(),
+            "--batch-size".to_owned(),
+            "10000".to_owned(),
         ])
         .unwrap();
         assert_eq!(
             normalized,
             vec![
                 "--api-version=2".to_owned(),
-                "--admission-generation=7".to_owned()
+                "--admission-generation=7".to_owned(),
+                "--batch-size=10000".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn import_batch_size_is_explicit_and_positive() {
+        assert_eq!(parse_import_batch_size("10000").unwrap(), 10_000);
+        assert!(matches!(
+            parse_import_batch_size("0"),
+            Err(ImportClientError::InvalidBatchSize(value)) if value == "0"
+        ));
+        assert!(matches!(
+            parse_import_batch_size("not-a-number"),
+            Err(ImportClientError::InvalidBatchSize(value)) if value == "not-a-number"
+        ));
     }
 }
