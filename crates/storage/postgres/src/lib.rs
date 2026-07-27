@@ -10,6 +10,18 @@ use lethe_storage_api::{
 use postgres::{Client, NoTls, Transaction, types::ToSql};
 use sha2::{Digest, Sha256};
 
+mod general;
+mod general_cutover;
+mod general_migrations;
+mod general_projection;
+mod general_runtime;
+mod general_s3;
+mod general_slack;
+
+pub use general::PostgresPersistence;
+pub use general_migrations::{MigrationOutcome, apply_general_migrations};
+pub use general_s3::{S3BlobStore, S3BlobStoreConfig, S3TransportPolicy};
+
 #[derive(Debug, thiserror::Error)]
 pub enum PostgresOperationalStoreError {
     #[error("postgres error: {0}")]

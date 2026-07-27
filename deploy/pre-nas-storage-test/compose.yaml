@@ -1,0 +1,60 @@
+name: lethe-pre-nas-storage-test
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:?POSTGRES_IMAGE is required}
+    environment:
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:?DEPLOYMENT_MODE is required}
+      POSTGRES_DB: ${TEST_POSTGRES_DB:?TEST_POSTGRES_DB is required}
+      POSTGRES_PASSWORD: ${TEST_POSTGRES_PASSWORD:?TEST_POSTGRES_PASSWORD is required}
+      POSTGRES_USER: ${TEST_POSTGRES_USER:?TEST_POSTGRES_USER is required}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          test "$$DEPLOYMENT_MODE" = test &&
+          PGPASSWORD="$$POSTGRES_PASSWORD"
+          psql --host=127.0.0.1 --username="$$POSTGRES_USER"
+          --dbname="$$POSTGRES_DB" --no-psqlrc --tuples-only
+          --command="SELECT 1"
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+    ports:
+      - 127.0.0.1:${TEST_POSTGRES_PORT:?TEST_POSTGRES_PORT is required}:5432
+    tmpfs:
+      - /var/lib/postgresql/data
+    networks:
+      - test-internal
+
+  minio:
+    image: ${MINIO_IMAGE:?MINIO_IMAGE is required}
+    command:
+      - server
+      - /data
+      - --console-address
+      - :9001
+    environment:
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:?DEPLOYMENT_MODE is required}
+      MINIO_ROOT_PASSWORD: ${TEST_MINIO_ROOT_PASSWORD:?TEST_MINIO_ROOT_PASSWORD is required}
+      MINIO_ROOT_USER: ${TEST_MINIO_ROOT_USER:?TEST_MINIO_ROOT_USER is required}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          test "$$DEPLOYMENT_MODE" = test &&
+          curl --fail http://localhost:9000/minio/health/live
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+    ports:
+      - 127.0.0.1:${TEST_MINIO_PORT:?TEST_MINIO_PORT is required}:9000
+    tmpfs:
+      - /data
+    networks:
+      - test-internal
+
+networks:
+  test-internal:

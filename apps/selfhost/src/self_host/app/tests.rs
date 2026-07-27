@@ -20,15 +20,15 @@ use lethe_core::domain::supplemental::InputAnchorSet;
 use super::{
     AppCore, AppService, BulkImportMaterializeTestGate, CompactProjectionState,
     GoogleSourceRuntime, ImportItemResult, ImportOutcome, NonCorpusRebuildPublishTestGate,
-    SearchJobStatus, SelfHostError, SlackSourceRuntime, classify_slack_ingress,
-    discovered_slack_threads, extract_slide_text_fragments, infer_profile_name_from_fragments,
-    latest_revision_to_capture, namespace_draft, non_empty_state, ranked_self_intro_slide_indices,
-    thread_root_ts,
+    SearchJobStatus, SelfHostError, SlackSourceRuntime, SourceObservationExportQuery,
+    classify_slack_ingress, discovered_slack_threads, extract_slide_text_fragments,
+    infer_profile_name_from_fragments, latest_revision_to_capture, namespace_draft,
+    non_empty_state, ranked_self_intro_slide_indices, thread_root_ts,
 };
 use crate::self_host::config::{
     ApiTokenConfig, CorpusProjectionConfig, FreshnessConfig, GoogleConfig, JsonWebKey,
     JsonWebKeySet, McpOAuthConfig, OperationalLedgerConfig, OpsConfig, ResourceLimits,
-    SecretString, SelfHostConfig, SlackConfig, SlideAiConfig, SupplementalConfig,
+    SecretString, SelfHostConfig, SlackConfig, SlideAiConfig, StorageConfig, SupplementalConfig,
 };
 use crate::self_host::google::HttpGoogleSlidesClient;
 use crate::self_host::slack::HttpSlackClient;
@@ -244,9 +244,11 @@ fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
         bind_addr: "127.0.0.1:0".into(),
         mcp_bind_addr: "127.0.0.1:0".into(),
         mcp_oauth: test_mcp_oauth(),
-        database_path: db.clone(),
-        blob_dir: blobs,
-        secret_encryption_key: [7; 32],
+        storage: StorageConfig::Sqlite {
+            database_path: db.clone(),
+            blob_dir: blobs,
+            secret_encryption_key: [7; 32],
+        },
         operational_ledger: OperationalLedgerConfig::Sqlite {
             data_space_id: lethe_core::domain::DataSpaceId::new("space:test"),
             database_path: db.with_extension("operational.sqlite3"),
@@ -268,6 +270,7 @@ fn test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
             max_page_size: 100,
             max_search_job_workers: 2,
             max_search_job_records: 1_000,
+            max_source_export_scan_records: 10_000,
             max_leaf_observations: 100_000,
             retention_days: 30,
         },
@@ -700,12 +703,20 @@ fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppSe
     let persistence: Arc<Mutex<Box<dyn lethe_storage_api::StoragePorts>>> =
         Arc::new(Mutex::new(Box::new(persistence)));
     let mut persistence_read_pool = Vec::with_capacity(4);
+    let StorageConfig::Sqlite {
+        database_path: general_database_path,
+        blob_dir: general_blob_dir,
+        secret_encryption_key: general_encryption_key,
+    } = &config.storage
+    else {
+        panic!("test_service requires the explicit SQLite general backend");
+    };
     for _ in 0..4 {
         persistence_read_pool.push(Arc::new(Mutex::new(Box::new(
             SqlitePersistence::open_with_routing_key_order(
-                &config.database_path,
-                &config.blob_dir,
-                &config.secret_encryption_key,
+                general_database_path,
+                general_blob_dir,
+                general_encryption_key,
                 config.routing_key_order,
             )
             .unwrap(),
@@ -845,6 +856,144 @@ fn test_service(config: SelfHostConfig, persistence: SqlitePersistence) -> AppSe
         .set_state("append_consumer:person-page", "0")
         .unwrap();
     service
+}
+
+fn source_export_observation(id: &str, schema: &str) -> Observation {
+    Observation {
+        id: ObservationId::new(id),
+        schema: SchemaRef::new(schema),
+        schema_version: SemVer::new("1.0.0"),
+        observer: ObserverRef::new("obs:askbot-slack"),
+        source_system: Some(SourceSystemRef::new("sys:askbot-slack")),
+        actor: None,
+        authority_model: AuthorityModel::LakeAuthoritative,
+        capture_model: CaptureModel::Event,
+        subject: EntityRef::new(format!("source:{id}")),
+        target: None,
+        payload: serde_json::json!({"native_id": id}),
+        attachments: Vec::new(),
+        published: "2026-07-27T00:00:00Z".parse().unwrap(),
+        recorded_at: "2026-07-27T00:00:01Z".parse().unwrap(),
+        consent: None,
+        idempotency_key: IdempotencyKey::new(format!("source-export:{id}")),
+        meta: serde_json::json!({
+            "canonical_json": serde_json::json!({
+                "source": "askbot-source-export-test",
+                "native_id": id,
+                "schema": schema,
+            }).to_string(),
+            "source_container": "askbot-source-export-test",
+        }),
+    }
+}
+
+#[test]
+fn source_export_pins_watermark_skips_unrelated_and_resumes_without_duplicates() {
+    let root = std::env::temp_dir().join(format!("lethe-source-export-{}", uuid::Uuid::now_v7()));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let service = test_service(test_config(db, blobs), persistence);
+
+    for observation in [
+        source_export_observation("source-a", "schema:askbot-source-observation"),
+        source_export_observation("unrelated", "schema:observer-heartbeat"),
+        source_export_observation("source-b", "schema:askbot-source-observation"),
+    ] {
+        service
+            .persistence_lock()
+            .unwrap()
+            .append_observation(&observation)
+            .unwrap();
+    }
+
+    let first = service
+        .export_source_observations(&SourceObservationExportQuery {
+            after_append_seq: 0,
+            limit: 1,
+            watermark: None,
+        })
+        .unwrap();
+    assert_eq!(first.watermark, 3);
+    assert_eq!(first.next_after_append_seq, 1);
+    assert!(!first.complete);
+    assert_eq!(first.items.len(), 1);
+    assert_eq!(first.items[0].observation.id.as_str(), "source-a");
+
+    service
+        .persistence_lock()
+        .unwrap()
+        .append_observation(&source_export_observation(
+            "source-after-watermark",
+            "schema:askbot-source-observation",
+        ))
+        .unwrap();
+
+    let continuation = SourceObservationExportQuery {
+        after_append_seq: first.next_after_append_seq,
+        limit: 10,
+        watermark: Some(first.watermark),
+    };
+    let resumed = service.export_source_observations(&continuation).unwrap();
+    let retried = service.export_source_observations(&continuation).unwrap();
+    assert_eq!(resumed.watermark, 3);
+    assert_eq!(resumed.next_after_append_seq, 3);
+    assert!(resumed.complete);
+    assert_eq!(resumed.items.len(), 1);
+    assert_eq!(resumed.items[0].append_seq, 3);
+    assert_eq!(resumed.items[0].observation.id.as_str(), "source-b");
+    assert_eq!(
+        retried.items[0].observation.id,
+        resumed.items[0].observation.id
+    );
+}
+
+#[test]
+fn source_export_rejects_impossible_watermark_and_scan_exhaustion() {
+    let root = std::env::temp_dir().join(format!(
+        "lethe-source-export-bounds-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let db = root.join("lethe.sqlite3");
+    let blobs = root.join("blobs");
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let mut config = test_config(db, blobs);
+    config.resource_limits.max_source_export_scan_records = 1;
+    let service = test_service(config, persistence);
+
+    for observation in [
+        source_export_observation("unrelated", "schema:observer-heartbeat"),
+        source_export_observation("source", "schema:askbot-source-observation"),
+    ] {
+        service
+            .persistence_lock()
+            .unwrap()
+            .append_observation(&observation)
+            .unwrap();
+    }
+
+    assert!(matches!(
+        service.export_source_observations(&SourceObservationExportQuery {
+            after_append_seq: 0,
+            limit: 1,
+            watermark: Some(3),
+        }),
+        Err(SelfHostError::SourceExportValidation {
+            code: "source_export_watermark_ahead",
+            ..
+        })
+    ));
+    assert!(matches!(
+        service.export_source_observations(&SourceObservationExportQuery {
+            after_append_seq: 0,
+            limit: 1,
+            watermark: Some(2),
+        }),
+        Err(SelfHostError::SourceExportUnavailable {
+            code: "source_export_scan_bound_exhausted",
+            ..
+        })
+    ));
 }
 
 #[test]

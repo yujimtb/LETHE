@@ -759,7 +759,7 @@ impl AppService {
             .persistence_lock()?
             .apply_retention(self.config.resource_limits.retention_days)?;
         if slide_analyses > 0 || retained_observations > 0 {
-            let materialize_result = self.refresh_materialized_snapshot(&mut core);
+            let materialize_result = self.refresh_materialized_snapshot(&core);
             let index_result = self.search_index.catch_up_after_append();
             if let Err(error) = materialize_result {
                 core.mark_non_corpus_materializations_stale();

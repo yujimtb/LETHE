@@ -30,6 +30,7 @@ lethe-search-index = { path = "../../crates/search-index" }
 lethe-storage-api = { path = "../../crates/storage/api" }
 lethe-storage-postgres = { path = "../../crates/storage/postgres" }
 lethe-storage-sqlite = { path = "../../crates/storage/sqlite" }
+postgres.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 ring.workspace = true

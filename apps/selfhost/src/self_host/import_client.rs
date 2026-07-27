@@ -771,17 +771,19 @@ mod tests {
         set_test_token();
         let drafts = adapter_drafts(1);
         let attempts = (IMPORT_CONCURRENCY_RETRY_LIMIT + 1) as usize;
-        let responses = std::iter::repeat((
-            429,
-            serde_json::json!({
-                "error": "import_concurrency_limit",
-                "detail": "concurrent import limit 2 is currently full",
-                "details": {"maximum": 2},
-                "retry_after": 0
-            })
-            .to_string(),
-        ))
-        .take(attempts)
+        let responses = std::iter::repeat_n(
+            (
+                429,
+                serde_json::json!({
+                    "error": "import_concurrency_limit",
+                    "detail": "concurrent import limit 2 is currently full",
+                    "details": {"maximum": 2},
+                    "retry_after": 0
+                })
+                .to_string(),
+            ),
+            attempts,
+        )
         .collect();
         let (base_url, server) = spawn_http_responses(responses);
 

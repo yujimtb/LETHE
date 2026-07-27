@@ -146,6 +146,16 @@ as a retry identity or routing uniqueness key. The request body limit is
 page limit defaults to 500 for the personal lake. Limit errors include both
 the actual value and the applied maximum.
 
+Provider-page adapters that must advance their frontier only after every item
+is durable do not use this v2 partial-success endpoint. They use the distinct
+`POST /api/v3/import/atomic-observation-pages` contract and, for attachments,
+`PUT /api/v3/import/source-blobs/{sha256}`. A new empty v3-only unit is
+registered through `POST /api/v3/source-units/{source_instance_id}/bootstrap`;
+LETHE, not the client, verifies that the unit is empty and issues generation 1.
+v3 requires an active unit and positive generation, has no bulk-session field,
+and never falls back to v1/v2. The exact wire contract and ask_bot observer matrix are documented
+in [Atomic source page ingestion v3](atomic-source-page-ingestion.md).
+
 For v2, the shared Rust client replaces each adapter's v1 idempotency key only
 at the HTTP boundary using `meta.object_id` and `meta.canonical_json`; the
 adapter draft itself remains unchanged. `ingested` and

@@ -173,22 +173,33 @@ async fn handle_json_rpc(
                 "version": env!("CARGO_PKG_VERSION"),
             }
         })),
-        "tools/list" => Ok(tools_list_result(
-            &state.service.corpus_source_type_summaries()?,
-        )),
+        "tools/list" => {
+            let service = state.service.clone();
+            let source_types =
+                run_blocking(move || Ok(service.corpus_source_type_summaries()?)).await?;
+            Ok(tools_list_result(&source_types))
+        }
         "tools/call" => {
             let params: ToolCallParams = parse_params(request.params)?;
-            call_tool(
-                &state.service,
-                &state.oauth.protected_resource_metadata_url,
-                token,
-                params,
-            )
+            let service = state.service.clone();
+            let metadata_url = state.oauth.protected_resource_metadata_url.clone();
+            let token = token.clone();
+            run_blocking(move || call_tool(&service, &metadata_url, &token, params)).await
         }
         other => Err(JsonRpcAppError::method_not_found(format!(
             "unsupported MCP method: {other}"
         ))),
     }
+}
+
+async fn run_blocking<T, F>(operation: F) -> Result<T, JsonRpcAppError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, JsonRpcAppError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| JsonRpcAppError::internal(error.to_string()))?
 }
 
 fn tools_list_result(source_types: &[CorpusSourceTypeSummary]) -> Value {

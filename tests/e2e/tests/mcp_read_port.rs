@@ -19,7 +19,7 @@ use lethe_selfhost::self_host::app::AppService;
 use lethe_selfhost::self_host::config::{
     ApiTokenConfig, CorpusProjectionConfig, FreshnessConfig, GoogleConfig, JsonWebKey,
     JsonWebKeySet, McpOAuthConfig, OperationalLedgerConfig, OpsConfig, ResourceLimits,
-    SecretString, SelfHostConfig, SupplementalConfig,
+    SecretString, SelfHostConfig, StorageConfig, SupplementalConfig,
 };
 use lethe_selfhost::self_host::mcp::build_mcp_router;
 use lethe_selfhost::self_host::server::build_router;
@@ -197,9 +197,11 @@ fn test_config(db: PathBuf, blobs: PathBuf, oauth: McpOAuthConfig) -> SelfHostCo
         bind_addr: "127.0.0.1:8080".into(),
         mcp_bind_addr: "127.0.0.1:8090".into(),
         mcp_oauth: oauth,
-        database_path: db.clone(),
-        blob_dir: blobs,
-        secret_encryption_key: [7; 32],
+        storage: StorageConfig::Sqlite {
+            database_path: db.clone(),
+            blob_dir: blobs,
+            secret_encryption_key: [7; 32],
+        },
         operational_ledger: OperationalLedgerConfig::Sqlite {
             data_space_id: lethe_core::domain::DataSpaceId::new("space:mcp-e2e"),
             database_path: db.with_extension("operational.sqlite3"),
@@ -221,6 +223,7 @@ fn test_config(db: PathBuf, blobs: PathBuf, oauth: McpOAuthConfig) -> SelfHostCo
             max_page_size: 100,
             max_search_job_workers: 2,
             max_search_job_records: 1_000,
+            max_source_export_scan_records: 10_000,
             max_leaf_observations: 100_000,
             retention_days: 30,
         },

@@ -17,10 +17,12 @@ use lethe_selfhost::self_host::app::AppService;
 use lethe_selfhost::self_host::config::{
     ApiTokenConfig, CorpusProjectionConfig, FreshnessConfig, GoogleConfig, JsonWebKey,
     JsonWebKeySet, McpOAuthConfig, OperationalLedgerConfig, OpsConfig, ResourceLimits,
-    SecretString, SelfHostConfig, SlackConfig, SlideAiConfig, SupplementalConfig,
+    SecretString, SelfHostConfig, SlackConfig, SlideAiConfig, StorageConfig, SupplementalConfig,
 };
 use lethe_selfhost::self_host::server::build_router;
+use lethe_storage_api::{BlobStore as StorageBlobStore, CutoverStore};
 use lethe_storage_sqlite::persistence::SqlitePersistence;
+use sha2::{Digest, Sha256};
 use tower::util::ServiceExt;
 
 fn temp_paths() -> (PathBuf, PathBuf, PathBuf) {
@@ -123,14 +125,25 @@ fn v2_slack_draft(
 }
 
 fn persisted_v2_observation(draft: &ObservationDraft) -> Observation {
+    persisted_v2_observation_for_source(draft, "slack-test")
+}
+
+fn persisted_v2_observation_for_source(
+    draft: &ObservationDraft,
+    source_instance_id: &str,
+) -> Observation {
     let mut meta = draft.meta.as_object().cloned().unwrap();
     meta.insert(
         "source_instance".to_owned(),
-        serde_json::Value::String("slack-test".to_owned()),
+        serde_json::Value::String(source_instance_id.to_owned()),
     );
+    let source_container = meta
+        .get("source_container")
+        .and_then(serde_json::Value::as_str)
+        .unwrap();
     meta.insert(
         "source_container".to_owned(),
-        serde_json::Value::String("slack-test:C01ABC".to_owned()),
+        serde_json::Value::String(format!("{source_instance_id}:{source_container}")),
     );
     Observation {
         id: Observation::new_id(),
@@ -151,6 +164,129 @@ fn persisted_v2_observation(draft: &ObservationDraft) -> Observation {
         idempotency_key: draft.idempotency_key.clone(),
         meta: serde_json::Value::Object(meta),
     }
+}
+
+fn askbot_source_draft(
+    source_instance_id: &str,
+    object_id: &str,
+    observer: &str,
+    source_system: &str,
+    attachments: Vec<lethe_core::domain::BlobRef>,
+) -> ObservationDraft {
+    let source_slug = source_system.strip_prefix("sys:").unwrap();
+    let native_payload = serde_json::json!({
+        "channel_id": "C01ABC",
+        "ts": object_id,
+        "text": format!("native payload {object_id}"),
+    });
+    let payload_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&native_payload).unwrap()));
+    let blob_digests = attachments
+        .iter()
+        .map(|blob_ref| {
+            blob_ref
+                .as_str()
+                .strip_prefix("blob:sha256:")
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    let canonical_json = serde_json::json!({
+        "source_instance_id": source_instance_id,
+        "object_id": object_id,
+        "payload_sha256": payload_sha256,
+    })
+    .to_string();
+    ObservationDraft {
+        schema: SchemaRef::new("schema:askbot-source-observation"),
+        schema_version: SemVer::new("1.0.0"),
+        observer: ObserverRef::new(observer),
+        source_system: Some(SourceSystemRef::new(source_system)),
+        authority_model: AuthorityModel::LakeAuthoritative,
+        capture_model: CaptureModel::Event,
+        subject: EntityRef::new(format!("https://askbot.hlab.college/subjects/{object_id}")),
+        target: None,
+        payload: serde_json::json!({
+            "subject": format!("https://askbot.hlab.college/subjects/{object_id}"),
+            "observation": format!("https://askbot.hlab.college/observations/{object_id}"),
+            "conflict_set": format!("https://askbot.hlab.college/conflicts/{object_id}"),
+            "schema": format!("https://askbot.hlab.college/schemas/{source_slug}/v1"),
+            "native_identifier": {
+                "source": format!("https://askbot.hlab.college/sources/{source_slug}"),
+                "schema": format!("https://askbot.hlab.college/native-identifiers/{source_slug}/v1"),
+                "parts": {
+                    "channel_id": "C01ABC",
+                    "ts": object_id,
+                }
+            },
+            "source_position": object_id,
+            "revision": format!("revision:{object_id}"),
+            "observed_at": Utc::now().to_rfc3339(),
+            "payload": native_payload,
+            "tombstone": false,
+            "blob_digests": blob_digests,
+            "payload_sha256": payload_sha256,
+        }),
+        attachments,
+        published: Utc::now(),
+        idempotency_key: identity_key(source_instance_id, object_id, &canonical_json),
+        client_ref: Some(object_id.to_owned()),
+        meta: serde_json::json!({
+            "object_id": object_id,
+            "canonical_json": canonical_json,
+            "source_container": "C01ABC",
+        }),
+    }
+}
+
+fn activate_v2_source(
+    persistence: &SqlitePersistence,
+    source_instance_id: &str,
+    canary: &ObservationDraft,
+) -> u64 {
+    let mut observation = persisted_v2_observation_for_source(canary, source_instance_id);
+    observation.idempotency_key = IdempotencyKey::new(format!(
+        "{source_instance_id}:legacy:{}",
+        canary.meta["object_id"].as_str().unwrap()
+    ));
+    persistence.persist_observation(&observation).unwrap();
+    persistence.identity_bridge_apply_batch(1024).unwrap();
+    persistence
+        .cutover_register(source_instance_id, "owner:e2e", "register v3 source")
+        .unwrap();
+    persistence
+        .cutover_begin_drain(source_instance_id, "owner:e2e", "fence v3 source")
+        .unwrap();
+    let canonical_json = canary.meta["canonical_json"].as_str().unwrap().to_owned();
+    let fixture = lethe_storage_api::CutoverFixture {
+        object_id: canary.meta["object_id"].as_str().unwrap().to_owned(),
+        canonical_json: canonical_json.clone(),
+        expected_identity_key: identity_key(
+            source_instance_id,
+            canary.meta["object_id"].as_str().unwrap(),
+            &canonical_json,
+        )
+        .as_str()
+        .to_owned(),
+        expected_observation_id: Some(observation.id),
+    };
+    persistence
+        .cutover_activate(
+            source_instance_id,
+            "owner:e2e",
+            "activate v3 source",
+            &fixture,
+        )
+        .unwrap()
+        .generation
+}
+
+fn atomic_page_audit_count(persistence: &SqlitePersistence) -> usize {
+    persistence
+        .audit_event_page(None, 10_000)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.event_json.contains("v3_atomic_observation_page"))
+        .count()
 }
 
 fn ingestion_test_config(db: PathBuf, blobs: PathBuf) -> SelfHostConfig {
@@ -234,9 +370,11 @@ fn test_config_with_corpus(db: PathBuf, blobs: PathBuf, corpus_mode: CorpusMode)
         bind_addr: "127.0.0.1:0".into(),
         mcp_bind_addr: "127.0.0.1:0".into(),
         mcp_oauth: test_mcp_oauth(),
-        database_path: db.clone(),
-        blob_dir: blobs,
-        secret_encryption_key: [7; 32],
+        storage: StorageConfig::Sqlite {
+            database_path: db.clone(),
+            blob_dir: blobs,
+            secret_encryption_key: [7; 32],
+        },
         operational_ledger: OperationalLedgerConfig::Sqlite {
             data_space_id: lethe_core::domain::DataSpaceId::new("space:e2e"),
             database_path: db.with_extension("operational.sqlite3"),
@@ -253,6 +391,7 @@ fn test_config_with_corpus(db: PathBuf, blobs: PathBuf, corpus_mode: CorpusMode)
                 "read:corpus".into(),
                 "read:answer-log".into(),
                 "read:operational".into(),
+                "read:source-observations".into(),
                 "write:operational".into(),
                 "read:history".into(),
                 "write:history".into(),
@@ -267,6 +406,7 @@ fn test_config_with_corpus(db: PathBuf, blobs: PathBuf, corpus_mode: CorpusMode)
             max_page_size: 100,
             max_search_job_workers: 2,
             max_search_job_records: 1_000,
+            max_source_export_scan_records: 10_000,
             max_leaf_observations: 100_000,
             retention_days: 30,
         },
@@ -644,6 +784,727 @@ fn bootstrap_ready(config: SelfHostConfig) -> AppService {
     let service = AppService::bootstrap(config).unwrap();
     wait_for_search_index_ready(&service);
     service
+}
+
+#[test]
+fn source_observation_export_http_contract_is_strict_authorized_and_restartable() {
+    let (root, db, blobs) = temp_paths();
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let source_instance_id = "askbot-slack-export-e2e";
+    let source_a = persisted_v2_observation_for_source(
+        &askbot_source_draft(
+            source_instance_id,
+            "export-a",
+            "obs:askbot-slack-adapter",
+            "sys:slack",
+            vec![],
+        ),
+        source_instance_id,
+    );
+    let unrelated = slack_observation(
+        "U-OTHER",
+        "other@example.test",
+        "Other",
+        "unrelated",
+        "general",
+        "export-unrelated",
+    );
+    let source_b = persisted_v2_observation_for_source(
+        &askbot_source_draft(
+            source_instance_id,
+            "export-b",
+            "obs:askbot-slack-adapter",
+            "sys:slack",
+            vec![],
+        ),
+        source_instance_id,
+    );
+    for observation in [&source_a, &unrelated, &source_b] {
+        persistence
+            .append_observation_idempotent(observation)
+            .unwrap();
+    }
+    drop(persistence);
+
+    let mut config = test_config(db.clone(), blobs.clone());
+    config.api_tokens.push(ApiTokenConfig {
+        token: SecretString::new("corpus-only-token").unwrap(),
+        scopes: vec!["read:corpus".into()],
+    });
+    let service = bootstrap_ready(config.clone());
+    let app = build_router(service.clone());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    let request = |uri: &str, token: &str| {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let response_json = |response: axum::response::Response| {
+        let status = response.status();
+        let body = runtime
+            .block_on(async { axum::body::to_bytes(response.into_body(), usize::MAX).await })
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        )
+    };
+
+    let denied = runtime
+        .block_on(app.clone().oneshot(request(
+            "/api/v3/export/source-observations?after_append_seq=0&limit=1",
+            "corpus-only-token",
+        )))
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    for invalid_uri in [
+        "/api/v3/export/source-observations?after_append_seq=0",
+        "/api/v3/export/source-observations?after_append_seq=0&limit=1&unknown=true",
+    ] {
+        let invalid = runtime
+            .block_on(app.clone().oneshot(request(invalid_uri, "test-api-token")))
+            .unwrap();
+        let (status, json) = response_json(invalid);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "source_export_query_invalid");
+    }
+    for (invalid_uri, expected_error) in [
+        (
+            "/api/v3/export/source-observations?after_append_seq=0&limit=0",
+            "source_export_limit_invalid",
+        ),
+        (
+            "/api/v3/export/source-observations?after_append_seq=0&limit=101",
+            "source_export_limit_invalid",
+        ),
+        (
+            "/api/v3/export/source-observations?after_append_seq=4&limit=1&watermark=3",
+            "source_export_continuation_invalid",
+        ),
+        (
+            "/api/v3/export/source-observations?after_append_seq=0&limit=1&watermark=4",
+            "source_export_watermark_ahead",
+        ),
+    ] {
+        let invalid = runtime
+            .block_on(app.clone().oneshot(request(invalid_uri, "test-api-token")))
+            .unwrap();
+        let (status, json) = response_json(invalid);
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["error"], expected_error);
+    }
+    let alternate = runtime
+        .block_on(app.clone().oneshot(request(
+            "/api/v2/export/source-observations?after_append_seq=0&limit=1",
+            "test-api-token",
+        )))
+        .unwrap();
+    assert_eq!(alternate.status(), StatusCode::NOT_FOUND);
+
+    let first = runtime
+        .block_on(app.clone().oneshot(request(
+            "/api/v3/export/source-observations?after_append_seq=0&limit=1",
+            "test-api-token",
+        )))
+        .unwrap();
+    let (status, first_json) = response_json(first);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        first_json
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            "complete".to_owned(),
+            "items".to_owned(),
+            "next_after_append_seq".to_owned(),
+            "watermark".to_owned(),
+        ])
+    );
+    assert_eq!(first_json["watermark"], 3);
+    assert_eq!(first_json["next_after_append_seq"], 1);
+    assert_eq!(
+        first_json["items"][0]["observation"]["id"],
+        source_a.id.as_str()
+    );
+
+    let inspector = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let source_after_watermark = persisted_v2_observation_for_source(
+        &askbot_source_draft(
+            source_instance_id,
+            "export-after-watermark",
+            "obs:askbot-slack-adapter",
+            "sys:slack",
+            vec![],
+        ),
+        source_instance_id,
+    );
+    inspector
+        .append_observation_idempotent(&source_after_watermark)
+        .unwrap();
+    drop(inspector);
+    drop(app);
+    drop(service);
+
+    let restarted = build_router(bootstrap_ready(config));
+    let continuation_uri = format!(
+        "/api/v3/export/source-observations?after_append_seq={}&limit=10&watermark={}",
+        first_json["next_after_append_seq"].as_u64().unwrap(),
+        first_json["watermark"].as_u64().unwrap(),
+    );
+    let continuation = runtime
+        .block_on(restarted.oneshot(request(&continuation_uri, "test-api-token")))
+        .unwrap();
+    let (status, continuation_json) = response_json(continuation);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(continuation_json["watermark"], 3);
+    assert_eq!(continuation_json["next_after_append_seq"], 3);
+    assert_eq!(continuation_json["complete"], true);
+    assert_eq!(continuation_json["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        continuation_json["items"][0]["observation"]["id"],
+        source_b.id.as_str()
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn v3_atomic_page_and_source_blob_http_contract_is_all_or_nothing_and_durable() {
+    let (root, db, blobs) = temp_paths();
+    let source_instance_id = "askbot-slack-e2e";
+    let persistence = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let canary = askbot_source_draft(
+        source_instance_id,
+        "canary",
+        "obs:askbot-slack-adapter",
+        "sys:slack",
+        vec![],
+    );
+    let generation = activate_v2_source(&persistence, source_instance_id, &canary);
+    assert_eq!(generation, 2);
+    let google_source_instance_id = "askbot-google-docs-e2e";
+    let google_canary = askbot_source_draft(
+        google_source_instance_id,
+        "google-canary",
+        "obs:askbot-docs-adapter",
+        "sys:google-docs",
+        vec![],
+    );
+    let google_generation =
+        activate_v2_source(&persistence, google_source_instance_id, &google_canary);
+    let note_source_instance_id = "askbot-note-e2e";
+    let note_canary = askbot_source_draft(
+        note_source_instance_id,
+        "note-canary",
+        "obs:askbot-note-adapter",
+        "sys:note",
+        vec![],
+    );
+    let note_generation = activate_v2_source(&persistence, note_source_instance_id, &note_canary);
+    drop(persistence);
+
+    let mut config = ingestion_test_config(db.clone(), blobs.clone());
+    config
+        .freshness
+        .threshold_seconds
+        .insert("sys:google-docs".to_owned(), 36 * 3600);
+    config
+        .freshness
+        .threshold_seconds
+        .insert("sys:note".to_owned(), 36 * 3600);
+    let service = bootstrap_ready(config.clone());
+    let app = build_router(service.clone());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let inspector = SqlitePersistence::open(&db, &blobs, &[7; 32]).unwrap();
+    let baseline_count = inspector.observation_stats().unwrap().count;
+    let baseline_audits = atomic_page_audit_count(&inspector);
+
+    let valid_without_blob = askbot_source_draft(
+        source_instance_id,
+        "valid-before-mixed",
+        "obs:askbot-slack-adapter",
+        "sys:slack",
+        vec![],
+    );
+    let invalid_source_contract = askbot_source_draft(
+        source_instance_id,
+        "invalid-source-contract",
+        "obs:askbot-docs-adapter",
+        "sys:slack",
+        vec![],
+    );
+    let mixed_response = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v3/import/atomic-observation-pages")
+                        .header("authorization", "Bearer test-api-token")
+                        .header("x-lethe-admission-generation", generation)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "source_instance_id": source_instance_id,
+                                "drafts": [valid_without_blob, invalid_source_contract],
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(mixed_response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let mixed_body = runtime
+        .block_on(async { axum::body::to_bytes(mixed_response.into_body(), usize::MAX).await })
+        .unwrap();
+    let mixed_json: serde_json::Value = serde_json::from_slice(&mixed_body).unwrap();
+    assert_eq!(mixed_json["error"], "atomic_page_rejected");
+    assert_eq!(inspector.observation_stats().unwrap().count, baseline_count);
+    assert_eq!(atomic_page_audit_count(&inspector), baseline_audits);
+
+    let unknown_field_response = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v3/import/atomic-observation-pages")
+                        .header("authorization", "Bearer test-api-token")
+                        .header("x-lethe-admission-generation", generation)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "source_instance_id": source_instance_id,
+                                "drafts": [canary],
+                                "atomic": true,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(unknown_field_response.status(), StatusCode::BAD_REQUEST);
+
+    let empty_page_response = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v3/import/atomic-observation-pages")
+                        .header("authorization", "Bearer test-api-token")
+                        .header("x-lethe-admission-generation", generation)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "source_instance_id": source_instance_id,
+                                "drafts": [],
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(empty_page_response.status(), StatusCode::BAD_REQUEST);
+
+    let missing_generation_draft = askbot_source_draft(
+        source_instance_id,
+        "missing-generation",
+        "obs:askbot-slack-adapter",
+        "sys:slack",
+        vec![],
+    );
+    let missing_generation_response = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v3/import/atomic-observation-pages")
+                        .header("authorization", "Bearer test-api-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "source_instance_id": source_instance_id,
+                                "drafts": [missing_generation_draft],
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(
+        missing_generation_response.status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    let duplicate_ref_first = askbot_source_draft(
+        source_instance_id,
+        "duplicate-ref-first",
+        "obs:askbot-slack-adapter",
+        "sys:slack",
+        vec![],
+    );
+    let mut duplicate_ref_second = askbot_source_draft(
+        source_instance_id,
+        "duplicate-ref-second",
+        "obs:askbot-slack-adapter",
+        "sys:slack",
+        vec![],
+    );
+    duplicate_ref_second.client_ref = duplicate_ref_first.client_ref.clone();
+    let duplicate_ref_response = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v3/import/atomic-observation-pages")
+                        .header("authorization", "Bearer test-api-token")
+                        .header("x-lethe-admission-generation", generation)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "source_instance_id": source_instance_id,
+                                "drafts": [duplicate_ref_first, duplicate_ref_second],
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(
+        duplicate_ref_response.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(inspector.observation_stats().unwrap().count, baseline_count);
+    assert_eq!(atomic_page_audit_count(&inspector), baseline_audits);
+
+    let blob_bytes = b"askbot-source-blob-e2e".to_vec();
+    let blob_digest = hex::encode(Sha256::digest(&blob_bytes));
+    let unauthenticated_blob_response = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/api/v3/import/source-blobs/{blob_digest}"))
+                        .header("x-lethe-source-instance", source_instance_id)
+                        .header("x-lethe-admission-generation", generation)
+                        .body(Body::from(blob_bytes.clone()))
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(
+        unauthenticated_blob_response.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let wrong_digest = "1".repeat(64);
+    let wrong_digest_response = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/api/v3/import/source-blobs/{wrong_digest}"))
+                        .header("authorization", "Bearer test-api-token")
+                        .header("x-lethe-source-instance", source_instance_id)
+                        .header("x-lethe-admission-generation", generation)
+                        .body(Body::from(blob_bytes.clone()))
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(
+        wrong_digest_response.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert!(
+        inspector
+            .get_blob(&lethe_core::domain::BlobRef::new(format!(
+                "blob:sha256:{wrong_digest}"
+            )))
+            .unwrap()
+            .is_none()
+    );
+
+    let uppercase_digest = blob_digest.to_ascii_uppercase();
+    let uppercase_path_response = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/api/v3/import/source-blobs/{uppercase_digest}"))
+                        .header("authorization", "Bearer test-api-token")
+                        .header("x-lethe-source-instance", source_instance_id)
+                        .header("x-lethe-admission-generation", generation)
+                        .body(Body::from(blob_bytes.clone()))
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(
+        uppercase_path_response.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    let oversized = vec![b'x'; service.source_blob_body_limit() + 1];
+    let oversized_digest = hex::encode(Sha256::digest(&oversized));
+    let oversized_response = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/api/v3/import/source-blobs/{oversized_digest}"))
+                        .header("authorization", "Bearer test-api-token")
+                        .header("x-lethe-source-instance", source_instance_id)
+                        .header("x-lethe-admission-generation", generation)
+                        .body(Body::from(oversized))
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(oversized_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(
+        inspector
+            .get_blob(&lethe_core::domain::BlobRef::new(format!(
+                "blob:sha256:{oversized_digest}"
+            )))
+            .unwrap()
+            .is_none()
+    );
+
+    for _ in 0..2 {
+        let response = runtime
+            .block_on(async {
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("PUT")
+                            .uri(format!("/api/v3/import/source-blobs/{blob_digest}"))
+                            .header("authorization", "Bearer test-api-token")
+                            .header("x-lethe-source-instance", source_instance_id)
+                            .header("x-lethe-admission-generation", generation)
+                            .body(Body::from(blob_bytes.clone()))
+                            .unwrap(),
+                    )
+                    .await
+            })
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = runtime
+            .block_on(async { axum::body::to_bytes(response.into_body(), usize::MAX).await })
+            .unwrap();
+        let receipt: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(receipt["blob_ref"], format!("blob:sha256:{blob_digest}"));
+        assert_eq!(receipt["size_bytes"], blob_bytes.len());
+    }
+
+    let blob_ref = lethe_core::domain::BlobRef::new(format!("blob:sha256:{blob_digest}"));
+    let valid = askbot_source_draft(
+        source_instance_id,
+        "valid-with-blob",
+        "obs:askbot-slack-adapter",
+        "sys:slack",
+        vec![blob_ref],
+    );
+    let request_body = serde_json::json!({
+        "source_instance_id": source_instance_id,
+        "drafts": [valid],
+    })
+    .to_string();
+    let success_response = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v3/import/atomic-observation-pages")
+                        .header("authorization", "Bearer test-api-token")
+                        .header("x-lethe-admission-generation", generation)
+                        .header("content-type", "application/json")
+                        .body(Body::from(request_body.clone()))
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(success_response.status(), StatusCode::OK);
+    let success_body = runtime
+        .block_on(async { axum::body::to_bytes(success_response.into_body(), usize::MAX).await })
+        .unwrap();
+    let success_json: serde_json::Value = serde_json::from_slice(&success_body).unwrap();
+    assert_eq!(success_json["ingested"], 1);
+    assert_eq!(success_json["duplicates"], 0);
+    assert_eq!(success_json["results"][0]["outcome"], "ingested");
+
+    let retry_response = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v3/import/atomic-observation-pages")
+                        .header("authorization", "Bearer test-api-token")
+                        .header("x-lethe-admission-generation", generation)
+                        .header("content-type", "application/json")
+                        .body(Body::from(request_body.clone()))
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(retry_response.status(), StatusCode::OK);
+    let retry_body = runtime
+        .block_on(async { axum::body::to_bytes(retry_response.into_body(), usize::MAX).await })
+        .unwrap();
+    let retry_json: serde_json::Value = serde_json::from_slice(&retry_body).unwrap();
+    assert_eq!(retry_json["ingested"], 0);
+    assert_eq!(retry_json["duplicates"], 1);
+    assert_eq!(retry_json["results"][0]["outcome"], "duplicate");
+    assert_eq!(
+        inspector.observation_stats().unwrap().count,
+        baseline_count + 1
+    );
+
+    let before_missing_audits = atomic_page_audit_count(&inspector);
+    let missing_blob = lethe_core::domain::BlobRef::new(format!("blob:sha256:{}", "0".repeat(64)));
+    let missing_blob_draft = askbot_source_draft(
+        source_instance_id,
+        "missing-blob",
+        "obs:askbot-slack-adapter",
+        "sys:slack",
+        vec![missing_blob],
+    );
+    let missing_response = runtime
+        .block_on(async {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v3/import/atomic-observation-pages")
+                        .header("authorization", "Bearer test-api-token")
+                        .header("x-lethe-admission-generation", generation)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "source_instance_id": source_instance_id,
+                                "drafts": [missing_blob_draft],
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(missing_response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        inspector.observation_stats().unwrap().count,
+        baseline_count + 1
+    );
+    assert_eq!(atomic_page_audit_count(&inspector), before_missing_audits);
+
+    for (source, generation, observer, source_system, object_id) in [
+        (
+            google_source_instance_id,
+            google_generation,
+            "obs:askbot-docs-adapter",
+            "sys:google-docs",
+            "google-valid",
+        ),
+        (
+            note_source_instance_id,
+            note_generation,
+            "obs:askbot-note-adapter",
+            "sys:note",
+            "note-valid",
+        ),
+    ] {
+        let draft = askbot_source_draft(source, object_id, observer, source_system, vec![]);
+        let response = runtime
+            .block_on(async {
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/v3/import/atomic-observation-pages")
+                            .header("authorization", "Bearer test-api-token")
+                            .header("x-lethe-admission-generation", generation)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                serde_json::json!({
+                                    "source_instance_id": source,
+                                    "drafts": [draft],
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+            })
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    drop(inspector);
+    drop(app);
+    drop(service);
+    drop(runtime);
+
+    let restarted = bootstrap_ready(config);
+    let restarted_app = build_router(restarted);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let restart_retry = runtime
+        .block_on(async {
+            restarted_app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v3/import/atomic-observation-pages")
+                        .header("authorization", "Bearer test-api-token")
+                        .header("x-lethe-admission-generation", generation)
+                        .header("content-type", "application/json")
+                        .body(Body::from(request_body))
+                        .unwrap(),
+                )
+                .await
+        })
+        .unwrap();
+    assert_eq!(restart_retry.status(), StatusCode::OK);
+    let body = runtime
+        .block_on(async { axum::body::to_bytes(restart_retry.into_body(), usize::MAX).await })
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["results"][0]["outcome"], "duplicate");
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

@@ -61,15 +61,21 @@ pub trait ConsentDecisionResolver {
 /// Validates and normalizes an ingestion request without accessing the lake.
 pub struct ObservationPreparer<'a> {
     registry: &'a RegistryStore,
-    blobs: &'a BlobStore,
+    blob_admission: BlobAdmission<'a>,
     consent_resolver: Option<&'a dyn ConsentDecisionResolver>,
+}
+
+#[derive(Clone, Copy)]
+enum BlobAdmission<'a> {
+    InMemory(&'a BlobStore),
+    DeferredToAtomicStore,
 }
 
 impl<'a> ObservationPreparer<'a> {
     pub fn new(registry: &'a RegistryStore, blobs: &'a BlobStore) -> Self {
         Self {
             registry,
-            blobs,
+            blob_admission: BlobAdmission::InMemory(blobs),
             consent_resolver: None,
         }
     }
@@ -81,7 +87,24 @@ impl<'a> ObservationPreparer<'a> {
     ) -> Self {
         Self {
             registry,
-            blobs,
+            blob_admission: BlobAdmission::InMemory(blobs),
+            consent_resolver: Some(consent_resolver),
+        }
+    }
+
+    /// Construct a preparer for a caller whose atomic storage transaction
+    /// performs authoritative blob-reference admission.
+    ///
+    /// This mode only defers the effectful existence/digest check. Registry,
+    /// policy, temporal, source-contract, and payload validation remain
+    /// identical to [`Self::new_with_consent_resolver`].
+    pub fn new_for_atomic_storage(
+        registry: &'a RegistryStore,
+        consent_resolver: &'a dyn ConsentDecisionResolver,
+    ) -> Self {
+        Self {
+            registry,
+            blob_admission: BlobAdmission::DeferredToAtomicStore,
             consent_resolver: Some(consent_resolver),
         }
     }
@@ -262,12 +285,14 @@ impl<'a> ObservationPreparer<'a> {
         // Step 6: Idempotency is decided by the append boundary.
 
         // Step 7: Verify blob refs exist (if any).
-        for br in &req.attachments {
-            if !self.blobs.contains(br) {
-                return Err(IngestResult::Rejected {
-                    class: lethe_core::domain::FailureClass::ValidationFailure,
-                    message: format!("Blob {} not found in blob store", br),
-                });
+        if let BlobAdmission::InMemory(blobs) = self.blob_admission {
+            for br in &req.attachments {
+                if !blobs.contains(br) {
+                    return Err(IngestResult::Rejected {
+                        class: lethe_core::domain::FailureClass::ValidationFailure,
+                        message: format!("Blob {} not found in blob store", br),
+                    });
+                }
             }
         }
 

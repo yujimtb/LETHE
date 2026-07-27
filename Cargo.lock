@@ -1452,6 +1452,7 @@ dependencies = [
  "axum",
  "base64",
  "chrono",
+ "hex",
  "lethe-adapter-api",
  "lethe-adapter-chatgpt",
  "lethe-adapter-claude",
@@ -1472,6 +1473,7 @@ dependencies = [
  "lethe-storage-sqlite",
  "ring",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tower",
  "uuid",
@@ -1767,6 +1769,7 @@ dependencies = [
  "lethe-storage-api",
  "lethe-storage-postgres",
  "lethe-storage-sqlite",
+ "postgres",
  "pretty_assertions",
  "regex",
  "reqwest",
@@ -1803,13 +1806,20 @@ dependencies = [
 name = "lethe-storage-postgres"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "hex",
  "lethe-core",
+ "lethe-runtime",
  "lethe-storage-api",
  "postgres",
+ "quick-xml",
+ "reqwest",
+ "ring",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]
@@ -2341,6 +2351,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "quick-xml"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+dependencies = [
+ "memchr",
+ "serde",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2362,9 +2382,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.14"
+version = "0.11.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
+checksum = "4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e"
 dependencies = [
  "bytes",
  "getrandom 0.3.4",
