@@ -10,7 +10,13 @@
 !tests/
 !tests/**
 !deploy/
+deploy/**
+!deploy/personal-lake/
+deploy/personal-lake/**
+!deploy/personal-lake/config.toml
+!deploy/personal-lake/config.host.toml
 !deploy/persistent-index-benchmark/
+deploy/persistent-index-benchmark/**
 !deploy/persistent-index-benchmark/Dockerfile
 **/.env
 **/.env.*
