@@ -23,6 +23,11 @@ pub enum StorageError {
     CutoverConflict(String),
     #[error("cutover rollback refused: {0}")]
     CutoverRollbackRefused(String),
+    #[error("atomic observation page item {index} has a canonical collision with {existing_id}")]
+    AtomicPageCollision {
+        index: usize,
+        existing_id: ObservationId,
+    },
 }
 
 pub type StorageResult<T> = Result<T, StorageError>;
@@ -723,6 +728,19 @@ pub trait CutoverStore: Send {
         audit_events: &[AuditEventRecord],
     ) -> StorageResult<Vec<AppendOutcome>>;
 
+    /// Append one v2-identity source page as a single transaction.
+    ///
+    /// Unlike the generic v2 partial-success API, a canonical collision is an
+    /// error and MUST roll back every new Observation, audit record, and
+    /// cutover metric from this call.
+    fn append_observations_v2_atomic_page(
+        &self,
+        source_instance_id: &str,
+        generation: u64,
+        observations: &[Observation],
+        audit_events: &[AuditEventRecord],
+    ) -> StorageResult<Vec<AppendOutcome>>;
+
     fn cutover_admit(
         &self,
         source_instance_id: &str,
@@ -742,6 +760,17 @@ pub trait CutoverStore: Send {
     ) -> StorageResult<IdentityBridgeResolution>;
 
     fn cutover_register(
+        &self,
+        source_instance_id: &str,
+        authority: &str,
+        reason: &str,
+    ) -> StorageResult<CutoverState>;
+    /// Bootstrap a new v3-only source unit directly into v2 admission.
+    ///
+    /// The backend MUST verify atomically that the unit has no prior state and
+    /// no canonical Observation. It MUST NOT create a v1 credential or bridge
+    /// fixture.
+    fn bootstrap_v3_source_unit(
         &self,
         source_instance_id: &str,
         authority: &str,
@@ -898,6 +927,82 @@ pub trait BlobStore: Send {
     fn put_blob(&self, data: &[u8], max_bytes: usize) -> StorageResult<BlobRef>;
     fn put_blobs(&self, data: &[&[u8]], max_bytes: usize) -> StorageResult<Vec<BlobRef>>;
     fn get_blob(&self, blob_ref: &BlobRef) -> StorageResult<Option<Vec<u8>>>;
+}
+
+const BLOB_REF_PREFIX: &str = "blob:sha256:";
+const DEEP_HEALTH_PROBE: &[u8] = b"lethe-storage-deep-health-v1";
+
+/// Parse and validate the backend-independent content address carried by a
+/// `BlobRef`.
+pub fn blob_ref_sha256(blob_ref: &BlobRef) -> StorageResult<[u8; 32]> {
+    let digest = blob_ref
+        .as_str()
+        .strip_prefix(BLOB_REF_PREFIX)
+        .ok_or_else(|| {
+            StorageError::Invariant(format!(
+                "blob reference must start with {BLOB_REF_PREFIX}: {blob_ref}"
+            ))
+        })?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(StorageError::Invariant(format!(
+            "blob reference digest must be 64 lowercase hexadecimal characters: {blob_ref}"
+        )));
+    }
+    let decoded = hex::decode(digest).map_err(|error| {
+        StorageError::Invariant(format!("blob reference digest is invalid: {error}"))
+    })?;
+    decoded.try_into().map_err(|_| {
+        StorageError::Invariant("decoded SHA-256 digest must contain exactly 32 bytes".to_owned())
+    })
+}
+
+/// Verify that every referenced object exists and hashes to its declared
+/// backend-independent content address.
+///
+/// `max_total_bytes` bounds bytes materialized by this admission check. An
+/// empty set succeeds without touching the backend.
+pub fn verify_blob_references(
+    store: &(impl BlobStore + ?Sized),
+    blob_refs: &[BlobRef],
+    max_total_bytes: usize,
+) -> StorageResult<()> {
+    let mut total = 0_usize;
+    let mut unique = std::collections::BTreeSet::new();
+    for blob_ref in blob_refs {
+        let expected = blob_ref_sha256(blob_ref)?;
+        if !unique.insert(blob_ref.as_str()) {
+            continue;
+        }
+        let data = store.get_blob(blob_ref)?.ok_or_else(|| {
+            StorageError::Invariant(format!("referenced blob does not exist: {blob_ref}"))
+        })?;
+        total = total.checked_add(data.len()).ok_or_else(|| {
+            StorageError::Invariant("referenced blob verification byte count overflowed".to_owned())
+        })?;
+        if total > max_total_bytes {
+            return Err(StorageError::Invariant(format!(
+                "referenced blob verification bytes {total} exceed maximum {max_total_bytes}"
+            )));
+        }
+        let actual: [u8; 32] = sha2::Sha256::digest(&data).into();
+        if actual != expected {
+            return Err(StorageError::Invariant(format!(
+                "referenced blob content digest mismatch: {blob_ref}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Exercise a BlobStore through the same put/get/digest path used by
+/// ingestion. The fixed content makes repeated readiness checks idempotent.
+pub fn blob_store_deep_health(store: &(impl BlobStore + ?Sized)) -> StorageResult<()> {
+    let blob_ref = store.put_blob(DEEP_HEALTH_PROBE, DEEP_HEALTH_PROBE.len())?;
+    verify_blob_references(store, &[blob_ref], DEEP_HEALTH_PROBE.len())
 }
 
 pub trait SupplementalStore: Send {
@@ -1094,6 +1199,45 @@ impl<T> StoragePorts for T where
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct TestBlobStore {
+        blobs: Mutex<BTreeMap<String, Vec<u8>>>,
+    }
+
+    impl BlobStore for TestBlobStore {
+        fn put_blob(&self, data: &[u8], max_bytes: usize) -> StorageResult<BlobRef> {
+            if data.len() > max_bytes {
+                return Err(StorageError::Invariant("test blob is too large".to_owned()));
+            }
+            let blob_ref = BlobRef::new(format!(
+                "{BLOB_REF_PREFIX}{}",
+                hex::encode(sha2::Sha256::digest(data))
+            ));
+            self.blobs
+                .lock()
+                .map_err(|_| StorageError::Backend("test blob mutex poisoned".to_owned()))?
+                .insert(blob_ref.as_str().to_owned(), data.to_vec());
+            Ok(blob_ref)
+        }
+
+        fn put_blobs(&self, data: &[&[u8]], max_bytes: usize) -> StorageResult<Vec<BlobRef>> {
+            data.iter()
+                .map(|value| self.put_blob(value, max_bytes))
+                .collect()
+        }
+
+        fn get_blob(&self, blob_ref: &BlobRef) -> StorageResult<Option<Vec<u8>>> {
+            Ok(self
+                .blobs
+                .lock()
+                .map_err(|_| StorageError::Backend("test blob mutex poisoned".to_owned()))?
+                .get(blob_ref.as_str())
+                .cloned())
+        }
+    }
 
     fn item(item_key: &str) -> ProjectionItem {
         ProjectionItem {
@@ -1189,6 +1333,52 @@ mod tests {
             }],
         };
         assert!(archive.validate().is_err());
+    }
+
+    #[test]
+    fn blob_reference_parser_rejects_noncanonical_values() {
+        assert!(blob_ref_sha256(&BlobRef::new("sha256:abc")).is_err());
+        assert!(
+            blob_ref_sha256(&BlobRef::new(format!(
+                "{BLOB_REF_PREFIX}{}",
+                "A".repeat(64)
+            )))
+            .is_err()
+        );
+        assert!(
+            blob_ref_sha256(&BlobRef::new(format!(
+                "{BLOB_REF_PREFIX}{}",
+                "a".repeat(63)
+            )))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn referenced_blob_verification_detects_missing_mismatch_and_budget() {
+        let store = TestBlobStore::default();
+        let valid = store.put_blob(b"valid", 5).unwrap();
+        assert!(verify_blob_references(&store, std::slice::from_ref(&valid), 5).is_ok());
+        assert!(verify_blob_references(&store, std::slice::from_ref(&valid), 4).is_err());
+
+        let missing = BlobRef::new(format!("{BLOB_REF_PREFIX}{}", "a".repeat(64)));
+        assert!(verify_blob_references(&store, &[missing], 1024).is_err());
+
+        let mismatched = BlobRef::new(format!("{BLOB_REF_PREFIX}{}", "b".repeat(64)));
+        store
+            .blobs
+            .lock()
+            .unwrap()
+            .insert(mismatched.as_str().to_owned(), b"not-b".to_vec());
+        assert!(verify_blob_references(&store, &[mismatched], 1024).is_err());
+    }
+
+    #[test]
+    fn blob_deep_health_is_idempotent() {
+        let store = TestBlobStore::default();
+        blob_store_deep_health(&store).unwrap();
+        blob_store_deep_health(&store).unwrap();
+        assert_eq!(store.blobs.lock().unwrap().len(), 1);
     }
 }
 
@@ -1450,6 +1640,10 @@ pub mod conformance {
             Err(StorageError::Invariant(_))
         ));
         assert_eq!(store.put_blobs(&[], 1024).unwrap(), Vec::<BlobRef>::new());
+        blob_store_deep_health(store).unwrap();
+        verify_blob_references(store, &batch, 2048).unwrap();
+        let missing = BlobRef::new(format!("{BLOB_REF_PREFIX}{}", "0".repeat(64)));
+        assert!(verify_blob_references(store, &[missing], 1024).is_err());
     }
 
     pub fn materializer_round_trip<T: ProjectionMaterializer>(materializer: &T) {

@@ -61,6 +61,8 @@ source-native write adapter は実装していません。
 - [Runtime reference](docs/architecture/runtime-reference.md)
 - [Repository layout](docs/development/repository-layout.md)
 - [Personal lake ingestion](docs/development/personal-lake-ingestion.md)
+- [Atomic source page ingestion v3](docs/development/atomic-source-page-ingestion.md)
+- [Source Observation export v3](docs/development/source-observation-export.md)
 - [OpenSpec module index](openspec/specs/_index.md)
 - [Security](SECURITY.md)
 
@@ -144,6 +146,8 @@ cargo run -p lethe-selfhost
 - `POST /api/history/imports/inventory` (`write:history`)
 - `POST /api/history/imports` (`write:history`)
 - `POST /api/history/query` (`read:history`)
+- `GET /api/v3/export/source-observations` (`read:source-observations`)
+- `POST /api/v3/source-units/{source_instance_id}/bootstrap` (`admin:cutover`)
 
 `/health` 以外は `Authorization: Bearer <token>` が必要です。Person Projection ID
 は `proj:person-page` です。旧 `/api/persons/*` ルートや raw CAS 配信ルートは

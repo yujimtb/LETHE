@@ -3736,6 +3736,296 @@ fn v2_bridge_duplicate_preserves_ledger_delta_and_canonical_collision() {
 }
 
 #[test]
+fn atomic_v2_page_retries_and_rolls_back_new_items_on_collision() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let store =
+        SqlitePersistence::open(&tmp.join("test.sqlite3"), &tmp.join("blobs"), &[7; 32]).unwrap();
+    let canary_json = serde_json::json!({"fixture": "canary"}).to_string();
+    let canary = bridge_observation(
+        "atomic-unit",
+        "canary",
+        &canary_json,
+        "atomic-unit:legacy:canary",
+    );
+    store
+        .append_observations_v1_with_admission(
+            "atomic-unit",
+            None,
+            std::slice::from_ref(&canary),
+            &[],
+        )
+        .unwrap();
+    store.identity_bridge_apply_batch(16).unwrap();
+    store
+        .cutover_register("atomic-unit", "owner:test", "register atomic test unit")
+        .unwrap();
+    store
+        .cutover_begin_drain("atomic-unit", "owner:test", "fence atomic test unit")
+        .unwrap();
+    let canary_fixture = lethe_storage_api::CutoverFixture {
+        object_id: "canary".to_owned(),
+        canonical_json: canary_json.clone(),
+        expected_identity_key: bridge_identity("atomic-unit", "canary", &canary_json),
+        expected_observation_id: Some(canary.id.clone()),
+    };
+    store
+        .cutover_activate(
+            "atomic-unit",
+            "owner:test",
+            "activate atomic test unit",
+            &canary_fixture,
+        )
+        .unwrap();
+
+    let first_json = serde_json::json!({"body": "first"}).to_string();
+    let second_json = serde_json::json!({"body": "second"}).to_string();
+    let first = bridge_observation(
+        "atomic-unit",
+        "first",
+        &first_json,
+        &bridge_identity("atomic-unit", "first", &first_json),
+    );
+    let second = bridge_observation(
+        "atomic-unit",
+        "second",
+        &second_json,
+        &bridge_identity("atomic-unit", "second", &second_json),
+    );
+    let appended = store
+        .append_observations_v2_atomic_page("atomic-unit", 2, &[first.clone(), second.clone()], &[])
+        .unwrap();
+    assert!(
+        appended
+            .iter()
+            .all(|outcome| matches!(outcome, lethe_storage_api::AppendOutcome::Appended(_)))
+    );
+    let duplicate = store
+        .append_observations_v2_atomic_page("atomic-unit", 2, &[first, second], &[])
+        .unwrap();
+    assert!(
+        duplicate
+            .iter()
+            .all(|outcome| matches!(outcome, lethe_storage_api::AppendOutcome::Duplicate(_)))
+    );
+    assert_eq!(store.observation_stats().unwrap().count, 3);
+    let stale_json = serde_json::json!({"body": "stale generation"}).to_string();
+    let stale = bridge_observation(
+        "atomic-unit",
+        "stale",
+        &stale_json,
+        &bridge_identity("atomic-unit", "stale", &stale_json),
+    );
+    assert!(matches!(
+        store.append_observations_v2_atomic_page("atomic-unit", 1, &[stale], &[]),
+        Err(lethe_storage_api::StorageError::CutoverAdmissionDenied(_))
+    ));
+    assert_eq!(store.observation_stats().unwrap().count, 3);
+
+    let duplicate_audit = lethe_storage_api::AuditEventRecord {
+        id: "audit:atomic-duplicate".to_owned(),
+        timestamp: "2026-07-27T00:00:00Z".to_owned(),
+        actor: "actor:test".to_owned(),
+        event_json: "{}".to_owned(),
+    };
+    store
+        .record_audit_event(
+            &duplicate_audit.id,
+            &duplicate_audit.timestamp,
+            &duplicate_audit.actor,
+            &duplicate_audit.event_json,
+        )
+        .unwrap();
+    let audit_failure_json = serde_json::json!({"body": "audit failure"}).to_string();
+    let audit_failure = bridge_observation(
+        "atomic-unit",
+        "audit-failure",
+        &audit_failure_json,
+        &bridge_identity("atomic-unit", "audit-failure", &audit_failure_json),
+    );
+    assert!(matches!(
+        store.append_observations_v2_atomic_page(
+            "atomic-unit",
+            2,
+            &[audit_failure],
+            &[duplicate_audit],
+        ),
+        Err(lethe_storage_api::StorageError::Backend(_))
+    ));
+    assert_eq!(store.observation_stats().unwrap().count, 3);
+
+    let legacy_json = serde_json::json!({"body": "legacy"}).to_string();
+    let legacy = bridge_observation(
+        "collision-unit",
+        "legacy",
+        &legacy_json,
+        "collision-unit:legacy:legacy",
+    );
+    store
+        .append_observations_v1_with_admission(
+            "collision-unit",
+            None,
+            std::slice::from_ref(&legacy),
+            &[],
+        )
+        .unwrap();
+    store.identity_bridge_apply_batch(16).unwrap();
+    store
+        .cutover_register(
+            "collision-unit",
+            "owner:test",
+            "register collision test unit",
+        )
+        .unwrap();
+    store
+        .cutover_begin_drain("collision-unit", "owner:test", "fence collision test unit")
+        .unwrap();
+    let collision_fixture = lethe_storage_api::CutoverFixture {
+        object_id: "legacy".to_owned(),
+        canonical_json: legacy_json.clone(),
+        expected_identity_key: bridge_identity("collision-unit", "legacy", &legacy_json),
+        expected_observation_id: Some(legacy.id.clone()),
+    };
+    store
+        .cutover_activate(
+            "collision-unit",
+            "owner:test",
+            "activate collision test unit",
+            &collision_fixture,
+        )
+        .unwrap();
+    let collision_identity = bridge_identity("collision-unit", "legacy", &legacy_json);
+    let mismatched_json = serde_json::json!({"body": "mismatched candidate"}).to_string();
+    store
+        .conn
+        .execute(
+            "INSERT INTO identity_bridge_candidates (
+                v2_identity_key, observation_id, source_instance_id, append_seq,
+                canonical_json, canonical_json_sha256
+             ) VALUES (?1, 'legacy-collision', 'collision-unit', 999, ?2, ?3)",
+            params![
+                collision_identity,
+                mismatched_json,
+                canonical_json_sha256(&mismatched_json)
+            ],
+        )
+        .unwrap();
+
+    let before = store.observation_stats().unwrap().count;
+    let new_json = serde_json::json!({"body": "must roll back"}).to_string();
+    let new_observation = bridge_observation(
+        "collision-unit",
+        "new",
+        &new_json,
+        &bridge_identity("collision-unit", "new", &new_json),
+    );
+    let collision = bridge_observation(
+        "collision-unit",
+        "legacy",
+        &legacy_json,
+        &bridge_identity("collision-unit", "legacy", &legacy_json),
+    );
+    let result = store.append_observations_v2_atomic_page(
+        "collision-unit",
+        2,
+        &[new_observation, collision],
+        &[],
+    );
+    assert!(matches!(
+        result,
+        Err(lethe_storage_api::StorageError::AtomicPageCollision { index: 1, .. })
+    ));
+    assert_eq!(store.observation_stats().unwrap().count, before);
+
+    let missing_blob_json = serde_json::json!({"body": "missing blob"}).to_string();
+    let mut missing_blob = bridge_observation(
+        "collision-unit",
+        "missing-blob",
+        &missing_blob_json,
+        &bridge_identity("collision-unit", "missing-blob", &missing_blob_json),
+    );
+    missing_blob.attachments = vec![BlobRef::new(format!("blob:sha256:{}", "0".repeat(64)))];
+    let result =
+        store.append_observations_v2_atomic_page("collision-unit", 2, &[missing_blob], &[]);
+    assert!(
+        matches!(result, Err(lethe_storage_api::StorageError::Invariant(message)) if message.contains("referenced blob does not exist"))
+    );
+    assert_eq!(store.observation_stats().unwrap().count, before);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn v3_source_unit_bootstrap_requires_an_empty_unit_and_issues_only_v2_generation_one() {
+    let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
+    let store =
+        SqlitePersistence::open(&tmp.join("test.sqlite3"), &tmp.join("blobs"), &[7; 32]).unwrap();
+
+    let state = store
+        .bootstrap_v3_source_unit("v3-native-unit", "owner:test", "bootstrap")
+        .unwrap();
+    assert_eq!(state.phase, lethe_storage_api::CutoverPhase::V2Active);
+    assert_eq!(state.generation, 1);
+    let retry = store
+        .bootstrap_v3_source_unit("v3-native-unit", "owner:test", "exact retry")
+        .unwrap();
+    assert_eq!(retry.source_instance_id, state.source_instance_id);
+    assert_eq!(retry.phase, state.phase);
+    assert_eq!(retry.generation, state.generation);
+    assert_eq!(retry.fence_append_seq, state.fence_append_seq);
+    assert_eq!(retry.first_v2_append_seq, state.first_v2_append_seq);
+    assert_eq!(retry.v2_ingested, state.v2_ingested);
+    assert!(
+        store
+            .cutover_admit(
+                "v3-native-unit",
+                lethe_storage_api::CutoverApiVersion::V2,
+                Some(1),
+            )
+            .is_ok()
+    );
+    assert!(matches!(
+        store.cutover_admit(
+            "v3-native-unit",
+            lethe_storage_api::CutoverApiVersion::V1,
+            Some(1),
+        ),
+        Err(lethe_storage_api::StorageError::CutoverAdmissionDenied(_))
+    ));
+    assert!(matches!(
+        store.cutover_rollback("v3-native-unit", "owner:test", "invalid"),
+        Err(lethe_storage_api::StorageError::CutoverRollbackRefused(reason))
+            if reason.contains("no v1 protocol")
+    ));
+
+    let canonical_json = serde_json::json!({"body": "native v3"}).to_string();
+    let identity = bridge_identity("v3-native-unit", "object-1", &canonical_json);
+    let observation = bridge_observation("v3-native-unit", "object-1", &canonical_json, &identity);
+    let outcomes = store
+        .append_observations_v2_atomic_page(
+            "v3-native-unit",
+            1,
+            std::slice::from_ref(&observation),
+            &[],
+        )
+        .unwrap();
+    assert!(matches!(
+        outcomes.as_slice(),
+        [lethe_storage_api::AppendOutcome::Appended(_)]
+    ));
+    assert_eq!(
+        store.cutover_state("v3-native-unit").unwrap().phase,
+        lethe_storage_api::CutoverPhase::V2Committed
+    );
+    assert!(matches!(
+        store.bootstrap_v3_source_unit("v3-native-unit", "owner:test", "must fail"),
+        Err(lethe_storage_api::StorageError::CutoverConflict(reason))
+            if reason.contains("canonical Observations")
+    ));
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
 fn cutover_fence_activation_generation_and_rollback_boundary_are_durable() {
     let tmp = std::env::temp_dir().join(format!("lethe-test-{}", uuid::Uuid::now_v7()));
     let store =

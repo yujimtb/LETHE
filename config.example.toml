@@ -75,9 +75,32 @@ oauth_jwks_path = "./mcp-jwks.json"
 # Local durable stores. encryption_key_env names the environment variable that
 # contains the storage key; the key itself must not be written into TOML.
 [storage]
+backend = "sqlite"
 database_path = "./data/lethe.sqlite3"
 blob_dir = "./data/blobs"
 encryption_key_env = "LETHE_STORAGE_ENCRYPTION_KEY"
+
+# PostgreSQL + S3を選ぶ場合は、上の[storage] variantを残さず、次の必須fieldを
+# すべて指定する。secret値そのものはTOMLへ書かない。
+# [storage]
+# backend = "postgres"
+# data_space_id = "space:college"
+# dsn_env = "LETHE_GENERAL_POSTGRES_DSN"
+# schema = "lethe_general"
+# role = "lethe_general"
+# read_pool_size = 4
+#
+# [storage.blobs]
+# endpoint = "https://replace-with-minio.example"
+# region = "us-east-1"
+# bucket = "lethe-general-blobs"
+# access_key_env = "LETHE_GENERAL_S3_ACCESS_KEY"
+# secret_key_env = "LETHE_GENERAL_S3_SECRET_KEY"
+# path_style = true
+# tls_policy = "required"
+# timeout_seconds = 10
+# max_object_bytes = 10485760
+# orphan_min_age_seconds = 86400
 
 # Operational events use one explicitly pinned DataSpace per backend. A SQLite
 # DataSpace must have its own database file and blob directory.
@@ -106,6 +129,7 @@ max_import_drafts = 10000
 max_page_size = 100
 max_search_job_workers = 2
 max_search_job_records = 1000
+max_source_export_scan_records = 10000
 max_leaf_observations = 100000
 retention_days = 30
 
@@ -137,6 +161,10 @@ reject_unregistered_kinds = true
 [[api_tokens]]
 token_env = "LETHE_API_READ_TOKEN"
 scopes = ["read:persons", "read:timeline", "read:corpus", "read:operational", "read:history"]
+
+[[api_tokens]]
+token_env = "LETHE_API_SOURCE_EXPORT_TOKEN"
+scopes = ["read:source-observations"]
 
 [[api_tokens]]
 token_env = "LETHE_API_WRITE_TOKEN"

@@ -30,5 +30,19 @@ Nanihold Interface Pilot向けのPersonal履歴取込と単一HistoryReader契�
 個人 lake の Claude/ChatGPT/GitHub ingestion 手順は
 [`development/personal-lake-ingestion.md`](development/personal-lake-ingestion.md) にあります。
 
+外部source adapterの全件原子的page投入とcontent-addressed source blob APIは
+[`development/atomic-source-page-ingestion.md`](development/atomic-source-page-ingestion.md)
+にあります。
+
+内部Projection/migration clientが正規ask_bot source Observationを固定watermarkで
+読む契約は
+[`development/source-observation-export.md`](development/source-observation-export.md)
+にあります。
+
 OpenSpec SHALL coverage の CI ハーネス規約は
 [`development/review-harness.md`](development/review-harness.md) にあります。
+
+General Observation Lake の PostgreSQL + S3 構成、migration、deep readiness、
+pre-NAS試験、restore、incident対応は
+[`development/postgres-s3-general-storage.md`](development/postgres-s3-general-storage.md)
+にあります。

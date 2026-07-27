@@ -124,7 +124,7 @@ fn cutover_state_connection(
         match current_phase {
             None => {
                 if from_phase != "uninitialized"
-                    || to_phase != CutoverPhase::V1Active
+                    || !matches!(to_phase, CutoverPhase::V1Active | CutoverPhase::V2Active)
                     || *generation != 1
                 {
                     return Err(PersistenceError::SchemaInvariant(format!(
@@ -895,6 +895,87 @@ impl CutoverStore for SqlitePersistence {
         Ok(outcomes.into_iter().map(port_outcome).collect())
     }
 
+    fn append_observations_v2_atomic_page(
+        &self,
+        source_instance_id: &str,
+        generation: u64,
+        observations: &[Observation],
+        audit_events: &[lethe_storage_api::AuditEventRecord],
+    ) -> StorageResult<Vec<PortAppendOutcome>> {
+        validate_cutover_unit(source_instance_id).map_err(storage_error)?;
+        if generation == 0 {
+            return Err(StorageError::Invariant(
+                "atomic page admission generation must be positive".to_owned(),
+            ));
+        }
+        let tree = self.partition_tree_snapshot().map_err(storage_error)?;
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .map_err(PersistenceError::from)
+            .map_err(storage_error)?;
+        if cutover_state_connection(&transaction, source_instance_id)
+            .map_err(storage_error)?
+            .is_none()
+        {
+            return Err(StorageError::CutoverAdmissionDenied(format!(
+                "atomic page cutover unit {source_instance_id} is not registered"
+            )));
+        }
+        self.cutover_admit_transaction(
+            &transaction,
+            source_instance_id,
+            CutoverApiVersion::V2,
+            Some(generation),
+        )
+        .map_err(storage_error)?;
+        let blob_refs = observations
+            .iter()
+            .flat_map(|observation| observation.attachments.iter().cloned())
+            .collect::<Vec<_>>();
+        verify_blob_references(self, &blob_refs, usize::MAX)?;
+        let (outcomes, bridge_hits) = self
+            .append_v2_in_transaction(&transaction, &tree, source_instance_id, observations)
+            .map_err(storage_error)?;
+        if let Some((index, existing_id)) =
+            outcomes
+                .iter()
+                .enumerate()
+                .find_map(|(index, outcome)| match outcome {
+                    DurableAppendOutcome::CanonicalCollision(existing_id) => {
+                        Some((index, existing_id.clone()))
+                    }
+                    DurableAppendOutcome::Appended(_) | DurableAppendOutcome::Duplicate(_) => None,
+                })
+        {
+            return Err(StorageError::AtomicPageCollision { index, existing_id });
+        }
+        for audit in audit_events {
+            insert_audit_event(&transaction, audit).map_err(storage_error)?;
+        }
+        let appended_ids = outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                DurableAppendOutcome::Appended(id) => Some(id.clone()),
+                DurableAppendOutcome::Duplicate(_)
+                | DurableAppendOutcome::CanonicalCollision(_) => None,
+            })
+            .collect::<Vec<_>>();
+        Self::record_v2_append_metrics(
+            &transaction,
+            source_instance_id,
+            bridge_hits,
+            &appended_ids,
+            "actor:self-host",
+            "first v3 atomic page observation committed",
+        )?;
+        transaction
+            .commit()
+            .map_err(PersistenceError::from)
+            .map_err(storage_error)?;
+        Ok(outcomes.into_iter().map(port_outcome).collect())
+    }
+
     fn cutover_admit(
         &self,
         source_instance_id: &str,
@@ -1126,6 +1207,81 @@ impl CutoverStore for SqlitePersistence {
         )
         .map_err(storage_error)?;
         set_active_credential(&transaction, source_instance_id, CutoverApiVersion::V1, 1)
+            .map_err(storage_error)?;
+        ensure_metrics_row(&transaction, source_instance_id).map_err(storage_error)?;
+        transaction
+            .commit()
+            .map_err(PersistenceError::from)
+            .map_err(storage_error)?;
+        self.cutover_state(source_instance_id)
+    }
+
+    fn bootstrap_v3_source_unit(
+        &self,
+        source_instance_id: &str,
+        authority: &str,
+        reason: &str,
+    ) -> StorageResult<CutoverState> {
+        validate_cutover_unit(source_instance_id).map_err(storage_error)?;
+        if authority.trim().is_empty() || reason.trim().is_empty() {
+            return Err(storage_error(PersistenceError::SchemaInvariant(
+                "cutover transition authority and reason must not be blank".to_owned(),
+            )));
+        }
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .map_err(PersistenceError::from)
+            .map_err(storage_error)?;
+        let existing_observation = transaction
+            .query_row(
+                "SELECT EXISTS (
+                    SELECT 1
+                    FROM observations
+                    WHERE json_extract(observation_json, '$.meta.source_instance') = ?1
+                 )",
+                [source_instance_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(PersistenceError::from)
+            .map_err(storage_error)?;
+        let existing_state =
+            cutover_state_connection(&transaction, source_instance_id).map_err(storage_error)?;
+        if existing_observation {
+            return Err(StorageError::CutoverConflict(format!(
+                "v3 source unit {source_instance_id} already has canonical Observations"
+            )));
+        }
+        if let Some(state) = existing_state {
+            if state.phase == CutoverPhase::V2Active
+                && state.generation == 1
+                && state.fence_append_seq.is_none()
+                && state.first_v2_append_seq.is_none()
+                && state.v2_ingested == 0
+            {
+                transaction
+                    .commit()
+                    .map_err(PersistenceError::from)
+                    .map_err(storage_error)?;
+                return Ok(state);
+            }
+            return Err(StorageError::CutoverConflict(format!(
+                "v3 source unit {source_instance_id} already has a non-bootstrap state"
+            )));
+        }
+        record_transition(
+            &transaction,
+            source_instance_id,
+            "uninitialized",
+            CutoverPhase::V2Active,
+            authority,
+            reason,
+            1,
+            None,
+            None,
+        )
+        .map_err(storage_error)?;
+        set_active_credential(&transaction, source_instance_id, CutoverApiVersion::V2, 1)
             .map_err(storage_error)?;
         ensure_metrics_row(&transaction, source_instance_id).map_err(storage_error)?;
         transaction
@@ -1395,6 +1551,23 @@ impl CutoverStore for SqlitePersistence {
             .map_err(storage_error)?;
         let state =
             required_state_transaction(&transaction, source_instance_id).map_err(storage_error)?;
+        let initial_phase = transaction
+            .query_row(
+                "SELECT to_phase
+                 FROM cutover_transition_log
+                 WHERE source_instance_id = ?1
+                 ORDER BY event_seq
+                 LIMIT 1",
+                [source_instance_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(PersistenceError::from)
+            .map_err(storage_error)?;
+        if initial_phase == CutoverPhase::V2Active.as_str() {
+            return Err(StorageError::CutoverRollbackRefused(
+                "rollback refused for a v3-native source unit with no v1 protocol".to_owned(),
+            ));
+        }
         if state.phase == CutoverPhase::V2Committed || state.v2_ingested > 0 {
             return Err(StorageError::CutoverRollbackRefused(
                 "rollback refused after first v2 ingested observation; forward-fix is required"

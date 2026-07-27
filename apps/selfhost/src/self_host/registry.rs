@@ -114,6 +114,15 @@ pub fn seed_registry() -> RegistryStore {
             })
             .unwrap();
     }
+    registry
+        .register_source_system(SourceSystem {
+            id: SourceSystemRef::new("sys:note"),
+            name: "note".into(),
+            provider: Some("note".into()),
+            api_version: Some("v1".into()),
+            source_class: SourceClass::MutableText,
+        })
+        .unwrap();
 
     registry
         .register_observer(Observer {
@@ -311,6 +320,58 @@ pub fn seed_registry() -> RegistryStore {
             })
             .unwrap();
     }
+    for (observer_id, name, source_system) in [
+        (
+            "obs:askbot-slack-adapter",
+            "ask_bot Slack Adapter",
+            "sys:slack",
+        ),
+        (
+            "obs:askbot-drive-adapter",
+            "ask_bot Drive Adapter",
+            "sys:google-drive",
+        ),
+        (
+            "obs:askbot-docs-adapter",
+            "ask_bot Docs Adapter",
+            "sys:google-docs",
+        ),
+        (
+            "obs:askbot-sheets-adapter",
+            "ask_bot Sheets Adapter",
+            "sys:google-sheets",
+        ),
+        (
+            "obs:askbot-slides-adapter",
+            "ask_bot Slides Adapter",
+            "sys:google-slides",
+        ),
+        (
+            "obs:askbot-forms-adapter",
+            "ask_bot Forms Adapter",
+            "sys:google-forms",
+        ),
+        (
+            "obs:askbot-note-adapter",
+            "ask_bot note Adapter",
+            "sys:note",
+        ),
+    ] {
+        registry
+            .register_observer(Observer {
+                id: ObserverRef::new(observer_id),
+                name: name.into(),
+                observer_type: ObserverType::Crawler,
+                source_system: SourceSystemRef::new(source_system),
+                adapter_version: SemVer::new("1.0.0"),
+                schemas: vec![SchemaRef::new("schema:askbot-source-observation")],
+                authority_model: AuthorityModel::LakeAuthoritative,
+                capture_model: CaptureModel::Event,
+                owner: "ask_bot".into(),
+                trust_level: TrustLevel::Automated,
+            })
+            .unwrap();
+    }
 
     registry
         .register_source_system(SourceSystem {
@@ -385,6 +446,7 @@ pub fn seed_registry() -> RegistryStore {
             )
             .unwrap();
     }
+    registry.register_schema(askbot_source_schema()).unwrap();
     for schema in base_supplemental_kind_schemas() {
         registry.register_supplemental_kind_schema(schema).unwrap();
     }
@@ -702,6 +764,87 @@ fn contracts(observer_ids: &[&str]) -> Vec<SchemaSourceContract> {
             compatible_range: ">=1.0.0 <2.0.0".to_owned(),
         })
         .collect()
+}
+
+fn askbot_source_schema() -> ObservationSchema {
+    ObservationSchema {
+        id: SchemaRef::new("schema:askbot-source-observation"),
+        name: "ask_bot Source Observation Envelope".into(),
+        version: SemVer::new("1.0.0"),
+        subject_type: EntityTypeRef::new("et:*"),
+        target_type: None,
+        payload_schema: serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "subject",
+                "observation",
+                "conflict_set",
+                "schema",
+                "native_identifier",
+                "source_position",
+                "revision",
+                "observed_at",
+                "payload",
+                "tombstone",
+                "blob_digests",
+                "payload_sha256"
+            ],
+            "properties": {
+                "subject": {"type": "string", "format": "uri"},
+                "observation": {"type": "string", "format": "uri"},
+                "conflict_set": {"type": "string", "format": "uri"},
+                "schema": {"type": "string", "format": "uri"},
+                "native_identifier": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["source", "schema", "parts"],
+                    "properties": {
+                        "source": {"type": "string", "format": "uri"},
+                        "schema": {"type": "string", "format": "uri"},
+                        "parts": {
+                            "type": "object",
+                            "minProperties": 1,
+                            "additionalProperties": {
+                                "type": "string",
+                                "minLength": 1
+                            }
+                        }
+                    }
+                },
+                "source_position": {"type": "string", "minLength": 1},
+                "revision": {"type": "string", "minLength": 1},
+                "observed_at": {"type": "string", "format": "date-time"},
+                "payload": true,
+                "tombstone": {"type": "boolean"},
+                "blob_digests": {
+                    "type": "array",
+                    "uniqueItems": true,
+                    "items": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$"
+                    }
+                },
+                "payload_sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                }
+            }
+        }),
+        source_contracts: contracts(&[
+            "obs:askbot-slack-adapter",
+            "obs:askbot-drive-adapter",
+            "obs:askbot-docs-adapter",
+            "obs:askbot-sheets-adapter",
+            "obs:askbot-slides-adapter",
+            "obs:askbot-forms-adapter",
+            "obs:askbot-note-adapter",
+        ]),
+        attachment_config: None,
+        registered_by: None,
+        registered_at: None,
+    }
 }
 
 /// Projection contracts declare only the fields read by a projector.  The
@@ -1203,5 +1346,80 @@ fn card_queue_spec() -> ProjectionSpec {
         tags: vec!["card-queue".into(), "reply".into()],
         description: Some("Reply draft approval and send state machine".into()),
         created_by: "self-host".into(),
+    }
+}
+
+#[cfg(test)]
+mod askbot_source_contract_tests {
+    use super::*;
+    use chrono::Utc;
+    use lethe_engine::lake::{BlobStore, IngestRequest, ObservationPreparer};
+
+    fn request(observer: &str, source_system: &str, suffix: &str) -> IngestRequest {
+        IngestRequest {
+            schema: SchemaRef::new("schema:askbot-source-observation"),
+            schema_version: SemVer::new("1.0.0"),
+            observer: ObserverRef::new(observer),
+            source_system: Some(SourceSystemRef::new(source_system)),
+            authority_model: AuthorityModel::LakeAuthoritative,
+            capture_model: CaptureModel::Event,
+            subject: EntityRef::new(format!("https://askbot.hlab.college/subjects/{suffix}")),
+            target: None,
+            payload: serde_json::json!({
+                "subject": format!("https://askbot.hlab.college/subjects/{suffix}"),
+                "observation": format!("https://askbot.hlab.college/observations/{suffix}"),
+                "conflict_set": format!("https://askbot.hlab.college/conflicts/{suffix}"),
+                "schema": "https://askbot.hlab.college/schemas/native/v1",
+                "native_identifier": {
+                    "source": format!("https://askbot.hlab.college/sources/{suffix}"),
+                    "schema": "https://askbot.hlab.college/native-identifiers/v1",
+                    "parts": {"id": suffix},
+                },
+                "source_position": suffix,
+                "revision": format!("revision:{suffix}"),
+                "observed_at": Utc::now().to_rfc3339(),
+                "payload": {"native_field": suffix},
+                "tombstone": false,
+                "blob_digests": [],
+                "payload_sha256": "0".repeat(64),
+            }),
+            attachments: vec![],
+            published: Utc::now(),
+            idempotency_key: IdempotencyKey::new(format!("askbot-contract:{suffix}")),
+            meta: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn all_askbot_source_observers_prepare_and_cross_source_mismatch_fails() {
+        let registry = seed_registry();
+        let blobs = BlobStore::new();
+        let preparer = ObservationPreparer::new(&registry, &blobs);
+        for (observer, source_system, suffix) in [
+            ("obs:askbot-slack-adapter", "sys:slack", "slack"),
+            ("obs:askbot-drive-adapter", "sys:google-drive", "drive"),
+            ("obs:askbot-docs-adapter", "sys:google-docs", "docs"),
+            ("obs:askbot-sheets-adapter", "sys:google-sheets", "sheets"),
+            ("obs:askbot-slides-adapter", "sys:google-slides", "slides"),
+            ("obs:askbot-forms-adapter", "sys:google-forms", "forms"),
+            ("obs:askbot-note-adapter", "sys:note", "note"),
+        ] {
+            assert!(
+                preparer
+                    .prepare(request(observer, source_system, suffix))
+                    .is_ok(),
+                "{observer} must prepare its declared source contract"
+            );
+        }
+
+        let mismatch =
+            preparer.prepare(request("obs:askbot-docs-adapter", "sys:slack", "mismatch"));
+        assert!(matches!(
+            mismatch,
+            Err(IngestResult::Rejected {
+                class: FailureClass::ValidationFailure,
+                ..
+            })
+        ));
     }
 }

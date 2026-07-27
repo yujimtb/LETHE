@@ -18,3 +18,13 @@ deploy/personal-lake/data/
 # local deploy artifacts
 deploy/personal-lake/backups-*/
 deploy/personal-lake/rehearsal-data/
+deploy/personal-lake/rehearsal-data-*/
+deploy/personal-lake/gate.env
+deploy/personal-lake/config.toml.*.bak
+
+# Local worktrees, generated logs, caches, and inspection captures
+/_eep_worktrees/
+/cargo-test.log
+/claudeai_mcp_current.md
+/claudeai_mcp_current.png
+**/__pycache__/

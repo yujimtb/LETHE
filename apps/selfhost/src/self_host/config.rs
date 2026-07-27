@@ -18,9 +18,7 @@ pub struct SelfHostConfig {
     pub bind_addr: String,
     pub mcp_bind_addr: String,
     pub mcp_oauth: McpOAuthConfig,
-    pub database_path: PathBuf,
-    pub blob_dir: PathBuf,
-    pub secret_encryption_key: [u8; 32],
+    pub storage: StorageConfig,
     pub operational_ledger: OperationalLedgerConfig,
     pub poll_interval: Duration,
     pub routing_key_order: RoutingKeyOrder,
@@ -35,6 +33,44 @@ pub struct SelfHostConfig {
     pub slide_analysis_limit: Option<usize>,
     pub slide_ai: Option<SlideAiConfig>,
     pub supplemental: SupplementalConfig,
+}
+
+#[derive(Debug, Clone)]
+pub enum StorageConfig {
+    Sqlite {
+        database_path: PathBuf,
+        blob_dir: PathBuf,
+        secret_encryption_key: [u8; 32],
+    },
+    Postgres {
+        data_space_id: DataSpaceId,
+        dsn: SecretString,
+        schema: String,
+        role: String,
+        read_pool_size: usize,
+        blobs: S3BlobConfig,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct S3BlobConfig {
+    pub endpoint: String,
+    pub region: String,
+    pub bucket: String,
+    pub access_key: SecretString,
+    pub secret_key: SecretString,
+    pub path_style: bool,
+    pub tls_policy: S3TlsPolicy,
+    pub timeout_seconds: u64,
+    pub max_object_bytes: usize,
+    pub orphan_min_age_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum S3TlsPolicy {
+    Required,
+    TestHttp,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +161,7 @@ pub struct ResourceLimits {
     pub max_page_size: usize,
     pub max_search_job_workers: usize,
     pub max_search_job_records: usize,
+    pub max_source_export_scan_records: usize,
     pub max_leaf_observations: usize,
     pub retention_days: u32,
 }
@@ -242,11 +279,36 @@ struct McpFileConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
+enum StorageFileConfig {
+    Sqlite {
+        database_path: PathBuf,
+        blob_dir: PathBuf,
+        encryption_key_env: String,
+    },
+    Postgres {
+        data_space_id: String,
+        dsn_env: String,
+        schema: String,
+        role: String,
+        read_pool_size: usize,
+        blobs: S3BlobFileConfig,
+    },
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StorageFileConfig {
-    database_path: PathBuf,
-    blob_dir: PathBuf,
-    encryption_key_env: String,
+struct S3BlobFileConfig {
+    endpoint: String,
+    region: String,
+    bucket: String,
+    access_key_env: String,
+    secret_key_env: String,
+    path_style: bool,
+    tls_policy: S3TlsPolicy,
+    timeout_seconds: u64,
+    max_object_bytes: usize,
+    orphan_min_age_seconds: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -289,6 +351,7 @@ struct LimitsFileConfig {
     max_page_size: usize,
     max_search_job_workers: usize,
     max_search_job_records: usize,
+    max_source_export_scan_records: usize,
     max_leaf_observations: usize,
     retention_days: u32,
 }
@@ -507,6 +570,43 @@ impl SelfHostConfig {
                 role,
             },
         };
+        let storage = match raw.storage {
+            StorageFileConfig::Sqlite {
+                database_path,
+                blob_dir,
+                encryption_key_env,
+            } => StorageConfig::Sqlite {
+                database_path,
+                blob_dir,
+                secret_encryption_key: parse_encryption_key(&required_env(&encryption_key_env)?)?,
+            },
+            StorageFileConfig::Postgres {
+                data_space_id,
+                dsn_env,
+                schema,
+                role,
+                read_pool_size,
+                blobs,
+            } => StorageConfig::Postgres {
+                data_space_id: DataSpaceId::new(data_space_id),
+                dsn: SecretString::new(required_env(&dsn_env)?)?,
+                schema,
+                role,
+                read_pool_size,
+                blobs: S3BlobConfig {
+                    endpoint: blobs.endpoint,
+                    region: blobs.region,
+                    bucket: blobs.bucket,
+                    access_key: SecretString::new(required_env(&blobs.access_key_env)?)?,
+                    secret_key: SecretString::new(required_env(&blobs.secret_key_env)?)?,
+                    path_style: blobs.path_style,
+                    tls_policy: blobs.tls_policy,
+                    timeout_seconds: blobs.timeout_seconds,
+                    max_object_bytes: blobs.max_object_bytes,
+                    orphan_min_age_seconds: blobs.orphan_min_age_seconds,
+                },
+            },
+        };
 
         Ok(Self {
             bind_addr: raw.server.bind_addr,
@@ -519,11 +619,7 @@ impl SelfHostConfig {
                 jwks_path: raw.mcp.oauth_jwks_path,
                 jwks,
             },
-            database_path: raw.storage.database_path,
-            blob_dir: raw.storage.blob_dir,
-            secret_encryption_key: parse_encryption_key(&required_env(
-                &raw.storage.encryption_key_env,
-            )?)?,
+            storage,
             operational_ledger,
             poll_interval: Duration::from_secs(raw.runtime.poll_seconds),
             routing_key_order: raw.routing.key_order,
@@ -537,6 +633,7 @@ impl SelfHostConfig {
                 max_page_size: raw.limits.max_page_size,
                 max_search_job_workers: raw.limits.max_search_job_workers,
                 max_search_job_records: raw.limits.max_search_job_records,
+                max_source_export_scan_records: raw.limits.max_source_export_scan_records,
                 max_leaf_observations: raw.limits.max_leaf_observations,
                 retention_days: raw.limits.retention_days,
             },
@@ -610,10 +707,15 @@ impl FileConfig {
             self.limits.max_search_job_records,
         )?;
         require_positive(
+            "limits.max_source_export_scan_records",
+            self.limits.max_source_export_scan_records,
+        )?;
+        require_positive(
             "limits.max_leaf_observations",
             self.limits.max_leaf_observations,
         )?;
         require_positive("limits.retention_days", self.limits.retention_days as usize)?;
+        self.storage.validate()?;
         self.operational_ledger.validate()?;
         self.corpus.validate()?;
         if matches!(self.corpus.mode, CorpusMode::PersonalAllText) {
@@ -734,6 +836,108 @@ impl FileConfig {
         }
         Ok(())
     }
+}
+
+impl StorageFileConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        match self {
+            Self::Sqlite {
+                database_path,
+                blob_dir,
+                encryption_key_env,
+            } => {
+                require_path("storage.database_path", database_path)?;
+                require_path("storage.blob_dir", blob_dir)?;
+                require_non_empty("storage.encryption_key_env", encryption_key_env)
+            }
+            Self::Postgres {
+                data_space_id,
+                dsn_env,
+                schema,
+                role,
+                read_pool_size,
+                blobs,
+            } => {
+                require_non_empty("storage.data_space_id", data_space_id)?;
+                require_non_empty("storage.dsn_env", dsn_env)?;
+                require_postgres_identifier("storage.schema", schema)?;
+                require_postgres_identifier("storage.role", role)?;
+                require_positive("storage.read_pool_size", *read_pool_size)?;
+                blobs.validate()
+            }
+        }
+    }
+}
+
+impl S3BlobFileConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let endpoint = reqwest::Url::parse(&self.endpoint)
+            .map_err(|error| ConfigError::Invalid(format!("storage.blobs.endpoint: {error}")))?;
+        if !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+            || endpoint.query().is_some()
+            || endpoint.fragment().is_some()
+        {
+            return Err(ConfigError::Invalid(
+                "storage.blobs.endpoint must not contain credentials, query, or fragment"
+                    .to_owned(),
+            ));
+        }
+        match self.tls_policy {
+            S3TlsPolicy::Required if endpoint.scheme() != "https" => {
+                return Err(ConfigError::Invalid(
+                    "storage.blobs.endpoint must use https when tls_policy is required".to_owned(),
+                ));
+            }
+            S3TlsPolicy::TestHttp => {
+                let host = endpoint.host_str().unwrap_or_default();
+                let test_host =
+                    host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "minio";
+                if endpoint.scheme() != "http" || !test_host {
+                    return Err(ConfigError::Invalid(
+                        "test_http S3 endpoint must use http on localhost, loopback, or minio"
+                            .to_owned(),
+                    ));
+                }
+            }
+            S3TlsPolicy::Required => {}
+        }
+        require_non_empty("storage.blobs.region", &self.region)?;
+        require_s3_bucket("storage.blobs.bucket", &self.bucket)?;
+        require_non_empty("storage.blobs.access_key_env", &self.access_key_env)?;
+        require_non_empty("storage.blobs.secret_key_env", &self.secret_key_env)?;
+        require_positive(
+            "storage.blobs.timeout_seconds",
+            self.timeout_seconds as usize,
+        )?;
+        require_positive("storage.blobs.max_object_bytes", self.max_object_bytes)?;
+        require_positive(
+            "storage.blobs.orphan_min_age_seconds",
+            self.orphan_min_age_seconds as usize,
+        )?;
+        let _ = self.path_style;
+        Ok(())
+    }
+}
+
+fn require_path(field: &str, value: &Path) -> Result<(), ConfigError> {
+    require_non_empty(field, &value.to_string_lossy())
+}
+
+fn require_s3_bucket(field: &str, value: &str) -> Result<(), ConfigError> {
+    require_non_empty(field, value)?;
+    let valid = (3..=63).contains(&value.len())
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    if !valid {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must be a 3-63 character lowercase DNS label"
+        )));
+    }
+    Ok(())
 }
 
 impl OperationalLedgerFileConfig {
@@ -1096,6 +1300,7 @@ mod tests {
             oauth_audience = "lethe-mcp"
             oauth_jwks_path = "mcp-jwks.json"
             [storage]
+            backend = "sqlite"
             database_path = "data/lethe.sqlite3"
             blob_dir = "data/blobs"
             encryption_key_env = "ENCRYPTION_KEY"
@@ -1118,6 +1323,7 @@ mod tests {
             max_page_size = 1
             max_search_job_workers = 2
             max_search_job_records = 2
+            max_source_export_scan_records = 10
             max_leaf_observations = 1
             retention_days = 30
             [corpus]
@@ -1171,6 +1377,7 @@ mod tests {
             oauth_audience = "lethe-mcp"
             oauth_jwks_path = "mcp-jwks.json"
             [storage]
+            backend = "sqlite"
             database_path = "data/lethe.sqlite3"
             blob_dir = "data/blobs"
             encryption_key_env = "ENCRYPTION_KEY"
@@ -1193,6 +1400,7 @@ mod tests {
             max_page_size = 1
             max_search_job_workers = 2
             max_search_job_records = 2
+            max_source_export_scan_records = 10
             max_leaf_observations = 1
             retention_days = 3650
             [corpus]
@@ -1234,6 +1442,7 @@ mod tests {
             oauth_audience = "lethe-mcp"
             oauth_jwks_path = "mcp-jwks.json"
             [storage]
+            backend = "sqlite"
             database_path = "data/lethe.sqlite3"
             blob_dir = "data/blobs"
             encryption_key_env = "ENCRYPTION_KEY"
@@ -1256,6 +1465,7 @@ mod tests {
             max_page_size = 1
             max_search_job_workers = 2
             max_search_job_records = 2
+            max_source_export_scan_records = 10
             max_leaf_observations = 1
             retention_days = 3650
             [corpus]
@@ -1298,6 +1508,7 @@ mod tests {
             oauth_audience = "lethe-mcp"
             oauth_jwks_path = "mcp-jwks.json"
             [storage]
+            backend = "sqlite"
             database_path = "data/lethe.sqlite3"
             blob_dir = "data/blobs"
             encryption_key_env = "ENCRYPTION_KEY"
@@ -1320,6 +1531,7 @@ mod tests {
             max_page_size = 1
             max_search_job_workers = 2
             max_search_job_records = 2
+            max_source_export_scan_records = 10
             max_leaf_observations = 1
             retention_days = 30
             [corpus]
@@ -1347,5 +1559,95 @@ mod tests {
         .unwrap();
 
         assert!(raw.validate().is_err());
+    }
+
+    #[test]
+    fn general_storage_backend_tag_is_required_and_mixed_fields_are_rejected() {
+        assert!(
+            toml::from_str::<StorageFileConfig>(
+                r#"
+                database_path = "data/lethe.sqlite3"
+                blob_dir = "data/blobs"
+                encryption_key_env = "KEY"
+                "#,
+            )
+            .is_err()
+        );
+        assert!(
+            toml::from_str::<StorageFileConfig>(
+                r#"
+                backend = "postgres"
+                data_space_id = "space:test"
+                dsn_env = "DSN"
+                schema = "ask_bot"
+                role = "ask_bot"
+                read_pool_size = 4
+                database_path = "legacy.sqlite3"
+                [blobs]
+                endpoint = "http://minio:9000"
+                region = "us-east-1"
+                bucket = "ask-bot-test"
+                access_key_env = "ACCESS"
+                secret_key_env = "SECRET"
+                path_style = true
+                tls_policy = "test_http"
+                timeout_seconds = 10
+                max_object_bytes = 1048576
+                orphan_min_age_seconds = 3600
+                "#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn postgres_s3_storage_config_validates_explicit_test_boundary() {
+        let valid: StorageFileConfig = toml::from_str(
+            r#"
+            backend = "postgres"
+            data_space_id = "space:test"
+            dsn_env = "DSN"
+            schema = "ask_bot"
+            role = "ask_bot"
+            read_pool_size = 4
+            [blobs]
+            endpoint = "http://minio:9000"
+            region = "us-east-1"
+            bucket = "ask-bot-test"
+            access_key_env = "ACCESS"
+            secret_key_env = "SECRET"
+            path_style = true
+            tls_policy = "test_http"
+            timeout_seconds = 10
+            max_object_bytes = 1048576
+            orphan_min_age_seconds = 3600
+            "#,
+        )
+        .unwrap();
+        assert!(valid.validate().is_ok());
+
+        let insecure: StorageFileConfig = toml::from_str(
+            r#"
+            backend = "postgres"
+            data_space_id = "space:test"
+            dsn_env = "DSN"
+            schema = "ask_bot"
+            role = "ask_bot"
+            read_pool_size = 4
+            [blobs]
+            endpoint = "http://storage.example.test"
+            region = "us-east-1"
+            bucket = "ask-bot-test"
+            access_key_env = "ACCESS"
+            secret_key_env = "SECRET"
+            path_style = true
+            tls_policy = "required"
+            timeout_seconds = 10
+            max_object_bytes = 1048576
+            orphan_min_age_seconds = 3600
+            "#,
+        )
+        .unwrap();
+        assert!(insecure.validate().is_err());
     }
 }

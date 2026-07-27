@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::attribute_inventory::{AttributeInventoryDocument, build_inventory_documents};
 use crate::self_host::config::{
-    GoogleConfig, OperationalLedgerConfig, SelfHostConfig, SlackConfig,
+    GoogleConfig, OperationalLedgerConfig, S3TlsPolicy, SelfHostConfig, SlackConfig, StorageConfig,
 };
 use crate::self_host::google::HttpGoogleSlidesClient;
 use crate::self_host::registry::{seed_projection_catalog, seed_registry};
@@ -93,9 +93,11 @@ use lethe_storage_api::{
     DiscoveredSlackThread, ObservationStats, OperationalAppendOutcome, OperationalAppendRequest,
     OperationalEventFilter, OperationalEventStats, OperationalStoragePorts, PersistedSyncState,
     ProjectionItem, ProjectionItemCommit, SlackThreadCatalogEntry, SlackThreadKey, StorageError,
-    StoragePorts, StoredObservation, StoredOperationalEvent,
+    StoragePorts, StoredObservation, StoredOperationalEvent, blob_ref_sha256,
 };
-use lethe_storage_postgres::PostgresOperationalEventStore;
+use lethe_storage_postgres::{
+    PostgresOperationalEventStore, PostgresPersistence, S3BlobStoreConfig, S3TransportPolicy,
+};
 use lethe_storage_sqlite::persistence::{
     PersistenceError, SqliteOperationalEventStore, SqlitePersistence,
 };
@@ -150,6 +152,25 @@ pub enum SelfHostError {
         detail: String,
         details: serde_json::Value,
     },
+    #[error("atomic page rejected")]
+    AtomicPageRejected { failures: Vec<AtomicPageFailure> },
+    #[error("atomic page storage transaction failed")]
+    AtomicPageTransient,
+    #[error("source blob validation failed: {code}")]
+    SourceBlobValidation {
+        code: &'static str,
+        details: serde_json::Value,
+    },
+    #[error("source Observation export validation failed: {code}")]
+    SourceExportValidation {
+        code: &'static str,
+        details: serde_json::Value,
+    },
+    #[error("source Observation export unavailable: {code}")]
+    SourceExportUnavailable {
+        code: &'static str,
+        details: serde_json::Value,
+    },
     #[error("operational ledger startup failed: {0}")]
     OperationalLedger(String),
     #[error("serialization error: {0}")]
@@ -179,6 +200,49 @@ pub struct ImportReport {
     pub results: Vec<ImportItemResult>,
     #[serde(default)]
     pub summary: ImportSummary,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AtomicPageReport {
+    pub ingested: usize,
+    pub duplicates: usize,
+    pub results: Vec<AtomicPageItemResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "outcome", rename_all = "lowercase")]
+pub enum AtomicPageItemResult {
+    Ingested {
+        client_ref: String,
+        observation_id: ObservationId,
+    },
+    Duplicate {
+        client_ref: String,
+        existing_id: ObservationId,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AtomicPageFailureClass {
+    Validation,
+    Collision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AtomicPageFailure {
+    pub index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_ref: Option<String>,
+    pub error_code: String,
+    pub failure_class: AtomicPageFailureClass,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceBlobReceipt {
+    pub blob_ref: BlobRef,
+    pub size_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -624,6 +688,10 @@ const PROJECTION_FOLD_DECLARATIONS: &[(&str, ProjectionFoldBehavior)] = &[
     ),
     (
         "schema:bot-answer-log",
+        ProjectionFoldBehavior::FreshnessOnly,
+    ),
+    (
+        "schema:askbot-source-observation",
         ProjectionFoldBehavior::FreshnessOnly,
     ),
     (
@@ -1892,6 +1960,70 @@ fn prepare_draft(core: &AppCore, draft: ObservationDraft) -> Result<Observation,
             idempotency_key: draft.idempotency_key,
             meta: draft.meta,
         })
+}
+
+fn prepare_atomic_draft(
+    core: &AppCore,
+    draft: ObservationDraft,
+) -> Result<Observation, IngestResult> {
+    ObservationPreparer::new_for_atomic_storage(&core.registry, &core.compact_state).prepare(
+        IngestRequest {
+            schema: draft.schema,
+            schema_version: draft.schema_version,
+            observer: draft.observer,
+            source_system: draft.source_system,
+            authority_model: draft.authority_model,
+            capture_model: draft.capture_model,
+            subject: draft.subject,
+            target: draft.target,
+            payload: draft.payload,
+            attachments: draft.attachments,
+            published: draft.published,
+            idempotency_key: draft.idempotency_key,
+            meta: draft.meta,
+        },
+    )
+}
+
+fn atomic_failure(
+    index: usize,
+    client_ref: Option<String>,
+    error_code: impl Into<String>,
+    failure_class: AtomicPageFailureClass,
+) -> AtomicPageFailure {
+    AtomicPageFailure {
+        index,
+        client_ref,
+        error_code: error_code.into(),
+        failure_class,
+    }
+}
+
+fn atomic_failure_from_ingest_result(
+    index: usize,
+    client_ref: String,
+    result: IngestResult,
+) -> AtomicPageFailure {
+    match result {
+        IngestResult::Rejected { class, .. } => atomic_failure(
+            index,
+            Some(client_ref),
+            error_code_for_failure(class),
+            AtomicPageFailureClass::Validation,
+        ),
+        IngestResult::Quarantined { ticket } => atomic_failure(
+            index,
+            Some(client_ref),
+            error_code_for_quarantine(ticket.kind),
+            AtomicPageFailureClass::Validation,
+        ),
+        IngestResult::Ingested { .. } | IngestResult::Duplicate { .. } => atomic_failure(
+            index,
+            Some(client_ref),
+            "invalid_preparation_result",
+            AtomicPageFailureClass::Validation,
+        ),
+    }
 }
 
 fn privacy_audit_details(observations: &[Observation]) -> Vec<serde_json::Value> {
@@ -6205,17 +6337,19 @@ fn current_materialized_snapshot(
         pending_item_commit: None,
     };
     materialized.validate()?;
-    Ok(MaterializedSnapshotRestore::Restored(materialized))
+    Ok(MaterializedSnapshotRestore::Restored(Box::new(
+        materialized,
+    )))
 }
 
 #[derive(Debug)]
 enum MaterializedSnapshotRestore {
-    Restored(MaterializedProjectionSnapshot),
+    Restored(Box<MaterializedProjectionSnapshot>),
     RebuildRequired { reason: String },
 }
 
 fn validate_persisted_supplemental_anchors(
-    persistence: &SqlitePersistence,
+    persistence: &dyn StoragePorts,
     records: &[lethe_core::domain::SupplementalRecord],
 ) -> Result<(), SelfHostError> {
     for record in records {
@@ -6295,6 +6429,58 @@ fn bootstrap_materialized_placeholder(
 
 impl AppService {
     pub fn bootstrap(config: SelfHostConfig) -> Result<Self, SelfHostError> {
+        let open_general_storage = || -> Result<(Box<dyn StoragePorts>, bool), SelfHostError> {
+            match &config.storage {
+                StorageConfig::Sqlite {
+                    database_path,
+                    blob_dir,
+                    secret_encryption_key,
+                } => {
+                    let persistence = SqlitePersistence::open_with_routing_key_order(
+                        database_path,
+                        blob_dir,
+                        secret_encryption_key,
+                        config.routing_key_order,
+                    )?;
+                    let migrations = persistence.schema_migrations_applied_on_open();
+                    Ok((Box::new(persistence), migrations))
+                }
+                StorageConfig::Postgres {
+                    data_space_id,
+                    dsn,
+                    schema,
+                    role,
+                    read_pool_size,
+                    blobs,
+                } => {
+                    let transport_policy = match blobs.tls_policy {
+                        S3TlsPolicy::Required => S3TransportPolicy::RequiredTls,
+                        S3TlsPolicy::TestHttp => S3TransportPolicy::TestHttp,
+                    };
+                    let persistence = PostgresPersistence::connect_no_tls(
+                        data_space_id.clone(),
+                        dsn.expose(),
+                        schema,
+                        role,
+                        *read_pool_size,
+                        S3BlobStoreConfig {
+                            endpoint: blobs.endpoint.clone(),
+                            region: blobs.region.clone(),
+                            bucket: blobs.bucket.clone(),
+                            access_key: blobs.access_key.expose().to_owned(),
+                            secret_key: blobs.secret_key.expose().to_owned(),
+                            path_style: blobs.path_style,
+                            transport_policy,
+                            timeout: Duration::from_secs(blobs.timeout_seconds),
+                            max_object_bytes: blobs.max_object_bytes,
+                            orphan_min_age: Duration::from_secs(blobs.orphan_min_age_seconds),
+                        },
+                    )?;
+                    let migrations = !persistence.migration_outcome().applied_versions.is_empty();
+                    Ok((Box::new(persistence), migrations))
+                }
+            }
+        };
         let open_operational_ledger =
             || -> Result<Box<dyn OperationalStoragePorts>, SelfHostError> {
                 match &config.operational_ledger {
@@ -6333,16 +6519,10 @@ impl AppService {
         // accepting requests so a first owner query cannot hold the operational-ledger mutex
         // while scanning every historical event.
         let history_projection = HistoryProjection::rebuild(operational_ledger.as_ref())?;
-        let persistence = SqlitePersistence::open_with_routing_key_order(
-            &config.database_path,
-            &config.blob_dir,
-            &config.secret_encryption_key,
-            config.routing_key_order,
-        )?;
-        let schema_migrations_applied = persistence.schema_migrations_applied_on_open();
+        let (persistence, schema_migrations_applied) = open_general_storage()?;
         let stats = persistence.observation_stats()?;
         let supplementals = persistence.load_supplementals()?;
-        validate_persisted_supplemental_anchors(&persistence, &supplementals)?;
+        validate_persisted_supplemental_anchors(persistence.as_ref(), &supplementals)?;
         let supplemental_fingerprint = supplemental_fingerprint(&supplementals)?;
         let person_page_ref = ProjectionRef::new("proj:person-page");
         let persisted_projection_item_count =
@@ -6353,14 +6533,14 @@ impl AppService {
         let had_persisted_manifest = persisted_manifest.is_some();
         let persisted_materialized = match persisted_manifest {
             Some(value) => match current_materialized_snapshot(
-                &persistence,
+                persistence.as_ref(),
                 value,
                 stats,
                 &supplemental_fingerprint,
                 persisted_projection_item_count,
                 persisted_reply_slo_count,
             )? {
-                MaterializedSnapshotRestore::Restored(materialized) => Some(materialized),
+                MaterializedSnapshotRestore::Restored(materialized) => Some(*materialized),
                 MaterializedSnapshotRestore::RebuildRequired { reason } => {
                     tracing::warn!(
                         manifest_restore_rejection_reason = %reason,
@@ -6408,28 +6588,12 @@ impl AppService {
             persisted_sync_state,
         )?;
         let mut persistence_read_pool = Vec::with_capacity(4);
-        persistence_read_pool.push(Arc::new(Mutex::new(
-            Box::new(persistence) as Box<dyn StoragePorts>
-        )));
+        persistence_read_pool.push(Arc::new(Mutex::new(persistence)));
         for _ in 1..4 {
-            persistence_read_pool.push(Arc::new(Mutex::new(Box::new(
-                SqlitePersistence::open_with_routing_key_order(
-                    &config.database_path,
-                    &config.blob_dir,
-                    &config.secret_encryption_key,
-                    config.routing_key_order,
-                )?,
-            )
-                as Box<dyn StoragePorts>)));
+            persistence_read_pool.push(Arc::new(Mutex::new(open_general_storage()?.0)));
         }
-        let persistence: Arc<Mutex<Box<dyn StoragePorts>>> = Arc::new(Mutex::new(Box::new(
-            SqlitePersistence::open_with_routing_key_order(
-                &config.database_path,
-                &config.blob_dir,
-                &config.secret_encryption_key,
-                config.routing_key_order,
-            )?,
-        )));
+        let persistence: Arc<Mutex<Box<dyn StoragePorts>>> =
+            Arc::new(Mutex::new(open_general_storage()?.0));
         let mut operational_ledger_read_pool = Vec::with_capacity(4);
         for _ in 0..4 {
             operational_ledger_read_pool.push(Arc::new(Mutex::new(open_operational_ledger()?)));
@@ -6548,9 +6712,9 @@ impl AppService {
             service.publish_core_snapshot(&core);
             drop(core);
             drop(_derived_lane);
-            let mut core = service.core_lock()?;
+            let core = service.core_lock()?;
             service.refresh_materialized_snapshot_with_reason(
-                &mut core,
+                &core,
                 if !had_persisted_manifest {
                     "bootstrap"
                 } else if schema_migrations_applied {
@@ -6899,6 +7063,383 @@ impl AppService {
         let core = self.core_snapshot();
         self.ensure_projection_fresh(&core.catalog, "proj:person-page")?;
         Ok(build_inventory_documents(&core.snapshot))
+    }
+
+    pub fn ingest_atomic_observation_page(
+        &self,
+        drafts: Vec<ObservationDraft>,
+        source_instance_id: &str,
+        admission_generation: u64,
+    ) -> Result<AtomicPageReport, SelfHostError> {
+        let _import_permit = self.try_acquire_import_permit()?;
+        let _operation = self.bulk_import_operation_lock()?;
+        if source_instance_id.trim().is_empty() {
+            return Err(SelfHostError::IngestionRequest {
+                code: "source_instance_required",
+                detail: "source_instance_id must not be blank".to_owned(),
+                details: serde_json::json!({"field": "source_instance_id"}),
+            });
+        }
+        if admission_generation == 0 {
+            return Err(SelfHostError::IngestionRequest {
+                code: "admission_generation_required",
+                detail: "admission generation must be a positive integer".to_owned(),
+                details: serde_json::json!({"header": "X-LETHE-Admission-Generation"}),
+            });
+        }
+        if drafts.is_empty() {
+            return Err(SelfHostError::IngestionRequest {
+                code: "atomic_page_empty",
+                detail: "drafts must contain at least one item".to_owned(),
+                details: serde_json::json!({"field": "drafts"}),
+            });
+        }
+        if drafts.len() > self.config.resource_limits.max_import_drafts {
+            return Err(SelfHostError::AtomicPageRejected {
+                failures: vec![atomic_failure(
+                    self.config.resource_limits.max_import_drafts,
+                    None,
+                    "draft_count_exceeded",
+                    AtomicPageFailureClass::Validation,
+                )],
+            });
+        }
+
+        let mut client_ref_counts = BTreeMap::<String, usize>::new();
+        for draft in &drafts {
+            if let Some(client_ref) = draft
+                .client_ref
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                *client_ref_counts.entry(client_ref.clone()).or_default() += 1;
+            }
+        }
+
+        let core = self.core_snapshot();
+        let mut failures = Vec::new();
+        let mut prepared = Vec::with_capacity(drafts.len());
+        for (index, draft) in drafts.into_iter().enumerate() {
+            let failures_before = failures.len();
+            let client_ref = match draft.client_ref.clone() {
+                Some(client_ref) if !client_ref.trim().is_empty() => {
+                    if client_ref_counts
+                        .get(&client_ref)
+                        .copied()
+                        .unwrap_or_default()
+                        != 1
+                    {
+                        failures.push(atomic_failure(
+                            index,
+                            Some(client_ref.clone()),
+                            "client_ref_duplicate",
+                            AtomicPageFailureClass::Validation,
+                        ));
+                    }
+                    Some(client_ref)
+                }
+                value => {
+                    failures.push(atomic_failure(
+                        index,
+                        value,
+                        "client_ref_required",
+                        AtomicPageFailureClass::Validation,
+                    ));
+                    None
+                }
+            };
+
+            let payload_bytes = serde_json::to_vec(&draft.payload)?.len();
+            if payload_bytes > self.config.resource_limits.max_payload_bytes {
+                failures.push(atomic_failure(
+                    index,
+                    client_ref.clone(),
+                    "payload_too_large",
+                    AtomicPageFailureClass::Validation,
+                ));
+            }
+
+            let draft = match derive_v2_identity(draft, source_instance_id) {
+                Ok(draft) => Some(draft),
+                Err(error) => {
+                    failures.push(atomic_failure(
+                        index,
+                        client_ref.clone(),
+                        error.code,
+                        AtomicPageFailureClass::Validation,
+                    ));
+                    None
+                }
+            };
+            if let Some(draft) = draft {
+                match prepare_atomic_draft(&core, draft) {
+                    Ok(observation) => {
+                        if failures.len() == failures_before {
+                            prepared.push(PreparedImportObservation {
+                                index,
+                                client_ref: client_ref
+                                    .expect("validated atomic draft has a client_ref"),
+                                observation,
+                            });
+                        }
+                    }
+                    Err(result) => failures.push(atomic_failure_from_ingest_result(
+                        index,
+                        client_ref.unwrap_or_default(),
+                        result,
+                    )),
+                }
+            }
+        }
+        if !failures.is_empty() {
+            failures.sort_by_key(|failure| failure.index);
+            return Err(SelfHostError::AtomicPageRejected { failures });
+        }
+        if prepared.len() != client_ref_counts.len() {
+            return Err(SelfHostError::AtomicPageTransient);
+        }
+
+        let mut blob_failures = Vec::new();
+        {
+            let persistence = self.persistence_read_lock()?;
+            for item in &prepared {
+                for blob_ref in &item.observation.attachments {
+                    let expected = match blob_ref_sha256(blob_ref) {
+                        Ok(expected) => expected,
+                        Err(_) => {
+                            blob_failures.push(atomic_failure(
+                                item.index,
+                                Some(item.client_ref.clone()),
+                                "blob_reference_invalid",
+                                AtomicPageFailureClass::Validation,
+                            ));
+                            continue;
+                        }
+                    };
+                    let bytes = match persistence.get_blob(blob_ref) {
+                        Ok(Some(bytes)) => bytes,
+                        Ok(None) => {
+                            blob_failures.push(atomic_failure(
+                                item.index,
+                                Some(item.client_ref.clone()),
+                                "blob_reference_missing",
+                                AtomicPageFailureClass::Validation,
+                            ));
+                            continue;
+                        }
+                        Err(_) => return Err(SelfHostError::AtomicPageTransient),
+                    };
+                    if bytes.len() > self.config.resource_limits.max_blob_bytes {
+                        blob_failures.push(atomic_failure(
+                            item.index,
+                            Some(item.client_ref.clone()),
+                            "blob_reference_too_large",
+                            AtomicPageFailureClass::Validation,
+                        ));
+                        continue;
+                    }
+                    let actual: [u8; 32] = Sha256::digest(&bytes).into();
+                    if actual != expected {
+                        blob_failures.push(atomic_failure(
+                            item.index,
+                            Some(item.client_ref.clone()),
+                            "blob_reference_digest_mismatch",
+                            AtomicPageFailureClass::Validation,
+                        ));
+                    }
+                }
+            }
+        }
+        if !blob_failures.is_empty() {
+            blob_failures.sort_by_key(|failure| failure.index);
+            return Err(SelfHostError::AtomicPageRejected {
+                failures: blob_failures,
+            });
+        }
+
+        let observations = prepared
+            .iter()
+            .map(|item| item.observation.clone())
+            .collect::<Vec<_>>();
+        let event = self.build_audit_event(
+            "actor:self-host",
+            AuditEventKind::WriteExecution,
+            serde_json::json!({
+                "mode": "v3_atomic_observation_page",
+                "source_instance_id": source_instance_id,
+                "requested": observations.len(),
+                "privacy_decisions": privacy_audit_details(&observations),
+            }),
+        )?;
+        let audit_events = vec![AppService::audit_record(&event)?];
+        let outcomes = {
+            let persistence = self.persistence_lock()?;
+            match persistence.append_observations_v2_atomic_page(
+                source_instance_id,
+                admission_generation,
+                &observations,
+                &audit_events,
+            ) {
+                Ok(outcomes) => outcomes,
+                Err(StorageError::AtomicPageCollision {
+                    index,
+                    existing_id: _,
+                }) => {
+                    let item = prepared
+                        .get(index)
+                        .ok_or(SelfHostError::AtomicPageTransient)?;
+                    return Err(SelfHostError::AtomicPageRejected {
+                        failures: vec![atomic_failure(
+                            item.index,
+                            Some(item.client_ref.clone()),
+                            "canonical_collision",
+                            AtomicPageFailureClass::Collision,
+                        )],
+                    });
+                }
+                Err(error @ StorageError::CutoverAdmissionDenied(_))
+                | Err(error @ StorageError::CutoverConflict(_))
+                | Err(error @ StorageError::CutoverRollbackRefused(_)) => {
+                    return Err(SelfHostError::Storage(error));
+                }
+                Err(_) => {
+                    tracing::error!(
+                        source_instance_id,
+                        page_count = observations.len(),
+                        error_code = "atomic_storage_failure",
+                        "atomic source page transaction failed"
+                    );
+                    return Err(SelfHostError::AtomicPageTransient);
+                }
+            }
+        };
+        if outcomes.len() != prepared.len() {
+            return Err(SelfHostError::AtomicPageTransient);
+        }
+
+        let mut ingested = 0;
+        let mut duplicates = 0;
+        let mut results = Vec::with_capacity(outcomes.len());
+        for (item, outcome) in prepared.into_iter().zip(outcomes) {
+            match outcome {
+                DurableAppendOutcome::Appended(observation_id) => {
+                    if observation_id != item.observation.id {
+                        return Err(SelfHostError::AtomicPageTransient);
+                    }
+                    ingested += 1;
+                    results.push(AtomicPageItemResult::Ingested {
+                        client_ref: item.client_ref,
+                        observation_id,
+                    });
+                }
+                DurableAppendOutcome::Duplicate(existing_id) => {
+                    duplicates += 1;
+                    results.push(AtomicPageItemResult::Duplicate {
+                        client_ref: item.client_ref,
+                        existing_id,
+                    });
+                }
+                DurableAppendOutcome::CanonicalCollision(_) => {
+                    return Err(SelfHostError::AtomicPageTransient);
+                }
+            }
+        }
+        if ingested > 0 {
+            self.trigger_append_consumer();
+        }
+        Ok(AtomicPageReport {
+            ingested,
+            duplicates,
+            results,
+        })
+    }
+
+    pub fn put_source_blob(
+        &self,
+        source_instance_id: &str,
+        admission_generation: u64,
+        expected_sha256: &str,
+        data: &[u8],
+    ) -> Result<SourceBlobReceipt, SelfHostError> {
+        if source_instance_id.trim().is_empty() {
+            return Err(SelfHostError::SourceBlobValidation {
+                code: "source_instance_required",
+                details: serde_json::json!({"header": "X-LETHE-Source-Instance"}),
+            });
+        }
+        if admission_generation == 0 {
+            return Err(SelfHostError::SourceBlobValidation {
+                code: "admission_generation_required",
+                details: serde_json::json!({"header": "X-LETHE-Admission-Generation"}),
+            });
+        }
+        if expected_sha256.len() != 64
+            || !expected_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(SelfHostError::SourceBlobValidation {
+                code: "blob_digest_invalid",
+                details: serde_json::json!({"field": "sha256"}),
+            });
+        }
+        if data.len() > self.config.resource_limits.max_blob_bytes {
+            return Err(SelfHostError::SourceBlobValidation {
+                code: "blob_too_large",
+                details: serde_json::json!({
+                    "actual_bytes": data.len(),
+                    "max_bytes": self.config.resource_limits.max_blob_bytes,
+                }),
+            });
+        }
+
+        let persistence = self.persistence_lock()?;
+        match persistence.cutover_state(source_instance_id) {
+            Ok(_) => {}
+            Err(StorageError::Invariant(_)) => {
+                return Err(SelfHostError::SourceBlobValidation {
+                    code: "cutover_unit_not_ready",
+                    details: serde_json::json!({"source_instance_id": source_instance_id}),
+                });
+            }
+            Err(error) => return Err(SelfHostError::Storage(error)),
+        }
+        persistence.cutover_admit(
+            source_instance_id,
+            CutoverApiVersion::V2,
+            Some(admission_generation),
+        )?;
+        let actual_sha256 = hex::encode(Sha256::digest(data));
+        if actual_sha256 != expected_sha256 {
+            return Err(SelfHostError::SourceBlobValidation {
+                code: "blob_digest_mismatch",
+                details: serde_json::json!({"field": "sha256"}),
+            });
+        }
+        let blob_ref = persistence.put_blob(data, self.config.resource_limits.max_blob_bytes)?;
+        drop(persistence);
+
+        let expected_ref = BlobRef::new(format!("blob:sha256:{expected_sha256}"));
+        if blob_ref != expected_ref {
+            tracing::error!(
+                source_instance_id,
+                digest = expected_sha256,
+                error_code = "blob_store_receipt_mismatch",
+                "general blob store returned a non-canonical receipt"
+            );
+            return Err(SelfHostError::AtomicPageTransient);
+        }
+        let mut core = self.core_lock()?;
+        core.blobs.put(data);
+        self.publish_core_snapshot(&core);
+        Ok(SourceBlobReceipt {
+            blob_ref,
+            size_bytes: data.len(),
+        })
+    }
+
+    pub fn source_blob_body_limit(&self) -> usize {
+        self.config.resource_limits.max_blob_bytes
     }
 
     pub fn ingest_observation_drafts(
@@ -7594,6 +8135,7 @@ pub(crate) mod projection_api;
 mod search_index;
 mod service_support;
 mod slide_support;
+mod source_export;
 mod supplemental_write;
 mod sync;
 mod sync_support;
@@ -7614,3 +8156,8 @@ use sync_support::*;
 
 #[cfg(test)]
 mod tests;
+
+pub use source_export::{
+    SourceObservationExportItem, SourceObservationExportPage, SourceObservationExportQuery,
+    export_source_observation_page,
+};

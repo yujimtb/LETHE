@@ -117,7 +117,7 @@ impl<'a> BackgroundRebuildStorage<'a> {
             persistence_lock_hold_ms = lock_hold_ms,
             "background non-corpus rebuild page completed"
         );
-        if page_number == 1 || page_number % 100 == 0 {
+        if page_number == 1 || page_number.is_multiple_of(100) {
             tracing::info!(
                 page_count = page_number,
                 elapsed_ms = Self::duration_ms(self.started_at.elapsed()),
@@ -431,6 +431,19 @@ impl AppService {
         Ok(self
             .persistence_lock()?
             .cutover_register(source_instance_id, authority, reason)?)
+    }
+
+    pub fn bootstrap_v3_source_unit(
+        &self,
+        source_instance_id: &str,
+        authority: &str,
+        reason: &str,
+    ) -> Result<CutoverState, SelfHostError> {
+        Ok(self.persistence_lock()?.bootstrap_v3_source_unit(
+            source_instance_id,
+            authority,
+            reason,
+        )?)
     }
 
     pub fn cutover_inventory(&self) -> Result<Vec<CutoverInventoryItem>, SelfHostError> {

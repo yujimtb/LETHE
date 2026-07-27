@@ -38,7 +38,7 @@ use lethe_storage_api::{
     SlackThreadCatalogStore as SlackThreadCatalogStorePort, SlackThreadKey, StorageError,
     StorageResult, StoredObservation, StoredOperationalEvent,
     SupplementalProjectionCommitter as SupplementalProjectionCommitterPort,
-    SupplementalStore as SupplementalStorePort, SyncMetricRecord,
+    SupplementalStore as SupplementalStorePort, SyncMetricRecord, verify_blob_references,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -3330,6 +3330,9 @@ fn projection_item_validation_error(error: StorageError) -> PersistenceError {
         | StorageError::CutoverRollbackRefused(message) => {
             PersistenceError::SchemaInvariant(message)
         }
+        StorageError::AtomicPageCollision { existing_id, .. } => PersistenceError::SchemaInvariant(
+            format!("atomic page collision with existing observation {existing_id}"),
+        ),
     }
 }
 
