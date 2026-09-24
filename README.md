@@ -258,3 +258,23 @@ SQLite、blob、取得済み資料、credential は Git 管理対象外です。
 ```powershell
 python ./scripts/public_release_audit.py --check-history
 ```
+
+## License
+
+Except for third-party material identified in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md), LETHE-authored software,
+Projection implementations and specifications, scripts, and documentation in
+this repository are licensed under the
+[Server Side Public License, version 1 (SSPL-1.0)](LICENSE).
+
+The project uses SSPL-1.0 so that LETHE can be used and modified while the
+license's service-source obligations apply when LETHE functionality is offered
+to third parties as a service. This paragraph describes the project's intent;
+the license text controls the legal terms.
+
+SSPL-1.0 is a source-available license and is not approved by the Open Source
+Initiative. OpenSpec-generated development-agent files retain their upstream
+MIT license; see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) and
+[`LICENSES/OpenSpec-MIT.txt`](LICENSES/OpenSpec-MIT.txt).
+
+Copyright (c) 2026 Yuji Mitobe.

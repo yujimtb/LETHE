@@ -2,6 +2,7 @@
 name = "lethe-storage-sqlite"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 aes-gcm.workspace = true

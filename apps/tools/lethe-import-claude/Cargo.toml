@@ -2,6 +2,7 @@
 name = "lethe-import-claude"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 lethe-adapter-claude = { path = "../../../crates/adapters/claude" }
