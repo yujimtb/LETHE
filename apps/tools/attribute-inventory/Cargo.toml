@@ -2,6 +2,7 @@
 name = "lethe-attribute-inventory"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 lethe-selfhost = { path = "../../selfhost" }

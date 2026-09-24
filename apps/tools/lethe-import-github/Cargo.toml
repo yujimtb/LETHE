@@ -2,6 +2,7 @@
 name = "lethe-import-github"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 lethe-adapter-github = { path = "../../../crates/adapters/github" }
